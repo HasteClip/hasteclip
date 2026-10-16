@@ -1326,6 +1326,8 @@ impl Ready {
         let handle_w = 9.0;
         let in_handle = Rect::from_min_max(Pos2::new(xi - handle_w, body.top()), Pos2::new(xi, body.bottom()));
         let out_handle = Rect::from_min_max(Pos2::new(xo, body.top()), Pos2::new(xo + handle_w, body.bottom()));
+        crate::demo::mark(&ctx, || "trim:in".into(), in_handle);
+        crate::demo::mark(&ctx, || "trim:out".into(), out_handle);
         let hover_pos = ui.input(|i| i.pointer.hover_pos());
         for (h, left, drag) in [(in_handle, true, Drag::In), (out_handle, false, Drag::Out)] {
             let active = self.dragging == Some(drag) || (self.dragging.is_none() && hover_pos.is_some_and(|p| h.expand(5.0).contains(p)));

@@ -12,6 +12,7 @@ mod autostart;
 mod away;
 mod clips;
 mod collections;
+mod demo;
 mod webcam_ui;
 mod discord;
 mod editor;
@@ -517,6 +518,8 @@ struct App {
     /// Games' icons.
     pub(crate) web_images: web_images::WebImages,
     pub(crate) updater: update::Updater,
+    /// A demo being recorded (`HASTECLIP_DEMO_SCRIPT`), see `demo.rs`.
+    demo: Option<demo::Demo>,
     pub(crate) presence: discord::Presence,
     /// Saves a clip as Save clip is pressed, frames or not.
     quick_save: service::QuickSave,
@@ -681,6 +684,7 @@ impl App {
             nav: nav::History::default(),
             web_images: Default::default(),
             updater,
+            demo: demo::Demo::from_env(&ctx),
             presence: discord::Presence::new(),
             clipped_game: None,
             games,
@@ -1076,6 +1080,9 @@ impl eframe::App for App {
             laps.lap("settings");
         }
         laps.report();
+        if let Some(demo) = &mut self.demo {
+            demo.after(&ctx);
+        }
 
         // Keep repainting: every frame while capturing (live timer), else a steady
         // tick so capture-thread events and folder changes are picked up promptly.
@@ -1087,6 +1094,9 @@ impl eframe::App for App {
     }
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if let Some(demo) = &mut self.demo {
+            demo.input(ctx, raw_input);
+        }
         ui_kit::replay_click(ctx, raw_input);
     }
 

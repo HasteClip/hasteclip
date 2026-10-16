@@ -196,6 +196,8 @@ pub fn play_button(ui: &mut egui::Ui, playing: bool) -> Centre {
     let p = theme::pal(ui);
     let mut c = Centre::default();
     let (r, resp) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::click());
+    crate::demo::mark(ui.ctx(), || "play".into(), r);
+    crate::demo::playing(ui.ctx(), playing);
     let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered(), theme::FAST);
     let down = resp.is_pointer_button_down_on();
     let rr = if down { r.shrink(1.0) } else { r };
@@ -272,6 +274,7 @@ pub enum Pinned {
 /// seconds), and the moments as pins. `removable`: your markers can be taken
 /// away from their right-click menu.
 pub fn ruler(ui: &mut egui::Ui, rect: Rect, view: (f64, f64), fps: f64, frames: bool, moments: &[Moment], removable: bool) -> Option<Pinned> {
+    crate::demo::timeline(ui.ctx(), rect, view, moments.iter().filter(|m| m.marker).map(|m| m.t));
     let p = theme::pal(ui);
     let painter = ui.painter_at(rect.expand2(vec2(10.0, 0.0)));
     let (v0, span) = view;
