@@ -1885,6 +1885,17 @@ impl App {
     /// A demo step that's more than input (see `demo.rs`).
     fn demo_action(&mut self, action: demo::Action) {
         match action {
+            demo::Action::Unsave => {
+                demo::take_back_saves();
+                self.refresh_clips();
+            }
+            demo::Action::EmptyCollections => {
+                let lib = self.settings.output_dir.clone();
+                let all: Vec<(String, Vec<PathBuf>)> = self.collections.list().iter().map(|c| (c.id.clone(), c.clips.iter().map(|k| lib.join(k)).collect())).collect();
+                for (id, clips) in all {
+                    self.collections.remove(&id, &clips);
+                }
+            }
             demo::Action::Clipping(on) => {
                 if on && self.rec_state == RecState::Idle {
                     self.start_replay_buffer();

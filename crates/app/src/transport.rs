@@ -275,6 +275,14 @@ pub enum Pinned {
 /// away from their right-click menu.
 pub fn ruler(ui: &mut egui::Ui, rect: Rect, view: (f64, f64), fps: f64, frames: bool, moments: &[Moment], removable: bool) -> Option<Pinned> {
     crate::demo::timeline(ui.ctx(), rect, view, moments.iter().filter(|m| m.marker).map(|m| m.t));
+    // Your markers are cues for the person making a demo, not part of it.
+    let shown: Vec<Moment>;
+    let moments = if crate::demo::on() {
+        shown = moments.iter().filter(|m| !m.marker).cloned().collect();
+        &shown[..]
+    } else {
+        moments
+    };
     let p = theme::pal(ui);
     let painter = ui.painter_at(rect.expand2(vec2(10.0, 0.0)));
     let (v0, span) = view;

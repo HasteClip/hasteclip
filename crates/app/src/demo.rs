@@ -179,6 +179,9 @@ enum Step {
         click: bool,
         #[serde(default)]
         double: bool,
+        /// Keys held, like `"cmd"` (select a clip) or `"shift"`.
+        #[serde(default)]
+        mods: Option<String>,
     },
     /// Press the button on a target (or where the pointer is), move by `by`
     /// points or onto `to`, let go.
@@ -207,7 +210,7 @@ enum Step {
     /// Move the open clip's playhead to a marker (`"marker:1"` is the first),
     /// `before` seconds ahead of it, by clicking the timeline there.
     Seek {
-        seek: String,
+        seek: Moment,
         #[serde(default)]
         before: f64,
     },
@@ -224,6 +227,10 @@ enum Step {
         #[serde(default = "default_move")]
         secs: f64,
     },
+    /// Put back what the scene changed, so it can end as it began (a looping
+    /// video): `"saves"` takes the clips saving handed over back out of the
+    /// library, `"collections"` empties every collection.
+    Reset { reset: String },
     /// Show or hide the pointer.
     Pointer { pointer: bool },
     /// Start (`true`) or stop clipping, as the app does at launch. Nothing is
@@ -237,6 +244,8 @@ enum Step {
 /// What the app does for a step that's more than input: taken by the app
 /// each frame ([`Demo::take_action`]).
 pub enum Action {
+    Unsave,
+    EmptyCollections,
     Clipping(bool),
     Shortcut(crate::settings::ShortcutAction),
 }
@@ -335,7 +344,7 @@ impl Demo {
                 frames.push(image.clone());
                 false
             }
-            Event::PointerMoved(_) | Event::PointerButton { .. } | Event::MouseWheel { .. } | Event::Key { .. } | Event::Text(_) | Event::PointerGone => false,
+            Event::PointerMoved(_) | Event::PointerButton { .. } | Event::MouseWheel { .. } | Event::Key { .. } | Event::ModifiersChanged(_) | Event::Text(_) | Event::PointerGone => false,
             _ => true,
         });
         let now = raw.time.unwrap_or(0.0);
@@ -405,7 +414,7 @@ impl Demo {
         let resolve = |s: &mut Self, target: &Target| -> Option<Pos2> {
             match target {
                 Target::Point([x, y]) => Some(pos2(*x, *y)),
-                Target::Named(name) => match marks.get(name).copied().or_else(|| nth_clip(&marks, name)) {
+                Target::Named(name) => match marks.get(name).copied().or_else(|| nth_clip(&marks, name)).or_else(|| by_prefix(&marks, name)) {
                     Some(r) => Some(r.center()),
                     None => {
                         let since = *s.waiting.get_or_insert(now);
@@ -425,6 +434,14 @@ impl Demo {
                 if t >= wait {
                     next(self);
                 }
+            }
+            Step::Reset { reset } => {
+                self.action = Some(match reset.as_str() {
+                    "saves" => Action::Unsave,
+                    "collections" => Action::EmptyCollections,
+                    other => fail(&format!("reset \"saves\" or \"collections\", not \"{other}\"")),
+                });
+                next(self);
             }
             Step::Pointer { pointer } => {
                 self.shown = pointer;
@@ -519,11 +536,15 @@ impl Demo {
                     next(self);
                 }
             }
-            Step::Click { double, .. } => {
+            Step::Click { double, mods, .. } => {
+                let modifiers = mods.as_deref().map_or(Modifiers::NONE, |m| parse_key(&format!("{m}+a")).1);
                 // Press and release on frames of their own, like a hand: a
                 // press, a frame held, a release (twice for a double click).
                 let frames = if double { 4 } else { 2 };
                 let n = self.click_frame;
+                if n == 0 && modifiers != Modifiers::NONE {
+                    raw.events.push(Event::ModifiersChanged(modifiers));
+                }
                 if n < frames {
                     let pressed = n.is_multiple_of(2);
                     raw.events.push(Event::PointerButton { pos: self.pointer, button: PointerButton::Primary, pressed, modifiers });
@@ -531,6 +552,7 @@ impl Demo {
                     self.click_frame += 1;
                 } else {
                     self.click_frame = 0;
+                    raw.events.push(Event::ModifiersChanged(Modifiers::NONE));
                     next(self);
                 }
             }
@@ -598,7 +620,7 @@ impl Demo {
             Step::Seek { seek, before } => {
                 if self.seek_at.is_none() {
                     let Some(tl) = ctx.data(|d| d.get_temp::<Timeline>(markers_id())) else { return };
-                    let at = tl.time_of(&Moment::Named(seek.clone())) - before;
+                    let at = tl.time_of(&seek) - before;
                     self.seek_at = Some(pos2(tl.x_of(at), tl.rect.center().y));
                 }
                 let to = self.seek_at.unwrap_or(self.pointer);
@@ -652,6 +674,15 @@ fn nth_clip(marks: &HashMap<String, Rect>, name: &str) -> Option<Rect> {
     let mut cards: Vec<Rect> = marks.iter().filter(|(k, _)| k.starts_with("clip:")).map(|(_, r)| *r).collect();
     cards.sort_by(|a, b| (a.top().round(), a.left()).partial_cmp(&(b.top().round(), b.left())).unwrap_or(std::cmp::Ordering::Equal));
     cards.get(n.checked_sub(1)?).copied()
+}
+
+/// The one spot whose name starts with `name` ("clip:6 kills" for "clip:6
+/// kills (1 headshot) on Nuke · 00:38:21", "button:Stop clipping" for its
+/// tooltip with the key).
+fn by_prefix(marks: &HashMap<String, Rect>, name: &str) -> Option<Rect> {
+    let mut found = marks.iter().filter(|(k, _)| k.starts_with(name));
+    let first = found.next()?;
+    found.next().is_none().then(|| *first.1)
 }
 
 fn ease(t: f64) -> f64 {
@@ -749,6 +780,22 @@ fn hide_saves(saves: &[PathBuf]) {
     let _ = SAVES.set(std::sync::Mutex::new(queue.into()));
 }
 
+/// Clips saving handed over: where they are now, where they waited, and
+/// their place in the library, for [`take_back_saves`].
+static HANDED: std::sync::Mutex<Vec<(PathBuf, PathBuf, PathBuf)>> = std::sync::Mutex::new(Vec::new());
+
+/// Take the clips saving handed over back out of the library (they wait to be
+/// saved again, and go home when the demo ends).
+pub fn take_back_saves() {
+    let handed = std::mem::take(&mut *HANDED.lock().unwrap());
+    let Some(queue) = SAVES.get() else { return };
+    for (to, held, rel) in handed.into_iter().rev() {
+        if std::fs::rename(&to, &held).is_ok() {
+            queue.lock().unwrap().push_front((held, rel));
+        }
+    }
+}
+
 static SAVES: OnceLock<std::sync::Mutex<std::collections::VecDeque<(PathBuf, PathBuf)>>> = OnceLock::new();
 
 /// The capture service while a demo runs: says it's clipping when asked to
@@ -784,6 +831,7 @@ pub(crate) fn capture_thread(rx: mpsc::Receiver<crate::service::Cmd>, tx: mpsc::
                             let _ = tx.send(Evt::Error(format!("demo: couldn't hand over a clip: {e}")));
                             return;
                         }
+                        HANDED.lock().unwrap().push((to.clone(), held, rel));
                         let _ = tx.send(Evt::Saved(crate::service::landed(to, details)));
                     });
                 }
