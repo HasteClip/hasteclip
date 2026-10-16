@@ -301,6 +301,8 @@ pub struct Demo {
     click_frame: u8,
     /// Where a drag took hold.
     grabbed: Option<Pos2>,
+    /// When a trim's pull started (step time).
+    pull_started: Option<f64>,
     /// For the app to do this frame.
     action: Option<Action>,
     /// Before recording starts: the last frame's time, and since when frames
@@ -337,6 +339,7 @@ impl Demo {
             seek_at: None,
             click_frame: 0,
             grabbed: None,
+            pull_started: None,
             action: None,
             last_frame: None,
             steady_since: None,
@@ -425,6 +428,7 @@ impl Demo {
             s.waiting = None;
             s.seek_at = None;
             s.grabbed = None;
+            s.pull_started = None;
         };
         let resolve = |s: &mut Self, target: &Target| -> Option<Pos2> {
             match target {
@@ -470,7 +474,10 @@ impl Demo {
                     self.started = None;
                     return;
                 };
-                let grab = pos2(handle.center().x, handle.top() + 24.0);
+                // Once held, the handle moves with the pointer: the pull goes
+                // from where it took hold, never from where the handle is now
+                // (that ran away, the whole way in a few frames).
+                let grab = self.grabbed.unwrap_or_else(|| pos2(handle.center().x, handle.top() + 24.0));
                 let Some(tl) = ctx.data(|d| d.get_temp::<Timeline>(markers_id())) else { return };
                 let end = pos2(tl.x_of(tl.time_of(&to) - before), grab.y);
                 // A long way takes longer, as a hand does.
@@ -484,20 +491,22 @@ impl Demo {
                     self.pointer = grab;
                     raw.events.push(Event::PointerButton { pos: grab, button: PointerButton::Primary, pressed: true, modifiers });
                     self.down = true;
-                    // Where it's pulled to is fixed now: the handle moves under the pointer.
+                    // Where it's held and where it's pulled to are fixed now.
+                    self.grabbed = Some(grab);
                     self.seek_at = Some(end);
+                    self.pull_started = Some(t);
                     return;
                 }
                 let end = self.seek_at.unwrap_or(end);
-                let pull = t - reach;
-                // A long pull takes longer (`secs` is for a short one), so a
-                // handle crossing the timeline isn't thrown: about 260 points
-                // a second, at most 4.
-                let secs = secs.max((grab.distance(end) as f64 / 260.0).min(4.0));
-                self.pointer = glide(grab, end, pull, secs);
+                let pull = t - self.pull_started.unwrap_or(reach);
+                // A long pull takes longer (`secs` is for a short one), at a
+                // hand's pace: about 300 points a second, at most 4 s.
+                let secs = secs.max((grab.distance(end) as f64 / 300.0).min(4.0));
+                self.pointer = grab + (end - grab) * ease_gentle((pull / secs).clamp(0.0, 1.0)) as f32;
                 if pull >= secs + 0.05 {
                     raw.events.push(Event::PointerButton { pos: self.pointer, button: PointerButton::Primary, pressed: false, modifiers });
                     self.down = false;
+                    eprintln!("demo: trim {trim} pulled {:.0} points in {secs:.2} s", grab.distance(end));
                     next(self);
                 }
             }
@@ -706,6 +715,12 @@ fn by_prefix(marks: &HashMap<String, Rect>, name: &str) -> Option<Rect> {
 
 fn ease(t: f64) -> f64 {
     if t < 0.5 { 4.0 * t * t * t } else { 1.0 - (-2.0 * t + 2.0).powi(3) / 2.0 }
+}
+
+/// Eased in and out, but without `ease`'s burst in the middle (at most about
+/// 1.6 times the average speed, not 3): a long pull reads as a steady hand.
+fn ease_gentle(t: f64) -> f64 {
+    (1.0 - (t * std::f64::consts::PI).cos()) / 2.0
 }
 
 fn glide(from: Pos2, to: Pos2, t: f64, secs: f64) -> Pos2 {
