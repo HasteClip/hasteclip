@@ -928,6 +928,9 @@ impl eframe::App for App {
         let mut laps = Laps::start();
 
         self.navigate(&ctx);
+        if let Some(action) = self.demo.as_mut().and_then(demo::Demo::take_action) {
+            self.demo_action(action);
+        }
 
         // A clip plays in its card on Clips only.
         if self.page != Page::Clips {
@@ -1080,9 +1083,6 @@ impl eframe::App for App {
             laps.lap("settings");
         }
         laps.report();
-        if let Some(demo) = &mut self.demo {
-            demo.after(&ctx);
-        }
 
         // Keep repainting: every frame while capturing (live timer), else a steady
         // tick so capture-thread events and folder changes are picked up promptly.
@@ -1090,6 +1090,10 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(100));
         } else {
             ctx.request_repaint_after(Duration::from_millis(300));
+        }
+        // Last: a demo records every frame.
+        if let Some(demo) = &mut self.demo {
+            demo.after(&ctx);
         }
     }
 
@@ -1188,7 +1192,8 @@ impl App {
             self.clip_saving();
         }
         // Not while samples are played on the speakers: the detector would hear them.
-        let listen = self.settings.voice_clip && self.rec_state == RecState::Buffering && self.recording_shortcut.is_none() && self.page != Page::VoiceReview;
+        // (Never in a demo recording: it clips nothing, and the mic stays shut.)
+        let listen = self.settings.voice_clip && self.rec_state == RecState::Buffering && self.recording_shortcut.is_none() && self.page != Page::VoiceReview && self.demo.is_none();
         self.voice.collect(self.settings.voice_samples);
         let mic = listen.then(|| self.voice_mic()).flatten();
         self.voice.listen(mic.as_deref());
@@ -1868,6 +1873,22 @@ impl App {
     /// OS default is *now* (e.g. headphones plugged in since launch).
     fn refresh_audio_devices(&mut self) {
         self.audio = capture::audio::list_audio_devices();
+    }
+
+    /// A demo step that's more than input (see `demo.rs`).
+    fn demo_action(&mut self, action: demo::Action) {
+        match action {
+            demo::Action::Clipping(on) => {
+                if on && self.rec_state == RecState::Idle {
+                    self.start_replay_buffer();
+                } else if !on && self.rec_state != RecState::Idle {
+                    self.stop();
+                }
+            }
+            demo::Action::Shortcut(settings::ShortcutAction::ToggleBuffer) => self.toggle_buffer(),
+            demo::Action::Shortcut(settings::ShortcutAction::ToggleRecord) => self.toggle_record(),
+            demo::Action::Shortcut(settings::ShortcutAction::SaveClip) => self.save_clip(),
+        }
     }
 
     fn start_replay_buffer(&mut self) {

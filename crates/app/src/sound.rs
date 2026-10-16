@@ -38,7 +38,8 @@ fn cache() -> &'static Mutex<HashMap<String, Pcm>> {
 
 /// The clip-saved sound, if it's on.
 pub fn play_saved(cfg: &SaveSound) {
-    if cfg.enabled {
+    // A demo recording or a muted test instance (`HASTECLIP_MUTE`) stays quiet.
+    if cfg.enabled && !crate::player::dev_muted() && !crate::demo::on() {
         play(&cfg.sound, cfg.volume, cfg.recorded);
     }
 }

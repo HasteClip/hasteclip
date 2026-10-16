@@ -74,6 +74,25 @@ struct Timeline {
     markers: Vec<f64>,
 }
 
+impl Timeline {
+    /// Seconds into the clip of a moment the script names.
+    fn time_of(&self, m: &Moment) -> f64 {
+        match m {
+            Moment::Secs(s) => *s,
+            Moment::Named(name) => {
+                let n: usize = name.strip_prefix("marker:").and_then(|n| n.parse().ok()).unwrap_or_else(|| fail(&format!("a moment is \"marker:N\" or seconds, not \"{name}\"")));
+                *self.markers.get(n.saturating_sub(1)).unwrap_or_else(|| fail(&format!("the open clip has {} markers, not {n} (put them in with B in the player)", self.markers.len())))
+            }
+        }
+    }
+
+    /// Where a time is on the timeline, as the ruler draws it.
+    fn x_of(&self, t: f64) -> f32 {
+        let (v0, span) = self.view;
+        self.rect.left() + (((t - v0) / span.max(0.001)).clamp(0.0, 1.0) as f32) * self.rect.width()
+    }
+}
+
 /// Whether the open clip is playing, as its play button shows: so `play` can
 /// press it only when it needs to.
 pub fn playing(ctx: &Context, playing: bool) {
@@ -107,6 +126,10 @@ struct Script {
     /// Frames a second.
     #[serde(default = "default_fps")]
     fps: u32,
+    /// Clips that saving hands over, in turn (paths inside the library). They
+    /// leave the library when the demo starts and come back as new clips.
+    #[serde(default)]
+    saves: Vec<PathBuf>,
     steps: Vec<Step>,
 }
 
@@ -114,7 +137,8 @@ fn default_fps() -> u32 {
     60
 }
 
-/// One thing the script does. Targets: `"clip:<title>"`, `"filter:<name>"`,
+/// One thing the script does. Targets: `"clip:<title>"` or `"clip:2"` (the
+/// second card on screen), `"filter:<name>"`,
 /// `"button:<label>"` (buttons and menu items), `"play"`, `"trim:in"`,
 /// `"trim:out"`, `"timeline"`, or a point `[x, y]` in the window's points.
 #[derive(Deserialize, Clone)]
@@ -170,12 +194,43 @@ enum Step {
     /// Make the open clip play (`true`) or pause (`false`): moves to its play
     /// button and clicks it, unless it's already that way.
     Play { play: bool },
+    /// Drag a trim handle (`"in"` or `"out"`) to a moment: `"marker:N"`, or
+    /// seconds into the clip, `before` (or `after`, negative) seconds off it.
+    Trim {
+        trim: String,
+        to: Moment,
+        #[serde(default)]
+        before: f64,
+        #[serde(default = "default_move")]
+        secs: f64,
+    },
     /// Show or hide the pointer.
     Pointer { pointer: bool },
+    /// Start (`true`) or stop clipping, as the app does at launch. Nothing is
+    /// recorded in a demo; saving hands over the script's `saves`.
+    Clipping { clipping: bool },
+    /// Press a global shortcut, as from inside a game: `"save"` (save a clip),
+    /// `"clipping"`, `"record"`.
+    Shortcut { shortcut: String },
+}
+
+/// What the app does for a step that's more than input: taken by the app
+/// each frame ([`Demo::take_action`]).
+pub enum Action {
+    Clipping(bool),
+    Shortcut(crate::settings::ShortcutAction),
 }
 
 fn default_move() -> f64 {
     0.7
+}
+
+/// A moment in the open clip: `"marker:N"` (the Nth marker) or seconds.
+#[derive(Deserialize, Clone)]
+#[serde(untagged)]
+enum Moment {
+    Named(String),
+    Secs(f64),
 }
 
 #[derive(Deserialize, Clone)]
@@ -205,6 +260,10 @@ pub struct Demo {
     seek_at: Option<Pos2>,
     /// How far into a click: press, release, (press, release).
     click_frame: u8,
+    /// Where a drag took hold.
+    grabbed: Option<Pos2>,
+    /// For the app to do this frame.
+    action: Option<Action>,
     /// Before recording starts: the last frame's time, and since when frames
     /// have come on time.
     last_frame: Option<f64>,
@@ -222,6 +281,7 @@ impl Demo {
         let text = std::fs::read_to_string(path).unwrap_or_else(|e| fail(&format!("can't read {}: {e}", path.display())));
         let script: Script = serde_json::from_str(&text).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
         let out = path.parent().unwrap_or(std::path::Path::new(".")).join(&script.out);
+        hide_saves(&script.saves);
         eprintln!("demo: {} steps → {}", script.steps.len(), out.display());
         ctx.request_repaint();
         Some(Self {
@@ -237,6 +297,8 @@ impl Demo {
             waiting: None,
             seek_at: None,
             click_frame: 0,
+            grabbed: None,
+            action: None,
             last_frame: None,
             steady_since: None,
         })
@@ -310,11 +372,12 @@ impl Demo {
             s.started = None;
             s.waiting = None;
             s.seek_at = None;
+            s.grabbed = None;
         };
         let resolve = |s: &mut Self, target: &Target| -> Option<Pos2> {
             match target {
                 Target::Point([x, y]) => Some(pos2(*x, *y)),
-                Target::Named(name) => match marks.get(name) {
+                Target::Named(name) => match marks.get(name).copied().or_else(|| nth_clip(&marks, name)) {
                     Some(r) => Some(r.center()),
                     None => {
                         let since = *s.waiting.get_or_insert(now);
@@ -337,6 +400,55 @@ impl Demo {
             }
             Step::Pointer { pointer } => {
                 self.shown = pointer;
+                next(self);
+            }
+            Step::Trim { trim, to, before, secs } => {
+                // Held by its top, over the picture lane: lower down it'd
+                // cross a sound lane's volume line and show its level.
+                let Some(handle) = marks.get(&format!("trim:{trim}")).copied() else {
+                    resolve(self, &Target::Named(format!("trim:{trim}")));
+                    self.started = None;
+                    return;
+                };
+                let grab = pos2(handle.center().x, handle.top() + 24.0);
+                let Some(tl) = ctx.data(|d| d.get_temp::<Timeline>(markers_id())) else { return };
+                let end = pos2(tl.x_of(tl.time_of(&to) - before), grab.y);
+                let reach = if from.distance(grab) > 1.0 { 0.5 } else { 0.0 };
+                if t < reach {
+                    self.shown = true;
+                    self.pointer = glide(from, grab, t, reach);
+                    return;
+                }
+                if !self.down {
+                    self.pointer = grab;
+                    raw.events.push(Event::PointerButton { pos: grab, button: PointerButton::Primary, pressed: true, modifiers });
+                    self.down = true;
+                    // Where it's pulled to is fixed now: the handle moves under the pointer.
+                    self.seek_at = Some(end);
+                    return;
+                }
+                let end = self.seek_at.unwrap_or(end);
+                let pull = t - reach;
+                self.pointer = glide(grab, end, pull, secs);
+                if pull >= secs + 0.05 {
+                    raw.events.push(Event::PointerButton { pos: self.pointer, button: PointerButton::Primary, pressed: false, modifiers });
+                    self.down = false;
+                    next(self);
+                }
+            }
+            Step::Clipping { clipping } => {
+                self.action = Some(Action::Clipping(clipping));
+                next(self);
+            }
+            Step::Shortcut { shortcut } => {
+                use crate::settings::ShortcutAction as S;
+                let a = match shortcut.as_str() {
+                    "save" => S::SaveClip,
+                    "clipping" => S::ToggleBuffer,
+                    "record" => S::ToggleRecord,
+                    other => fail(&format!("not a shortcut: \"{other}\" (save, clipping, record)")),
+                };
+                self.action = Some(Action::Shortcut(a));
                 next(self);
             }
             Step::Play { play } => {
@@ -409,8 +521,12 @@ impl Demo {
                     self.pointer = grab;
                     raw.events.push(Event::PointerButton { pos: grab, button: PointerButton::Primary, pressed: true, modifiers });
                     self.down = true;
+                    self.grabbed = Some(grab);
                     return;
                 }
+                // Pull from where it was grabbed: what's dragged moves with the
+                // pointer, so its mark does too.
+                let grab = self.grabbed.unwrap_or(grab);
                 let end = match (&to, by) {
                     (Some(target), _) => match resolve(self, target) {
                         Some(p) => p,
@@ -451,14 +567,9 @@ impl Demo {
             }
             Step::Seek { seek, before } => {
                 if self.seek_at.is_none() {
-                    let n: usize = seek.strip_prefix("marker:").and_then(|n| n.parse().ok()).unwrap_or_else(|| fail(&format!("seek wants \"marker:N\", not \"{seek}\"")));
                     let Some(tl) = ctx.data(|d| d.get_temp::<Timeline>(markers_id())) else { return };
-                    let Some(&at) = tl.markers.get(n.saturating_sub(1)) else {
-                        fail(&format!("the open clip has {} markers, not {n} (put them in with B in the player)", tl.markers.len()))
-                    };
-                    let (v0, span) = tl.view;
-                    let f = ((at - before - v0) / span.max(0.001)).clamp(0.0, 1.0) as f32;
-                    self.seek_at = Some(pos2(tl.rect.left() + tl.rect.width() * f, tl.rect.center().y));
+                    let at = tl.time_of(&Moment::Named(seek.clone())) - before;
+                    self.seek_at = Some(pos2(tl.x_of(at), tl.rect.center().y));
                 }
                 let to = self.seek_at.unwrap_or(self.pointer);
                 let secs = 0.6;
@@ -477,6 +588,11 @@ impl Demo {
         }
     }
 
+    /// A step's action for the app, if this frame has one.
+    pub fn take_action(&mut self) -> Option<Action> {
+        self.action.take()
+    }
+
     /// After the app has drawn: the pointer on top, last frame's marks kept
     /// for aiming, and the frame asked for.
     pub fn after(&mut self, ctx: &Context) {
@@ -493,6 +609,15 @@ impl Demo {
         // Every frame, for an even video.
         ctx.request_repaint();
     }
+}
+
+/// `clip:N`: the Nth clip card on screen, reading left to right, top down
+/// (so a script needn't know the clips' names).
+fn nth_clip(marks: &HashMap<String, Rect>, name: &str) -> Option<Rect> {
+    let n: usize = name.strip_prefix("clip:")?.parse().ok()?;
+    let mut cards: Vec<Rect> = marks.iter().filter(|(k, _)| k.starts_with("clip:")).map(|(_, r)| *r).collect();
+    cards.sort_by(|a, b| (a.top().round(), a.left()).partial_cmp(&(b.top().round(), b.left())).unwrap_or(std::cmp::Ordering::Equal));
+    cards.get(n.checked_sub(1)?).copied()
 }
 
 fn ease(t: f64) -> f64 {
@@ -542,6 +667,85 @@ fn draw_pointer(ctx: &Context, at: Pos2, down: bool) {
     let mut outline = shape.clone();
     outline.push(shape[0]);
     painter.add(egui::Shape::line(outline, egui::Stroke::new(1.1, Color32::from_gray(20))));
+}
+
+/// The library the demo runs on (`HASTECLIP_LIBRARY`).
+fn library() -> PathBuf {
+    std::env::var_os("HASTECLIP_LIBRARY").map(PathBuf::from).unwrap_or_else(|| fail("a demo runs on a copy of a library: set HASTECLIP_LIBRARY"))
+}
+
+/// Where the prepared clips wait, out of the library's sight.
+fn waiting_room() -> PathBuf {
+    std::env::temp_dir().join(format!("hasteclip-demo-saves-{}", std::process::id()))
+}
+
+/// The clips saving will hand over: moved out of the library now, in order.
+fn hide_saves(saves: &[PathBuf]) {
+    if saves.is_empty() {
+        return;
+    }
+    let lib = library();
+    let room = waiting_room();
+    let _ = std::fs::create_dir_all(&room);
+    let mut queue = Vec::new();
+    for (i, rel) in saves.iter().enumerate() {
+        let from = lib.join(rel);
+        let held = room.join(format!("{i}"));
+        std::fs::rename(&from, &held).unwrap_or_else(|e| fail(&format!("can't set aside {}: {e}", from.display())));
+        queue.push((held, rel.clone()));
+    }
+    let _ = SAVES.set(std::sync::Mutex::new(queue.into()));
+}
+
+static SAVES: OnceLock<std::sync::Mutex<std::collections::VecDeque<(PathBuf, PathBuf)>>> = OnceLock::new();
+
+/// The capture service while a demo runs: says it's clipping when asked to
+/// start, and on save hands over the next prepared clip as a just-saved one
+/// (a new `clip_<now>` name that keeps what came after it, like " - Ace on
+/// Ancient", so it lands in Today under its title). Nothing is recorded.
+pub(crate) fn capture_thread(rx: mpsc::Receiver<crate::service::Cmd>, tx: mpsc::Sender<crate::service::Evt>) -> std::thread::JoinHandle<()> {
+    use crate::service::{Cmd, Evt};
+    std::thread::spawn(move || {
+        while let Ok(cmd) = rx.recv() {
+            match cmd {
+                Cmd::Start(mode, _) => {
+                    let _ = tx.send(Evt::State(Some(mode)));
+                }
+                Cmd::SaveClip(dir, details) => {
+                    let next = SAVES.get().and_then(|q| q.lock().ok()?.pop_front());
+                    let tx = tx.clone();
+                    std::thread::spawn(move || {
+                        // About as long as a real save takes.
+                        std::thread::sleep(std::time::Duration::from_millis(1300));
+                        let Some((held, rel)) = next else {
+                            let _ = tx.send(Evt::Error("The demo has no more clips to save (add them to \"saves\")".into()));
+                            return;
+                        };
+                        let stem = rel.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                        // What follows the clip's own timestamp: " - Ace on Ancient".
+                        let rest = stem.split_once(" - ").map(|(_, r)| format!(" - {r}")).unwrap_or_default();
+                        let ext = rel.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_else(|| "mp4".into());
+                        let name = format!("clip_{}{rest}.{ext}", chrono::Local::now().format("%Y-%m-%d_%H-%M-%S"));
+                        let _ = std::fs::create_dir_all(&dir);
+                        let to = dir.join(name);
+                        if let Err(e) = std::fs::rename(&held, &to) {
+                            let _ = tx.send(Evt::Error(format!("demo: couldn't hand over a clip: {e}")));
+                            return;
+                        }
+                        let _ = tx.send(Evt::Saved(crate::service::landed(to, details)));
+                    });
+                }
+                Cmd::Stop(..) => {
+                    let _ = tx.send(Evt::State(None));
+                }
+                Cmd::StopAndAck(ack) => {
+                    let _ = ack.send(());
+                }
+                Cmd::Quit => break,
+                Cmd::UpdateVideo(_) | Cmd::ReplaySeconds(_) | Cmd::SetMic(..) => {}
+            }
+        }
+    })
 }
 
 fn fail(msg: &str) -> ! {
