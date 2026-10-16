@@ -8,6 +8,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // no console window on release Windows
 
 mod app_icons;
+mod archive;
 mod autostart;
 mod away;
 mod clips;
@@ -48,6 +49,7 @@ mod store;
 mod thumbs;
 mod tray;
 mod theme;
+mod transfer;
 mod time_field;
 mod ui_kit;
 mod update;
@@ -452,6 +454,8 @@ struct App {
     /// Clips' sound being saved as MP3s, when done.
     mp3_tx: std::sync::mpsc::Sender<Result<PathBuf, String>>,
     mp3_rx: std::sync::mpsc::Receiver<Result<PathBuf, String>>,
+    /// An export or import of clips running (see `transfer.rs`).
+    transfer: Option<transfer::Transfer>,
     next_render_id: u64,
     /// Open "Rename clip" dialog.
     pub(crate) rename: Option<library::Rename>,
@@ -646,6 +650,7 @@ impl App {
             render_rx,
             mp3_tx,
             mp3_rx,
+            transfer: None,
             next_render_id: 0,
             rename: None,
             selection: library::Selection::default(),
@@ -1149,7 +1154,7 @@ impl eframe::App for App {
 
 // --- Running in the background: the tray, closing the window ---
 impl App {
-    fn background(&mut self, _ctx: &egui::Context) {
+    fn background(&mut self, ctx: &egui::Context) {
         // Global shortcuts: these fire even while a game is focused. Paused while
         // the Settings recorder listens, so pressing the current key rebinds it
         // instead of starting a recording.
@@ -1200,6 +1205,8 @@ impl App {
         self.updater.set_auto(self.settings.auto_update);
         self.pump_renders();
         self.pump_mp3s();
+        self.import_dropped(ctx);
+        self.pump_transfer();
         // Every frame, not just while the Sources page draws: leaving the page must
         // stop the meters' capture, or macOS keeps showing its recording indicator.
         self.ensure_level_monitor();
