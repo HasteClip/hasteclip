@@ -29,7 +29,7 @@ use crate::{App, RecState, clips, share, thumbs};
 /// The panel's width, from the rail's edge (its card's right edge is where
 /// Settings' search ends too).
 pub const PANEL_W: f32 = 244.0;
-use crate::library_grid::{DAY_H, GridItem, Key};
+use crate::library_grid::{DAY_H, GridItem};
 /// The window is too narrow for the panel below this page width: its list
 /// moves into a menu on the title.
 const PANEL_FROM: f32 = 700.0;
@@ -250,10 +250,13 @@ impl App {
                 let place = self.moves.layout().groups[gi];
                 let open = opens[gi];
                 let folded = day.is_some_and(|d| self.folded.contains(&d));
+                // Whether any of the day's clips were shown before: only then
+                // does its heading slide, with them.
+                let carried = moving && self.moves.carries(self.shown.groups[gi].items.iter().map(|it| crate::library_grid::key_for(it, &self.clips, &render_dests)));
                 // The day's heading, sliding with its clips.
                 if let (Some(d), Some(head)) = (day, place.head) {
                     let target = Pos2::new(0.0, head);
-                    let p = self.moves.place(&Key::Day(d), target, now, view, None);
+                    let p = self.moves.place_day(d, target, carried, now, view);
                     if (p.at.y + DAY_H >= reach.0 && p.at.y <= reach.1) || (head + DAY_H >= reach.0 && head <= reach.1) {
                         let rect = Rect::from_min_size(origin + p.at.to_vec2(), vec2(avail, DAY_H));
                         let mut hui = ui.new_child(egui::UiBuilder::new().max_rect(rect).id_salt(("day", d)));
@@ -306,7 +309,7 @@ impl App {
                     let item = self.shown.groups[gi].items[i].clone();
                     let target = Pos2::new(0.0, place.cards) + m.offset(i);
                     let key = crate::library_grid::key_for(&item, &self.clips, &render_dests);
-                    let p = self.moves.place(&key, target, now, view, day);
+                    let p = self.moves.place(&key, target, now, view, day.filter(|_| carried));
                     let rect = Rect::from_min_size(origin + p.at.to_vec2(), m.card);
                     let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
                     cui.set_clip_rect(clip);
