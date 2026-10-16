@@ -1,0 +1,17 @@
+{
+  "branches": ["main"],
+  "tagFormat": "v${version}",
+  "plugins": [
+    "@semantic-release/commit-analyzer",
+    "@semantic-release/release-notes-generator",
+    ["@semantic-release/exec", {
+      "verifyReleaseCmd": "echo ${nextRelease.version} > .next-version && if [ -n \"$EXPECT_VERSION\" ] && [ \"$EXPECT_VERSION\" != \"${nextRelease.version}\" ]; then echo \"built as $EXPECT_VERSION, but the next version is ${nextRelease.version}\" >&2; exit 1; fi"
+    }],
+    ["@semantic-release/github", {
+      "assets": [{ "path": "Releases/*" }],
+      "successComment": false,
+      "failComment": false,
+      "releasedLabels": false
+    }]
+  ]
+}

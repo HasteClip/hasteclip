@@ -1,0 +1,926 @@
+//! Live audio: per-source volume/mute controls and level meters shared with the
+//! UI ([`LiveAudio`]), and the mixer that turns timestamped source audio into the
+//! recorded tracks.
+//!
+//! Every source is aligned on one host clock: [`SourceFeed`] places each block of
+//! samples by its capture timestamp (gaps become silence, overlaps are dropped)
+//! and converts it to 48 kHz stereo. The mixer then pulls exactly the same span
+//! from every feed a short moment behind real time, applies volume, meters it, and
+//! writes the mix and the separate tracks — so tracks can never drift apart.
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
+use rubato::{Fft, FixedSync, Resampler};
+
+/// Sample rate of every recorded track.
+pub const RATE: u32 = 48_000;
+
+/// Limiter ceiling: -1 dBFS, leaving headroom for the AAC encoder's overshoot.
+const CEILING: f32 = 0.891;
+
+/// An `f32` that can be shared between threads without a lock.
+#[derive(Debug, Default)]
+struct AtomicF32(AtomicU32);
+
+impl AtomicF32 {
+    fn new(v: f32) -> Self {
+        Self(AtomicU32::new(v.to_bits()))
+    }
+    fn load(&self) -> f32 {
+        f32::from_bits(self.0.load(Ordering::Relaxed))
+    }
+    fn store(&self, v: f32) {
+        self.0.store(v.to_bits(), Ordering::Relaxed);
+    }
+    fn swap(&self, v: f32) -> f32 {
+        f32::from_bits(self.0.swap(v.to_bits(), Ordering::Relaxed))
+    }
+    /// For non-negative values the bit patterns sort like the floats do.
+    fn fetch_max(&self, v: f32) {
+        self.0.fetch_max(v.max(0.0).to_bits(), Ordering::Relaxed);
+    }
+}
+
+/// Left/right levels since the meter was last read, linear (1.0 = full scale).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Levels {
+    pub peak: [f32; 2],
+    pub rms: [f32; 2],
+}
+
+impl Levels {
+    pub fn max_peak(&self) -> f32 {
+        self.peak[0].max(self.peak[1])
+    }
+}
+
+/// A level meter, written by the audio thread and read by the UI.
+#[derive(Debug, Default)]
+pub struct Meter {
+    peak: [AtomicF32; 2],
+    /// Sum of squares per channel and frame count since the last read, plus the
+    /// RMS last handed out (for reads that land between two blocks).
+    energy: Mutex<Energy>,
+}
+
+#[derive(Debug, Default)]
+struct Energy {
+    sum: [f64; 2],
+    frames: usize,
+    last_rms: [f32; 2],
+}
+
+impl Meter {
+    /// Levels since the last call. Taking resets them, so no transient is missed
+    /// between UI frames and the RMS covers everything in between.
+    pub fn take(&self) -> Levels {
+        let peak = [self.peak[0].swap(0.0), self.peak[1].swap(0.0)];
+        let mut e = self.energy.lock().unwrap();
+        if e.frames > 0 {
+            let n = e.frames as f64;
+            e.last_rms = [(e.sum[0] / n).sqrt() as f32, (e.sum[1] / n).sqrt() as f32];
+            e.sum = [0.0; 2];
+            e.frames = 0;
+        }
+        Levels { peak, rms: e.last_rms }
+    }
+
+    fn record(&self, block: &[[f32; 2]]) {
+        let mut peak = [0f32; 2];
+        let mut sum = [0f64; 2];
+        for f in block {
+            for c in 0..2 {
+                peak[c] = peak[c].max(f[c].abs());
+                sum[c] += (f[c] * f[c]) as f64;
+            }
+        }
+        for c in 0..2 {
+            self.peak[c].fetch_max(peak[c]);
+        }
+        let mut e = self.energy.lock().unwrap();
+        e.sum[0] += sum[0];
+        e.sum[1] += sum[1];
+        e.frames += block.len();
+    }
+
+    fn clear(&self) {
+        for p in &self.peak {
+            p.store(0.0);
+        }
+        *self.energy.lock().unwrap() = Energy::default();
+    }
+}
+
+/// What a source is doing right now, for the UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceStatus {
+    /// Not being captured.
+    Off,
+    Live,
+    /// An app source whose app isn't running; it starts by itself when it opens.
+    WaitingForApp,
+    /// The device isn't connected (or couldn't be opened).
+    Unavailable,
+}
+
+/// Live controls and meter for one source.
+#[derive(Debug)]
+pub struct Channel {
+    gain: AtomicF32,
+    muted: AtomicBool,
+    status: AtomicU8,
+    /// After volume and mute: what goes into the clip.
+    pub meter: Meter,
+    /// Before volume and mute: what the source delivers (shows a muted mic is live).
+    pub input: Meter,
+    /// Gets the source's sound as it arrives (before volume and mute), mono at
+    /// [`RATE`], when set: for listening to the microphone ("HasteClip
+    /// that").
+    tap: Mutex<Option<std::sync::mpsc::Sender<Vec<f32>>>>,
+    /// Noise removal on its sound (a microphone's): shared with its feed,
+    /// which does it as the sound arrives.
+    denoise: Arc<AtomicBool>,
+}
+
+impl Channel {
+    fn new() -> Self {
+        Self {
+            gain: AtomicF32::new(1.0),
+            muted: AtomicBool::new(false),
+            status: AtomicU8::new(0),
+            meter: Meter::default(),
+            input: Meter::default(),
+            tap: Mutex::new(None),
+            denoise: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Remove background noise (fans, keyboards, hum) from its sound. Takes
+    /// effect immediately, even mid-recording.
+    pub fn set_denoise(&self, on: bool) {
+        self.denoise.store(on, Ordering::Relaxed);
+    }
+
+    pub(crate) fn denoise_flag(&self) -> Arc<AtomicBool> {
+        self.denoise.clone()
+    }
+
+    /// Hand the source's sound, mono at [`RATE`], to `tap` (`None`: stop).
+    pub fn set_tap(&self, tap: Option<std::sync::mpsc::Sender<Vec<f32>>>) {
+        *self.tap.lock().unwrap() = tap;
+    }
+
+    fn send_tap(&self, block: &[[f32; 2]]) {
+        let mut tap = self.tap.lock().unwrap();
+        if let Some(tx) = tap.as_ref()
+            && tx.send(block.iter().map(|f| (f[0] + f[1]) * 0.5).collect()).is_err()
+        {
+            *tap = None;
+        }
+    }
+
+    /// Volume as linear gain (1.0 = unchanged). Takes effect immediately, even
+    /// mid-recording.
+    pub fn set_volume(&self, gain: f32, muted: bool) {
+        self.gain.store(gain.max(0.0));
+        self.muted.store(muted, Ordering::Relaxed);
+    }
+
+    /// The gain applied now: 0 when muted.
+    pub fn gain(&self) -> f32 {
+        self.effective_gain()
+    }
+
+    fn effective_gain(&self) -> f32 {
+        if self.muted.load(Ordering::Relaxed) { 0.0 } else { self.gain.load() }
+    }
+
+    pub fn status(&self) -> SourceStatus {
+        match self.status.load(Ordering::Relaxed) {
+            1 => SourceStatus::Live,
+            2 => SourceStatus::WaitingForApp,
+            3 => SourceStatus::Unavailable,
+            _ => SourceStatus::Off,
+        }
+    }
+
+    pub(crate) fn set_status(&self, s: SourceStatus) {
+        let v = match s {
+            SourceStatus::Off => 0,
+            SourceStatus::Live => 1,
+            SourceStatus::WaitingForApp => 2,
+            SourceStatus::Unavailable => 3,
+        };
+        self.status.store(v, Ordering::Relaxed);
+        if s != SourceStatus::Live {
+            self.meter.clear();
+            self.input.clear();
+        }
+    }
+}
+
+/// Volume controls and meters for every source plus the clip's mix, shared by the
+/// UI, the level monitor and the recorder. Keyed by the source's stable id.
+#[derive(Debug, Default)]
+pub struct LiveAudio {
+    channels: Mutex<HashMap<String, Arc<Channel>>>,
+    /// The clip's mix (track 1), after the limiter.
+    pub master: Meter,
+    limiter: AtomicBool,
+    /// Largest limiter gain reduction (dB) since the UI last looked.
+    reduction_db: AtomicF32,
+}
+
+impl LiveAudio {
+    pub fn new() -> Arc<Self> {
+        let live = Self::default();
+        live.limiter.store(true, Ordering::Relaxed);
+        Arc::new(live)
+    }
+
+    /// The channel for a source id (created at unity gain on first use).
+    pub fn channel(&self, id: &str) -> Arc<Channel> {
+        self.channels.lock().unwrap().entry(id.to_owned()).or_insert_with(|| Arc::new(Channel::new())).clone()
+    }
+
+    pub fn set_limiter(&self, on: bool) {
+        self.limiter.store(on, Ordering::Relaxed);
+    }
+
+    /// How hard the limiter worked since the last call, in dB (0 = untouched).
+    pub fn take_reduction_db(&self) -> f32 {
+        self.reduction_db.swap(0.0)
+    }
+
+    /// Mark every source as not captured (when capture stops).
+    pub(crate) fn all_off(&self) {
+        for ch in self.channels.lock().unwrap().values() {
+            ch.set_status(SourceStatus::Off);
+        }
+        self.master.clear();
+    }
+}
+
+/// Host time of the first video frame (or monitor start): t=0 for every track.
+#[derive(Debug, Default)]
+pub(crate) struct Clock {
+    t0_bits: AtomicU64,
+}
+
+impl Clock {
+    pub(crate) fn get(&self) -> Option<f64> {
+        let bits = self.t0_bits.load(Ordering::Acquire);
+        (bits != 0).then(|| f64::from_bits(bits))
+    }
+    pub(crate) fn set(&self, t0: f64) {
+        self.t0_bits.store(t0.to_bits(), Ordering::Release);
+    }
+}
+
+/// One source's audio, placed on the shared clock and converted to 48 kHz stereo,
+/// waiting for the mixer.
+pub(crate) struct SourceFeed {
+    rate: u32,
+    clock: Arc<Clock>,
+    st: Mutex<FeedState>,
+    /// Feeds summed into this one: a source made of several streams (on
+    /// Windows, one per captured process tree), each placed on the clock by
+    /// itself.
+    children: Mutex<Vec<Arc<SourceFeed>>>,
+}
+
+struct FeedState {
+    /// Next expected input frame (at the source's own rate), once started.
+    next_in: Option<i64>,
+    resampler: Option<Fft<f32>>,
+    /// Input waiting for a full resampler chunk, per channel.
+    pending: [Vec<f32>; 2],
+    /// Converted frames; `out_base` is the output frame index of the first one.
+    out: VecDeque<[f32; 2]>,
+    out_base: i64,
+    /// Output frames still to discard: resampler delay, or audio that arrived
+    /// after the mixer had already moved past it.
+    skip_out: i64,
+    /// Noise removal, when this feed is a microphone's.
+    denoise: Option<Denoise>,
+}
+
+impl SourceFeed {
+    /// Correct timing once it's off by more than this; smaller jitter is ignored.
+    const TOLERANCE: f64 = 0.04;
+    /// A gap longer than this starts the feed over instead of being filled
+    /// with silence (a guess: longer than any dropout worth keeping in step).
+    const RESTART_AFTER: f64 = 1.0;
+
+    pub(crate) fn new(rate: u32, clock: Arc<Clock>) -> Arc<Self> {
+        let resampler = (rate != RATE)
+            .then(|| Fft::<f32>::new(rate as usize, RATE as usize, 1024, 2, FixedSync::Input).ok())
+            .flatten();
+        Arc::new(Self {
+            rate,
+            clock,
+            st: Mutex::new(FeedState {
+                next_in: None,
+                resampler,
+                pending: [Vec::new(), Vec::new()],
+                out: VecDeque::new(),
+                out_base: 0,
+                skip_out: 0,
+                denoise: None,
+            }),
+            children: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Remove noise from this feed's sound while `on` is set (it can change
+    /// at any moment). Delays it by one RNNoise frame, 10 ms, whether on or
+    /// off, so switching doesn't shift it in time.
+    pub(crate) fn denoise_with(&self, on: Arc<AtomicBool>) {
+        let mut st = self.st.lock().unwrap();
+        st.denoise = Some(Denoise::new(on));
+    }
+
+    /// A new feed (at `rate`) whose audio is added to this one's.
+    pub(crate) fn add_child(&self, rate: u32) -> Arc<SourceFeed> {
+        let child = SourceFeed::new(rate, self.clock.clone());
+        self.children.lock().unwrap().push(child.clone());
+        child
+    }
+
+    pub(crate) fn remove_child(&self, child: &Arc<SourceFeed>) {
+        self.children.lock().unwrap().retain(|c| !Arc::ptr_eq(c, child));
+    }
+
+    /// Interleaved samples (`channels` per frame) whose first frame was captured
+    /// at host time `start`. Mono is played on both sides; extra channels beyond
+    /// two are dropped.
+    pub(crate) fn push(&self, start: f64, samples: &[f32], channels: usize) {
+        let Some(t0) = self.clock.get() else { return };
+        let channels = channels.max(1);
+        let frames = samples.len() / channels;
+        let rate = self.rate as f64;
+        let expected = ((start - t0) * rate).round() as i64;
+        let mut st = self.st.lock().unwrap();
+
+        // Back after a long gap (playback paused, a device that stopped):
+        // start over at its time, as on its first sound, rather than fill the
+        // gap with silence: the mixer reads silence where nothing arrived
+        // anyway, and filling it at the source's rate went through the
+        // resampler (384 kHz output: a long pause took tens of seconds, in an
+        // audio callback the player's closing waited on).
+        if st.next_in.is_some_and(|next| expected - next > (Self::RESTART_AFTER * rate) as i64) {
+            st.next_in = None;
+            st.pending.iter_mut().for_each(Vec::clear);
+            if let Some(r) = st.resampler.as_mut() {
+                r.reset();
+            }
+        }
+        if st.next_in.is_none() {
+            st.next_in = Some(expected);
+            st.out.clear();
+            st.out_base = (expected as f64 * RATE as f64 / rate).round() as i64;
+            st.skip_out = st.resampler.as_ref().map_or(0, |r| r.output_delay() as i64)
+                + if st.denoise.is_some() { Denoise::DELAY as i64 } else { 0 };
+        }
+        let drift = expected - st.next_in.unwrap();
+        let tolerance = (Self::TOLERANCE * rate) as i64;
+        let mut skip = 0usize;
+        if drift > tolerance {
+            st.feed_silence(drift as usize);
+        } else if drift < -tolerance {
+            skip = ((-drift) as usize).min(frames);
+        }
+        let (l, r): (Vec<f32>, Vec<f32>) = (skip..frames)
+            .map(|i| {
+                let f = &samples[i * channels..];
+                (f[0], if channels > 1 { f[1] } else { f[0] })
+            })
+            .unzip();
+        st.feed(&l, &r);
+    }
+
+    /// The output frame just past the newest audio that has arrived (in this
+    /// feed or any it sums), if any has.
+    pub(crate) fn arrived(&self) -> Option<i64> {
+        let own = {
+            let st = self.st.lock().unwrap();
+            st.next_in.map(|_| st.out_base + st.out.len() as i64)
+        };
+        self.children.lock().unwrap().iter().filter_map(|c| c.arrived()).chain(own).max()
+    }
+
+    /// `n` frames starting at output frame `from` (silence where nothing has
+    /// arrived), without consuming them — for the meters, which look at audio
+    /// well ahead of what's being written.
+    pub(crate) fn peek(&self, from: i64, n: usize) -> Vec<[f32; 2]> {
+        let mut buf = vec![[0f32; 2]; n];
+        {
+            let st = self.st.lock().unwrap();
+            let end = from + n as i64;
+            let lo = from.max(st.out_base);
+            let hi = end.min(st.out_base + st.out.len() as i64);
+            for idx in lo..hi {
+                buf[(idx - from) as usize] = st.out[(idx - st.out_base) as usize];
+            }
+        }
+        for child in self.children.lock().unwrap().iter() {
+            add(&mut buf, &child.peek(from, n));
+        }
+        buf
+    }
+
+    /// Exactly `n` frames starting at output frame `from` (silence where nothing
+    /// arrived), and forget everything before `from + n`.
+    pub(crate) fn take(&self, from: i64, n: usize) -> Vec<[f32; 2]> {
+        let mut st = self.st.lock().unwrap();
+        let end = from + n as i64;
+        let write = st.out_base + st.out.len() as i64;
+        let mut buf = vec![[0f32; 2]; n];
+        let lo = from.max(st.out_base);
+        let hi = end.min(write);
+        for idx in lo..hi {
+            buf[(idx - from) as usize] = st.out[(idx - st.out_base) as usize];
+        }
+        let consumed = (end - st.out_base).clamp(0, st.out.len() as i64);
+        st.out.drain(..consumed as usize);
+        st.out_base += consumed;
+        if st.out_base < end {
+            // The mixer got ahead of this source: whatever arrives for that span
+            // now is too late.
+            st.skip_out += end - st.out_base;
+            st.out_base = end;
+        }
+        drop(st);
+        for child in self.children.lock().unwrap().iter() {
+            for (a, c) in buf.iter_mut().zip(child.take(from, n)) {
+                a[0] += c[0];
+                a[1] += c[1];
+            }
+        }
+        buf
+    }
+}
+
+impl FeedState {
+    fn feed_silence(&mut self, frames: usize) {
+        let zeros = vec![0f32; frames];
+        self.feed(&zeros, &zeros);
+    }
+
+    fn feed(&mut self, l: &[f32], r: &[f32]) {
+        if let Some(next) = self.next_in.as_mut() {
+            *next += l.len() as i64;
+        }
+        if self.resampler.is_none() {
+            self.append(l.iter().zip(r).map(|(&a, &b)| [a, b]));
+            return;
+        }
+        self.pending[0].extend_from_slice(l);
+        self.pending[1].extend_from_slice(r);
+        // Chunks are read from `used` on and the start cut off once at the
+        // end: cutting each chunk off the front moved all the rest every
+        // time, quadratic in a long run of input.
+        let mut used = 0;
+        loop {
+            let resampler = self.resampler.as_mut().unwrap();
+            let need = resampler.input_frames_next();
+            if self.pending[0].len() - used < need {
+                break;
+            }
+            let input: Vec<Vec<f32>> = self.pending.iter().map(|p| p[used..used + need].to_vec()).collect();
+            used += need;
+            let out_frames = resampler.output_frames_next();
+            let mut output = vec![vec![0f32; out_frames]; 2];
+            let done = SequentialSliceOfVecs::new(&input, 2, need)
+                .ok()
+                .zip(SequentialSliceOfVecs::new_mut(&mut output, 2, out_frames).ok())
+                .and_then(|(i, mut o)| resampler.process_into_buffer(&i, &mut o, None).ok());
+            let Some((_, written)) = done else { break };
+            let frames: Vec<[f32; 2]> = (0..written).map(|i| [output[0][i], output[1][i]]).collect();
+            self.append(frames.into_iter());
+        }
+        for p in &mut self.pending {
+            p.drain(..used);
+        }
+    }
+
+    fn append(&mut self, frames: impl Iterator<Item = [f32; 2]>) {
+        let frames: Vec<[f32; 2]> = match self.denoise.as_mut() {
+            Some(d) => d.process(frames),
+            None => frames.collect(),
+        };
+        for f in frames {
+            if self.skip_out > 0 {
+                self.skip_out -= 1;
+            } else {
+                self.out.push_back(f);
+            }
+        }
+    }
+}
+
+/// RNNoise on a feed's 48 kHz sound, in its 10 ms frames: both sides are
+/// made one (a microphone is mono) and cleaned together. RNNoise hands each
+/// frame back one frame later, so the sound always comes out a frame late,
+/// on or off, and turning it on or off never shifts it; across a switch it
+/// fades from one to the other over a frame.
+pub(crate) struct Denoise {
+    on: Arc<AtomicBool>,
+    state: Box<nnnoiseless::DenoiseState<'static>>,
+    /// Waiting for a full frame.
+    pending: Vec<[f32; 2]>,
+    /// The previous frame as it came: what RNNoise's output lines up with.
+    dry: Vec<[f32; 2]>,
+    /// Whether the last frame was cleaned.
+    was_on: bool,
+}
+
+impl Denoise {
+    pub(crate) const FRAME: usize = nnnoiseless::DenoiseState::FRAME_SIZE;
+    /// How late the sound comes out, in frames of sound.
+    const DELAY: usize = Self::FRAME;
+
+    pub(crate) fn new(on: Arc<AtomicBool>) -> Self {
+        Self {
+            on,
+            state: nnnoiseless::DenoiseState::new(),
+            pending: Vec::with_capacity(Self::FRAME * 2),
+            dry: vec![[0.0; 2]; Self::FRAME],
+            was_on: false,
+        }
+    }
+
+    /// Mono sound in, mono out (a frame late).
+    pub(crate) fn process_mono(&mut self, samples: &[f32]) -> Vec<f32> {
+        self.process(samples.iter().map(|&s| [s, s])).into_iter().map(|f| f[0]).collect()
+    }
+
+    fn process(&mut self, frames: impl Iterator<Item = [f32; 2]>) -> Vec<[f32; 2]> {
+        self.pending.extend(frames);
+        let whole = self.pending.len() / Self::FRAME * Self::FRAME;
+        let mut out = Vec::with_capacity(whole);
+        let mut input = [0f32; Self::FRAME];
+        let mut cleaned = [0f32; Self::FRAME];
+        for chunk in self.pending[..whole].chunks_exact(Self::FRAME) {
+            // Run even while off, so it knows the noise the moment it's turned on.
+            for (i, f) in input.iter_mut().zip(chunk) {
+                *i = (f[0] + f[1]) * 0.5 * 32768.0;
+            }
+            self.state.process_frame(&mut cleaned, &input);
+            let on = self.on.load(Ordering::Relaxed);
+            for (k, (f, c)) in self.dry.iter().zip(&cleaned).enumerate() {
+                let c = (c / 32768.0).clamp(-1.0, 1.0);
+                let t = (k + 1) as f32 / Self::FRAME as f32;
+                let wet = match (self.was_on, on) {
+                    (true, true) => 1.0,
+                    (false, false) => 0.0,
+                    (false, true) => t,
+                    (true, false) => 1.0 - t,
+                };
+                out.push([f[0] + (c - f[0]) * wet, f[1] + (c - f[1]) * wet]);
+            }
+            self.dry.copy_from_slice(chunk);
+            self.was_on = on;
+        }
+        self.pending.drain(..whole);
+        out
+    }
+}
+
+/// A source as the mixer sees it.
+pub(crate) struct MixInput {
+    pub feed: Arc<SourceFeed>,
+    pub channel: Arc<Channel>,
+    pub in_mix: bool,
+    /// Its own track, if it has one.
+    pub track: Option<Sender<Vec<f32>>>,
+}
+
+/// How far behind real time the meters run: just enough for the sources'
+/// newest audio to have arrived. A source whose audio comes later (a device
+/// that buffers a lot: Bluetooth, or any in a virtual machine on Linux,
+/// where timestamps include the device's buffering) holds them back until it
+/// has, so it doesn't look silent.
+const METER_LAG: f64 = 0.04;
+
+/// A source whose newest audio is older than this isn't delivering (an app
+/// that went quiet, a mic unplugged): the meters don't wait for it.
+const STALLED: f64 = 0.5;
+
+/// Mix sources into tracks until `stop` is set: every 10 ms, take the span that's
+/// `latency` seconds behind now from every feed, apply volume, sum the mix
+/// (through the limiter) and send each track as interleaved 48 kHz stereo. On
+/// stop it flushes up to the current time, then drops the senders.
+///
+/// The meters don't wait for that: `latency` is there so late audio still
+/// makes it into the file (up to 300 ms while recording), which made meters
+/// lag just as far. Each tick they look ahead at audio only [`METER_LAG`] old,
+/// which the feeds still hold, and run the same volume, mix and limiter on it.
+///
+/// `rest_track` gets the sum of sources that are in the mix without a track of
+/// their own, so the separate tracks always add up to the mix (the editor
+/// rebuilds it from them).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_mixer(
+    inputs: Vec<MixInput>,
+    mix_track: Option<Sender<Vec<f32>>>,
+    rest_track: Option<Sender<Vec<f32>>>,
+    live: Arc<LiveAudio>,
+    clock: Arc<Clock>,
+    now: fn() -> f64,
+    latency: f64,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut gains: Vec<f32> = inputs.iter().map(|i| i.channel.effective_gain()).collect();
+        let mut limiter = Limiter::new();
+        let mut mixed: Option<i64> = None;
+        // The meters' own position and limiter, ahead of the mix.
+        let mut metered: Option<i64> = None;
+        let mut meter_limiter = Limiter::new();
+        loop {
+            let stopping = stop.load(Ordering::Relaxed);
+            if let Some(t0) = clock.get() {
+                let mut target = ((now() - t0 - METER_LAG) * RATE as f64).floor() as i64;
+                let stalled = target - (STALLED * RATE as f64) as i64;
+                if let Some(slowest) = inputs.iter().filter_map(|i| i.feed.arrived()).filter(|&a| a > stalled).min() {
+                    target = target.min(slowest);
+                }
+                let from = metered.get_or_insert(target.max(0));
+                // Never meter what's already been written (and so is gone).
+                *from = (*from).max(mixed.unwrap_or(0));
+                while *from < target {
+                    let n = ((target - *from) as usize).min(RATE as usize / 50);
+                    let mut mix = vec![[0f32; 2]; n];
+                    for input in &inputs {
+                        let mut block = input.feed.peek(*from, n);
+                        input.channel.input.record(&block);
+                        input.channel.send_tap(&block);
+                        let g = input.channel.effective_gain();
+                        for f in block.iter_mut() {
+                            f[0] *= g;
+                            f[1] *= g;
+                        }
+                        input.channel.meter.record(&block);
+                        if input.in_mix {
+                            add(&mut mix, &block);
+                        }
+                    }
+                    if live.limiter.load(Ordering::Relaxed) {
+                        let reduction = meter_limiter.process(&mut mix);
+                        live.reduction_db.fetch_max(reduction);
+                    }
+                    live.master.record(&mix);
+                    *from += n as i64;
+                }
+                let behind = if stopping { 0.0 } else { latency };
+                let target = ((now() - t0 - behind) * RATE as f64).floor() as i64;
+                let from = mixed.get_or_insert(0);
+                while *from < target {
+                    let n = ((target - *from) as usize).min(RATE as usize / 50);
+                    let mut mix = vec![[0f32; 2]; n];
+                    let mut rest = vec![[0f32; 2]; if rest_track.is_some() { n } else { 0 }];
+                    for (input, gain) in inputs.iter().zip(gains.iter_mut()) {
+                        let mut block = input.feed.take(*from, n);
+                        // Ramp to the new volume across the block so fader moves don't click.
+                        let target_gain = input.channel.effective_gain();
+                        for (k, f) in block.iter_mut().enumerate() {
+                            let g = *gain + (target_gain - *gain) * (k + 1) as f32 / n as f32;
+                            f[0] *= g;
+                            f[1] *= g;
+                        }
+                        *gain = target_gain;
+                        if input.in_mix {
+                            add(&mut mix, &block);
+                            if input.track.is_none() {
+                                add(&mut rest, &block);
+                            }
+                        }
+                        if let Some(tx) = &input.track {
+                            let _ = tx.send(interleave(&block));
+                        }
+                    }
+                    if live.limiter.load(Ordering::Relaxed) {
+                        limiter.process(&mut mix);
+                    }
+                    if let Some(tx) = &mix_track {
+                        let _ = tx.send(interleave(&mix));
+                    }
+                    if let Some(tx) = &rest_track {
+                        let _ = tx.send(interleave(&rest));
+                    }
+                    *from += n as i64;
+                }
+            }
+            if stopping {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        live.all_off();
+    })
+}
+
+fn add(acc: &mut [[f32; 2]], block: &[[f32; 2]]) {
+    for (a, f) in acc.iter_mut().zip(block) {
+        a[0] += f[0];
+        a[1] += f[1];
+    }
+}
+
+fn interleave(block: &[[f32; 2]]) -> Vec<f32> {
+    block.iter().flat_map(|f| *f).collect()
+}
+
+/// Peak limiter: instant attack (nothing ever exceeds the ceiling), smooth release.
+struct Limiter {
+    gain: f32,
+    release: f32,
+}
+
+impl Limiter {
+    fn new() -> Self {
+        // ~150 ms back to unity after a peak.
+        Self { gain: 1.0, release: 1.0 - (-1.0 / (0.15 * RATE as f32)).exp() }
+    }
+
+    /// Limit in place; returns the largest gain reduction applied, in dB.
+    fn process(&mut self, block: &mut [[f32; 2]]) -> f32 {
+        let mut min_gain = 1f32;
+        for f in block.iter_mut() {
+            let peak = f[0].abs().max(f[1].abs());
+            let allowed = if peak > CEILING { CEILING / peak } else { 1.0 };
+            self.gain = (self.gain + (1.0 - self.gain) * self.release).min(allowed);
+            f[0] *= self.gain;
+            f[1] *= self.gain;
+            min_gain = min_gain.min(self.gain);
+        }
+        -20.0 * min_gain.log10()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clock_at_zero() -> Arc<Clock> {
+        let c = Arc::new(Clock::default());
+        c.set(1000.0);
+        c
+    }
+
+    /// Hiss under a voice that comes and goes: the hiss between words much
+    /// quieter, and the sound a frame late, on or off.
+    #[test]
+    fn denoise_removes_noise_and_keeps_timing() {
+        let on = Arc::new(AtomicBool::new(true));
+        let mut seed = 1u32;
+        let mut noise = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
+        };
+        // 4 s: a voice-like buzz (150 Hz and its harmonics) for half of each
+        // second, over hiss throughout.
+        let input: Vec<[f32; 2]> = (0..192_000)
+            .map(|i| {
+                let t = i as f32 / RATE as f32;
+                let voiced = t.fract() < 0.5;
+                let buzz: f32 = if voiced { (1..15).map(|h| (std::f32::consts::TAU * 150.0 * h as f32 * t).sin() / h as f32).sum::<f32>() * 0.1 } else { 0.0 };
+                let v = buzz + noise() * 0.02;
+                [v, v]
+            })
+            .collect();
+        let mut d = Denoise::new(on.clone());
+        let out = d.process(input.iter().copied());
+        assert_eq!(out.len(), input.len());
+        let rms = |s: &[[f32; 2]]| (s.iter().map(|f| f[0] * f[0]).sum::<f32>() / s.len() as f32).sqrt();
+        // A gap between words (well inside it), and a word, in the last second.
+        let gap = 3 * 48_000 + 30_000..3 * 48_000 + 46_000;
+        let word = 3 * 48_000 + 4_000..3 * 48_000 + 20_000;
+        let (before, after) = (rms(&input[gap.clone()]), rms(&out[gap]));
+        assert!(after < before * 0.2, "hiss between words {before} -> {after}");
+        let (before, after) = (rms(&input[word.clone()]), rms(&out[word]));
+        assert!(after > before * 0.5, "voice {before} -> {after}");
+
+        // Off: the sound as it came, a frame late.
+        on.store(false, Ordering::Relaxed);
+        let mut d = Denoise::new(on);
+        let out = d.process(input.iter().copied());
+        assert_eq!(out[Denoise::DELAY..], input[..input.len() - Denoise::DELAY]);
+    }
+
+    #[test]
+    fn denoised_feed_stays_on_time() {
+        let feed = SourceFeed::new(RATE, clock_at_zero());
+        feed.denoise_with(Arc::new(AtomicBool::new(false)));
+        // 30 ms of ones, captured 20 ms after t0: still at 20 ms, though it
+        // comes out of the denoiser a frame late.
+        feed.push(1000.02, &vec![1.0; 1440 * 2], 2);
+        feed.push(1000.05, &vec![0.0; 960 * 2], 2);
+        let out = feed.take(0, 3840);
+        assert!(out[..960].iter().all(|f| f[0] == 0.0));
+        assert!(out[960..2400].iter().all(|f| f[0] == 1.0), "{:?}", &out[950..970]);
+        assert!(out[2400..2880].iter().all(|f| f[0] == 0.0));
+    }
+
+    #[test]
+    fn feed_places_audio_by_timestamp() {
+        let feed = SourceFeed::new(RATE, clock_at_zero());
+        // 10 ms of ones, captured 20 ms after t0.
+        feed.push(1000.02, &vec![1.0; 480 * 2], 2);
+        let out = feed.take(0, 1920);
+        assert!(out[..960].iter().all(|f| f[0] == 0.0));
+        assert!(out[960..1440].iter().all(|f| f[0] == 1.0));
+        assert!(out[1440..].iter().all(|f| f[0] == 0.0));
+    }
+
+    #[test]
+    fn late_audio_is_dropped_not_shifted() {
+        let feed = SourceFeed::new(RATE, clock_at_zero());
+        let _ = feed.take(0, 480); // mixer already past the first 10 ms
+        feed.push(1000.0, &vec![1.0; 960], 1); // 20 ms starting at 0
+        let out = feed.take(480, 480);
+        assert!(out.iter().all(|f| f[0] == 1.0 && f[1] == 1.0));
+        assert!(feed.take(960, 10).iter().all(|f| f[0] == 0.0));
+    }
+
+    #[test]
+    fn resampled_feed_keeps_its_place() {
+        let feed = SourceFeed::new(44_100, clock_at_zero());
+        // One second of a constant, starting at t0.
+        feed.push(1000.0, &vec![0.5; 44_100], 1);
+        let out = feed.take(0, 40_000);
+        let mid = &out[2000..38_000];
+        assert!(mid.iter().all(|f| (f[0] - 0.5).abs() < 0.01), "resampled level holds");
+    }
+
+    /// A 384 kHz output (the player's, on a card that runs that fast) that
+    /// stops for a minute and starts again: placed at its new time, fast (the
+    /// gap was filled with silence through the resampler: tens of seconds).
+    #[test]
+    fn long_gap_starts_the_feed_over() {
+        let feed = SourceFeed::new(384_000, clock_at_zero());
+        feed.push(1000.0, &vec![0.5; 38_400 * 2], 2); // 100 ms
+        let _ = feed.take(0, 4_800);
+        let t = std::time::Instant::now();
+        feed.push(1060.0, &vec![0.5; 384_000 * 2], 2); // 1 s, a minute later
+        assert!(t.elapsed() < std::time::Duration::from_millis(500), "took {:?}", t.elapsed());
+        let at = 60 * RATE as i64;
+        // Silence in the gap, up to its time; then the sound.
+        assert!(feed.take(4_800, 4_800).iter().all(|f| f[0] == 0.0));
+        assert!(feed.take(at - 4_800, 4_800).iter().all(|f| f[0] == 0.0), "nothing before its time");
+        let out = feed.take(at, RATE as usize);
+        assert!(out[4_000..44_000].iter().all(|f| (f[0] - 0.5).abs() < 0.01), "its level, in place");
+    }
+
+    /// A short gap is still filled, so what follows stays in step.
+    #[test]
+    fn short_gap_is_filled() {
+        let feed = SourceFeed::new(RATE, clock_at_zero());
+        feed.push(1000.0, &vec![1.0; 480 * 2], 2); // 10 ms at 0
+        feed.push(1000.5, &vec![1.0; 480 * 2], 2); // 10 ms at 500 ms
+        let out = feed.take(0, 25_000);
+        assert!(out[..480].iter().all(|f| f[0] == 1.0));
+        assert!(out[480..24_000].iter().all(|f| f[0] == 0.0));
+        assert!(out[24_000..24_480].iter().all(|f| f[0] == 1.0));
+    }
+
+    #[test]
+    fn children_are_summed() {
+        let feed = SourceFeed::new(RATE, clock_at_zero());
+        let a = feed.add_child(RATE);
+        let b = feed.add_child(RATE);
+        a.push(1000.0, &vec![0.25; 960], 2);
+        b.push(1000.0, &vec![0.5; 960], 2);
+        assert!(feed.take(0, 480).iter().all(|f| (f[0] - 0.75).abs() < 1e-6));
+        feed.remove_child(&b);
+        b.push(1000.01, &vec![0.5; 960], 2);
+        a.push(1000.01, &vec![0.25; 960], 2);
+        assert!(feed.take(480, 480).iter().all(|f| (f[0] - 0.25).abs() < 1e-6));
+    }
+
+    #[test]
+    fn peek_reads_ahead_without_consuming() {
+        let feed = SourceFeed::new(RATE, clock_at_zero());
+        feed.push(1000.0, &vec![0.5; 960], 2); // 10 ms
+        assert!(feed.peek(0, 480).iter().all(|f| f[0] == 0.5));
+        assert!(feed.peek(240, 480)[..240].iter().all(|f| f[0] == 0.5), "still there");
+        assert!(feed.peek(240, 480)[240..].iter().all(|f| f[0] == 0.0), "silence past what arrived");
+        assert!(feed.take(0, 480).iter().all(|f| f[0] == 0.5), "peeking took nothing");
+    }
+
+    #[test]
+    fn limiter_holds_the_ceiling() {
+        let mut lim = Limiter::new();
+        let mut block = vec![[1.8f32, -1.5]; 1000];
+        let reduction = lim.process(&mut block);
+        assert!(block.iter().all(|f| f[0].abs() <= CEILING + 1e-6 && f[1].abs() <= CEILING + 1e-6));
+        assert!(reduction > 5.0);
+    }
+}

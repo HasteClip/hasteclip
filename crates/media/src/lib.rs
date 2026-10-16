@@ -1,0 +1,1516 @@
+//! Non-destructive clip editing: probe, decode for preview, and render edits.
+//!
+//! An edit never touches the original recording: it's an [`Edit`] (trim range and
+//! per-track volume) rendered into a new file. Where the original, the edit and
+//! the render live is the app's business; this crate only probes and renders.
+//!
+//! Backed by the `ffmpeg`/`ffprobe` binaries ([`ffmpeg`], [`ffprobe`]).
+
+pub mod pcm;
+
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+
+/// Min, max and mean square of every `per` samples: the per-sample pass of a
+/// waveform, here so it runs optimized even in debug builds (millions of
+/// samples per track).
+pub fn sample_peaks(samples: &[f32], per: usize) -> Vec<[f32; 3]> {
+    samples
+        .chunks(per.max(1))
+        .map(|c| {
+            let (mut lo, mut hi, mut sq) = (f32::MAX, f32::MIN, 0.0f32);
+            for &s in c {
+                lo = lo.min(s);
+                hi = hi.max(s);
+                sq += s * s;
+            }
+            [lo, hi, sq / c.len() as f32]
+        })
+        .collect()
+}
+
+/// RGBA pixels (`width` x `height`, alpha ignored) as a JPEG.
+pub fn encode_jpeg(rgba: &[u8], width: u16, height: u16, quality: u8) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(64 * 1024);
+    jpeg_encoder::Encoder::new(&mut out, quality).encode(rgba, width, height, jpeg_encoder::ColorType::Rgba).ok()?;
+    Some(out)
+}
+
+/// Sample rate audio is decoded at for preview playback and waveforms.
+pub const PREVIEW_RATE: u32 = 48_000;
+
+/// An `ffmpeg` command. See [`tool`].
+pub fn ffmpeg() -> Command {
+    tool("ffmpeg")
+}
+
+/// An `ffmpeg` for background work (scrub frames, thumbnails): at lower CPU
+/// priority, so playback and the game always come first.
+pub fn ffmpeg_background() -> Command {
+    let mut cmd = tool("ffmpeg");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+        cmd.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
+    }
+    #[cfg(unix)]
+    {
+        // `nice` in front of it: the same, without unsafe pre-exec hooks.
+        let program = cmd.get_program().to_owned();
+        let mut niced = Command::new("nice");
+        niced.args(["-n", "10"]).arg(program);
+        cmd = niced;
+    }
+    cmd
+}
+
+/// An `ffprobe` command. See [`tool`].
+pub fn ffprobe() -> Command {
+    tool("ffprobe")
+}
+
+/// A command for one of the ffmpeg tools: a copy shipped next to the app wins
+/// over the one on `PATH`. On Windows it runs without a console window (the
+/// app is a GUI program, so each run would otherwise flash one).
+pub fn tool(name: &str) -> Command {
+    let bundled = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.join(name).with_extension(std::env::consts::EXE_EXTENSION)))
+        .filter(|p| p.is_file());
+    #[allow(unused_mut)]
+    let mut cmd = Command::new(bundled.as_deref().unwrap_or(Path::new(name)));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+/// Probed facts about a clip.
+#[derive(Debug, Clone)]
+pub struct ClipInfo {
+    pub duration: f64,
+    pub fps: f64,
+    pub width: u32,
+    pub height: u32,
+    /// The video's bitrate, when the file says.
+    pub video_kbps: Option<u32>,
+    pub audio: Vec<AudioStream>,
+    /// Permanent id from the clip tag, once the clip has one (see [`clip_tag`]).
+    pub id: Option<String>,
+}
+
+impl ClipInfo {
+    pub fn frame_duration(&self) -> f64 {
+        1.0 / self.fps
+    }
+
+    /// Snap a time to the start of the frame that contains it.
+    pub fn snap(&self, t: f64) -> f64 {
+        let f = (t * self.fps + 1e-6).floor();
+        (f / self.fps).clamp(0.0, self.duration)
+    }
+
+    pub fn frame_index(&self, t: f64) -> u64 {
+        (t * self.fps + 1e-6).floor().max(0.0) as u64
+    }
+
+    /// The source tracks you can mix. Our recordings put a premixed "Mix" on
+    /// track 1 followed by the separate tracks; the mix is rebuilt from them on
+    /// export, so only those are offered. Files without that layout expose every
+    /// audio stream.
+    pub fn source_tracks(&self) -> Vec<&AudioStream> {
+        let has_mix = self.audio.first().is_some_and(|a| a.title.as_deref() == Some("Mix"));
+        if has_mix && self.audio.len() > 1 {
+            self.audio[1..].iter().collect()
+        } else {
+            self.audio.iter().collect()
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AudioStream {
+    /// Index among the file's audio streams (`0:a:N`).
+    pub index: usize,
+    pub title: Option<String>,
+    /// Part of the clip's mix. False for tracks recorded only for editing (e.g.
+    /// a voice chat kept out of shared clips): the rebuilt mix leaves them out
+    /// unless you choose to add them.
+    pub in_mix: bool,
+}
+
+impl AudioStream {
+    pub fn label(&self) -> String {
+        self.title.clone().unwrap_or_else(|| format!("Track {}", self.index + 1))
+    }
+}
+
+pub fn probe(source: &Path) -> Result<ClipInfo> {
+    let out = ffprobe()
+        .args(["-v", "error", "-show_entries"])
+        .arg("format=duration:format_tags=comment:stream=index,codec_type,width,height,avg_frame_rate,r_frame_rate,bit_rate:stream_tags=title,handler_name,name")
+        .args(["-of", "json"])
+        .arg(source)
+        .stdin(Stdio::null())
+        .output()
+        .context("failed to run ffprobe — is ffmpeg installed?")?;
+    if !out.status.success() {
+        bail!("couldn't read this video");
+    }
+
+    #[derive(Deserialize)]
+    struct Probe {
+        streams: Vec<Stream>,
+        format: Format,
+    }
+    #[derive(Deserialize)]
+    struct Format {
+        duration: Option<String>,
+        #[serde(default)]
+        tags: FormatTags,
+    }
+    #[derive(Deserialize, Default)]
+    struct FormatTags {
+        /// MP4 lowercases it, MKV doesn't.
+        #[serde(alias = "COMMENT")]
+        comment: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Stream {
+        codec_type: String,
+        width: Option<u32>,
+        height: Option<u32>,
+        avg_frame_rate: Option<String>,
+        r_frame_rate: Option<String>,
+        bit_rate: Option<String>,
+        #[serde(default)]
+        tags: Tags,
+    }
+    #[derive(Deserialize, Default)]
+    struct Tags {
+        title: Option<String>,
+        handler_name: Option<String>,
+        /// Some muxers (e.g. the mp4 "segment" path) store the name here.
+        name: Option<String>,
+    }
+
+    let p: Probe = serde_json::from_slice(&out.stdout).context("unexpected ffprobe output")?;
+    let duration: f64 = p.format.duration.as_deref().and_then(|d| d.parse().ok()).unwrap_or(0.0);
+    // Older recordings have no tag: every track after the mix was in it.
+    let tag = p.format.tags.comment.as_deref().map(parse_clip_tag).unwrap_or_default();
+    let mix_members = tag.mix;
+    let video = p.streams.iter().find(|s| s.codec_type == "video").context("no video stream")?;
+    let fps = [&video.avg_frame_rate, &video.r_frame_rate]
+        .into_iter()
+        .flatten()
+        .filter_map(|r| parse_rate(r))
+        .next()
+        .unwrap_or(60.0);
+    let audio = p
+        .streams
+        .iter()
+        .filter(|s| s.codec_type == "audio")
+        .enumerate()
+        .map(|(index, s)| AudioStream {
+            index,
+            // MKV carries our names in title; MP4 in handler_name or name. Ignore
+            // the generic handler names muxers write by default.
+            title: [&s.tags.title, &s.tags.name, &s.tags.handler_name]
+                .into_iter()
+                .flatten()
+                .find(|t| !t.is_empty() && *t != "SoundHandler" && *t != "AudioHandler")
+                .cloned(),
+            in_mix: mix_members.as_ref().is_none_or(|m| m.contains(&index)),
+        })
+        .collect();
+    Ok(ClipInfo {
+        duration,
+        fps,
+        width: video.width.unwrap_or(0),
+        height: video.height.unwrap_or(0),
+        video_kbps: video.bit_rate.as_deref().and_then(|b| b.parse::<u64>().ok()).map(|b| (b / 1000) as u32).filter(|&k| k > 0),
+        audio,
+        id: tag.id,
+    })
+}
+
+/// What our file comment says about a clip.
+#[derive(Debug, Default, PartialEq)]
+pub struct ClipTag {
+    /// Audio streams that make up the mix (`0:a:N` indices).
+    pub mix: Option<Vec<usize>>,
+    /// Permanent id, tying the file to its assets (original, edit) wherever it's
+    /// moved or renamed.
+    pub id: Option<String>,
+}
+
+/// The file comment for a clip: `hasteclip:mix=1,2 id=3f9c…`. Recordings start
+/// with just the mix; the id is added the first time the clip is edited.
+pub fn clip_tag(mix: &[usize], id: Option<&str>) -> String {
+    let list: Vec<String> = mix.iter().map(|n| n.to_string()).collect();
+    let mut tag = format!("hasteclip:mix={}", list.join(","));
+    if let Some(id) = id {
+        tag += &format!(" id={id}");
+    }
+    tag
+}
+
+/// The clip tag of a render of `edit`: mix members in the output's own layout
+/// (track 1 is the new mix, then each source in order), so reopening the render
+/// starts with the same tracks muted.
+pub fn render_tag(edit: &Edit, id: Option<&str>) -> String {
+    let mix: Vec<usize> = edit.tracks.iter().enumerate().filter(|(_, t)| !t.muted).map(|(i, _)| i + 1).collect();
+    clip_tag(&mix, id)
+}
+
+pub fn parse_clip_tag(comment: &str) -> ClipTag {
+    let Some(rest) = comment.strip_prefix("hasteclip:") else { return ClipTag::default() };
+    let mut tag = ClipTag::default();
+    for field in rest.split_whitespace() {
+        if let Some(list) = field.strip_prefix("mix=") {
+            tag.mix = Some(list.split(',').filter_map(|n| n.trim().parse().ok()).collect());
+        } else if let Some(id) = field.strip_prefix("id=") {
+            tag.id = Some(id.to_owned()).filter(|id| !id.is_empty());
+        }
+    }
+    tag
+}
+
+fn parse_rate(r: &str) -> Option<f64> {
+    let (n, d) = r.split_once('/')?;
+    let (n, d): (f64, f64) = (n.parse().ok()?, d.parse().ok()?);
+    (n > 0.0 && d > 0.0).then_some(n / d)
+}
+
+/// A volume keyframe on a track: at `t` seconds (source time) the gain is `db`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct VolumePoint {
+    pub t: f64,
+    pub db: f32,
+}
+
+/// One source track's mix setting.
+///
+/// Volume is `gain` everywhere, unless `points` has keyframes: then it follows
+/// them, linear in dB between points and flat before the first / after the last
+/// (like volume rubber-banding in Premiere).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackEdit {
+    pub index: usize,
+    /// Linear gain; 1.0 = unchanged. Used when there are no keyframes.
+    pub gain: f32,
+    pub muted: bool,
+    #[serde(default)]
+    pub points: Vec<VolumePoint>,
+}
+
+impl TrackEdit {
+    /// Volume in dB at source time `t` (ignores mute).
+    pub fn db_at(&self, t: f64) -> f32 {
+        let pts = &self.points;
+        match pts.len() {
+            0 => to_db(self.gain),
+            _ if t <= pts[0].t => pts[0].db,
+            _ if t >= pts[pts.len() - 1].t => pts[pts.len() - 1].db,
+            _ => {
+                // Ramps follow the fader, so a fade from silence sounds even
+                // instead of staying inaudible for most of its length.
+                let i = pts.partition_point(|p| p.t <= t);
+                let (a, b) = (pts[i - 1], pts[i]);
+                let f = ((t - a.t) / (b.t - a.t).max(1e-9)) as f32;
+                let (pa, pb) = (fader_pos(a.db), fader_pos(b.db));
+                fader_db(pa + (pb - pa) * f)
+            }
+        }
+    }
+
+    /// Linear gain at `t`, mute applied.
+    pub fn gain_at(&self, t: f64) -> f32 {
+        if self.muted { 0.0 } else { from_db(self.db_at(t)) }
+    }
+
+    /// Whether this track plays back exactly as recorded.
+    pub fn is_unity(&self) -> bool {
+        !self.muted && self.points.iter().all(|p| p.db.abs() < 0.05) && (self.points.len() > 0 || (self.gain - 1.0).abs() < 0.005)
+    }
+
+    /// An ffmpeg `volume` expression for this track, with `t` = seconds since `start`.
+    fn volume_expr(&self, start: f64) -> String {
+        if self.muted {
+            return "0".into();
+        }
+        if self.points.is_empty() {
+            return format!("{:.5}", self.gain);
+        }
+        // Nested if(): piecewise-linear dB, converted to linear gain. Ramps follow
+        // the fader (see `db_at`): straight in dB down to -30 dB; one that dips
+        // below is split into short straight pieces that track the curve.
+        let mut pts: Vec<(f64, f32)> = Vec::new();
+        for (i, p) in self.points.iter().enumerate() {
+            if let Some(prev) = i.checked_sub(1).map(|j| self.points[j]) {
+                if prev.db.min(p.db) < -30.0 {
+                    const PIECES: usize = 8;
+                    for k in 1..PIECES {
+                        let t = prev.t + (p.t - prev.t) * k as f64 / PIECES as f64;
+                        pts.push((t - start, self.db_at(t)));
+                    }
+                }
+            }
+            pts.push((p.t - start, p.db));
+        }
+        let mut db = format!("{:.3}", pts[pts.len() - 1].1);
+        for w in pts.windows(2).rev() {
+            let ((t0, d0), (t1, d1)) = (w[0], w[1]);
+            let seg = format!("({d0:.3}+({:.3})*(t-({t0:.4}))/{:.4})", d1 - d0, (t1 - t0).max(1e-6));
+            db = format!("if(lt(t,{t1:.4}),{seg},{db})");
+        }
+        db = format!("if(lt(t,{:.4}),{:.3},{db})", pts[0].0, pts[0].1);
+        // At the bottom of the fader: true silence, not just very quiet.
+        format!("if(lte({db},{SILENT_DB}),0,pow(10,({db})/20))")
+    }
+}
+
+/// Volume this low is silence (shown as −∞): the bottom of the fader.
+pub const SILENT_DB: f32 = -96.0;
+/// The top of the fader.
+pub const FADER_MAX_DB: f32 = 24.0;
+/// The fader law, as (position 0..=1, dB) points with straight lines in dB
+/// between them: like a mixing desk, the top three quarters are even in dB
+/// (equal distance sounds like an equal step louder, 0 dB about two thirds
+/// up), and the bottom quarter tapers through −30 and −60 down to silence.
+const FADER: [(f32, f32); 4] = [(0.0, SILENT_DB), (0.08, -60.0), (0.25, -30.0), (1.0, FADER_MAX_DB)];
+
+/// Fader position (0..=1) for a volume in dB.
+pub fn fader_pos(db: f32) -> f32 {
+    let db = db.clamp(SILENT_DB, FADER_MAX_DB);
+    for w in FADER.windows(2) {
+        let ((p0, d0), (p1, d1)) = (w[0], w[1]);
+        if db <= d1 {
+            return p0 + (db - d0) / (d1 - d0) * (p1 - p0);
+        }
+    }
+    1.0
+}
+
+/// Volume in dB at fader position `pos` (0..=1).
+pub fn fader_db(pos: f32) -> f32 {
+    let pos = pos.clamp(0.0, 1.0);
+    for w in FADER.windows(2) {
+        let ((p0, d0), (p1, d1)) = (w[0], w[1]);
+        if pos <= p1 {
+            return d0 + (pos - p0) / (p1 - p0) * (d1 - d0);
+        }
+    }
+    FADER_MAX_DB
+}
+
+/// Everything about how a clip has been edited.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Edit {
+    pub start: f64,
+    pub end: f64,
+    pub tracks: Vec<TrackEdit>,
+    /// How the saved file is made: size, rate, bitrate, audio.
+    #[serde(default)]
+    pub output: Output,
+}
+
+/// How a saved clip is made, when not just like the recording: smaller
+/// (resolution, frame rate, bitrate or a size to fit under) and with fewer
+/// audio tracks. The default changes nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct Output {
+    /// Height in pixels (the width follows the shape); only below the source's.
+    #[serde(default)]
+    pub height: Option<u32>,
+    /// Frames per second; only below the source's.
+    #[serde(default)]
+    pub fps: Option<u32>,
+    /// Video bitrate.
+    #[serde(default)]
+    pub video_kbps: Option<u32>,
+    /// Aim for a file no bigger than this many megabytes (MiB): picks the
+    /// video bitrate from the length, over `video_kbps`.
+    #[serde(default)]
+    pub max_mb: Option<u32>,
+    /// Only the mix (track 1), not each source on its own track too.
+    #[serde(default)]
+    pub mix_only: bool,
+    /// Frame blending: the rate the picture is mixed down from (a whole
+    /// multiple of the frame rate, below the source's), each new frame the
+    /// average of the frames in its slot, like motion blur. `None` just
+    /// drops the in-between frames.
+    #[serde(default)]
+    pub blend_fps: Option<u32>,
+}
+
+/// AAC bitrate of each audio track a render writes.
+pub const RENDER_AUDIO_KBPS: u32 = 192;
+
+/// The rates a clip of `src_fps` can be blended down from for output at
+/// `out` fps: whole multiples of it, up to the clip's own rate.
+pub fn blend_rates(out: u32, src_fps: f64) -> Vec<u32> {
+    (2..).map(|k| out * k).take_while(|&r| out > 0 && r as f64 <= src_fps + 0.5).collect()
+}
+
+impl Output {
+    /// The settings that actually change something for `info` (a height or
+    /// rate at or above the source's is the source's).
+    pub fn effective(&self, info: &ClipInfo) -> Self {
+        let mut e = Self {
+            height: self.height.filter(|&h| h < info.height),
+            fps: self.fps.filter(|&f| (f as f64) < info.fps - 0.5),
+            video_kbps: self.video_kbps.filter(|&k| info.video_kbps.is_none_or(|src| k < src)),
+            max_mb: self.max_mb,
+            mix_only: self.mix_only,
+            blend_fps: None,
+        };
+        e.fit_picture(info);
+        let out = e.fps.map_or(info.fps, f64::from).round() as u32;
+        e.blend_fps = self.blend_fps.filter(|b| e.fps.is_some() && blend_rates(out, info.fps).contains(b));
+        e
+    }
+
+    /// With a size to fit under and the resolution or rate left as they
+    /// are: the biggest picture the bitrate can carry (about 0.05 bits per
+    /// pixel), as an encoder can't make a big picture small enough: a
+    /// minute of 3600×2338 asked for 10 MB came out at 14.
+    fn fit_picture(&mut self, info: &ClipInfo) {
+        let Some(mb) = self.max_mb else { return };
+        if self.height.is_some() && self.fps.is_some() {
+            return;
+        }
+        let audio = if self.mix_only { RENDER_AUDIO_KBPS } else { RENDER_AUDIO_KBPS * (info.source_tracks().len() as u32 + 1) };
+        let audio = if info.audio.is_empty() { 0 } else { audio };
+        let kbps = fit_kbps(mb, info.duration, audio) as f64 * 1000.0;
+        let aspect = info.width as f64 / info.height.max(1) as f64;
+        let src_fps = info.fps.round() as u32;
+        // Best first: full rate down to 30, then smaller.
+        let heights = [2160, 1440, 1080, 720, 540, 480, 360];
+        let rates: Vec<u32> = [src_fps, 30].into_iter().filter(|&f| f <= src_fps).collect();
+        for h in heights.into_iter().filter(|&h| h <= info.height) {
+            for &f in &rates {
+                let (h, f) = (self.height.unwrap_or(h), self.fps.unwrap_or(f));
+                if kbps / (h as f64 * h as f64 * aspect * f as f64) >= 0.05 {
+                    self.height = self.height.or(Some(h).filter(|&h| h < info.height));
+                    self.fps = self.fps.or(Some(f).filter(|&f| (f as f64) < info.fps - 0.5));
+                    return;
+                }
+            }
+        }
+        self.height = self.height.or(Some(360).filter(|&h| h < info.height));
+        self.fps = self.fps.or(Some(30).filter(|&f| (f as f64) < info.fps - 0.5));
+    }
+
+    /// Whether the video must be re-encoded whole (else it can be copied).
+    pub fn changes_video(&self, info: &ClipInfo) -> bool {
+        let e = self.effective(info);
+        e.height.is_some() || e.fps.is_some() || e.video_kbps.is_some() || e.max_mb.is_some()
+    }
+
+    /// Output frame size for `info`: even, same shape.
+    pub fn size(&self, info: &ClipInfo) -> (u32, u32) {
+        match self.effective(info).height {
+            None => (info.width, info.height),
+            Some(h) => {
+                let w = (info.width as f64 * h as f64 / info.height.max(1) as f64 / 2.0).round() as u32 * 2;
+                (w.max(2), h / 2 * 2)
+            }
+        }
+    }
+
+    /// Output frame rate for `info`.
+    pub fn frame_rate(&self, info: &ClipInfo) -> f64 {
+        self.effective(info).fps.map_or(info.fps, f64::from)
+    }
+
+    /// Audio tracks a render of `edit` writes.
+    pub fn audio_tracks(&self, edit: &Edit) -> u32 {
+        match edit.tracks.len() {
+            0 => 0,
+            n if self.mix_only => 1.min(n as u32),
+            n => n as u32 + 1,
+        }
+    }
+
+    /// The video bitrate a render of `duration` seconds uses: the size
+    /// target's, else the one chosen, else the source's (`None` if unknown).
+    pub fn video_kbps_for(&self, info: &ClipInfo, edit: &Edit) -> Option<u32> {
+        let e = self.effective(info);
+        if let Some(mb) = e.max_mb {
+            return Some(fit_kbps(mb, edit.duration(), self.audio_tracks(edit) * RENDER_AUDIO_KBPS));
+        }
+        if let Some(k) = e.video_kbps {
+            return Some(k);
+        }
+        // Smaller or fewer frames and no bitrate chosen: the source's, scaled
+        // down with the pixels a second (to the ¾ power: smaller pictures need
+        // a bit more per pixel to look as good).
+        let src = info.video_kbps?;
+        let (w, h) = self.size(info);
+        let ratio = (w as f64 * h as f64 * self.frame_rate(info)) / (info.width as f64 * info.height as f64 * info.fps).max(1.0);
+        Some(((src as f64 * ratio.min(1.0).powf(0.75)) as u32).max(500))
+    }
+
+    /// Roughly how big a render of `edit` comes out, in bytes.
+    pub fn estimate_bytes(&self, info: &ClipInfo, edit: &Edit) -> Option<u64> {
+        let video = self.video_kbps_for(info, edit)? as f64;
+        let audio = (self.audio_tracks(edit) * RENDER_AUDIO_KBPS) as f64;
+        Some(((video + audio) * 1000.0 / 8.0 * edit.duration()) as u64)
+    }
+}
+
+/// Video bitrate (kbps) for a file of `duration` s to come in under `mb` MiB
+/// next to `audio_kbps` of audio. Hardware encoders overshoot a little, and
+/// the container takes a few percent, so it aims 10% low; never below 200.
+pub fn fit_kbps(mb: u32, duration: f64, audio_kbps: u32) -> u32 {
+    let total = mb as f64 * 1024.0 * 1024.0 * 8.0 / 1000.0 / duration.max(0.1) * 0.90;
+    (total - audio_kbps as f64).max(200.0) as u32
+}
+
+impl Edit {
+    /// The same edit of a copy of the source whose time `by` seconds is the
+    /// source's time zero (one trimmed to start `by` in).
+    pub fn shifted(&self, by: f64) -> Self {
+        let mut e = self.clone();
+        e.start = (e.start - by).max(0.0);
+        e.end = (e.end - by).max(e.start);
+        for t in &mut e.tracks {
+            for p in &mut t.points {
+                p.t -= by;
+            }
+        }
+        e
+    }
+
+    /// The identity edit for a clip: full length, every source at unity.
+    pub fn new(info: &ClipInfo) -> Self {
+        Self {
+            start: 0.0,
+            end: info.duration,
+            tracks: info
+                .source_tracks()
+                .iter()
+                // A track that wasn't in the clip's mix starts muted, so the rebuilt
+                // mix matches the original until you choose to bring it in.
+                .map(|a| TrackEdit { index: a.index, gain: 1.0, muted: !a.in_mix, points: Vec::new() })
+                .collect(),
+            output: Output::default(),
+        }
+    }
+
+    /// Whether this edit changes anything versus the original.
+    pub fn is_identity(&self, info: &ClipInfo) -> bool {
+        let eps = info.frame_duration() / 2.0;
+        // Unchanged = as recorded: unity volume, and muted only where the track
+        // wasn't in the mix to begin with.
+        let as_recorded = |t: &TrackEdit| {
+            let in_mix = info.audio.iter().find(|a| a.index == t.index).is_none_or(|a| a.in_mix);
+            TrackEdit { muted: false, ..t.clone() }.is_unity() && t.muted == !in_mix
+        };
+        self.start <= eps
+            && self.end >= info.duration - eps
+            && self.tracks.iter().all(as_recorded)
+            && !self.output.changes_video(info)
+            && !(self.output.mix_only && self.tracks.len() > 1)
+    }
+
+    pub fn duration(&self) -> f64 {
+        (self.end - self.start).max(0.0)
+    }
+}
+
+fn hidden_sibling(source: &Path, suffix: &str) -> PathBuf {
+    let name = source.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    source.with_file_name(format!(".{name}{suffix}"))
+}
+
+/// Decode one audio stream to interleaved stereo f32 at [`PREVIEW_RATE`].
+pub fn decode_audio(source: &Path, stream: usize) -> Result<Vec<f32>> {
+    let mut child = ffmpeg()
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(source)
+        .args(["-map", &format!("0:a:{stream}"), "-ac", "2", "-ar", &PREVIEW_RATE.to_string()])
+        .args(["-f", "f32le", "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to run ffmpeg")?;
+    let mut bytes = Vec::new();
+    child.stdout.take().context("no ffmpeg output")?.read_to_end(&mut bytes)?;
+    child.wait()?;
+    Ok(bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
+}
+
+/// An RGBA frame.
+pub struct Frame {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// Decode the exact frame at `t`, scaled to `width` (aspect kept).
+pub fn frame_at(source: &Path, t: f64, width: u32) -> Result<Frame> {
+    frame(source, t, width, true)
+}
+
+fn frame(source: &Path, t: f64, width: u32, exact: bool) -> Result<Frame> {
+    let info_h = |w: u32, src_w: u32, src_h: u32| -> u32 {
+        // Even height, as ffmpeg's scale=-2 would produce.
+        (((w as f64) * src_h as f64 / src_w.max(1) as f64 / 2.0).round() as u32 * 2).max(2)
+    };
+    // Need the source size to know how many bytes come back.
+    let (sw, sh) = video_size(source)?;
+    let height = info_h(width, sw, sh);
+    let mut cmd = ffmpeg();
+    cmd.args(["-hide_banner", "-loglevel", "error"]);
+    if !exact {
+        cmd.arg("-noaccurate_seek");
+    }
+    let out = cmd
+        .args(["-ss", &format!("{t:.4}"), "-i"])
+        .arg(source)
+        .args(["-frames:v", "1", "-vf", &format!("scale={width}:{height}:flags=bilinear")])
+        .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .context("failed to run ffmpeg")?;
+    let expected = (width * height * 4) as usize;
+    if out.stdout.len() < expected {
+        bail!("no frame at {t:.2}s");
+    }
+    Ok(Frame { width, height, rgba: out.stdout[..expected].to_vec() })
+}
+
+fn video_size(source: &Path) -> Result<(u32, u32)> {
+    let out = ffprobe()
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height"])
+        .args(["-of", "csv=p=0:s=x"])
+        .arg(source)
+        .output()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    let (w, h) = s.trim().split_once('x').context("no video size")?;
+    Ok((w.parse()?, h.parse()?))
+}
+
+/// Timeline thumbnails: the keyframes of `source`, `height` px tall, sent as
+/// `(time, frame)` as soon as each is decoded.
+///
+/// Keyframes are found from the file's index (no decoding), then decoded with
+/// `-skip_frame nokey` so only they are ever touched. That's the cheapest way to
+/// get many frames out of a long recording: our keyframes are every 1–2 s, and a
+/// keyframe decodes on its own. The clip is split into a few time ranges decoded
+/// in parallel with the hardware decoder, so the whole strip fills in at once
+/// rather than left to right.
+///
+/// At most about `max` keyframes become thumbnails, spread evenly over the clip;
+/// `on_keys` gets their times before any is decoded, so a timeline can lay out
+/// every cell once and fill each in when its own picture arrives, never showing
+/// a stand-in that changes later.
+pub fn keyframe_strip(
+    source: &Path,
+    height: u32,
+    max: usize,
+    on_keys: impl FnOnce(&[f64]),
+    mut on_frame: impl FnMut(f64, Frame) -> bool,
+) -> Result<()> {
+    let keys = keyframe_times(source)?;
+    if keys.is_empty() {
+        bail!("no keyframes");
+    }
+    let wanted = spread(&keys, max);
+    on_keys(&wanted);
+    let (sw, sh) = video_size(source)?;
+    // Even width, aspect kept.
+    let width = (((height as f64) * sw as f64 / sh.max(1) as f64 / 2.0).round() as u32 * 2).max(2);
+    let frame_bytes = (width * height * 4) as usize;
+
+    // Split the keyframes into contiguous ranges, one ffmpeg each.
+    let jobs = keys.len().clamp(1, 4);
+    let per = keys.len().div_ceil(jobs);
+    let (tx, rx) = std::sync::mpsc::channel::<(f64, Frame)>();
+    let mut children = Vec::new();
+    for chunk in keys.chunks(per) {
+        let (first, last) = (chunk[0], *chunk.last().unwrap());
+        let times = chunk.to_vec();
+        let wanted = wanted.clone();
+        let mut cmd = ffmpeg_background();
+        cmd.args(["-hide_banner", "-loglevel", "error"]);
+        if cfg!(target_os = "macos") {
+            cmd.args(["-hwaccel", "videotoolbox"]);
+        }
+        let mut child = cmd
+            // Seeking lands on the last keyframe at or before the time, so aim just
+            // past this range's first one: aiming before it would start a keyframe
+            // early and label every picture with the next one's time.
+            .args(["-skip_frame", "nokey", "-noaccurate_seek", "-ss", &format!("{:.4}", first + 0.001)])
+            // A little past the last keyframe so it's included, but not the next range's first.
+            .args(["-t", &format!("{:.4}", last - first + 0.01), "-i"])
+            .arg(source)
+            .args(["-an", "-vf", &format!("scale={width}:{height}:flags=bilinear"), "-fps_mode", "passthrough"])
+            .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("failed to run ffmpeg")?;
+        let mut out = child.stdout.take().context("no ffmpeg output")?;
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for t in times {
+                let mut rgba = vec![0u8; frame_bytes];
+                if out.read_exact(&mut rgba).is_err() {
+                    break;
+                }
+                if wanted.binary_search_by(|k| k.total_cmp(&t)).is_ok() && tx.send((t, Frame { width, height, rgba })).is_err() {
+                    break;
+                }
+            }
+        });
+        children.push(child);
+    }
+    drop(tx);
+    let mut cancelled = false;
+    for (t, f) in rx {
+        if !on_frame(t, f) {
+            cancelled = true;
+            break;
+        }
+    }
+    for mut c in children {
+        if cancelled {
+            let _ = c.kill();
+        }
+        let _ = c.wait();
+    }
+    Ok(())
+}
+
+/// About `max` of `keys` (sorted), evenly spread: each at least 1/`max` of the
+/// span after the one before. Always keeps the first.
+fn spread(keys: &[f64], max: usize) -> Vec<f64> {
+    let span = keys.last().unwrap_or(&0.0) - keys.first().unwrap_or(&0.0);
+    let gap = span / max.max(1) as f64;
+    let mut out: Vec<f64> = Vec::new();
+    for &k in keys {
+        if out.last().is_none_or(|l| k - l >= gap) {
+            out.push(k);
+        }
+    }
+    out
+}
+
+/// Presentation times of every keyframe, read from the container index.
+pub fn keyframe_times(source: &Path) -> Result<Vec<f64>> {
+    let out = ffprobe()
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0"])
+        .arg(source)
+        .stdin(Stdio::null())
+        .output()
+        .context("failed to run ffprobe")?;
+    let mut keys: Vec<f64> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let (t, flags) = l.split_once(',')?;
+            flags.contains('K').then(|| t.parse().ok()).flatten()
+        })
+        .collect();
+    keys.sort_by(f64::total_cmp);
+    keys.dedup();
+    Ok(keys)
+}
+
+/// Copy `from`..`to` of `source` to `dest` without re-encoding: every track,
+/// the clip tag and the track names. `from` should be a keyframe (a copy can
+/// only start on one). Returns where `from` landed in the copy.
+pub fn trim_copy(source: &Path, from: f64, to: f64, dest: &Path) -> Result<f64> {
+    run(ffmpeg()
+        .args(["-hide_banner", "-loglevel", "error", "-y"])
+        .args(["-ss", &format!("{from:.6}"), "-to", &format!("{to:.6}"), "-i"])
+        .arg(source)
+        .args(["-map", "0", "-c", "copy", "-map_metadata", "0", "-avoid_negative_ts", "make_zero"])
+        .arg(dest))?;
+    keyframe_times(dest)?.first().copied().context("the copy has no picture")
+}
+
+/// Render `edit` of `source` to `dest` (written to a hidden partial first, so a
+/// half-finished file never appears under its real name). `id` goes into the
+/// output's clip tag.
+pub fn render_to(source: &Path, info: &ClipInfo, edit: &Edit, dest: &Path, id: Option<&str>) -> Result<()> {
+    render_with_progress(source, info, edit, dest, id, |_| {})
+}
+
+/// Render with progress callbacks (0.0..=1.0).
+///
+/// "Smart render": only the frames between a cut and the nearest keyframe are
+/// re-encoded; everything between the first and last keyframe inside the trim is
+/// stream-copied untouched. A 20 s trim of a 60 fps 4K-wide recording drops from
+/// ~20 s (full re-encode) to ~3 s, and the copied part is bit-identical to the
+/// original. Falls back to a full re-encode when there's no keyframe to copy from.
+pub fn render_with_progress(
+    source: &Path,
+    info: &ClipInfo,
+    edit: &Edit,
+    dest: &Path,
+    id: Option<&str>,
+    progress: impl Fn(f32),
+) -> Result<()> {
+    let ext = dest.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or("mp4".into());
+    // One scratch dir per render: several can run at once (an edit and a "save as
+    // new" of the same clip), and they must never share intermediate files.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let work = std::env::temp_dir().join(format!("hasteclip-render-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work)?;
+    let result = (|| -> Result<()> {
+        progress(0.0);
+        let video = work.join(format!("video.{ext}"));
+        let plan = plan(source, info, edit);
+        let weights = Weights::new(&plan, edit.duration());
+        render_video(source, info, edit, &plan, &work, &video, &|f| progress(f * weights.video))?;
+        // `.name.rendering.mp4`: hidden (dotfile) so the library never shows a
+        // half-written clip, and ending in the real extension so ffmpeg picks the
+        // container. (Not `with_extension`, which would replace `.mp4` and could
+        // eat into the name.)
+        let partial = hidden_sibling(dest, &format!(".rendering.{ext}"));
+        mux_audio(source, info, edit, id, &video, &partial, &|f| progress(weights.video + f * (1.0 - weights.video)))?;
+        std::fs::rename(&partial, dest)?;
+        progress(1.0);
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&work);
+    result
+}
+
+/// How the video gets made: one full re-encode, or re-encoded edges around a
+/// stream-copied middle (start/end keyframes).
+enum Plan {
+    Encode,
+    Smart { k1: f64, k2: f64 },
+}
+
+fn plan(source: &Path, info: &ClipInfo, edit: &Edit) -> Plan {
+    // A new size, rate or bitrate: every frame is encoded again.
+    if edit.output.changes_video(info) {
+        return Plan::Encode;
+    }
+    // Keyframes inside the trim, with a frame of margin from the cuts.
+    let fd = info.frame_duration();
+    let keys: Vec<f64> = keyframes(source)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|&k| k >= edit.start - fd / 2.0 && k <= edit.end - fd)
+        .collect();
+    match (keys.first(), keys.last()) {
+        (Some(&k1), Some(&k2)) if k2 - k1 >= 1.0 && is_h264(source) => Plan::Smart { k1, k2 },
+        _ => Plan::Encode,
+    }
+}
+
+/// Rough relative cost of each step, so one progress bar moves at an even pace:
+/// encoding ~1 unit per second of video, copying and the audio mux far less.
+struct Weights {
+    video: f32,
+}
+
+impl Weights {
+    fn new(plan: &Plan, dur: f64) -> Self {
+        let video = match plan {
+            Plan::Encode => dur,
+            Plan::Smart { k1, k2 } => (dur - (k2 - k1)) + (k2 - k1) * 0.03,
+        };
+        let audio = dur * 0.04 + 0.3;
+        Self { video: (video / (video + audio)) as f32 }
+    }
+}
+
+/// Whether this ffmpeg has the filter `name` (builds differ), asked once.
+fn has_filter(name: &str) -> bool {
+    static FILTERS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let list = FILTERS.get_or_init(|| {
+        ffmpeg().args(["-hide_banner", "-filters"]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default()
+    });
+    list.lines().any(|l| l.split_whitespace().nth(1) == Some(name))
+}
+
+/// Video only, trimmed frame-exactly, into `out`. `progress` gets 0..=1.
+fn render_video(source: &Path, info: &ClipInfo, edit: &Edit, plan: &Plan, work: &Path, out: &Path, progress: &dyn Fn(f32)) -> Result<()> {
+    let output = edit.output.effective(info);
+    let kbps = if edit.output.changes_video(info) {
+        edit.output.video_kbps_for(info, edit).map(u64::from).unwrap_or(8_000)
+    } else {
+        source_video_kbps(source).unwrap_or(20_000)
+    };
+    // Smaller and fewer frames: scaled (Lanczos, sharp) and dropped evenly.
+    let mut filters = Vec::new();
+    if output.fps.is_some() {
+        let rate = edit.output.frame_rate(info);
+        match output.blend_fps {
+            // Frames at the blend rate, each output frame the average of the
+            // ones ending at its time.
+            // Mixed as light (what a screen gives off), not as pixel values,
+            // which are gamma-encoded: a fifth of a bright ghost's value is
+            // about 3% of its light, not 20%. Recordings are BT.709, limited.
+            Some(b) => {
+                let light = has_filter("zscale");
+                if light {
+                    filters.push("setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709".to_owned());
+                    filters.push("zscale=tin=iec61966-2-1:t=linear,format=gbrpf32le".to_owned());
+                }
+                if (b as f64) < info.fps - 0.5 {
+                    filters.push(format!("fps={b}"));
+                }
+                filters.push(format!("tmix=frames={}", (b as f64 / rate).round() as u32));
+                filters.push(format!("fps={rate}"));
+                if light {
+                    filters.push("zscale=tin=linear:t=iec61966-2-1,format=gbrp".to_owned());
+                    filters.push("scale=out_color_matrix=bt709:out_range=tv,format=yuv420p".to_owned());
+                    filters.push("setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709".to_owned());
+                }
+            }
+            None => filters.push(format!("fps={rate}")),
+        }
+    }
+    if output.height.is_some() {
+        let (w, h) = edit.output.size(info);
+        filters.push(format!("scale={w}:{h}:flags=lanczos"));
+    }
+    // A size to fit under: hold the encoder to the bitrate over short spans,
+    // not just on average.
+    let cap: Vec<String> = match output.max_mb {
+        Some(_) => vec!["-maxrate".into(), format!("{kbps}k"), "-bufsize".into(), format!("{}k", kbps * 2)],
+        None => Vec::new(),
+    };
+    // Every part gets the source's timescale. Otherwise the muxer picks one per
+    // part (copied middle 1/19200, encoded edges 1/15360) and concat, which
+    // copies timestamps without rescaling, plays the middle at the wrong rate:
+    // a 60 fps trim came out as 48 fps with a fifth of its frames gone.
+    let timescale = source_timescale(source).unwrap_or(600).to_string();
+    let encoder = video_encoder();
+    // VA-API encodes from GPU memory: the frames go up last.
+    if encoder == "h264_vaapi" {
+        filters.push("format=nv12,hwupload".to_owned());
+    }
+    let encode = |from: f64, to: f64, dest: &Path, progress: &dyn Fn(f32)| -> Result<()> {
+        run_progress(
+            ffmpeg()
+                .args(["-hide_banner", "-loglevel", "error", "-y"])
+                .args(vaapi_device(encoder))
+                .args(["-ss", &format!("{from:.6}"), "-to", &format!("{to:.6}"), "-i"])
+                .arg(source)
+                .args(["-map", "0:v:0", "-an", "-c:v", encoder, "-b:v", &format!("{kbps}k")])
+                .args(&cap)
+                .args(if filters.is_empty() { Vec::new() } else { vec!["-vf".to_owned(), filters.join(",")] })
+                // Same profile as our recordings so the segments can be joined.
+                .args(["-profile:v", "high"])
+                .args(if encoder == "h264_vaapi" { &[][..] } else { &["-pix_fmt", "yuv420p"][..] })
+                .args(["-video_track_timescale", &timescale])
+                .arg(dest),
+            to - from,
+            progress,
+        )
+    };
+
+    let Plan::Smart { k1, k2 } = *plan else {
+        return encode(edit.start, edit.end, out, progress);
+    };
+
+    // Share of the video work per part, by the same cost model as `Weights`.
+    let (head, mid, tail) = (k1 - edit.start, (k2 - k1) * 0.03, edit.end - k2);
+    let total = (head + mid + tail).max(1e-6);
+    let (w_head, w_mid) = ((head / total) as f32, (mid / total) as f32);
+    let mut parts = Vec::new();
+    if head > 1e-3 {
+        let path = work.join("head.mp4");
+        encode(edit.start, k1, &path, &|f| progress(f * w_head))?;
+        parts.push(path);
+    }
+    let path = work.join("mid.mp4");
+    run(ffmpeg()
+        .args(["-hide_banner", "-loglevel", "error", "-y"])
+        .args(["-ss", &format!("{k1:.6}"), "-to", &format!("{k2:.6}"), "-i"])
+        .arg(source)
+        .args(["-map", "0:v:0", "-an", "-c", "copy", "-avoid_negative_ts", "make_zero"])
+        .args(["-video_track_timescale", &timescale])
+        .arg(&path))?;
+    parts.push(path);
+    progress(w_head + w_mid);
+    if tail > 1e-3 {
+        let path = work.join("tail.mp4");
+        encode(k2, edit.end, &path, &|f| progress(w_head + w_mid + f * (1.0 - w_head - w_mid)))?;
+        parts.push(path);
+    }
+
+    let list = work.join("parts.txt");
+    let body: String = parts.iter().map(|p| format!("file '{}'\n", p.display())).collect();
+    std::fs::write(&list, body)?;
+    run(ffmpeg()
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0", "-i"])
+        .arg(&list)
+        .args(["-c", "copy"])
+        .arg(out))?;
+    progress(1.0);
+    Ok(())
+}
+
+/// Add the audio (new mix on track 1, then each source at its volume) to the
+/// rendered video, producing the final file.
+fn mux_audio(source: &Path, info: &ClipInfo, edit: &Edit, id: Option<&str>, video: &Path, out: &Path, progress: &dyn Fn(f32)) -> Result<()> {
+    let mut graph: Vec<String> = Vec::new();
+    let mut mix_inputs: Vec<String> = Vec::new();
+    let mut maps: Vec<String> = Vec::new();
+    let mut titles: Vec<String> = Vec::new();
+
+    for (i, t) in edit.tracks.iter().enumerate() {
+        // eval=frame re-evaluates per audio frame so keyframed volume ramps; `t`
+        // there counts from the trim start because the input is seeked.
+        graph.push(format!(
+            "[1:a:{}]volume='{}':eval=frame,asplit=2[m{i}][s{i}]",
+            t.index,
+            t.volume_expr(edit.start)
+        ));
+        if t.muted {
+            graph.push(format!("[m{i}]anullsink"));
+        } else {
+            mix_inputs.push(format!("[m{i}]"));
+        }
+        maps.push(format!("[s{i}]"));
+        titles.push(
+            info.audio
+                .iter()
+                .find(|a| a.index == t.index)
+                .map(|a| a.label())
+                .unwrap_or_else(|| format!("Track {}", t.index + 1)),
+        );
+    }
+    let has_audio = !edit.tracks.is_empty();
+    if has_audio {
+        if mix_inputs.is_empty() {
+            // Everything muted: keep a silent mix so the layout stays the same.
+            graph.push("anullsrc=r=48000:cl=stereo[mix]".into());
+        } else {
+            graph.push(format!(
+                "{}amix=inputs={}:normalize=0:duration=longest[mix]",
+                mix_inputs.concat(),
+                mix_inputs.len()
+            ));
+        }
+    }
+
+    let mut cmd = ffmpeg();
+    cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-i"]).arg(video);
+    cmd.args(["-ss", &format!("{:.6}", edit.start), "-t", &format!("{:.6}", edit.duration()), "-i"]).arg(source);
+    cmd.args(["-map", "0:v:0", "-c:v", "copy"]);
+    // Only the mix: the file's one track is the mix, and it's in its own mix.
+    let tag = if edit.output.mix_only { clip_tag(&[0], id) } else { render_tag(edit, id) };
+    cmd.args(["-metadata", &format!("comment={tag}")]);
+    if has_audio {
+        if edit.output.mix_only {
+            // The sources aren't written: each one's split ends here.
+            for m in &maps {
+                graph.push(format!("{m}anullsink"));
+            }
+            maps.clear();
+            titles.clear();
+        }
+        cmd.args(["-filter_complex", &graph.join(";"), "-map", "[mix]"]);
+        for m in &maps {
+            cmd.args(["-map", m]);
+        }
+        cmd.args(["-c:a", "aac", "-b:a", &format!("{RENDER_AUDIO_KBPS}k"), "-shortest"]);
+        let all_titles = std::iter::once("Mix".to_owned()).chain(titles);
+        for (i, t) in all_titles.enumerate() {
+            cmd.args([format!("-metadata:s:a:{i}"), format!("title={t}")]);
+            cmd.args([format!("-metadata:s:a:{i}"), format!("handler_name={t}")]);
+        }
+    }
+    cmd.args(["-movflags", "+faststart"]).arg(out);
+    let r = run_progress(&mut cmd, edit.duration(), progress);
+    if r.is_err() {
+        let _ = std::fs::remove_file(out);
+    }
+    r
+}
+
+/// Run an ffmpeg command, turning failure into an error with its last log line.
+fn run(cmd: &mut Command) -> Result<()> {
+    let out = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).output()?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        bail!("render failed: {}", err.lines().last().unwrap_or("unknown error"));
+    }
+    Ok(())
+}
+
+/// Run ffmpeg reporting progress through `-progress`: `out_time_us` against the
+/// expected output `duration`, as 0..=1.
+fn run_progress(cmd: &mut Command, duration: f64, progress: &dyn Fn(f32)) -> Result<()> {
+    use std::io::BufRead;
+    let mut child = cmd
+        .args(["-progress", "pipe:1", "-nostats"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stderr = child.stderr.take().expect("piped");
+    // Drain stderr on its own thread so a chatty ffmpeg can't block on a full pipe.
+    let err_thread = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = std::io::BufReader::new(stderr).read_to_string(&mut s);
+        s
+    });
+    for line in std::io::BufReader::new(child.stdout.take().expect("piped")).lines().map_while(|l| l.ok()) {
+        if let Some(us) = line.strip_prefix("out_time_us=") {
+            if let Ok(us) = us.trim().parse::<f64>() {
+                progress(((us / 1e6) / duration.max(1e-6)).clamp(0.0, 1.0) as f32);
+            }
+        }
+    }
+    let status = child.wait()?;
+    let err = err_thread.join().unwrap_or_default();
+    if !status.success() {
+        bail!("render failed: {}", err.lines().last().unwrap_or("unknown error"));
+    }
+    progress(1.0);
+    Ok(())
+}
+
+/// Keyframe timestamps of the video stream.
+fn keyframes(source: &Path) -> Result<Vec<f64>> {
+    let out = ffprobe()
+        .args(["-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey"])
+        .args(["-show_entries", "frame=pts_time", "-of", "csv=p=0"])
+        .arg(source)
+        .output()?;
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().trim_end_matches(',').parse().ok())
+        .collect())
+}
+
+fn is_h264(source: &Path) -> bool {
+    ffprobe()
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "csv=p=0"])
+        .arg(source)
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "h264")
+}
+
+/// The H.264 encoder for re-encoded cuts: the platform's hardware one on
+/// macOS; elsewhere x264 when this ffmpeg build has it (LGPL builds don't),
+/// else Media Foundation on Windows, or on Linux the GPU's (NVENC, VA-API)
+/// or OpenH264 — whichever really works (an ffmpeg lists NVENC without an
+/// NVIDIA card).
+fn video_encoder() -> &'static str {
+    static CHOSEN: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    CHOSEN.get_or_init(|| {
+        if cfg!(target_os = "macos") {
+            return "h264_videotoolbox";
+        }
+        let listed = ffmpeg_list("-encoders");
+        let has = |name: &str| listed.split_whitespace().any(|w| w == name);
+        if has("libx264") {
+            return "libx264";
+        }
+        if cfg!(windows) && has("h264_mf") {
+            return "h264_mf";
+        }
+        if cfg!(target_os = "linux") {
+            if let Some(e) = ["h264_nvenc", "h264_vaapi", "libopenh264"].into_iter().find(|e| has(e) && encodes(e)) {
+                return e;
+            }
+        }
+        "libx264"
+    })
+}
+
+/// `-encoders` / `-decoders` output of the ffmpeg in use.
+fn ffmpeg_list(what: &str) -> String {
+    ffmpeg()
+        .args(["-hide_banner", what])
+        .stdin(Stdio::null())
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+}
+
+/// Where VA-API encodes: the first GPU render node.
+fn vaapi_device(encoder: &str) -> Vec<String> {
+    if encoder != "h264_vaapi" {
+        return Vec::new();
+    }
+    let mut nodes: Vec<String> = std::fs::read_dir("/dev/dri")
+        .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with("renderD")).collect())
+        .unwrap_or_default();
+    nodes.sort();
+    let node = nodes.first().map_or("/dev/dri/renderD128".to_owned(), |n| format!("/dev/dri/{n}"));
+    vec!["-vaapi_device".to_owned(), node]
+}
+
+/// Whether `encoder` can really encode a few frames here.
+fn encodes(encoder: &str) -> bool {
+    let mut filters = "format=yuv420p".to_owned();
+    if encoder == "h264_vaapi" {
+        filters = "format=nv12,hwupload".to_owned();
+    }
+    ffmpeg()
+        .args(["-hide_banner", "-loglevel", "error"])
+        .args(vaapi_device(encoder))
+        .args(["-f", "lavfi", "-i", "color=c=black:s=320x180:r=30", "-frames:v", "5", "-vf", &filters, "-c:v", encoder, "-f", "null", "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// What's wrong with the ffmpeg in use, if anything: missing, or unable to
+/// read or write H.264 (Fedora's own `ffmpeg-free` can do neither without
+/// extra codecs). Takes a moment: call it off the UI thread.
+pub fn problem() -> Option<String> {
+    if ffmpeg().arg("-version").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_err() {
+        return Some(if cfg!(target_os = "linux") {
+            "ffmpeg isn't installed, so clips can't be played, edited or shown. Install it with your package manager \
+             (on Fedora, RPM Fusion's `ffmpeg`)."
+                .into()
+        } else {
+            "ffmpeg isn't installed, so clips can't be played, edited or shown.".into()
+        });
+    }
+    let decoders = ffmpeg_list("-decoders");
+    let decodes = decoders.split_whitespace().any(|w| w == "h264" || w == "h264_cuvid" || w == "libopenh264");
+    // Listed doesn't mean usable: Fedora's ffmpeg lists OpenH264 against a stub library.
+    let usable = decodes
+        && ffmpeg()
+            .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=black:s=64x64:r=30", "-frames:v", "2"])
+            .args(["-c:v", video_encoder(), "-f", "h264", "-"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success() && !o.stdout.is_empty())
+            .is_some_and(|o| {
+                let mut child = match ffmpeg()
+                    .args(["-hide_banner", "-loglevel", "error", "-f", "h264", "-i", "-", "-f", "null", "-"])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                {
+                    Ok(c) => c,
+                    Err(_) => return false,
+                };
+                if let Some(mut stdin) = child.stdin.take() {
+                    use std::io::Write;
+                    let _ = stdin.write_all(&o.stdout);
+                }
+                child.wait().is_ok_and(|s| s.success())
+            });
+    if usable {
+        return None;
+    }
+    Some(if cfg!(target_os = "linux") {
+        "This ffmpeg can't read or write H.264 video, so clips can't be played, edited or shown. Fedora's own \
+         ffmpeg leaves it out: install RPM Fusion's (`sudo dnf swap ffmpeg-free ffmpeg --allowerasing`), or the \
+         `openh264` package."
+            .into()
+    } else {
+        "This ffmpeg can't read or write H.264 video, so clips can't be played, edited or shown.".into()
+    })
+}
+
+/// Ticks per second of the video track (the denominator of its time base).
+fn source_timescale(source: &Path) -> Option<u32> {
+    let out = ffprobe()
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=time_base", "-of", "csv=p=0"])
+        .arg(source)
+        .output()
+        .ok()?;
+    let tb = String::from_utf8_lossy(&out.stdout);
+    let (_, den) = tb.trim().split_once('/')?;
+    den.parse().ok().filter(|&d| d > 0)
+}
+
+fn source_video_kbps(source: &Path) -> Option<u64> {
+    let out = ffprobe()
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=bit_rate", "-of", "csv=p=0"])
+        .arg(source)
+        .output()
+        .ok()?;
+    let bps: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+    Some((bps / 1000).max(2_000))
+}
+
+/// Peak and RMS of a block of interleaved samples, in linear units.
+pub fn levels(samples: &[f32]) -> (f32, f32) {
+    if samples.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mut peak = 0.0f32;
+    let mut sum = 0.0f64;
+    for &s in samples {
+        peak = peak.max(s.abs());
+        sum += (s as f64) * (s as f64);
+    }
+    (peak, (sum / samples.len() as f64).sqrt() as f32)
+}
+
+/// Linear amplitude → dBFS (floored at -90).
+pub fn to_db(x: f32) -> f32 {
+    if x <= 1.6e-5 { SILENT_DB } else { 20.0 * x.log10() }
+}
+
+/// dB → linear gain.
+pub fn from_db(db: f32) -> f32 {
+    if db <= SILENT_DB { 0.0 } else { 10f32.powf(db / 20.0) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fader_law() {
+        for db in [SILENT_DB, -60.0, -45.0, -30.0, -6.0, 0.0, 12.0, FADER_MAX_DB] {
+            assert!((fader_db(fader_pos(db)) - db).abs() < 1e-3, "{db}");
+        }
+        assert_eq!(fader_pos(SILENT_DB), 0.0);
+        assert_eq!(fader_pos(FADER_MAX_DB), 1.0);
+        // Even in dB above -30: each 6 dB is the same distance.
+        let step = |a: f32| fader_pos(a + 6.0) - fader_pos(a);
+        assert!((step(-24.0) - step(12.0)).abs() < 1e-5);
+        assert!((fader_pos(0.0) - 0.667).abs() < 0.01, "0 dB about two thirds up");
+        assert_eq!(from_db(SILENT_DB), 0.0);
+    }
+
+    #[test]
+    fn fades_from_silence_follow_the_fader() {
+        let track = TrackEdit {
+            index: 0,
+            gain: 1.0,
+            muted: false,
+            points: vec![VolumePoint { t: 0.0, db: SILENT_DB }, VolumePoint { t: 1.0, db: 0.0 }],
+        };
+        // Halfway through the fade is halfway along the fader, not -48 dB.
+        let mid = track.db_at(0.5);
+        assert!((fader_pos(mid) - fader_pos(0.0) / 2.0).abs() < 1e-4, "{mid}");
+        assert!(mid > -40.0);
+        assert_eq!(track.gain_at(0.0), 0.0);
+        // The render expression is pieced along the curve and silent at the start.
+        let expr = track.volume_expr(0.0);
+        assert!(expr.starts_with("if(lte("), "{expr}");
+        assert!(expr.matches("lt(t,").count() >= 8, "{expr}");
+    }
+
+    fn info() -> ClipInfo {
+        ClipInfo { duration: 60.0, fps: 60.0, width: 3600, height: 2338, video_kbps: Some(20_000), audio: Vec::new(), id: None }
+    }
+
+    #[test]
+    fn output_settings() {
+        let info = info();
+        let edit = |output| Edit { start: 0.0, end: 60.0, tracks: Vec::new(), output };
+        // Nothing chosen, or nothing below the source: the video is copied.
+        assert!(!Output::default().changes_video(&info));
+        assert!(!Output { height: Some(2338), fps: Some(60), video_kbps: Some(30_000), ..Default::default() }.changes_video(&info));
+        assert!(edit(Output { height: Some(4000), ..Default::default() }).is_identity(&info));
+        // 1080p keeps the shape, even sizes.
+        let o = Output { height: Some(1080), ..Default::default() };
+        assert_eq!(o.size(&info), (1662, 1080));
+        assert!(!edit(o).is_identity(&info));
+        // Smaller with no bitrate chosen: less than the source's.
+        let k = o.video_kbps_for(&info, &edit(o)).unwrap();
+        assert!(k < 20_000 && k > 5_000, "{k}");
+        // Under 10 MB for a minute with no audio: ~1.2 Mbps.
+        let fit = Output { max_mb: Some(10), ..Default::default() };
+        let k = fit.video_kbps_for(&info, &edit(fit)).unwrap();
+        assert!((1_150..1_300).contains(&k), "{k}");
+        let bytes = fit.estimate_bytes(&info, &edit(fit)).unwrap();
+        assert!(bytes < 10 * 1024 * 1024, "{bytes}");
+        // ...in a picture that bitrate can carry.
+        assert_eq!((fit.size(&info).1, fit.frame_rate(&info)), (720, 30.0));
+    }
+
+    #[test]
+    fn output_saved_with_the_edit() {
+        // Edits saved before export settings existed still open.
+        let old: Edit = serde_json::from_str(r#"{"start":1.0,"end":5.0,"tracks":[]}"#).unwrap();
+        assert_eq!(old.output, Output::default());
+        let mut e = old.clone();
+        e.output = Output { height: Some(720), max_mb: Some(10), mix_only: true, ..Default::default() };
+        let back: Edit = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+        assert_eq!(back.output, e.output);
+    }
+
+    #[test]
+    fn clip_tags() {
+        assert_eq!(clip_tag(&[1, 2], None), "hasteclip:mix=1,2");
+        assert_eq!(clip_tag(&[1], Some("ab12")), "hasteclip:mix=1 id=ab12");
+        assert_eq!(parse_clip_tag("hasteclip:mix=1,2,3"), ClipTag { mix: Some(vec![1, 2, 3]), id: None });
+        assert_eq!(parse_clip_tag("hasteclip:mix=1 id=ab12"), ClipTag { mix: Some(vec![1]), id: Some("ab12".into()) });
+        assert_eq!(parse_clip_tag("hasteclip:mix="), ClipTag { mix: Some(vec![]), id: None });
+        assert_eq!(parse_clip_tag("made with something else"), ClipTag::default());
+    }
+}
+
+#[cfg(test)]
+mod jpeg_tests {
+    /// Colour accuracy and cost of JPEG settings on a real frame:
+    /// `JPEG_FRAME=<1280x720 rgba> cargo test --release -p media jpeg_settings -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn jpeg_settings() {
+        let Some(path) = std::env::var_os("JPEG_FRAME") else { return };
+        let rgba = std::fs::read(path).unwrap();
+        let (w, h) = (1280u16, 720u16);
+        let grey = [0x2E, 0x32, 0x38];
+        for (q, sub) in [(75u8, true), (90, true), (95, true), (90, false), (95, false)] {
+            let t = std::time::Instant::now();
+            let mut out = Vec::new();
+            let mut enc = jpeg_encoder::Encoder::new(&mut out, q);
+            enc.set_sampling_factor(if sub { jpeg_encoder::SamplingFactor::F_2_2 } else { jpeg_encoder::SamplingFactor::F_1_1 });
+            enc.encode(&rgba, w, h, jpeg_encoder::ColorType::Rgba).unwrap();
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            // Decode with a tiny decoder-free check: re-encode isn't possible, so
+            // write it out for ffmpeg to read back.
+            let file = std::env::temp_dir().join(format!("jt_{q}_{sub}.jpg"));
+            std::fs::write(&file, &out).unwrap();
+            let back = std::process::Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&file).args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"]).output().unwrap().stdout;
+            let (mut n, mut err, mut worst) = (0u64, [0i64; 3], 0u8);
+            let mut all = 0u64;
+            for (a, b) in rgba.chunks_exact(4).zip(back.chunks_exact(4)) {
+                for c in 0..3 {
+                    all += a[c].abs_diff(b[c]) as u64;
+                }
+                if a[..3] == grey {
+                    n += 1;
+                    for c in 0..3 {
+                        err[c] += b[c] as i64 - a[c] as i64;
+                        worst = worst.max(a[c].abs_diff(b[c]));
+                    }
+                }
+            }
+            println!(
+                "q{q} {}: {:>3} KB, {ms:.1} ms; mean error {:.2}; {n} px of 2E3238: mean shift ({:+.2},{:+.2},{:+.2}) worst {worst}",
+                if sub { "4:2:0" } else { "4:4:4" },
+                out.len() / 1024,
+                all as f64 / (rgba.len() / 4 * 3) as f64,
+                err[0] as f64 / n.max(1) as f64,
+                err[1] as f64 / n.max(1) as f64,
+                err[2] as f64 / n.max(1) as f64
+            );
+        }
+    }
+}

@@ -1,0 +1,99 @@
+[package]
+name = "capture"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+serde_json = "1.0.151"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+rubato = "5.0.1"
+# Microphone noise removal (RNNoise, in Rust).
+nnnoiseless = { version = "0.5", default-features = false }
+# Mics on macOS and Windows (Linux records them from PipeWire, like the
+# rest), and "Listen" everywhere.
+cpal = "0.18.2"
+
+# macOS-only: native ScreenCaptureKit backend, so these Apple-framework bindings
+# must not be pulled in elsewhere.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
+dispatch2 = "0.3.1"
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", features = ["NSWorkspace", "NSRunningApplication", "NSImage", "NSGraphicsContext", "objc2-core-graphics"] }
+objc2-audio-toolbox = { version = "0.3.2", default-features = false, features = ["std", "AudioConverter", "objc2-core-audio-types"] }
+objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "dispatch2", "AVAssetWriter", "AVAssetWriterInput", "AVMediaFormat", "AVMetadataItem", "AVMetadataIdentifiers", "AVAsynchronousKeyValueLoading", "AVCaptureDevice", "AVCaptureInput", "AVCaptureOutputBase", "AVCaptureSession", "AVCaptureSessionPreset", "AVCaptureVideoDataOutput", "objc2-core-media", "objc2-core-video"] }
+objc2-core-audio-types = "0.3.2"
+objc2-core-foundation = { version = "0.3.2", features = ["CFArray", "CFCGTypes", "CFData", "CFDictionary", "CFNumber", "CFString"] }
+objc2-core-graphics = { version = "0.3.2", features = ["CGColor", "CGGeometry", "CGWindow", "CGDirectDisplay", "CGDisplayStream", "CGBitmapContext", "CGColorSpace", "CGContext", "CGImage"] }
+objc2-core-media = { version = "0.3.2", features = ["CMSampleBuffer", "CMBlockBuffer", "CMFormatDescription", "CMTime", "CMSync", "objc2-core-video", "objc2-core-audio-types"] }
+objc2-core-video = { version = "0.3.2", features = ["CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferIOSurface", "CVPixelBufferPool", "CVReturn", "objc2-io-surface"] }
+objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef", "IOSurfaceTypes", "objc2", "objc2-core-foundation"] }
+objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSDictionary", "NSString", "NSError", "NSEnumerator", "NSObject", "NSURL", "NSValue"] }
+objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "block2", "MTLAllocation", "MTLBlitCommandEncoder", "MTLCommandBuffer", "MTLCommandEncoder", "MTLCommandQueue", "MTLComputeCommandEncoder", "MTLComputePipeline", "MTLDevice", "MTLLibrary", "MTLPixelFormat", "MTLResource", "MTLTexture", "MTLTypes", "objc2-io-surface"] }
+objc2-screen-capture-kit = { version = "0.3.2", features = ["SCShareableContent", "SCStream", "block2", "dispatch2", "objc2-core-media", "objc2-core-graphics"] }
+objc2-video-toolbox = { version = "0.3.2", features = ["VTCompressionSession", "VTCompressionProperties", "VTDecompressionSession", "VTDecompressionProperties", "VTPixelTransferProperties", "VTSession", "VTErrors", "objc2-core-media", "objc2-core-video"] }
+
+# Windows-only: Windows Graphics Capture + Media Foundation + WASAPI backend.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-core = "0.62"
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_OpenGL",
+    "Win32_Media_Audio",
+    "Win32_Media_DirectShow",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_Multimedia",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Performance",
+    "Win32_System_SystemInformation",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+
+# Linux: the screen from the X server on X11 (no dialog, any desktop), or
+# copied from the compositor on Sway, Hyprland and their kin, or streamed by
+# KWin on KDE Plasma or Mutter on GNOME (no dialog either), else
+# through the xdg-desktop-portal, its pictures and all audio through
+# PipeWire. Encoding is done by ffmpeg, which the app ships with anyway.
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "screencast"] }
+pipewire = "0.10"
+pollster = "1"
+async-io = "2"
+futures-util = { version = "0.3", default-features = false }
+x11rb = { version = "0.13", features = ["randr", "res", "shm", "xfixes"] }
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-protocols-plasma = { version = "0.3", features = ["client"] }

@@ -1,0 +1,1513 @@
+//! Preview playback for the editor.
+//!
+//! Audio drives the clock: every source track is decoded up front to stereo f32
+//! and mixed live in the cpal callback at the current gains, so moving a slider is
+//! heard instantly. The playhead is however many samples the callback has played.
+//!
+//! Video follows the clock. On Windows and macOS it comes from the in-process
+//! hardware decoder (`video.rs`), which keeps the next frames decoded so play
+//! starts at once; if that can't open a file (or elsewhere), an ffmpeg process streams
+//! scaled RGBA frames from the playhead onward, and single exact frames are
+//! decoded on demand when paused. Either way the UI shows whichever decoded
+//! frame matches the clock. While scrubbing, frames come from the hardware
+//! decoder, live (`video.rs`); without one, from the scrub proxy, small
+//! frames built ahead in the background (`proxy.rs`).
+
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::sync::{Arc, Mutex};
+
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use media::pcm::Pcm;
+use media::{ClipInfo, PREVIEW_RATE, TrackEdit};
+
+use crate::proxy::Proxy;
+#[cfg(hw_decode)]
+use capture::decode::Picture;
+#[cfg(hw_decode)]
+use crate::video::Video;
+#[cfg(not(hw_decode))]
+struct Picture {
+    index: u64,
+    width: u32,
+}
+#[cfg(not(hw_decode))]
+struct Scrubbed {
+    asked: u64,
+    picture: Picture,
+    exact: bool,
+}
+
+/// Elsewhere there's no in-process decoder yet: a type with no values.
+#[cfg(not(hw_decode))]
+enum Video {}
+#[cfg(not(hw_decode))]
+impl Video {
+    fn failed(&self) -> bool { match *self {} }
+    fn show(&self, _: u64) { match *self {} }
+    fn scrub(&self, _: u64) { match *self {} }
+    fn take_scrub(&self) -> Option<Scrubbed> { match *self {} }
+    fn play(&self, _: u64) { match *self {} }
+    fn pause(&self) { match *self {} }
+    fn take_exact(&self, _: u64) -> Option<Picture> { match *self {} }
+    fn take_upto(&self, _: u64) -> Option<Picture> { match *self {} }
+    fn has(&self, _: u64) -> bool { match *self {} }
+    fn open_for(&self) -> Option<std::time::Duration> { match *self {} }
+}
+
+/// `HASTECLIP_DEBUG_VIDEO=1`: log what playback does, with times.
+pub fn debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("HASTECLIP_DEBUG_VIDEO").is_some())
+}
+
+macro_rules! trace {
+    ($($arg:tt)*) => {
+        if debug() {
+            eprintln!("{:>8.3} player: {}", crate::player::uptime(), format!($($arg)*));
+        }
+    };
+}
+
+/// Seconds since the app started, for debug logs.
+pub fn uptime() -> f64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
+}
+
+/// The scrub frames built so far, as a thin bar along the bottom of `lane`
+/// (which shows `from..to` seconds): built stretches lit, the rest dark. It
+/// fills from wherever the playhead is, not from the start.
+pub fn paint_proxy_bar(ui: &egui::Ui, player: &crate::player::Player, lane: egui::Rect, from: f64, to: f64) {
+    if player.proxy_progress() >= 1.0 {
+        return;
+    }
+    let n = (lane.width() / 2.0).max(1.0) as usize;
+    let built = player.proxy_built(from, to, n);
+    let p = ui.painter_at(lane);
+    let y = lane.bottom() - 3.0..=lane.bottom();
+    let step = lane.width() / n as f32;
+    let mut k = 0;
+    while k < n {
+        let on = built[k];
+        let run = built[k..].iter().take_while(|b| **b == on).count();
+        let x0 = lane.left() + k as f32 * step;
+        let color = if on { egui::Color32::from_white_alpha(150) } else { egui::Color32::from_white_alpha(25) };
+        p.rect_filled(egui::Rect::from_x_y_ranges(x0..=x0 + run as f32 * step, y.clone()), 0, color);
+        k += run;
+    }
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+}
+
+/// What's on screen, with its size in pixels.
+enum Display {
+    /// An uploaded image: scrub proxy frames, frames that came back to the CPU.
+    Image(egui::TextureId, egui::Vec2),
+    /// A decoded frame on the GPU, drawn with the sharp filter.
+    #[cfg(hw_decode)]
+    Gpu(crate::gpu_frames::Shown, egui::Vec2),
+}
+
+impl Display {
+    fn size(&self) -> egui::Vec2 {
+        match self {
+            Display::Image(_, s) => *s,
+            #[cfg(hw_decode)]
+            Display::Gpu(_, s) => *s,
+        }
+    }
+}
+
+/// Play waits at most this long for its first frame before the sound starts anyway.
+const START_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Preview frames are decoded at this width; plenty for an in-app viewer.
+pub const PREVIEW_WIDTH: u32 = 1280;
+
+/// Live mix state shared with the audio callback.
+pub struct Mix {
+    /// Per source track: volume (incl. keyframes) and mute, as in the edit.
+    pub tracks: Vec<TrackEdit>,
+    /// Peak/RMS of what was just played, per track and for the master, for meters.
+    pub track_levels: Vec<(f32, f32)>,
+    pub master_level: (f32, f32),
+    /// The same, per channel (left, right), for a stereo meter.
+    pub master_stereo: capture::mixer::Levels,
+}
+
+struct Shared {
+    /// Stereo frames (sample pairs) played since `start`.
+    pos: AtomicU64,
+    playing: AtomicBool,
+    /// Paused and being scrubbed: the sound follows `pos` (see [`Scrub`]).
+    scrubbing: AtomicBool,
+    /// Where playback stops (in stereo frames).
+    end: AtomicU64,
+    mix: Mutex<Mix>,
+    /// When the audio callback last moved `pos` ([`uptime`], µs), and how
+    /// much it moves it each time (µs of sound): the clock only moves in
+    /// those steps, so this says when the next frame can come up.
+    moved_at_us: AtomicU64,
+    step_us: AtomicU64,
+    /// How fast it plays (1.0 = as recorded), as `f32` bits.
+    speed: AtomicU32,
+}
+
+impl Shared {
+    fn new(mix: Mix) -> Self {
+        Self {
+            pos: AtomicU64::new(0),
+            playing: AtomicBool::new(false),
+            scrubbing: AtomicBool::new(false),
+            end: AtomicU64::new(u64::MAX),
+            mix: Mutex::new(mix),
+            moved_at_us: AtomicU64::new(0),
+            step_us: AtomicU64::new(0),
+            speed: AtomicU32::new(1.0f32.to_bits()),
+        }
+    }
+
+    fn speed(&self) -> f64 {
+        f64::from(f32::from_bits(self.speed.load(Ordering::Relaxed)))
+    }
+
+    /// How long until the clock (`pos`) shows `t` seconds or later: the first
+    /// audio callback after it gets there, plus a little. Playing only.
+    fn until(&self, t: f64) -> std::time::Duration {
+        let now = uptime();
+        let pos = self.pos.load(Ordering::Relaxed) as f64 / PREVIEW_RATE as f64;
+        let ahead = (t - pos).max(0.0) / self.speed().max(0.01);
+        let step = self.step_us.load(Ordering::Relaxed) as f64 / 1e6;
+        let wake = if step > 0.0 {
+            // The callback that moved it to `pos`, then whole steps on.
+            let moved = self.moved_at_us.load(Ordering::Relaxed) as f64 / 1e6;
+            moved + (ahead / step).ceil().max(1.0) * step
+        } else {
+            now + ahead
+        };
+        // A guess: callbacks come a little late now and then; waking 2 ms
+        // after one is due finds it done.
+        std::time::Duration::from_secs_f64((wake - now + 0.002).clamp(0.001, 0.1))
+    }
+}
+
+pub struct Player {
+    source: PathBuf,
+    info: ClipInfo,
+    shared: Arc<Shared>,
+    _stream: Option<cpal::Stream>,
+    pub audio_error: Option<String>,
+    /// Latest frame for display.
+    texture: Option<egui::TextureHandle>,
+    /// That frame's colours, blurred wide: the stage's light (a frame on the
+    /// GPU makes its own there).
+    glow: Option<egui::TextureHandle>,
+    /// What's on screen.
+    display: Option<Display>,
+    /// The GPU frame on screen, held so its texture isn't reused meanwhile.
+    on_screen: Option<Picture>,
+    /// GPU frames just taken off screen, held a few more frames: the GPU may
+    /// still be drawing them, and the decoder reuses a released texture.
+    retired: std::collections::VecDeque<(u64, Picture)>,
+    /// GPU frames opened for drawing (see `gpu_frames.rs`).
+    #[cfg(hw_decode)]
+    gpu_frames: crate::gpu_frames::Frames,
+    shown_frame: Option<u64>,
+    decoder: Option<FrameStream>,
+    still_tx: Sender<(u64, f64)>,
+    still_rx: Receiver<(u64, media::Frame)>,
+    /// Frame index the last on-demand still was requested for.
+    still_wanted: Option<u64>,
+    /// Every frame, small, for instant scrubbing, built in the background:
+    /// only without the hardware decoder (which scrubs live).
+    proxy: Option<Proxy>,
+    /// The frame a scrub last asked the hardware decoder for.
+    scrub_asked: Option<u64>,
+    /// Showing a proxy frame; swap in the sharp frame once the drag settles.
+    showing_proxy: bool,
+    /// While scrubbing where the proxy isn't built yet: the nearest frame
+    /// that is, on screen in place of the one wanted.
+    stand_in: Option<u64>,
+    /// The hardware decoder, while it works.
+    video: Option<Video>,
+    /// Play was pressed; the sound starts with the first frame (or after
+    /// [`START_WAIT`]), so picture and sound start together.
+    pending_start: Option<std::time::Instant>,
+    /// The decoder was told to play (to tell it to stop when playback ends).
+    video_playing: bool,
+    /// When play was last pressed, until its first frame shows (debug log).
+    played_at: Option<std::time::Instant>,
+    /// When the full-quality frame was last asked for (debug log).
+    asked_at: Option<std::time::Instant>,
+    /// Frames shown while playing, per second (debug log).
+    shown_count: Option<(std::time::Instant, u32)>,
+    /// The frame whose picture is on screen, whatever kind (debug log).
+    screen_index: Option<u64>,
+    /// How the picture keeps up while scrubbing (debug log).
+    scrub_stats: ScrubStats,
+    /// Stepping back frame by frame with the key held: the picture comes as
+    /// it does scrubbing (no sound).
+    stepping: bool,
+}
+
+/// Debug log: while scrubbing, once a second, how many new pictures came
+/// up, how many redraws showed the frame wanted, and how far behind it the
+/// picture was (in frames, over the redraws).
+#[derive(Default)]
+struct ScrubStats {
+    since: Option<std::time::Instant>,
+    redraws: u32,
+    pictures: u32,
+    exact: u32,
+    behind: u64,
+    worst: u64,
+    last: Option<u64>,
+}
+
+impl ScrubStats {
+    fn note(&mut self, want: u64, on_screen: Option<u64>, exact: bool) {
+        let since = *self.since.get_or_insert_with(std::time::Instant::now);
+        self.redraws += 1;
+        if on_screen != self.last {
+            self.pictures += 1;
+            self.last = on_screen;
+        }
+        self.exact += exact as u32;
+        let off = on_screen.map_or(want, |i| i.abs_diff(want));
+        self.behind += off;
+        self.worst = self.worst.max(off);
+        if since.elapsed().as_secs_f64() >= 1.0 {
+            trace!(
+                "scrubbing: {} new pictures/s, {} of {} redraws exact, behind by {:.1} frames on average (at most {})",
+                self.pictures,
+                self.exact,
+                self.redraws,
+                self.behind as f64 / self.redraws as f64,
+                self.worst
+            );
+            *self = Self { last: self.last, ..Self::default() };
+        }
+    }
+}
+
+impl Player {
+    /// `pcm` track `i` is source track `i` as interleaved stereo at
+    /// [`PREVIEW_RATE`]; it may still be filling in (it plays as it's decoded).
+    pub fn new(ctx: &egui::Context, source: &Path, info: ClipInfo, pcm: Arc<Pcm>, gains: Vec<TrackEdit>) -> Self {
+        Self::with_pcm(ctx, source, info, pcm, gains)
+    }
+
+    fn with_pcm(ctx: &egui::Context, source: &Path, info: ClipInfo, pcm: Arc<Pcm>, gains: Vec<TrackEdit>) -> Self {
+        let n = pcm.len();
+        let shared = Arc::new(Shared::new(Mix { tracks: gains, track_levels: vec![(0.0, 0.0); n], master_level: (0.0, 0.0), master_stereo: Default::default() }));
+        let (stream, audio_error) = match start_audio(shared.clone(), pcm.clone()) {
+            Ok(s) => (Some(s), None),
+            Err(e) => (None, Some(e)),
+        };
+
+        let (still_tx, still_rx) = still_worker(ctx, source);
+
+        let video = open_video(ctx, source, info.fps);
+        let proxy = video.is_none().then(|| Proxy::build(ctx, source, info.fps, total_frames(&info)));
+        Self {
+            source: source.to_path_buf(),
+            info,
+            shared,
+            _stream: stream,
+            audio_error,
+            texture: None,
+            glow: None,
+            display: None,
+            on_screen: None,
+            retired: Default::default(),
+            #[cfg(hw_decode)]
+            gpu_frames: Default::default(),
+            shown_frame: None,
+            decoder: None,
+            still_tx,
+            still_rx,
+            still_wanted: None,
+            proxy,
+            scrub_asked: None,
+            showing_proxy: false,
+            stand_in: None,
+            video,
+            pending_start: None,
+            video_playing: false,
+            played_at: None,
+            shown_count: None,
+            asked_at: None,
+            screen_index: None,
+            scrub_stats: ScrubStats::default(),
+            stepping: false,
+        }
+    }
+
+    /// The clip's file was renamed to `to`. What has it open keeps it open
+    /// (Windows lets an open file be renamed): the sound, the video decoder,
+    /// the scrub preview. Only what opens it again by name follows: nothing
+    /// reloads, nothing stops.
+    pub fn renamed(&mut self, ctx: &egui::Context, to: &Path) {
+        self.source = to.to_path_buf();
+        (self.still_tx, self.still_rx) = still_worker(ctx, to);
+    }
+
+    pub fn time(&self) -> f64 {
+        self.shared.pos.load(Ordering::Relaxed) as f64 / PREVIEW_RATE as f64
+    }
+
+    /// Playing, or about to (waiting for the first frame).
+    pub fn is_playing(&self) -> bool {
+        self.sound_playing() || self.pending_start.is_some()
+    }
+
+    fn sound_playing(&self) -> bool {
+        self.shared.playing.load(Ordering::Relaxed)
+    }
+
+    /// The hardware decoder, unless it's failed (then the ffmpeg path runs).
+    fn hw(&self) -> Option<&Video> {
+        self.video.as_ref().filter(|v| !v.failed())
+    }
+
+    /// Jump to `t` (seconds). Keeps playing if it was.
+    pub fn seek(&mut self, t: f64) {
+        let t = t.clamp(0.0, self.info.duration);
+        self.shared.pos.store(to_samples(t), Ordering::Relaxed);
+        self.decoder = None; // restarts from the new position if playing
+        if self.is_playing() {
+            if let Some(v) = self.hw() {
+                v.play(self.info.frame_index(t));
+            }
+        }
+    }
+
+    /// Play from the current position until `until` seconds.
+    pub fn play(&mut self, until: f64) {
+        trace!("play at frame {} (showing {:?}{})", self.info.frame_index(self.time()), self.shown_frame, if self.showing_proxy { ", proxy" } else { "" });
+        self.played_at = Some(std::time::Instant::now());
+        self.shared.end.store((until * PREVIEW_RATE as f64) as u64, Ordering::Relaxed);
+        if let Some(v) = self.hw() {
+            // Showing the frame under the playhead already: carry on from the
+            // next, which was decoded while paused. Otherwise wait for this one.
+            let want = self.info.frame_index(self.time());
+            let showing = self.shown_frame == Some(want) && !self.showing_proxy;
+            v.play(if showing { want + 1 } else { want });
+            self.video_playing = true;
+            if !showing {
+                self.pending_start = Some(std::time::Instant::now());
+                return;
+            }
+        }
+        self.shared.playing.store(true, Ordering::Relaxed);
+    }
+
+    /// How fast it plays: 1.0 as recorded, 0.5 half speed.
+    pub fn set_speed(&self, speed: f32) {
+        self.shared.speed.store(speed.clamp(0.1, 4.0).to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn pause(&mut self) {
+        self.shared.playing.store(false, Ordering::Relaxed);
+        self.pending_start = None;
+        self.decoder = None;
+        // Only when it was playing: the decoder acts on its newest command, so
+        // a needless pause right after asking for a frame would cancel that.
+        if self.video_playing {
+            if let Some(v) = self.hw() {
+                v.pause();
+            }
+        }
+        self.video_playing = false;
+    }
+
+    /// For the `n` steps of `from..to` seconds: which have scrub frames.
+    pub fn proxy_built(&self, from: f64, to: f64, n: usize) -> Vec<bool> {
+        match &self.proxy {
+            Some(p) => p.built(self.info.frame_index(from), self.info.frame_index(to), n),
+            None => vec![true; n],
+        }
+    }
+
+    /// Fraction of the scrub proxy that's built (0..=1); 1 without one.
+    pub fn proxy_progress(&self) -> f32 {
+        let Some(proxy) = &self.proxy else { return 1.0 };
+        (proxy.ready() as f64 / total_frames(&self.info).max(1) as f64).min(1.0) as f32
+    }
+
+    /// The small scrub frame `idx`, if there's a scrub proxy and it's been
+    /// built yet (for hover previews).
+    pub fn proxy_frame(&self, idx: u64) -> Option<egui::ColorImage> {
+        self.proxy.as_ref()?.frame(idx)
+    }
+
+    pub fn set_mix(&self, gains: Vec<TrackEdit>) {
+        if let Ok(mut m) = self.shared.mix.lock() {
+            m.tracks = gains;
+        }
+    }
+
+    /// Current meter readings: per track, then master.
+    pub fn levels(&self) -> (Vec<(f32, f32)>, (f32, f32)) {
+        match self.shared.mix.lock() {
+            Ok(m) => (m.track_levels.clone(), m.master_level),
+            Err(_) => (Vec::new(), (0.0, 0.0)),
+        }
+    }
+
+    /// The master's level per channel (left, right), for a stereo meter.
+    pub fn master_stereo(&self) -> capture::mixer::Levels {
+        self.shared.mix.lock().map(|m| m.master_stereo).unwrap_or_default()
+    }
+
+    /// Bring the displayed frame in line with the clock. Call once per UI frame.
+    /// `scrubbing`: the user is dragging, so favour instant proxy frames.
+    /// Returns the size of what's on screen (in pixels, to fit it); draw it
+    /// with [`Self::paint`].
+    pub fn update(&mut self, ctx: &egui::Context, scrubbing: bool) -> Option<egui::Vec2> {
+        // The hardware decoder broke (or can't read this file): scrub from a
+        // proxy after all.
+        if self.proxy.is_none() && self.hw().is_none() {
+            self.proxy = Some(Proxy::build(ctx, &self.source, self.info.fps, total_frames(&self.info)));
+        }
+        if let Some(proxy) = &self.proxy {
+            proxy.set_focus(self.info.frame_index(self.time()));
+        }
+        self.shared.scrubbing.store(scrubbing && !self.sound_playing(), Ordering::Relaxed);
+        #[cfg(hw_decode)]
+        if scrubbing || self.stepping {
+            crate::video::scrubbing();
+        }
+        if self.hw().is_some() {
+            // Each step back on its own decodes from the keyframe before it
+            // (up to a second of frames): held, it fell behind and froze
+            // until the steps came near a keyframe again.
+            let scrubbing = scrubbing || self.stepping;
+            self.update_hw(ctx, scrubbing);
+            self.note_scrub(scrubbing);
+            return self.display.as_ref().map(Display::size);
+        }
+        let t = self.time();
+        let want = self.info.frame_index(t);
+
+        if !self.is_playing() {
+            // Stopped by itself at the out point: the stream is now stale.
+            self.decoder = None;
+        }
+        if self.is_playing() {
+            if self.decoder.is_none() {
+                self.decoder = FrameStream::start(ctx, &self.source, &self.info, t).ok();
+            }
+            if let Some(dec) = &mut self.decoder {
+                // Drop frames we're already past; show the newest one not in the future.
+                let mut best = None;
+                while let Some((idx, _)) = dec.peek() {
+                    if idx > want {
+                        break;
+                    }
+                    best = dec.next();
+                }
+                if let Some((idx, frame)) = best {
+                    self.show(ctx, idx, frame);
+                }
+            }
+            if self.sound_playing() {
+                self.repaint_at_next_frame(ctx, want);
+            } else {
+                ctx.request_repaint();
+            }
+        } else {
+            while let Ok((idx, frame)) = self.still_rx.try_recv() {
+                if Some(idx) == self.still_wanted && idx == want {
+                    self.show(ctx, idx, frame);
+                }
+            }
+            // While dragging, show the proxy frame right away (every mouse move).
+            if self.shown_frame != Some(want) || (!scrubbing && self.showing_proxy) {
+                if self.shown_frame != Some(want) {
+                    if let Some(img) = self.proxy.as_ref().and_then(|p| p.frame(want)) {
+                        self.set_texture(ctx, img);
+                        self.shown_frame = Some(want);
+                        self.screen_index = Some(want);
+                        self.showing_proxy = true;
+                        self.stand_in = None;
+                        // Coming back to a frame sharpened before asks again.
+                        self.still_wanted = None;
+                    } else if scrubbing {
+                        self.show_stand_in(ctx, want);
+                    }
+                }
+                // Once the drag stops, sharpen to the full-quality exact frame.
+                if !scrubbing && self.still_wanted != Some(want) {
+                    self.still_wanted = Some(want);
+                    let _ = self.still_tx.send((want, t));
+                }
+            }
+        }
+        self.note_scrub(scrubbing);
+        self.display.as_ref().map(Display::size)
+    }
+
+    /// A key held to step back frame by frame (see `stepping`).
+    pub fn set_stepping(&mut self, on: bool) {
+        self.stepping = on;
+    }
+
+    /// Debug log: how the picture keeps up while scrubbing.
+    fn note_scrub(&mut self, scrubbing: bool) {
+        if !debug() {
+            return;
+        }
+        if !scrubbing || self.sound_playing() {
+            self.scrub_stats = ScrubStats::default();
+            return;
+        }
+        let want = self.info.frame_index(self.time());
+        let exact = self.shown_frame == Some(want);
+        self.scrub_stats.note(want, self.screen_index, exact);
+    }
+
+    /// Playing, showing frame `want`: draw again when the next one is due,
+    /// not on every display refresh (a 240 Hz screen redrew the whole page
+    /// four times per frame of a 60 fps clip). A frame that's late is
+    /// drawn when the decoder hands it over (it wakes the UI then).
+    fn repaint_at_next_frame(&self, ctx: &egui::Context, want: u64) {
+        let next = (want + 1) as f64 / self.info.fps.max(1.0);
+        crate::ui_kit::repaint_after(ctx, self.shared.until(next));
+    }
+
+    /// Draw the picture into `rect`: a decoded frame through the sharp
+    /// filter (`gpu_frames.rs`), anything else as an image.
+    pub fn paint(&self, ui: &egui::Ui, rect: egui::Rect) {
+        match &self.display {
+            Some(Display::Image(id, _)) => egui::Image::from_texture((*id, rect.size())).paint_at(ui, rect),
+            #[cfg(hw_decode)]
+            Some(Display::Gpu(shown, _)) => shown.paint(ui, rect),
+            None => {}
+        }
+    }
+
+    /// The picture's colours, blurred very wide, over `cover` (clipped to
+    /// `painter`): the light the stage around it takes. `id`: which stage.
+    pub fn paint_glow(&self, painter: &egui::Painter, cover: egui::Rect, id: egui::Id) -> bool {
+        match &self.display {
+            Some(Display::Image(..)) => match &self.glow {
+                Some(tex) => {
+                    painter.image(tex.id(), cover, egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+                    true
+                }
+                None => false,
+            },
+            #[cfg(hw_decode)]
+            Some(Display::Gpu(shown, _)) => {
+                shown.paint_glow(painter, cover, id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// [`Self::update`] with the hardware decoder.
+    /// `scrubbing`: a drag or wheel scrub is under way (proxy frames only).
+    fn update_hw(&mut self, ctx: &egui::Context, scrubbing: bool) {
+        let Some(v) = self.video.as_ref() else { return };
+        let want = self.info.frame_index(self.time());
+        // Waiting to start: the sound goes once the first frame is here.
+        if let Some(since) = self.pending_start {
+            // The wait counts from when the decoder opened (a few hundred ms
+            // after a clip opens), so picture and sound start together then
+            // too; at most 1.5 s in all.
+            let waited = v.open_for().map_or(std::time::Duration::ZERO, |open| open.min(since.elapsed()));
+            if v.has(want) || waited >= START_WAIT || since.elapsed() >= std::time::Duration::from_millis(1500) {
+                trace!("sound starts after {:.0} ms (frame ready: {})", since.elapsed().as_secs_f64() * 1000.0, v.has(want));
+                self.pending_start = None;
+                self.shared.playing.store(true, Ordering::Relaxed);
+            }
+            if let Some(p) = v.take_upto(want) {
+                self.show_picture(ctx, p);
+            }
+            ctx.request_repaint();
+            return;
+        }
+        if self.sound_playing() {
+            if debug() {
+                static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+                let mut last = LAST.lock().unwrap();
+                static PASSES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let passes = PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if last.is_none_or(|t| t.elapsed().as_secs_f64() >= 1.0) {
+                    *last = Some(std::time::Instant::now());
+                    PASSES.store(0, std::sync::atomic::Ordering::Relaxed);
+                    #[cfg(not(hw_decode))]
+                    let _ = passes;
+                    #[cfg(hw_decode)]
+                    trace!("playing: want {want}, showing {:?}, ahead {:?}, {passes} redraws/s, last frame {:.1} ms", self.shown_frame, v.ahead_info(), ctx.input(|i| i.unstable_dt) * 1000.0);
+                }
+            }
+            if let Some(p) = v.take_upto(want) {
+                self.show_picture(ctx, p);
+            }
+            self.repaint_at_next_frame(ctx, want);
+            return;
+        }
+        // Stopped by itself at the out point: so does the decoder.
+        if self.video_playing {
+            v.pause();
+            self.video_playing = false;
+            self.still_wanted = None;
+        }
+        // Scrubbing: what the decoder found for the newest frame asked (the
+        // keyframe on the way there, or the frame itself); then the exact
+        // frame asked once paused, which is newer.
+        let (found, exact) = (v.take_scrub(), v.take_exact(want));
+        if let Some(found) = found {
+            // Kept small while scrubbing back: sharp again once it stops.
+            let small = found.picture.width < self.info.width;
+            self.put_picture(ctx, found.picture);
+            self.showing_proxy = small;
+            // The picture for the frame asked even when its own number is
+            // lower (a dropped frame's slot).
+            if found.exact {
+                self.shown_frame = Some(found.asked);
+            }
+        }
+        if let Some(p) = exact {
+            if let Some(at) = self.asked_at.take() {
+                trace!("sharp frame {want} (picture {}) {:.0} ms after asking", p.index, at.elapsed().as_secs_f64() * 1000.0);
+            }
+            self.show_picture(ctx, p);
+            // It's the picture for `want` even when its own number is lower (a
+            // dropped frame's slot).
+            self.shown_frame = Some(want);
+        }
+        // The frame on screen; small is enough while scrubbing.
+        if self.shown_frame == Some(want) && (scrubbing || !self.showing_proxy) {
+            return;
+        }
+        let v = self.video.as_ref().expect("checked above");
+        if scrubbing {
+            // Every frame the playhead moves to (the decoder takes the newest).
+            if self.scrub_asked != Some(want) {
+                self.scrub_asked = Some(want);
+                // Stopping here again asks for the exact frame again.
+                self.still_wanted = None;
+                v.scrub(want);
+            }
+        } else if self.still_wanted != Some(want) {
+            // Paused somewhere new, or a scrub stopped (the mouse let go, the
+            // wheel settled) before its frame came: that frame, exactly.
+            // Asked once per frame wanted.
+            self.still_wanted = Some(want);
+            self.scrub_asked = None;
+            self.asked_at = Some(std::time::Instant::now());
+            v.show(want);
+        }
+    }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn show_picture(&mut self, ctx: &egui::Context, p: Picture) {
+        let idx = p.index;
+        let clock = self.info.frame_index(self.time());
+        if idx + 30 < clock || idx > clock + 30 {
+            trace!("WRONG FRAME on screen: {idx}, clock at {clock}");
+        }
+        if let Some(at) = self.played_at.take() {
+            trace!("first frame after play: {idx}, {:.0} ms after pressing", at.elapsed().as_secs_f64() * 1000.0);
+        }
+        // Counts frames that change the picture, not frames handed over.
+        if debug() && self.sound_playing() && self.shown_frame != Some(idx) {
+            let (now, ready) = (self.time(), self.proxy.as_ref().map_or(0, |p| p.ready()));
+            let (since, n) = self.shown_count.get_or_insert((std::time::Instant::now(), 0));
+            *n += 1;
+            if since.elapsed().as_secs_f64() >= 1.0 {
+                trace!("playing: {n} new frames in the last second, now {idx} at {now:.2} s (proxy {ready} ready)");
+                self.shown_count = None;
+            }
+        }
+        self.put_picture(ctx, p);
+    }
+
+    /// Put a decoded picture on screen.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn put_picture(&mut self, ctx: &egui::Context, p: Picture) {
+        let idx = p.index;
+        #[cfg(hw_decode)]
+        {
+            // On the GPU: draw its texture as it is.
+            let on_gpu = p.gpu.as_ref().and_then(|s| self.gpu_frames.show(s, p.width, p.height));
+            match on_gpu {
+                Some(shown) => {
+                    self.display = Some(Display::Gpu(shown, egui::vec2(p.width as f32, p.height as f32)));
+                    self.retire(ctx, Some(p));
+                }
+                None if p.rgba.is_empty() => {}
+                None => self.set_texture(ctx, crate::video::to_image(p)),
+            }
+        }
+        #[cfg(not(hw_decode))]
+        let _ = (ctx, p);
+        self.shown_frame = Some(idx);
+        self.screen_index = Some(idx);
+        self.showing_proxy = false;
+        self.stand_in = None;
+    }
+
+    /// Scrubbing where frame `want` isn't built yet: the nearest built frame
+    /// within 10 s instead, so the picture keeps following (the frame itself
+    /// replaces it as soon as it's built, and the sharp one once you stop).
+    fn show_stand_in(&mut self, ctx: &egui::Context, want: u64) {
+        let within = (self.info.fps * 10.0).round().max(1.0) as u64;
+        let Some(i) = self.proxy.as_ref().and_then(|p| p.nearest(want, within)) else { return };
+        if self.stand_in == Some(i) {
+            return;
+        }
+        if let Some(img) = self.proxy.as_ref().and_then(|p| p.frame(i)) {
+            self.set_texture(ctx, img);
+            self.shown_frame = None;
+            self.screen_index = Some(i);
+            self.showing_proxy = true;
+            self.stand_in = Some(i);
+            trace!("scrubbing: frame {want} not built, showing {i}");
+        }
+    }
+
+    fn show(&mut self, ctx: &egui::Context, idx: u64, frame: media::Frame) {
+        let img = egui::ColorImage::from_rgba_unmultiplied([frame.width as usize, frame.height as usize], &frame.rgba);
+        self.set_texture(ctx, img);
+        self.shown_frame = Some(idx);
+        self.screen_index = Some(idx);
+        self.showing_proxy = false;
+        self.stand_in = None;
+    }
+
+    /// Put `next` on screen (or nothing), keeping the frame it replaces for a
+    /// few more passes before its texture goes back to the decoder.
+    fn retire(&mut self, ctx: &egui::Context, next: Option<Picture>) {
+        /// Passes to hold a frame after it leaves the screen: more than the
+        /// GPU ever runs behind.
+        const HOLD: u64 = 4;
+        let pass = ctx.cumulative_pass_nr();
+        if let Some(old) = std::mem::replace(&mut self.on_screen, next) {
+            self.retired.push_back((pass, old));
+        }
+        while self.retired.front().is_some_and(|(at, _)| pass >= at + HOLD) {
+            self.retired.pop_front();
+        }
+    }
+
+    fn set_texture(&mut self, ctx: &egui::Context, img: egui::ColorImage) {
+        // The stage's light, made here for a picture that isn't on the GPU.
+        let glow = crate::transport::glow_image(&img);
+        match &mut self.glow {
+            Some(tex) => tex.set(glow, egui::TextureOptions::LINEAR),
+            None => self.glow = Some(ctx.load_texture("stage light", glow, egui::TextureOptions::LINEAR)),
+        }
+        match &mut self.texture {
+            Some(tex) => tex.set(img, egui::TextureOptions::LINEAR),
+            None => self.texture = Some(ctx.load_texture("preview", img, egui::TextureOptions::LINEAR)),
+        }
+        self.display = self.texture.as_ref().map(|t| Display::Image(t.id(), t.size_vec2()));
+        self.retire(ctx, None);
+    }
+}
+
+/// On-demand exact stills (paused/scrubbing): one worker, the newest
+/// request wins. It opens the file by name for each still.
+fn still_worker(ctx: &egui::Context, source: &Path) -> (Sender<(u64, f64)>, Receiver<(u64, media::Frame)>) {
+    let (still_tx, job_rx) = mpsc::channel::<(u64, f64)>();
+    let (done_tx, still_rx) = mpsc::channel();
+    let src = source.to_path_buf();
+    let repaint = ctx.clone();
+    std::thread::spawn(move || {
+        while let Ok(mut job) = job_rx.recv() {
+            while let Ok(newer) = job_rx.try_recv() {
+                job = newer;
+            }
+            if let Ok(frame) = media::frame_at(&src, job.1, PREVIEW_WIDTH) {
+                if done_tx.send((job.0, frame)).is_err() {
+                    break;
+                }
+                repaint.request_repaint();
+            }
+        }
+    });
+    (still_tx, still_rx)
+}
+
+/// The hardware decoder for `source`, on Windows and macOS (unless
+/// `HASTECLIP_NO_HW_DECODE` is set, to compare with the ffmpeg path).
+fn open_video(ctx: &egui::Context, source: &Path, fps: f64) -> Option<Video> {
+    #[cfg(hw_decode)]
+    if std::env::var_os("HASTECLIP_NO_HW_DECODE").is_none() {
+        return Some(Video::open(ctx, source, fps));
+    }
+    let _ = (ctx, source, fps);
+    None
+}
+
+/// Frames in the clip, as the app counts them.
+fn total_frames(info: &ClipInfo) -> usize {
+    (info.duration * info.fps).floor() as usize
+}
+
+/// The sound while scrubbing a paused clip, at its own pitch whatever the
+/// speed (WSOLA): every [`Scrub::HOP`] it takes a [`Scrub::GRAIN`]-long slice
+/// from where the playhead is right then, shifted by up to [`Scrub::SEARCH`]
+/// to line up with how the last slice goes on, and cross-fades it in, the
+/// fade's curves chosen by how alike the two are so the loudness holds (a
+/// plain fade between unalike slices dips in the middle: at 67 dips a second
+/// that sounded soft and buzzy). Moving
+/// faster than real time skips through, slower overlaps; a jump just takes
+/// the next slice from the new place. With the playhead still for
+/// [`Scrub::STILL`] it fades out (else one slice would repeat as a buzz).
+/// Runs in the audio callback: its buffers are allocated once.
+struct Scrub {
+    /// Output frames per second.
+    rate: f64,
+    /// Where the last slice started (source frames), if sounding.
+    prev: Option<usize>,
+    /// The second half of the last slice (unfaded), to overlap with the next.
+    tail: Vec<(f32, f32)>,
+    /// Made, not yet played (source rate).
+    made: std::collections::VecDeque<(f32, f32)>,
+    /// Two made samples the output is between, and how far (resampling).
+    a: (f32, f32),
+    b: (f32, f32),
+    frac: f64,
+    window: Vec<f32>,
+    /// Mono copies for lining slices up.
+    want: Vec<f32>,
+    near: Vec<f32>,
+    gains: Vec<f32>,
+    track_peak: Vec<f32>,
+    /// Loudness, eased (fades in and out).
+    level: f64,
+    /// The playhead last seen, and for how long (s) it hasn't moved.
+    last_target: f64,
+    still: f64,
+}
+
+impl Scrub {
+    // Starting values, to tune by ear.
+    /// Slice length (source frames): 40 ms, long enough to hear a sound as
+    /// itself, short enough to follow the playhead.
+    const GRAIN: usize = 1920;
+    /// A new slice every half slice (20 ms), overlapping the last.
+    const HOP: usize = Self::GRAIN / 2;
+    /// How far a slice may shift (each way) to line up: 7.5 ms.
+    const SEARCH: usize = 360;
+    /// Samples compared when lining up.
+    const MATCH: usize = 360;
+    /// Fade out once the playhead has been still this long (s).
+    const STILL: f64 = 0.08;
+    /// Fade time (s).
+    const FADE: f64 = 0.008;
+
+    fn new(rate: f64) -> Self {
+        let window = (0..Self::GRAIN).map(|k| (0.5 - 0.5 * (std::f64::consts::TAU * k as f64 / Self::GRAIN as f64).cos()) as f32).collect();
+        Self {
+            rate,
+            prev: None,
+            tail: vec![(0.0, 0.0); Self::HOP],
+            made: std::collections::VecDeque::with_capacity(Self::GRAIN * 2),
+            a: (0.0, 0.0),
+            b: (0.0, 0.0),
+            frac: 0.0,
+            window,
+            want: vec![0.0; Self::MATCH],
+            near: vec![0.0; 2 * Self::SEARCH + Self::MATCH],
+            gains: Vec::new(),
+            track_peak: Vec::new(),
+            level: 0.0,
+            last_target: -1.0,
+            still: 0.0,
+        }
+    }
+
+    /// Whether there's anything to play: scrubbing, or still fading out.
+    fn sounding(&self, scrubbing: bool) -> bool {
+        scrubbing || self.level > 1e-4
+    }
+
+    /// Playing normally again: the next scrub starts afresh.
+    fn reset(&mut self) {
+        self.silence();
+        self.last_target = -1.0;
+    }
+
+    /// Faded out: drop the slices (the next sound starts at its own place),
+    /// but keep watching the playhead, so standing still stays quiet.
+    fn silence(&mut self) {
+        self.prev = None;
+        self.tail.iter_mut().for_each(|t| *t = (0.0, 0.0));
+        self.made.clear();
+        self.a = (0.0, 0.0);
+        self.b = (0.0, 0.0);
+        self.level = 0.0;
+    }
+
+    /// Source frame `i` of every track, mixed with this slice's gains.
+    fn sample(&self, pcm: &Pcm, i: usize) -> (f32, f32) {
+        let (mut l, mut r) = (0.0, 0.0);
+        for (t, track) in pcm.tracks().iter().enumerate() {
+            if let Some((a, b)) = track.frame(i) {
+                let g = self.gains.get(t).copied().unwrap_or(1.0);
+                l += a * g;
+                r += b * g;
+            }
+        }
+        (l, r)
+    }
+
+    /// The next half slice into `made`, the slice taken near `target`.
+    fn make(&mut self, pcm: &Pcm, tracks: &[TrackEdit], target: usize) {
+        self.gains.clear();
+        self.gains.extend(tracks.iter().map(|tr| tr.gain_at(target as f64 / PREVIEW_RATE as f64)));
+        let start = match self.prev {
+            None => target,
+            Some(prev) => {
+                // Where the last slice would go on, and the start near the
+                // playhead that sounds most like it (cross-correlation).
+                let natural = prev + Self::HOP;
+                let lo = target.saturating_sub(Self::SEARCH);
+                for k in 0..Self::MATCH {
+                    let (l, r) = self.sample(pcm, natural + k);
+                    self.want[k] = l + r;
+                }
+                for k in 0..self.near.len() {
+                    let (l, r) = self.sample(pcm, lo + k);
+                    self.near[k] = l + r;
+                }
+                let mut best = (f32::MIN, target);
+                for off in (0..=2 * Self::SEARCH).step_by(2) {
+                    let c: f32 = (0..Self::MATCH).step_by(2).map(|k| self.want[k] * self.near[off + k]).sum();
+                    if c > best.0 {
+                        best = (c, lo + off);
+                    }
+                }
+                best.1
+            }
+        };
+        let tracks_n = pcm.len();
+        self.track_peak.resize(tracks_n, 0.0);
+        // How alike the overlapping halves are (correlation, 0..1): alike
+        // ones add up in step, unalike ones only in power, so the fade curves
+        // are scaled to keep the loudness either way.
+        let rho = if self.prev.is_some() {
+            let (mut ab, mut aa, mut bb) = (0.0f64, 0.0f64, 0.0f64);
+            for k in (0..Self::HOP).step_by(2) {
+                let (l, r) = self.sample(pcm, start + k);
+                let (x, y) = ((self.tail[k].0 + self.tail[k].1) as f64, (l + r) as f64);
+                ab += x * y;
+                aa += x * x;
+                bb += y * y;
+            }
+            if aa > 1e-12 && bb > 1e-12 { (ab / (aa * bb).sqrt()).clamp(0.0, 1.0) as f32 } else { 1.0 }
+        } else {
+            1.0
+        };
+        for k in 0..Self::HOP {
+            let (l, r) = self.sample(pcm, start + k);
+            let (fade_in, fade_out) = (self.window[k], self.window[Self::HOP + k]);
+            let norm = 1.0 / (fade_in * fade_in + fade_out * fade_out + 2.0 * rho * fade_in * fade_out).sqrt().max(1e-3);
+            let t = self.tail[k];
+            self.made.push_back(((t.0 * fade_out + l * fade_in) * norm, (t.1 * fade_out + r * fade_in) * norm));
+            self.tail[k] = self.sample(pcm, start + Self::HOP + k);
+        }
+        for (t, track) in pcm.tracks().iter().enumerate() {
+            let g = self.gains.get(t).copied().unwrap_or(1.0);
+            let peak = (start..start + Self::HOP)
+                .step_by(8)
+                .filter_map(|i| track.frame(i))
+                .map(|(l, r)| l.abs().max(r.abs()) * g)
+                .fold(0.0f32, f32::max);
+            self.track_peak[t] = peak;
+        }
+        self.prev = Some(start);
+    }
+
+    /// Fill `out` following the playhead at `target` (source frames); `active`
+    /// false fades out. Returns the master's (peak, rms) and each track's.
+    fn render(&mut self, out: &mut [f32], channels: usize, pcm: &Pcm, tracks: &[TrackEdit], target: f64, active: bool) -> (f32, f32, Vec<(f32, f32)>) {
+        let frames = out.len() / channels.max(1);
+        if (target - self.last_target).abs() >= 1.0 {
+            self.still = 0.0;
+        } else {
+            self.still += frames as f64 / self.rate;
+        }
+        self.last_target = target;
+        let want_level = if active && self.still < Self::STILL { 1.0 } else { 0.0 };
+        if want_level == 0.0 && self.level < 1e-4 {
+            // Quiet and staying so: nothing to make.
+            self.silence();
+            out.fill(0.0);
+            return (0.0, 0.0, vec![(0.0, 0.0); pcm.len()]);
+        }
+        let ease = 1.0 / (Self::FADE * self.rate);
+        let step = PREVIEW_RATE as f64 / self.rate;
+        let (mut peak, mut sq) = (0.0f32, 0.0f64);
+        for frame in out.chunks_mut(channels) {
+            self.frac += step;
+            while self.frac >= 1.0 {
+                self.frac -= 1.0;
+                if self.made.is_empty() {
+                    self.make(pcm, tracks, target as usize);
+                }
+                self.a = self.b;
+                self.b = self.made.pop_front().unwrap_or((0.0, 0.0));
+            }
+            self.level += (want_level - self.level) * ease;
+            let f = self.frac as f32;
+            let g = self.level as f32;
+            let l = (self.a.0 + (self.b.0 - self.a.0) * f) * g;
+            let r = (self.a.1 + (self.b.1 - self.a.1) * f) * g;
+            let m = l.abs().max(r.abs());
+            peak = peak.max(m);
+            sq += (m as f64).powi(2);
+            match channels {
+                1 => frame[0] = (l + r) * 0.5,
+                _ => {
+                    frame[0] = l;
+                    frame[1] = r;
+                }
+            }
+        }
+        if self.level < 1e-4 && want_level == 0.0 {
+            self.silence();
+        }
+        let rms = if frames == 0 { 0.0 } else { (sq / frames as f64).sqrt() as f32 };
+        let g = self.level as f32;
+        let levels = self.track_peak.iter().map(|&p| (p * g, p * g * 0.7)).collect();
+        (peak, rms, levels)
+    }
+}
+
+/// Opens the default output device and mixes the tracks into it.
+fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, String> {
+    let device = cpal::default_host().default_output_device().ok_or("no audio output device")?;
+    let supported = device.default_output_config().map_err(|e| e.to_string())?;
+    let channels = supported.channels() as usize;
+    let out_rate = supported.sample_rate() as f64;
+    let config = cpal::StreamConfig { channels: supported.channels(), sample_rate: supported.sample_rate(), buffer_size: cpal::BufferSize::Default };
+    // Source frames advanced per output frame at normal speed (1.0 when the
+    // device runs at 48 kHz).
+    let base_step = PREVIEW_RATE as f64 / out_rate;
+    let mut frac = 0.0f64;
+    let n_tracks = pcm.len();
+    let mut was_playing = false;
+    let mut scrub = Scrub::new(out_rate);
+    trace!("audio output: {} Hz, {} channels, buffer {:?}", out_rate, channels, supported.buffer_size());
+
+    let mut mix = move |out: &mut [f32], info: &cpal::OutputCallbackInfo| {
+        out.fill(0.0);
+        let playing = shared.playing.load(Ordering::Relaxed);
+        if playing != was_playing {
+            was_playing = playing;
+            if playing {
+                let ts = info.timestamp();
+                let latency = ts.playback.duration_since(ts.callback);
+                trace!("audio callback plays ({} frames per callback, heard {:?} later)", out.len() / channels.max(1), latency);
+            }
+        }
+        if !playing && scrub.sounding(shared.scrubbing.load(Ordering::Relaxed)) {
+            let tracks: Vec<TrackEdit> = match shared.mix.lock() {
+                Ok(m) => m.tracks.clone(),
+                Err(_) => return,
+            };
+            let target = shared.pos.load(Ordering::Relaxed) as f64;
+            let active = shared.scrubbing.load(Ordering::Relaxed);
+            let (peak, rms, track_levels) = scrub.render(out, channels, &pcm, &tracks, target, active);
+            if let Ok(mut m) = shared.mix.lock() {
+                m.track_levels = track_levels;
+                m.master_level = (peak, rms);
+                m.master_stereo = capture::mixer::Levels { peak: [peak; 2], rms: [rms; 2] };
+            }
+            return;
+        }
+        scrub.reset();
+        if !playing {
+            // Silence: report zero so meters fall and the UI can stop redrawing.
+            if let Ok(mut m) = shared.mix.try_lock() {
+                m.track_levels.iter_mut().for_each(|l| *l = (0.0, 0.0));
+                m.master_level = (0.0, 0.0);
+                m.master_stereo = Default::default();
+            }
+            return;
+        }
+        let tracks: Vec<TrackEdit> = match shared.mix.lock() {
+            Ok(m) => m.tracks.clone(),
+            Err(_) => return,
+        };
+        // Volume can ramp (keyframes): evaluate it every 256 samples (~5 ms)
+        // and interpolate in between, which is smooth and cheap.
+        let mut gains: Vec<f32> = Vec::new();
+        let mut next_eval = 0u64;
+        let end = shared.end.load(Ordering::Relaxed);
+        let mut pos = shared.pos.load(Ordering::Relaxed);
+        let mut track_peak = vec![0.0f32; n_tracks];
+        let mut track_sq = vec![0.0f64; n_tracks];
+        let (mut m_peak, mut m_sq, mut count) = (0.0f32, 0.0f64, 0usize);
+        let (mut lr_peak, mut lr_sq) = ([0.0f32; 2], [0.0f64; 2]);
+        // Faster or slower: through the sound in bigger or smaller steps,
+        // between its samples where a step lands between two (the pitch
+        // follows, like tape).
+        let step = base_step * shared.speed();
+
+        for frame in out.chunks_mut(channels) {
+            if pos >= end {
+                shared.playing.store(false, Ordering::Relaxed);
+                break;
+            }
+            if pos >= next_eval {
+                let t = pos as f64 / PREVIEW_RATE as f64;
+                gains = tracks.iter().map(|tr| tr.gain_at(t)).collect();
+                next_eval = pos + 256;
+            }
+            let (mut l, mut r) = (0.0f32, 0.0f32);
+            for (t, track) in pcm.tracks().iter().enumerate() {
+                // Not decoded yet (just opened, jumped far ahead): silence.
+                if let Some((a, b)) = track.frame(pos as usize) {
+                    let (a, b) = match track.frame(pos as usize + 1).filter(|_| frac > 0.0) {
+                        Some((a2, b2)) => (a + (a2 - a) * frac as f32, b + (b2 - b) * frac as f32),
+                        None => (a, b),
+                    };
+                    let g = gains.get(t).copied().unwrap_or(1.0);
+                    let (tl, tr) = (a * g, b * g);
+                    l += tl;
+                    r += tr;
+                    let a = tl.abs().max(tr.abs());
+                    track_peak[t] = track_peak[t].max(a);
+                    track_sq[t] += (a as f64).powi(2);
+                }
+            }
+            m_peak = m_peak.max(l.abs().max(r.abs()));
+            for (c, v) in [l, r].into_iter().enumerate() {
+                lr_peak[c] = lr_peak[c].max(v.abs());
+                lr_sq[c] += (v as f64).powi(2);
+            }
+            m_sq += (l.abs().max(r.abs()) as f64).powi(2);
+            count += 1;
+            match channels {
+                1 => frame[0] = (l + r) * 0.5,
+                _ => {
+                    frame[0] = l;
+                    frame[1] = r;
+                }
+            }
+            frac += step;
+            let whole = frac.floor();
+            pos += whole as u64;
+            frac -= whole;
+        }
+        shared.pos.store(pos, Ordering::Relaxed);
+        shared.moved_at_us.store((uptime() * 1e6) as u64, Ordering::Relaxed);
+        shared.step_us.store((out.len() / channels.max(1)) as u64 * 1_000_000 / out_rate.max(1.0) as u64, Ordering::Relaxed);
+
+        if count > 0 {
+            if let Ok(mut m) = shared.mix.lock() {
+                let rms = |sq: f64| (sq / count as f64).sqrt() as f32;
+                m.track_levels = (0..n_tracks).map(|t| (track_peak[t], rms(track_sq[t]))).collect();
+                m.master_level = (m_peak, rms(m_sq));
+                m.master_stereo = capture::mixer::Levels { peak: lr_peak, rms: [rms(lr_sq[0]), rms(lr_sq[1])] };
+            }
+        }
+    };
+    let muted = dev_muted();
+    // Recorded like any other app's sound (desktop capture leaves HasteClip
+    // out, see `capture::sources::own_sound`).
+    let mut recorded = capture::sources::own_sound::Playing::at(out_rate as u32);
+    let stream = device
+        .build_output_stream::<f32, _, _>(
+            config,
+            move |out: &mut [f32], info: &cpal::OutputCallbackInfo| {
+                mix(out, info);
+                if muted {
+                    out.fill(0.0);
+                }
+                // Silence needn't be handed over: a gap is silent.
+                if out.iter().any(|&x| x != 0.0) {
+                    let ts = info.timestamp();
+                    let delay = ts.playback.duration_since(ts.callback).as_secs_f64().min(0.5);
+                    recorded.push_frames(out, channels, delay);
+                }
+            },
+            |e| eprintln!("audio output error: {e}"),
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+    stream.play().map_err(|e| e.to_string())?;
+    Ok(stream)
+}
+
+/// Dev aid: `HASTECLIP_MUTE=1` plays everything silently, with the same
+/// timing (test instances that play and scrub clips).
+pub(crate) fn dev_muted() -> bool {
+    static MUTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MUTED.get_or_init(|| std::env::var_os("HASTECLIP_MUTE").is_some())
+}
+
+/// Only the sound of a short clip, through the same engine as the editor's
+/// player (the live mix, and the pitch-keeping scrub sound), with no picture:
+/// for listening to the voice samples.
+pub struct SoundPlayer {
+    shared: Arc<Shared>,
+    _stream: Option<cpal::Stream>,
+    pub error: Option<String>,
+    duration: f64,
+}
+
+impl SoundPlayer {
+    /// `pcm`'s one track is stereo at [`PREVIEW_RATE`], `duration` seconds long.
+    pub fn new(pcm: Arc<Pcm>, duration: f64) -> Self {
+        let tracks = vec![TrackEdit { index: 0, gain: 1.0, muted: false, points: Vec::new() }];
+        let shared = Arc::new(Shared::new(Mix { tracks, track_levels: vec![(0.0, 0.0)], master_level: (0.0, 0.0), master_stereo: Default::default() }));
+        let (stream, error) = match start_audio(shared.clone(), pcm) {
+            Ok(s) => (Some(s), None),
+            Err(e) => (None, Some(e)),
+        };
+        Self { shared, _stream: stream, error, duration }
+    }
+
+    pub fn time(&self) -> f64 {
+        self.shared.pos.load(Ordering::Relaxed) as f64 / PREVIEW_RATE as f64
+    }
+
+    pub fn is_playing(&self) -> bool {
+        self.shared.playing.load(Ordering::Relaxed)
+    }
+
+    pub fn seek(&self, t: f64) {
+        self.shared.pos.store(to_samples(t.clamp(0.0, self.duration)), Ordering::Relaxed);
+    }
+
+    /// Play from where it is until `until` seconds.
+    pub fn play(&self, until: f64) {
+        self.shared.end.store(to_samples(until), Ordering::Relaxed);
+        self.shared.scrubbing.store(false, Ordering::Relaxed);
+        self.shared.playing.store(true, Ordering::Relaxed);
+    }
+
+    pub fn pause(&self) {
+        self.shared.playing.store(false, Ordering::Relaxed);
+    }
+
+    /// The playhead is being dragged: the sound follows it.
+    pub fn scrub(&self, on: bool) {
+        self.shared.scrubbing.store(on && !self.is_playing(), Ordering::Relaxed);
+    }
+}
+
+/// Streams consecutive preview frames from a start time via one ffmpeg process.
+struct FrameStream {
+    child: Child,
+    rx: Receiver<(u64, media::Frame)>,
+    peeked: Option<(u64, media::Frame)>,
+}
+
+impl FrameStream {
+    fn start(ctx: &egui::Context, source: &Path, info: &ClipInfo, t: f64) -> std::io::Result<Self> {
+        let w = PREVIEW_WIDTH;
+        let h = (((w as f64) * info.height as f64 / info.width.max(1) as f64 / 2.0).round() as u32 * 2).max(2);
+        let mut child = media::ffmpeg()
+            .args(["-hide_banner", "-loglevel", "error", "-ss", &format!("{t:.4}"), "-i"])
+            .arg(source)
+            .args(["-an", "-vf", &format!("scale={w}:{h}:flags=bilinear"), "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let mut stdout = child.stdout.take().expect("piped");
+        // Small buffer: decoding runs just ahead of playback rather than racing to the end.
+        let (tx, rx): (SyncSender<_>, _) = mpsc::sync_channel(6);
+        let first = info.frame_index(t);
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let size = (w * h * 4) as usize;
+            let mut idx = first;
+            loop {
+                let mut buf = vec![0u8; size];
+                if stdout.read_exact(&mut buf).is_err() {
+                    break;
+                }
+                if tx.send((idx, media::Frame { width: w, height: h, rgba: buf })).is_err() {
+                    break;
+                }
+                repaint.request_repaint();
+                idx += 1;
+            }
+        });
+        Ok(Self { child, rx, peeked: None })
+    }
+
+    fn peek(&mut self) -> Option<(u64, ())> {
+        if self.peeked.is_none() {
+            self.peeked = self.rx.try_recv().ok();
+        }
+        self.peeked.as_ref().map(|(i, _)| (*i, ()))
+    }
+
+    fn next(&mut self) -> Option<(u64, media::Frame)> {
+        self.peek();
+        self.peeked.take()
+    }
+}
+
+impl Drop for FrameStream {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The position, in samples, for a seek to `t` seconds: rounded up, so it's
+/// never before `t`. Rounded down, a frame's start at a rate that isn't a
+/// whole number (59.9 fps) came back a hair before the frame, in the frame
+/// ahead of it, and stepping a frame forward from there stayed put.
+fn to_samples(t: f64) -> u64 {
+    (t * PREVIEW_RATE as f64).ceil() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A seek to a frame reads back as that frame, at rates that aren't
+    /// whole numbers too.
+    #[test]
+    fn seeking_to_a_frame_lands_on_it() {
+        for fps in [60.0, 107760.0 / 1799.0, 43128.0 / 719.0, 30000.0 / 1001.0, 144.0] {
+            let info = ClipInfo { duration: 120.0, fps, width: 2, height: 2, video_kbps: None, audio: Vec::new(), id: None };
+            for k in 0..(120.0 * fps) as u64 - 1 {
+                let t = info.snap(k as f64 / fps + 1e-9) + 1e-6;
+                let back = to_samples(t) as f64 / PREVIEW_RATE as f64;
+                assert_eq!(info.frame_index(back), k, "frame {k} at {fps} fps");
+            }
+        }
+    }
+
+    /// A stereo tone at `hz`, `secs` long, at the source rate.
+    fn tone(hz: f64, secs: f64) -> Vec<f32> {
+        let n = (secs * PREVIEW_RATE as f64) as usize;
+        (0..n).flat_map(|i| {
+            let v = (std::f64::consts::TAU * hz * i as f64 / PREVIEW_RATE as f64).sin() as f32 * 0.5;
+            [v, v]
+        }).collect()
+    }
+
+    /// Scrub with the playhead moving at `speed` × real time for `secs`;
+    /// returns the left channel out, at 48 kHz.
+    fn scrub(pcm: &[Vec<f32>], speed: f64, secs: f64, start: f64) -> Vec<f32> {
+        let pcm = &*Pcm::from_tracks(pcm.to_vec());
+        let rate = 48_000.0;
+        let mut s = Scrub::new(rate);
+        let tracks = [TrackEdit { index: 0, gain: 1.0, muted: false, points: Vec::new() }];
+        let mut out = Vec::new();
+        let mut target = start;
+        let block = 480; // 10 ms callbacks
+        for _ in 0..(secs * rate / block as f64) as usize {
+            let mut buf = vec![0.0f32; block * 2];
+            s.render(&mut buf, 2, pcm, &tracks, target, true);
+            out.extend(buf.chunks(2).map(|f| f[0]));
+            target += speed * block as f64 * PREVIEW_RATE as f64 / rate;
+        }
+        out
+    }
+
+    /// Frequency from upward zero crossings, over the loud part.
+    fn pitch(x: &[f32]) -> f64 {
+        let x = &x[x.len() / 4..];
+        let ups = x.windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count();
+        ups as f64 / (x.len() as f64 / 48_000.0)
+    }
+
+    #[test]
+    fn scrubbing_keeps_the_pitch() {
+        let pcm = vec![tone(440.0, 20.0)];
+        for speed in [0.5, 1.0, 2.0, 4.0, -1.0] {
+            let out = scrub(&pcm, speed, 1.0, 5.0 * PREVIEW_RATE as f64);
+            let hz = pitch(&out);
+            assert!((hz - 440.0).abs() < 15.0, "at {speed}× it came out at {hz:.0} Hz");
+            let loud = out[out.len() / 2..].iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+            assert!(loud > 0.3, "at {speed}× it's quiet ({loud})");
+        }
+    }
+
+    #[test]
+    fn standing_still_goes_quiet_and_a_jump_plays_the_new_place() {
+        // 440 Hz for the first 10 s, 880 after.
+        let mut pcm = tone(440.0, 10.0);
+        pcm.extend(tone(880.0, 10.0));
+        let pcm = vec![pcm];
+        let still = scrub(&pcm, 0.0, 0.5, 2.0 * PREVIEW_RATE as f64);
+        let end = still[still.len() - 2400..].iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+        assert!(end < 1e-3, "still playing when the playhead stands still ({end})");
+
+        let pcm = Pcm::from_tracks(pcm);
+        let rate = 48_000.0;
+        let mut s = Scrub::new(rate);
+        let tracks = [TrackEdit { index: 0, gain: 1.0, muted: false, points: Vec::new() }];
+        let mut out = Vec::new();
+        for k in 0..60 {
+            // Moving through the 440 Hz part, then a jump into the 880 Hz part.
+            let target = if k < 30 { 2.0 + k as f64 * 0.01 } else { 15.0 + k as f64 * 0.01 } * PREVIEW_RATE as f64;
+            let mut buf = vec![0.0f32; 960];
+            s.render(&mut buf, 2, &pcm, &tracks, target, true);
+            if k >= 35 {
+                out.extend(buf.chunks(2).map(|f| f[0]));
+            }
+        }
+        let hz = pitch(&out);
+        assert!((hz - 880.0).abs() < 30.0, "after the jump: {hz:.0} Hz");
+    }
+
+    /// Noise (like game sound: no two slices alike), stereo, at the source rate.
+    fn noise(secs: f64) -> Vec<f32> {
+        let mut x = 12345u32;
+        (0..(secs * PREVIEW_RATE as f64) as usize * 2)
+            .map(|_| {
+                x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                (x >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+            })
+            .collect()
+    }
+
+    /// RMS of `x`, and how much the RMS of 5 ms stretches varies (std / mean).
+    fn loudness(x: &[f32]) -> (f64, f64) {
+        let rms = |v: &[f32]| (v.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / v.len() as f64).sqrt();
+        let blocks: Vec<f64> = x.chunks(240).filter(|c| c.len() == 240).map(rms).collect();
+        let mean = blocks.iter().sum::<f64>() / blocks.len() as f64;
+        let var = blocks.iter().map(|b| (b - mean).powi(2)).sum::<f64>() / blocks.len() as f64;
+        (rms(x), var.sqrt() / mean)
+    }
+
+    #[test]
+    fn scrubbing_keeps_the_loudness_steady() {
+        let src = noise(20.0);
+        let left: Vec<f32> = src.chunks(2).map(|f| f[0]).collect();
+        let (in_rms, in_flutter) = loudness(&left[..48_000]);
+        let pcm = vec![src];
+        for speed in [0.5, 1.0, 2.0, 4.0, -1.0] {
+            let out = scrub(&pcm, speed, 1.5, 5.0 * PREVIEW_RATE as f64);
+            let (rms, flutter) = loudness(&out[24_000..]);
+            let db = 20.0 * (rms / in_rms).log10();
+            eprintln!("{speed}x: {db:+.2} dB, flutter {flutter:.3} (source {in_flutter:.3})");
+            assert!(db.abs() < 1.0, "at {speed}x the loudness is off by {db:.2} dB");
+            assert!(flutter < in_flutter * 1.5, "at {speed}x the loudness flutters ({flutter:.3} vs the source's {in_flutter:.3})");
+        }
+    }
+
+    #[test]
+    fn scrubbing_is_cheap_enough_for_the_audio_callback() {
+        // Six tracks (an editor clip), one second of output: well under a
+        // second even unoptimized.
+        let pcm: Vec<Vec<f32>> = (0..6).map(|_| tone(440.0, 20.0)).collect();
+        let t = std::time::Instant::now();
+        let _ = scrub(&pcm, 1.5, 1.0, 5.0 * PREVIEW_RATE as f64);
+        let took = t.elapsed();
+        eprintln!("one second of scrub sound, 6 tracks: {took:?}");
+        assert!(took.as_secs_f64() < 0.25, "took {took:?}");
+    }
+}

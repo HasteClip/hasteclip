@@ -1,0 +1,211 @@
+//! What's on screen, from the window server (CGWindowList): which app is in
+//! front, its windows, and whether one is still showing. Cheap enough to ask
+//! ten times a second (~1 ms); ScreenCaptureKit's own window list (slower,
+//! and asynchronous) is only fetched when the window to record changes.
+//!
+//! Apps go by bundle id (`com.mojang.minecraftlauncher`), or by executable
+//! name for the ones without a bundle (a game run from a folder: `java`,
+//! `wine64-preloader`) — the same ids the audio sources use.
+
+use objc2_app_kit::{NSApplicationActivationPolicy, NSRunningApplication, NSWorkspace};
+use objc2_core_foundation::{CFArray, CFDictionary, CFNumber, CGRect, CFRetained, CFString, CFType};
+use objc2_core_graphics::{
+    CGRectMakeWithDictionaryRepresentation, CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID, kCGWindowBounds, kCGWindowIsOnscreen,
+    kCGWindowLayer, kCGWindowNumber, kCGWindowOwnerPID,
+};
+
+use crate::Device;
+
+/// Windows smaller than this (points) aren't an app's picture: tool palettes,
+/// status items, invisible helpers.
+const MIN_SIDE: f64 = 120.0;
+
+/// One window of an app, as the window server lists it (front to back).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Window {
+    pub id: u32,
+    pub pid: i32,
+    pub on_screen: bool,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// Every normal app window (layer 0, big enough), front to back; with
+/// `on_screen_only`, only the ones showing.
+pub(crate) fn windows(on_screen_only: bool) -> Vec<Window> {
+    let mut option = CGWindowListOption::ExcludeDesktopElements;
+    if on_screen_only {
+        option |= CGWindowListOption::OptionOnScreenOnly;
+    }
+    let Some(list) = CGWindowListCopyWindowInfo(option, kCGNullWindowID) else { return Vec::new() };
+    let list: CFRetained<CFArray<CFDictionary<CFString, CFType>>> = unsafe { CFRetained::cast_unchecked(list) };
+    let own = std::process::id() as i32;
+    let number = |d: &CFDictionary<CFString, CFType>, key: &CFString| d.get(key).and_then(|v| v.downcast::<CFNumber>().ok()).and_then(|n| n.as_i64());
+    let mut out = Vec::new();
+    for i in 0..list.len() {
+        let Some(d) = list.get(i) else { continue };
+        if number(&d, unsafe { kCGWindowLayer }) != Some(0) {
+            continue;
+        }
+        let (Some(id), Some(pid)) = (number(&d, unsafe { kCGWindowNumber }), number(&d, unsafe { kCGWindowOwnerPID })) else { continue };
+        if pid as i32 == own {
+            continue;
+        }
+        let mut rect = CGRect::default();
+        let bounds = d.get(unsafe { kCGWindowBounds }).and_then(|v| v.downcast::<CFDictionary>().ok());
+        if !bounds.is_some_and(|b| unsafe { CGRectMakeWithDictionaryRepresentation(Some(&b), &mut rect) }) {
+            continue;
+        }
+        if rect.size.width < MIN_SIDE || rect.size.height < MIN_SIDE {
+            continue;
+        }
+        let on_screen = d.get(unsafe { kCGWindowIsOnscreen }).and_then(|v| v.downcast::<objc2_core_foundation::CFBoolean>().ok()).is_some_and(|b| b.as_bool());
+        out.push(Window { id: id as u32, pid: pid as i32, on_screen, width: rect.size.width, height: rect.size.height });
+    }
+    out
+}
+
+fn id_of(app: &NSRunningApplication) -> Option<String> {
+    app.bundleIdentifier()
+        .map(|b| b.to_string())
+        .or_else(|| app.executableURL().and_then(|u| u.lastPathComponent()).map(|n| n.to_string()))
+}
+
+/// An app's name for people: its localized name, else its id.
+fn name_of(app: &NSRunningApplication) -> Option<String> {
+    app.localizedName().map(|n| n.to_string()).or_else(|| id_of(app))
+}
+
+/// The app in front (the one with the keyboard).
+pub(crate) fn frontmost() -> Option<(i32, String)> {
+    let app = NSWorkspace::sharedWorkspace().frontmostApplication()?;
+    let pid = app.processIdentifier();
+    (pid != std::process::id() as i32).then(|| Some((pid, id_of(&app)?))).flatten()
+}
+
+/// The app in front: its id, and where it's installed (its bundle, else its
+/// executable).
+pub fn foreground_app_path() -> Option<(String, std::path::PathBuf)> {
+    let app = NSWorkspace::sharedWorkspace().frontmostApplication()?;
+    if app.processIdentifier() == std::process::id() as i32 {
+        return None;
+    }
+    let url = app.bundleURL().or_else(|| app.executableURL())?;
+    Some((id_of(&app)?, std::path::PathBuf::from(url.path()?.to_string())))
+}
+
+/// The pids of running apps with this id (an app can run more than once).
+pub(crate) fn pids_of(id: &str) -> Vec<i32> {
+    NSWorkspace::sharedWorkspace()
+        .runningApplications()
+        .iter()
+        .filter(|a| id_of(a).is_some_and(|i| i.eq_ignore_ascii_case(id)))
+        .map(|a| a.processIdentifier())
+        .collect()
+}
+
+/// The window to record for app `id`: its frontmost window that's showing
+/// (the list is front to back), else its biggest one at all (a minimized
+/// game keeps its last picture).
+pub(crate) fn find_app_window(id: &str, all: &[Window]) -> Option<Window> {
+    let pids = pids_of(id);
+    let mine = || all.iter().filter(|w| pids.contains(&w.pid));
+    mine().find(|w| w.on_screen).or_else(|| mine().max_by(|a, b| (a.width * a.height).total_cmp(&(b.width * b.height)))).copied()
+}
+
+/// Running apps with a window, for games and apps capture, sorted by name.
+pub fn list_windowed_apps() -> Vec<Device> {
+    let pids: std::collections::HashSet<i32> = windows(false).iter().map(|w| w.pid).collect();
+    let mut apps: Vec<Device> = NSWorkspace::sharedWorkspace()
+        .runningApplications()
+        .iter()
+        .filter(|a| pids.contains(&a.processIdentifier()))
+        // Apps with a Dock icon, or a bare process with no bundle (a game run
+        // from a folder). Agents with a window (menu bar apps' popovers,
+        // helpers, system UI like loginwindow) aren't apps to record.
+        .filter(|a| a.activationPolicy() == NSApplicationActivationPolicy::Regular || a.bundleIdentifier().is_none())
+        .filter_map(|a| Some(Device { id: id_of(&a)?, name: name_of(&a)? }))
+        .filter(|d| d.id != "com.apple.finder")
+        .collect();
+    apps.sort_by_key(|d| (d.name.to_lowercase(), d.id.to_lowercase()));
+    apps.dedup_by(|a, b| a.id.eq_ignore_ascii_case(&b.id));
+    apps
+}
+
+/// The app in front's id.
+pub fn foreground_exe() -> Option<String> {
+    frontmost().map(|(_, id)| id)
+}
+
+/// A running app's bundle's file name (`World of Warcraft.app`), else its
+/// executable's.
+pub(crate) fn bundle_file_name(id: &str) -> Option<String> {
+    let apps = NSWorkspace::sharedWorkspace().runningApplications();
+    let app = apps.iter().find(|a| id_of(a).is_some_and(|i| i.eq_ignore_ascii_case(id)))?;
+    app.bundleURL().or_else(|| app.executableURL()).and_then(|u| u.lastPathComponent()).map(|n| n.to_string())
+}
+
+/// How much of a macOS icon's square the icon itself fills: Apple's grid puts
+/// it on an 824-point plate in 1024 (room for its shadow), so in a box it
+/// looked a fifth smaller than the same app's icon on Windows, which fills its
+/// square. Measured on Safari, Music, Discord, Calculator, Chrome and Notes:
+/// 52 of 64 pixels, each.
+const PLATE: f64 = 52.0 / 64.0;
+
+/// The icon of the app with bundle id `id` (installed, running or not), as
+/// `size`×`size` RGBA (straight alpha, rows top to bottom), cropped to its
+/// plate so it fills the square as a Windows icon does. `None` for an id
+/// without an app bundle (a program run from a folder).
+pub fn app_icon(id: &str, size: u32) -> Option<Vec<u8>> {
+    use objc2_core_foundation::{CGPoint, CGSize};
+    use objc2_core_graphics::{CGBitmapContextCreate, CGColorSpace, CGContext, CGImageAlphaInfo};
+    use objc2_foundation::{NSRect, NSString};
+    let ws = NSWorkspace::sharedWorkspace();
+    let url = ws.URLForApplicationWithBundleIdentifier(&NSString::from_str(id))?;
+    let path = url.path()?;
+    let image = ws.iconForFile(&path);
+    // Asked for at the size it's drawn at (bigger than the square), so the
+    // picture chosen is sharp there.
+    let big = (size as f64 / PLATE).ceil();
+    let mut rect = NSRect::new(objc2_foundation::NSPoint::new(0.0, 0.0), objc2_foundation::NSSize::new(big, big));
+    // SAFETY: a proposed rect we own; no context or hints.
+    let cg = unsafe { image.CGImageForProposedRect_context_hints(&mut rect, None, None) }?;
+    let (w, h) = (size as usize, size as usize);
+    let mut px = vec![0u8; w * h * 4];
+    let space = CGColorSpace::new_device_rgb()?;
+    // SAFETY: `px` holds w*h*4 bytes and outlives the context, which is
+    // dropped at the end of this function.
+    let ctx = unsafe { CGBitmapContextCreate(px.as_mut_ptr().cast(), w, h, 8, w * 4, Some(&space), CGImageAlphaInfo::PremultipliedLast.0) }?;
+    // Drawn bigger than the square, centred, so the plate fills it and the
+    // margin around it falls outside.
+    let big = size as f64 / PLATE;
+    let at = (size as f64 - big) / 2.0;
+    CGContext::draw_image(Some(&ctx), objc2_core_foundation::CGRect::new(CGPoint::new(at, at), CGSize::new(big, big)), Some(&cg));
+    drop(ctx);
+    // Premultiplied to straight alpha.
+    for p in px.chunks_exact_mut(4) {
+        let a = p[3] as u32;
+        if a > 0 && a < 255 {
+            for c in &mut p[..3] {
+                *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
+            }
+        }
+    }
+    Some(px)
+}
+
+#[cfg(test)]
+mod icon_tests {
+    /// A Mac app's icon fills its square, as a Windows icon does: its plate,
+    /// not Apple's margin around it (`cargo test -p capture icon_fills
+    /// -- --ignored`, on a Mac with Safari).
+    #[test]
+    #[ignore]
+    fn icon_fills_the_square() {
+        let px = super::app_icon("com.apple.Safari", 64).expect("Safari's icon");
+        let alpha = |x: usize, y: usize| px[(y * 64 + x) * 4 + 3];
+        // Opaque right up to a pixel or so from each edge (the plate's
+        // rounded corners aside), where before it started 6 pixels in.
+        assert!(alpha(32, 1) > 200 && alpha(1, 32) > 200 && alpha(62, 32) > 200 && alpha(32, 62) > 200, "edges: {} {} {} {}", alpha(32, 1), alpha(1, 32), alpha(62, 32), alpha(32, 62));
+    }
+}

@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["crates/app", "crates/capture", "crates/media"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/Kaillr/hasteclip"
+
+# Optimize dependencies even in debug builds so capture/encode/preview stay smooth
+# while iterating. Our own crates stay fast to compile at opt-level 0.
+[profile.dev.package."*"]
+opt-level = 2
+
+# Our crates with per-frame work (decoding, pixels, JPEG) are optimized in
+# debug builds too: they change rarely, and unoptimized they're several times
+# slower (the scrub proxy took 30 s instead of 8 for a 2-minute clip). Generic
+# code from dependencies is compiled in the crate that uses it, so heavy
+# generic calls (like the JPEG encoder) live here, not in the app.
+[profile.dev.package.capture]
+opt-level = 2
+
+[profile.dev.package.media]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
