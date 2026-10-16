@@ -12,19 +12,30 @@
 //! app draws is read back from the GPU and piped to ffmpeg, so the window
 //! needn't be in front.
 //!
-//! The script is a JSON list of steps (see `Step`):
+//! The script is JSON: where the video goes, optionally clips that saving
+//! hands over (`saves`, see `capture_thread`), and the steps (see `Step`):
 //!
 //! ```json
-//! { "out": "demo.mp4", "steps": [
-//!   { "wait": 0.8 },
-//!   { "move": "clip:Ace on Ancient", "secs": 0.9 },
-//!   { "click": true },
-//!   { "seek": "marker:1", "before": 1.0 },
-//!   { "key": "space" },
-//!   { "drag": "trim:in", "by": [120, 0], "secs": 0.9 },
-//!   { "wait": 2 }
+//! { "out": "demo.mp4", "saves": ["CS2/clip_2026-10-14_10-47-46 - Ace on Ancient.mp4"], "steps": [
+//!   { "clipping": true },                    // start clipping (nothing is recorded)
+//!   { "shortcut": "save" },                  // the save shortcut, as from a game
+//!   { "wait": 0.8 },                         // hold still
+//!   { "move": "clip:1", "secs": 0.9 },       // glide onto the first card
+//!   { "click": true },                       // (or "double": true)
+//!   { "play": true },                        // play, if it isn't
+//!   { "trim": "in", "to": "marker:1", "before": 3 },  // a trim handle to a moment
+//!   { "seek": "marker:1", "before": 1 },     // the playhead to a moment
+//!   { "drag": "clip:2", "to": "filter:Best of the week" },  // or "by": [x, y]
+//!   { "key": "cmd+s" },  { "type": "text" },  { "scroll": 300 },
+//!   { "pointer": false }                     // hide the pointer
 //! ] }
 //! ```
+//!
+//! Targets: `clip:<title>` or `clip:N` (the Nth card on screen),
+//! `filter:<name>` (the library's games and collections), `button:<label>`
+//! (buttons and menu items, by label or tooltip), `play`, `trim:in`,
+//! `trim:out`, or a point `[x, y]` in the window's points. Moments:
+//! `marker:N` (the open clip's Nth marker, put in with B) or seconds.
 
 use std::collections::HashMap;
 use std::io::Write;
