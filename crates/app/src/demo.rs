@@ -380,6 +380,14 @@ impl Demo {
                 if let Some(rec) = self.recorder.take() {
                     rec.finish();
                 }
+                // Prepared clips that weren't saved go back where they were.
+                if let Some(q) = SAVES.get().and_then(|q| q.lock().ok()) {
+                    let lib = library();
+                    for (held, rel) in q.iter() {
+                        let _ = std::fs::rename(held, lib.join(rel));
+                    }
+                }
+                let _ = std::fs::remove_dir(waiting_room());
                 eprintln!("demo: done");
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
