@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 
 const TARBALL: &str = "HasteClip-linux-x64.tar.gz";
 /// GitHub's API for the repo's releases, newest first.
-const RELEASES: &str = "https://api.github.com/repos/Kaillr/hasteclip/releases?per_page=10";
+const RELEASES: &str = "https://api.github.com/repos/hasteclip/hasteclip/releases?per_page=10";
 
 /// The installed app: the folder the binary is in, if it's one we can update
 /// (unpacked from a release, ours to write to).

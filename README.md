@@ -35,11 +35,11 @@ HasteClip is in beta (versions 0.x): it works day to day, but not every feature 
 
 ## Install
 
-**Windows:** download `HasteClip-win-Setup.exe` from the [latest release](https://github.com/Kaillr/hasteclip/releases/latest) and run it. It installs for your user only (no admin prompt), ffmpeg included. Updates download in the background and install when you quit; turn that off in *Settings → Updates*.
+**Windows:** download `HasteClip-win-Setup.exe` from the [latest release](https://github.com/hasteclip/hasteclip/releases/latest) and run it. It installs for your user only (no admin prompt), ffmpeg included. Updates download in the background and install when you quit; turn that off in *Settings → Updates*.
 
-**macOS (Apple Silicon):** download `HasteClip-mac-arm64.dmg` from the [latest release](https://github.com/Kaillr/hasteclip/releases/latest), open it and drag HasteClip to Applications. ffmpeg is included. The app isn't signed by Apple yet, so macOS blocks the first launch: open it once, then go to *System Settings → Privacy & Security* and click *Open Anyway* (or run `xattr -dr com.apple.quarantine /Applications/HasteClip.app`). After each update macOS may ask for Screen Recording permission again. It doesn't update itself yet: download new releases by hand.
+**macOS (Apple Silicon):** download `HasteClip-mac-arm64.dmg` from the [latest release](https://github.com/hasteclip/hasteclip/releases/latest), open it and drag HasteClip to Applications. ffmpeg is included. The app isn't signed by Apple yet, so macOS blocks the first launch: open it once, then go to *System Settings → Privacy & Security* and click *Open Anyway* (or run `xattr -dr com.apple.quarantine /Applications/HasteClip.app`). After each update macOS may ask for Screen Recording permission again. It doesn't update itself yet: download new releases by hand.
 
-**Linux (x86-64):** download `HasteClip-linux-x64.tar.gz` from the [latest release](https://github.com/Kaillr/hasteclip/releases/latest), unpack it where you want to keep it and run `./hasteclip`; it adds itself to your apps on first launch. ffmpeg is included; you need PipeWire and an xdg-desktop-portal. It doesn't update itself yet: download new releases by hand.
+**Linux (x86-64):** download `HasteClip-linux-x64.tar.gz` from the [latest release](https://github.com/hasteclip/hasteclip/releases/latest), unpack it where you want to keep it and run `./hasteclip`; it adds itself to your apps on first launch. ffmpeg is included; you need PipeWire and an xdg-desktop-portal. It doesn't update itself yet: download new releases by hand.
 
 ## Requirements (building from source)
 
@@ -52,7 +52,7 @@ HasteClip is in beta (versions 0.x): it works day to day, but not every feature 
 ## Getting started
 
 ```sh
-git clone https://github.com/Kaillr/hasteclip.git
+git clone https://github.com/hasteclip/hasteclip.git
 cd hasteclip
 cargo run --release
 ```

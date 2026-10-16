@@ -79,7 +79,7 @@ CachyOS or newer) with PipeWire, as desktops have them. ffmpeg is included
 run it from a terminal: it says what's missing. Its log is in
 ~/.local/share/hasteclip/logs.
 
-https://github.com/Kaillr/hasteclip
+https://github.com/hasteclip/hasteclip
 EOF
 
 tar -C "$work" -czf "$out/$name.tar.gz" "$name"

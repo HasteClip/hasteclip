@@ -15,7 +15,7 @@ $PSNativeCommandUseErrorActionPreference = $true
 
 $root = Split-Path $PSScriptRoot
 Set-Location $root
-$repo = 'https://github.com/Kaillr/hasteclip'
+$repo = 'https://github.com/hasteclip/hasteclip'
 
 # The editor, thumbnails and probing run ffmpeg; shipping it means nothing else
 # to install. Pinned, so an update only carries it when this changes.
