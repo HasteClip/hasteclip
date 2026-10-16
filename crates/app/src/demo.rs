@@ -490,9 +490,10 @@ impl Demo {
                 }
                 let end = self.seek_at.unwrap_or(end);
                 let pull = t - reach;
-                // A long pull takes longer (`secs` is for about a third of the
-                // window), so a handle crossing the timeline isn't thrown.
-                let secs = secs.max(grab.distance(end) as f64 / 450.0);
+                // A long pull takes longer (`secs` is for a short one), so a
+                // handle crossing the timeline isn't thrown: about 260 points
+                // a second, at most 4.
+                let secs = secs.max((grab.distance(end) as f64 / 260.0).min(4.0));
                 self.pointer = glide(grab, end, pull, secs);
                 if pull >= secs + 0.05 {
                     raw.events.push(Event::PointerButton { pos: self.pointer, button: PointerButton::Primary, pressed: false, modifiers });

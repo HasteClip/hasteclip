@@ -1392,6 +1392,7 @@ fn overlay_icon(ui: &mut egui::Ui, glyph: &str, light: bool, tip: &str) -> egui:
     };
     ui.painter().rect_filled(rect, ui_kit::RADIUS, fill);
     ui.painter().text(rect.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(15.0), fg);
+    crate::demo::mark(ui.ctx(), || format!("button:{tip}"), rect);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip)
 }
 
