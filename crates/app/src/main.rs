@@ -711,6 +711,9 @@ impl App {
         if let Some(dir) = std::env::var_os("HASTECLIP_LIBRARY") {
             app.settings.auto_start_buffer = false;
             app.settings.output_dir = PathBuf::from(dir);
+            // A demo's deletes are for good: the copy it runs on goes away
+            // anyway, and nothing should land in the real Bin.
+            app.settings.delete_permanently = demo::on();
             app.refresh_clips();
         }
         if let Some(clip) = std::env::var_os("HASTECLIP_DEMO_RENDER").map(PathBuf::from) {
@@ -782,6 +785,9 @@ impl App {
         }
         // Never miss a moment: arm the buffer on launch (unless it can't work yet).
         if app.settings.auto_start_buffer && !open_sources && !open_review && app.permission != capture::Permission::Denied {
+            app.start_replay_buffer();
+        }
+        if demo::on() && demo::clipping_from_start() {
             app.start_replay_buffer();
         }
         app

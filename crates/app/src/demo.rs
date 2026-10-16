@@ -150,7 +150,17 @@ struct Script {
     /// leave the library when the demo starts and come back as new clips.
     #[serde(default)]
     saves: Vec<PathBuf>,
+    /// Clipping is on from the first frame (as it is when you use the app),
+    /// not turned on by a step.
+    #[serde(default)]
+    #[allow(dead_code)] // read by `clipping_from_start`
+    clipping: bool,
     steps: Vec<Step>,
+}
+
+/// Whether the script has clipping on from the start.
+pub fn clipping_from_start() -> bool {
+    script_path().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).is_some_and(|v| v["clipping"] == true)
 }
 
 fn default_fps() -> u32 {
