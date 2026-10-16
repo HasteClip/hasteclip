@@ -379,10 +379,15 @@ impl Demo {
         }
         // The step's events go after the pointer's move to where it was, then
         // one to where the step took it: a click lands where the pointer is.
-        raw.events.push(Event::PointerMoved(self.pointer));
+        // Hidden, it's not over anything: no hover (a card would start playing
+        // under it).
+        let hidden = !self.shown;
+        raw.events.push(if hidden { Event::PointerGone } else { Event::PointerMoved(self.pointer) });
         let at = raw.events.len();
         self.step_script(ctx, raw, now);
-        if raw.events.len() == at || !matches!(raw.events.last(), Some(Event::PointerMoved(_))) {
+        if !self.shown && raw.events.len() == at {
+            // Still hidden after the step: stays gone.
+        } else if raw.events.len() == at || !matches!(raw.events.last(), Some(Event::PointerMoved(_))) {
             raw.events.push(Event::PointerMoved(self.pointer));
         }
     }
@@ -485,6 +490,9 @@ impl Demo {
                 }
                 let end = self.seek_at.unwrap_or(end);
                 let pull = t - reach;
+                // A long pull takes longer (`secs` is for about a third of the
+                // window), so a handle crossing the timeline isn't thrown.
+                let secs = secs.max(grab.distance(end) as f64 / 450.0);
                 self.pointer = glide(grab, end, pull, secs);
                 if pull >= secs + 0.05 {
                     raw.events.push(Event::PointerButton { pos: self.pointer, button: PointerButton::Primary, pressed: false, modifiers });
@@ -835,6 +843,12 @@ pub(crate) fn capture_thread(rx: mpsc::Receiver<crate::service::Cmd>, tx: mpsc::
                         let rest = stem.split_once(" - ").map(|(_, r)| format!(" - {r}")).unwrap_or_default();
                         let ext = rel.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_else(|| "mp4".into());
                         let name = format!("clip_{}{rest}.{ext}", chrono::Local::now().format("%Y-%m-%d_%H-%M-%S"));
+                        // The game it was played in, as a game in the foreground
+                        // would have set it: the clip's own folder in the library.
+                        let dir = match rel.parent().filter(|p| !p.as_os_str().is_empty()) {
+                            Some(game) => library().join(game),
+                            None => dir,
+                        };
                         let _ = std::fs::create_dir_all(&dir);
                         let to = dir.join(name);
                         if let Err(e) = std::fs::rename(&held, &to) {
