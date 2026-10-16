@@ -1,5 +1,6 @@
 //! Demo recordings: the real app, driven by a script and recorded to a video,
-//! for the website. Only on when `HASTECLIP_DEMO_SCRIPT=<script.json>` is set
+//! for the website. Only in a build with the `demo` feature, and only on when
+//! `HASTECLIP_DEMO_SCRIPT=<script.json>` is set
 //! (with `HASTECLIP_LIBRARY` pointing at a copy of a library, so nothing real
 //! changes); otherwise every call here is one cheap check.
 //!
@@ -34,10 +35,18 @@ use std::sync::mpsc;
 use egui::{Color32, Context, Event, Id, Key, Modifiers, PointerButton, Pos2, Rect, pos2, vec2};
 use serde::Deserialize;
 
-/// The script, when `HASTECLIP_DEMO_SCRIPT` names one.
+/// The script, when `HASTECLIP_DEMO_SCRIPT` names one. Only in a build with
+/// the `demo` feature: in any other, demos are off and all of this is unused.
 fn script_path() -> Option<&'static PathBuf> {
     static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
-    PATH.get_or_init(|| std::env::var_os("HASTECLIP_DEMO_SCRIPT").map(PathBuf::from)).as_ref()
+    PATH.get_or_init(|| {
+        let path = std::env::var_os("HASTECLIP_DEMO_SCRIPT").map(PathBuf::from)?;
+        if !cfg!(feature = "demo") {
+            fail(&format!("this build can't record demos ({}): build with `--features demo`", path.display()));
+        }
+        Some(path)
+    })
+    .as_ref()
 }
 
 /// Whether a demo is being recorded.
@@ -603,6 +612,9 @@ impl Demo {
         if self.shown {
             draw_pointer(ctx, self.pointer, self.down);
         }
+        // Every pass, though egui draws twice per repaint request: the
+        // recorder keeps one picture per frame slot (asking for every other
+        // one missed frames whose slot rounded the same way).
         if self.recorder.is_some() && self.zero.is_some() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
         }
@@ -768,6 +780,7 @@ impl Recorder {
             let mut ffmpeg: Option<(std::process::Child, [usize; 2])> = None;
             let mut written = 0u64;
             let mut fresh = 0u64;
+            let mut extra = 0u64;
             let mut held: Option<std::sync::Arc<egui::ColorImage>> = None;
             for (image, at) in rx {
                 let size = image.size;
@@ -787,8 +800,15 @@ impl Recorder {
                     continue; // the window was resized mid-recording; keep the first size
                 }
                 let stdin = child.stdin.as_mut().expect("piped");
-                // Fill the frames up to this one's time with the last picture.
+                // The frame slot this picture belongs in. One that's already
+                // filled (the app drew twice in it: egui repaints twice per
+                // request, or the display runs at 120 Hz) keeps its picture.
                 let due = (at * f64::from(fps)).round() as u64;
+                if due < written {
+                    extra += 1;
+                    continue;
+                }
+                // Fill the frames up to this one's time with the last picture.
                 while written < due {
                     let fill = held.as_ref().unwrap_or(&image);
                     if stdin.write_all(fill.as_raw()).is_err() {
@@ -806,7 +826,7 @@ impl Recorder {
             if let Some((mut child, _)) = ffmpeg {
                 drop(child.stdin.take());
                 let _ = child.wait();
-                eprintln!("demo: {written} frames written, {fresh} of them new from the app ({} held over)", written - fresh);
+                eprintln!("demo: {written} frames ({:.1} s), {fresh} new from the app, {} held over ({extra} extra pictures left out)", written as f64 / f64::from(fps), written - fresh);
             }
         });
         Self { tx: Some(tx), thread: Some(thread) }
