@@ -447,6 +447,7 @@ impl App {
         let mut action = None;
         let chosen = self.library_filter == view.filter;
         let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
+        crate::demo::mark(ui.ctx(), || format!("filter:{}", view.label), rect);
         let drop_here = self.drop_target(ui, rect, &view.filter);
         let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered() || drop_here, theme::FAST);
         let on = theme::toggle(ui.ctx(), resp.id.with("on"), chosen, theme::NORMAL);
@@ -814,6 +815,7 @@ impl App {
         let thumb_rect = Rect::from_min_size(rect.min, vec2(rect.width(), rect.width() * 9.0 / 16.0));
         // click_and_drag: a click plays, a drag pulls the clip out.
         let resp = ui.interact(rect, egui::Id::new(("clip_card", &clip.path)), Sense::click_and_drag());
+        crate::demo::mark(ui.ctx(), || format!("clip:{}", clip.title()), thumb_rect);
         if self.reveal_clip.as_ref() == Some(&clip.path) {
             ui.scroll_to_rect(rect, Some(egui::Align::Center));
             self.reveal_clip = None;
@@ -1390,6 +1392,7 @@ fn overlay_icon(ui: &mut egui::Ui, glyph: &str, light: bool, tip: &str) -> egui:
     };
     ui.painter().rect_filled(rect, ui_kit::RADIUS, fill);
     ui.painter().text(rect.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(15.0), fg);
+    crate::demo::mark(ui.ctx(), || format!("button:{tip}"), rect);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip)
 }
 

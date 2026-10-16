@@ -14,7 +14,7 @@ use capture::{EncodeSettings, Mode};
 
 use crate::games::Details;
 
-enum Cmd {
+pub(crate) enum Cmd {
     Start(Mode, EncodeSettings),
     /// Save the replay buffer as a clip in this folder, its name ending in what
     /// happened in the game, if known.
@@ -116,6 +116,11 @@ impl CaptureService {
         let (evt_tx, evt_rx) = std::sync::mpsc::channel::<Evt>();
 
         let _ = STOP_HOOK.get_or_init(|| Mutex::new(None)).lock().map(|mut h| *h = Some(cmd_tx.clone()));
+        // A demo recording clips nothing: its stand-in hands over prepared clips.
+        if crate::demo::on() {
+            let thread = crate::demo::capture_thread(cmd_rx, evt_tx);
+            return Self { cmd_tx: Some(cmd_tx), evt_rx, thread: Some(thread) };
+        }
         let thread = thread::spawn(move || {
             // The backend lives entirely on this thread.
             let mut recorder = capture::default_recorder(live);
@@ -256,7 +261,7 @@ fn send(tx: &Sender<Evt>, evt: Evt) {
 
 /// A just-saved clip: named after what happened in the game, its moments
 /// kept with it.
-fn landed(path: PathBuf, details: Details) -> PathBuf {
+pub(crate) fn landed(path: PathBuf, details: Details) -> PathBuf {
     let path = named(path, details.summary);
     if !details.moments.is_empty() {
         crate::moments::keep(&path, &details.moments);

@@ -97,3 +97,8 @@ windows = { version = "0.62", features = [
 hound = "3"
 naga = { version = "30", features = ["wgsl-in"] }
 pollster = "1"
+
+[features]
+# Scripted demo recordings for the website (src/demo.rs): `cargo build
+# --release --features demo`. Without it, HASTECLIP_DEMO_SCRIPT says it can't.
+demo = []

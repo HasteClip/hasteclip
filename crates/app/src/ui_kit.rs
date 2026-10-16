@@ -640,6 +640,7 @@ impl<'a> Btn<'a> {
                 painter.rect_filled(bar, 0, theme::fade(fg, 0.6));
             }
         }
+        crate::demo::mark(ui.ctx(), || format!("button:{}", if self.label.is_empty() { self.tip.as_deref().unwrap_or("") } else { &self.label }), resp.rect);
         if let Some(tip) = &self.tip {
             resp = if self.enabled { resp.on_hover_text(tip) } else { resp.on_disabled_hover_text(tip) };
         }
@@ -1038,6 +1039,7 @@ impl<'a> Item<'a> {
     fn paint(self, ui: &mut egui::Ui, w: f32, sub: bool) -> Response {
         let p = theme::pal(ui);
         let (rect, resp) = ui.allocate_exact_size(vec2(w, 30.0), if self.enabled { Sense::click() } else { Sense::hover() });
+        crate::demo::mark(ui.ctx(), || format!("button:{}", self.label), rect);
         let open = sub && egui::Popup::is_id_open(ui.ctx(), egui::containers::menu::SubMenu::id_from_widget_id(resp.id));
         let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), self.enabled && (resp.hovered() || open), theme::FAST * 0.7);
         if hv > 0.0 {

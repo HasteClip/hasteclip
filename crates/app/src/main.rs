@@ -13,6 +13,7 @@ mod autostart;
 mod away;
 mod clips;
 mod collections;
+mod demo;
 mod webcam_ui;
 mod discord;
 mod editor;
@@ -521,6 +522,8 @@ struct App {
     /// Games' icons.
     pub(crate) web_images: web_images::WebImages,
     pub(crate) updater: update::Updater,
+    /// A demo being recorded (`HASTECLIP_DEMO_SCRIPT`), see `demo.rs`.
+    demo: Option<demo::Demo>,
     pub(crate) presence: discord::Presence,
     /// Saves a clip as Save clip is pressed, frames or not.
     quick_save: service::QuickSave,
@@ -686,6 +689,7 @@ impl App {
             nav: nav::History::default(),
             web_images: Default::default(),
             updater,
+            demo: demo::Demo::from_env(&ctx),
             presence: discord::Presence::new(),
             clipped_game: None,
             games,
@@ -707,6 +711,9 @@ impl App {
         if let Some(dir) = std::env::var_os("HASTECLIP_LIBRARY") {
             app.settings.auto_start_buffer = false;
             app.settings.output_dir = PathBuf::from(dir);
+            // A demo's deletes are for good: the copy it runs on goes away
+            // anyway, and nothing should land in the real Bin.
+            app.settings.delete_permanently = demo::on();
             app.refresh_clips();
         }
         if let Some(clip) = std::env::var_os("HASTECLIP_DEMO_RENDER").map(PathBuf::from) {
@@ -778,6 +785,9 @@ impl App {
         }
         // Never miss a moment: arm the buffer on launch (unless it can't work yet).
         if app.settings.auto_start_buffer && !open_sources && !open_review && app.permission != capture::Permission::Denied {
+            app.start_replay_buffer();
+        }
+        if demo::on() && demo::clipping_from_start() {
             app.start_replay_buffer();
         }
         app
@@ -929,6 +939,9 @@ impl eframe::App for App {
         let mut laps = Laps::start();
 
         self.navigate(&ctx);
+        if let Some(action) = self.demo.as_mut().and_then(demo::Demo::take_action) {
+            self.demo_action(action);
+        }
 
         // A clip plays in its card on Clips only.
         if self.page != Page::Clips {
@@ -1089,9 +1102,16 @@ impl eframe::App for App {
         } else {
             ctx.request_repaint_after(Duration::from_millis(300));
         }
+        // Last: a demo records every frame.
+        if let Some(demo) = &mut self.demo {
+            demo.after(&ctx);
+        }
     }
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if let Some(demo) = &mut self.demo {
+            demo.input(ctx, raw_input);
+        }
         ui_kit::replay_click(ctx, raw_input);
     }
 
@@ -1183,7 +1203,8 @@ impl App {
             self.clip_saving();
         }
         // Not while samples are played on the speakers: the detector would hear them.
-        let listen = self.settings.voice_clip && self.rec_state == RecState::Buffering && self.recording_shortcut.is_none() && self.page != Page::VoiceReview;
+        // (Never in a demo recording: it clips nothing, and the mic stays shut.)
+        let listen = self.settings.voice_clip && self.rec_state == RecState::Buffering && self.recording_shortcut.is_none() && self.page != Page::VoiceReview && self.demo.is_none();
         self.voice.collect(self.settings.voice_samples);
         let mic = listen.then(|| self.voice_mic()).flatten();
         self.voice.listen(mic.as_deref());
@@ -1866,6 +1887,33 @@ impl App {
     /// OS default is *now* (e.g. headphones plugged in since launch).
     fn refresh_audio_devices(&mut self) {
         self.audio = capture::audio::list_audio_devices();
+    }
+
+    /// A demo step that's more than input (see `demo.rs`).
+    fn demo_action(&mut self, action: demo::Action) {
+        match action {
+            demo::Action::Unsave => {
+                demo::take_back_saves();
+                self.refresh_clips();
+            }
+            demo::Action::EmptyCollections => {
+                let lib = self.settings.output_dir.clone();
+                let all: Vec<(String, Vec<PathBuf>)> = self.collections.list().iter().map(|c| (c.id.clone(), c.clips.iter().map(|k| lib.join(k)).collect())).collect();
+                for (id, clips) in all {
+                    self.collections.remove(&id, &clips);
+                }
+            }
+            demo::Action::Clipping(on) => {
+                if on && self.rec_state == RecState::Idle {
+                    self.start_replay_buffer();
+                } else if !on && self.rec_state != RecState::Idle {
+                    self.stop();
+                }
+            }
+            demo::Action::Shortcut(settings::ShortcutAction::ToggleBuffer) => self.toggle_buffer(),
+            demo::Action::Shortcut(settings::ShortcutAction::ToggleRecord) => self.toggle_record(),
+            demo::Action::Shortcut(settings::ShortcutAction::SaveClip) => self.save_clip(),
+        }
     }
 
     fn start_replay_buffer(&mut self) {
