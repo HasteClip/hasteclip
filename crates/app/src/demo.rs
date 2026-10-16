@@ -500,8 +500,8 @@ impl Demo {
                 let end = self.seek_at.unwrap_or(end);
                 let pull = t - self.pull_started.unwrap_or(reach);
                 // A long pull takes longer (`secs` is for a short one), at a
-                // hand's pace: about 300 points a second, at most 4 s.
-                let secs = secs.max((grab.distance(end) as f64 / 300.0).min(4.0));
+                // hand's pace: about 440 points a second, at most 3 s.
+                let secs = secs.max((grab.distance(end) as f64 / 440.0).min(3.0));
                 self.pointer = grab + (end - grab) * ease_gentle((pull / secs).clamp(0.0, 1.0)) as f32;
                 if pull >= secs + 0.05 {
                     raw.events.push(Event::PointerButton { pos: self.pointer, button: PointerButton::Primary, pressed: false, modifiers });
