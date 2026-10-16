@@ -277,12 +277,11 @@ struct Index {
     days: HashMap<chrono::NaiveDate, usize>,
 }
 
-/// What a card or heading is followed by from one layout to the next.
+/// What a card is followed by from one layout to the next.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Key {
     Clip(PathBuf),
     Placeholder(usize),
-    Day(chrono::NaiveDate),
 }
 
 impl Layout {
@@ -476,12 +475,45 @@ impl Moves {
         }
     }
 
+    /// Whether any of these cards (a day's) were shown before the change:
+    /// then they slide to their places, and the day's heading goes with them.
+    /// None (switching between games with no clip in common): the heading
+    /// has nothing to travel with, and appears in place with its clips.
+    pub fn carries(&self, mut keys: impl Iterator<Item = Key>) -> bool {
+        match &self.before {
+            Some(b) => keys.any(|k| b.layout.card(&k).is_some()),
+            None => false,
+        }
+    }
+
+    /// Where a day's heading (now at `target`) is drawn. `carried`: see
+    /// [`Moves::carries`]; a heading with none of its clips carried over
+    /// doesn't slide, even if the same day was shown before: it fades in
+    /// (and stays put if it's where it was).
+    pub fn place_day(&self, d: chrono::NaiveDate, target: Pos2, carried: bool, now: f64, view: (f32, f32)) -> Placed {
+        let Some(b) = &self.before else { return Placed { at: target, shown: 1.0 } };
+        let t = ((now - b.changed) as f32 / SLIDE).clamp(0.0, 1.0);
+        if t >= 1.0 {
+            return Placed { at: target, shown: 1.0 };
+        }
+        let e = theme::ease_out(t);
+        let was = b.layout.day(d);
+        if carried && let Some(from) = was {
+            let from = b.start(from, target, view);
+            return Placed { at: from + (target - from) * e, shown: 1.0 };
+        }
+        // Nothing carried over: in place; solid if the same heading was
+        // already there, else fading in like the cards under it.
+        let there = was.is_some_and(|w| (w.y - target.y).abs() < 0.5);
+        Placed { at: target, shown: if there { 1.0 } else { e } }
+    }
+
     /// Where `key` (now at `target`, content coordinates) is drawn, given
     /// the view now (top, bottom, content coordinates). `day`: the day the
-    /// card is under (its heading's key): a card that wasn't shown before
-    /// moves with its day's heading as it fades in, so a day's cards and its
-    /// heading arrive together (switching between games with no clip in
-    /// common, every card is new).
+    /// card is under, when that heading slides ([`Moves::carries`]): a card
+    /// that wasn't shown before moves with its day's heading as it fades in,
+    /// so a day's cards and its heading arrive together. `None`: it fades in
+    /// where it is.
     pub fn place(&self, key: &Key, target: Pos2, now: f64, view: (f32, f32), day: Option<chrono::NaiveDate>) -> Placed {
         let Some(b) = &self.before else { return Placed { at: target, shown: 1.0 } };
         let t = ((now - b.changed) as f32 / SLIDE).clamp(0.0, 1.0);
@@ -489,11 +521,7 @@ impl Moves {
             return Placed { at: target, shown: 1.0 };
         }
         let e = theme::ease_out(t);
-        let from = match key {
-            Key::Day(d) => b.layout.day(*d),
-            k => b.layout.card(k),
-        };
-        if let Some(from) = from {
+        if let Some(from) = b.layout.card(key) {
             let from = b.start(from, target, view);
             return Placed { at: from + (target - from) * e, shown: 1.0 };
         }
@@ -631,12 +659,12 @@ mod tests {
         assert_eq!((p.at, p.shown), (target, 1.0));
     }
 
-    /// Two games with no clip in common: every card is new, and each moves
-    /// with its day's heading (from where the heading was) while it fades
-    /// in, so a day arrives together instead of its heading sliding past
-    /// cards that are already in place.
+    /// Two games with no clip in common: every card is new, so nothing slides:
+    /// the days' headings stay where they are and the cards fade in beside
+    /// them. (A heading that slid past cards already in place, or on its own
+    /// for a day both games have, looked like it moved for no reason.)
     #[test]
-    fn new_cards_move_with_their_day() {
+    fn nothing_slides_when_no_clip_is_carried_over() {
         // Days 1-3: osu! has one clip a day, Dota 2 has ten a day, so in Dota 2
         // day 2's heading is far lower than in osu!.
         let mut clips: Vec<Clip> = (0..30).map(|i| clip(i, "Dota 2")).collect();
@@ -645,26 +673,61 @@ mod tests {
             c.path = PathBuf::from(format!("/lib/osu!/clip_2026-01-{:02}_09-00-00.mp4", d + 1));
             clips.push(c);
         }
-        let (_, osu) = layout_of(&clips, &Filter::Folder("osu!".into()), 900.0);
-        let (_, dota) = layout_of(&clips, &Filter::Folder("Dota 2".into()), 900.0);
+        let (shown, osu) = layout_of(&clips, &Filter::Folder("osu!".into()), 900.0);
+        let (dota_shown, dota) = layout_of(&clips, &Filter::Folder("Dota 2".into()), 900.0);
         let mut m = Moves::default();
         let id = |s| LayoutId { shown: s, metrics: (4, 900) };
         let view = (0.0, 2000.0);
+        let before: Vec<Vec<(Key, GridItem)>> = shown.groups.iter().map(|g| g.items.iter().map(|it| (key_for(it, &clips, &[]), it.clone())).collect()).collect();
         m.update(id(1), 0.0, false, || osu.clone(), |_| unreachable!(), |_| {}, Vec::new);
         m.set_view(view);
-        m.update(id(2), 10.0, false, || dota.clone(), |_| unreachable!(), |_| {}, Vec::new);
+        m.update(id(2), 10.0, false, || dota.clone(), |_| unreachable!(), |_| {}, || before.clone());
         let day = chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
         let (was, is) = (osu.day(day).unwrap(), dota.day(day).unwrap());
-        assert!(is.y - was.y > 100.0, "the heading moves down");
+        assert!(is.y - was.y > 100.0, "the heading is lower in the new view");
+
+        // Nothing of Dota 2's day 2 was shown before.
+        let group = dota_shown.groups.iter().find(|g| g.day == Some(day)).unwrap();
+        let keys = || group.items.iter().map(|it| key_for(it, &clips, &[]));
+        assert!(!m.carries(keys()));
+        // So the heading is already where it goes (not sliding from where the
+        // other game's was), fading in with the cards.
+        let mid = 10.0 + f64::from(SLIDE) / 2.0;
+        let heading = m.place_day(day, is, false, mid, view);
+        assert_eq!(heading.at, is);
+        assert!(heading.shown > 0.0 && heading.shown < 1.0, "fading in, not solid");
+        // The cards too: in place, fading in.
         let card = Key::Clip(clips[15].path.clone());
         let target = dota.card(&card).unwrap();
-        let p = m.place(&card, target, 10.0, view, Some(day));
-        assert_eq!(p.shown, 0.0);
-        assert!((p.at.y - (target.y - (is.y - was.y))).abs() < 0.5, "starts as far up as its heading: {} vs {}", p.at.y, target.y);
-        let heading = m.place(&Key::Day(day), is, 10.0 + f64::from(SLIDE) / 2.0, view, None);
-        let p = m.place(&card, target, 10.0 + f64::from(SLIDE) / 2.0, view, Some(day));
-        assert!(((p.at.y - target.y) - (heading.at.y - is.y)).abs() < 0.5, "travels with it");
-        assert_eq!(m.place(&card, target, 10.0 + f64::from(SLIDE), view, Some(day)).at, target);
+        let p = m.place(&card, target, mid, view, None);
+        assert_eq!(p.at, target);
+        assert!(p.shown > 0.0 && p.shown < 1.0);
+        assert_eq!(m.place(&card, target, 10.0 + f64::from(SLIDE), view, None).shown, 1.0);
+    }
+
+    /// A heading slides only when a clip under it was shown before: it goes
+    /// with its clips. Showing the same day in another view, with the heading
+    /// where it was and no clip in common, it stays solid, and doesn't move.
+    #[test]
+    fn a_heading_slides_with_its_clips_only() {
+        let clips: Vec<Clip> = (0..30).map(|i| clip(i, "osu!")).collect();
+        let (all_shown, all) = layout_of(&clips, &Filter::All, 900.0);
+        let (few_shown, few) = layout_of(&clips[..15], &Filter::All, 900.0);
+        let mut m = Moves::default();
+        let id = |s| LayoutId { shown: s, metrics: (4, 900) };
+        let view = (0.0, 2000.0);
+        let before: Vec<Vec<(Key, GridItem)>> = all_shown.groups.iter().map(|g| g.items.iter().map(|it| (key_for(it, &clips, &[]), it.clone())).collect()).collect();
+        m.update(id(1), 0.0, false, || all.clone(), |_| unreachable!(), |_| {}, Vec::new);
+        m.set_view(view);
+        m.update(id(2), 10.0, false, || few.clone(), |_| unreachable!(), |_| {}, || before.clone());
+        let day = few_shown.groups.iter().find_map(|g| g.day).unwrap();
+        let group = few_shown.groups.iter().find(|g| g.day == Some(day)).unwrap();
+        // Its clips were shown before: it's carried, and slides from where it was.
+        assert!(m.carries(group.items.iter().map(|it| key_for(it, &clips, &[]))));
+        let (was, is) = (all.day(day).unwrap(), few.day(day).unwrap());
+        let start = m.place_day(day, is, true, 10.0, view);
+        assert_eq!(start.at, was);
+        assert_eq!(m.place_day(day, is, true, 10.0 + f64::from(SLIDE), view).at, is);
     }
 
     /// Worked out again only when something changed.
