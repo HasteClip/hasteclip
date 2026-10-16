@@ -479,6 +479,36 @@ mod tests {
         assert!(!safe_name("a/b").contains('/'));
     }
 
+    /// A file exported by the other version (`HASTECLIP_IMPORT_FROM`) comes
+    /// in: edited clips are edited here (their edit folder found, original
+    /// included), markers and collections kept.
+    /// `cargo test --release archive::tests::import_other -- --ignored`.
+    #[test]
+    #[ignore = "needs a file from the other version"]
+    fn import_other() {
+        let _turn = crate::store::LIBRARY_TURN.lock().unwrap_or_else(|e| e.into_inner());
+        let file = PathBuf::from(std::env::var("HASTECLIP_IMPORT_FROM").expect("HASTECLIP_IMPORT_FROM"));
+        let into = temp("other-into");
+        crate::store::set_library(&into);
+        let mut cols = Collections::load(&into);
+        let done = import(&file, &into, &progress()).unwrap();
+        done.collect(&mut cols);
+        let (mut edited, mut with_original) = (0, 0);
+        for (clip, _) in &done.added {
+            if let Some(id) = crate::store::read_id(clip) {
+                edited += 1;
+                if crate::store::find_original(&into, &id).is_some() {
+                    with_original += 1;
+                }
+            }
+        }
+        eprintln!("{} clips in, {} skipped; {edited} edited here, {with_original} with their original; collections: {:?}", done.added.len(), done.skipped, cols.list().iter().map(|c| c.name.clone()).collect::<Vec<_>>());
+        assert!(edited > 0, "no edited clips were recognised as edited");
+        assert_eq!(edited, with_original, "an edited clip lost its original");
+        assert_eq!(cols.list().len(), 1);
+        let _ = std::fs::remove_dir_all(&into);
+    }
+
     /// Either version's extension is a clips file.
     #[test]
     fn both_extensions_import() {
