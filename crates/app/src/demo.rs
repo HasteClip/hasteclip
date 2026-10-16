@@ -441,7 +441,8 @@ impl Demo {
                 let grab = pos2(handle.center().x, handle.top() + 24.0);
                 let Some(tl) = ctx.data(|d| d.get_temp::<Timeline>(markers_id())) else { return };
                 let end = pos2(tl.x_of(tl.time_of(&to) - before), grab.y);
-                let reach = if from.distance(grab) > 1.0 { 0.5 } else { 0.0 };
+                // A long way takes longer, as a hand does.
+                let reach = if from.distance(grab) > 1.0 { (from.distance(grab) as f64 / 1100.0).clamp(0.4, 1.2) } else { 0.0 };
                 if t < reach {
                     self.shown = true;
                     self.pointer = glide(from, grab, t, reach);
@@ -539,7 +540,8 @@ impl Demo {
                     return;
                 };
                 // First glide onto what's grabbed, then hold and pull.
-                let reach = if from.distance(grab) > 1.0 { 0.5 } else { 0.0 };
+                // A long way takes longer, as a hand does.
+                let reach = if from.distance(grab) > 1.0 { (from.distance(grab) as f64 / 1100.0).clamp(0.4, 1.2) } else { 0.0 };
                 if t < reach {
                     self.shown = true;
                     self.pointer = glide(from, grab, t, reach);
@@ -628,6 +630,7 @@ impl Demo {
             let m = d.get_temp_mut_or_default::<Marks>(marks_id());
             m.last = std::mem::take(&mut m.now);
         });
+        draw_window_buttons(ctx);
         if self.shown {
             draw_pointer(ctx, self.pointer, self.down);
         }
@@ -680,6 +683,23 @@ fn capitalised(s: &str) -> String {
     c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
 }
 
+/// The macOS window buttons, drawn: the screenshots are only of what the app
+/// paints, and the real ones belong to the system. Centred over the rail like
+/// `shell::place_window_buttons` does.
+fn draw_window_buttons(ctx: &Context) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Debug, Id::new("demo_window_buttons")));
+    let (d, gap) = (12.0, 8.0);
+    let left = (crate::shell::RAIL_W - (d * 3.0 + gap * 2.0)) / 2.0;
+    for (i, (fill, edge)) in [(0xff5f57, 0xe0443e), (0xfebc2e, 0xdea123), (0x28c840, 0x1aab29)].into_iter().enumerate() {
+        let c = pos2(left + d / 2.0 + i as f32 * (d + gap), 26.0);
+        let rgb = |h: u32| Color32::from_rgb((h >> 16) as u8, (h >> 8) as u8, h as u8);
+        painter.circle(c, d / 2.0 - 0.25, rgb(fill), egui::Stroke::new(0.5, rgb(edge)));
+    }
+}
+
 /// The macOS arrow, drawn: white with a dark edge, pressed in a little while
 /// the button is down.
 fn draw_pointer(ctx: &Context, at: Pos2, down: bool) {
@@ -692,9 +712,10 @@ fn draw_pointer(ctx: &Context, at: Pos2, down: bool) {
         .collect();
     let shadow: Vec<Pos2> = shape.iter().map(|p| *p + vec2(0.0, 1.2)).collect();
     painter.add(egui::Shape::convex_polygon(shadow, Color32::from_black_alpha(70), egui::Stroke::NONE));
-    // Not convex (the tail): drawn as two convex halves under one outline.
-    painter.add(egui::Shape::convex_polygon(vec![shape[0], shape[1], shape[2], shape[5], shape[6]], Color32::WHITE, egui::Stroke::NONE));
-    painter.add(egui::Shape::convex_polygon(vec![shape[2], shape[3], shape[4], shape[5]], Color32::WHITE, egui::Stroke::NONE));
+    // Not convex (the tail): filled as convex pieces under one outline.
+    for piece in [&[0, 1, 2][..], &[0, 2, 5], &[0, 5, 6], &[2, 3, 4, 5]] {
+        painter.add(egui::Shape::convex_polygon(piece.iter().map(|&i| shape[i]).collect(), Color32::WHITE, egui::Stroke::NONE));
+    }
     let mut outline = shape.clone();
     outline.push(shape[0]);
     painter.add(egui::Shape::line(outline, egui::Stroke::new(1.1, Color32::from_gray(20))));
