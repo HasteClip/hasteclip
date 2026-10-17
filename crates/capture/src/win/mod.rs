@@ -216,8 +216,21 @@ impl Session {
         system::com_init();
         system::mf_startup()?;
         let gpu = d3d::Gpu::new()?;
+        eprintln!("capture on {} (graphics cards: {})", gpu.adapter_name(), d3d::adapter_names().join(", "));
         let (picture_source, (canvas_w, canvas_h)) = PictureSource::plan(&s.video)?;
         let (width, height) = crate::output_size(canvas_w, canvas_h, s.target_height);
+        // What's asked of this PC, for the log: a display showing fewer
+        // pictures than the frame rate repeats some (uneven, not skipped).
+        let screen = match &s.video {
+            VideoSource::Screen { id, .. } => Some(id.as_str()),
+            VideoSource::Apps { .. } => None,
+        };
+        eprintln!(
+            "recording {canvas_w}×{canvas_h} as {width}×{height}, {} fps{}, display at {}",
+            s.fps,
+            if s.blend_samples > 1 { format!(" blended from {}", s.fps * s.blend_samples) } else { String::new() },
+            system::display_refresh(screen).map_or("an unknown refresh rate".into(), |hz| format!("{hz} Hz")),
+        );
         let clock = Arc::new(Clock::default());
 
         let (titles, comment, has_rest) = track_layout(&s.sources);
@@ -1054,6 +1067,18 @@ impl FrameBlend {
         self.pending += 1;
     }
 
+    /// No looks in the frame so far (no picture has come up yet).
+    fn is_empty(&self) -> bool {
+        self.count + self.pending == 0
+    }
+
+    /// The frame is skipped: its looks are let go of unmixed, and the next
+    /// starts empty (the picture that's up stays up).
+    fn drop_frame(&mut self) {
+        self.pending = 0;
+        self.count = 0;
+    }
+
     /// Mix the looks at the picture that's up into the average, at once.
     fn flush(&mut self) {
         let steps = std::mem::take(&mut self.pending);
@@ -1068,19 +1093,16 @@ impl FrameBlend {
     }
 
     /// The frame is done: its average is ready for the converter, and the next
-    /// starts empty. How many looks it holds (None: nothing, no picture yet).
-    fn finish(&mut self) -> Option<u32> {
+    /// starts empty. Not for an empty one (see `is_empty`).
+    fn finish(&mut self) {
         self.flush();
-        if self.count == 0 {
-            return None;
-        }
         match &self.light {
             Some((_, view)) => self.quad.from_light(&self.gpu, &self.target, (self.own.width, self.own.height), view),
             // One look: the picture itself.
             None => unsafe { self.gpu.context.CopyResource(&self.average.texture, self.held_keep.as_ref().unwrap_or(&self.own.texture)) },
         }
         self.average.mark_frame(self.held_size);
-        Some(std::mem::take(&mut self.count))
+        self.count = 0;
     }
 }
 
@@ -1093,6 +1115,17 @@ const BLEND_LATE: f64 = 0.012;
 /// pictures' times averages out (a few hundred milliseconds), quick enough to
 /// follow a game that drifts.
 const PHASE_GAIN: f64 = 0.03;
+/// How far behind its frames the pacer may fall (seconds) before it skips
+/// the ones it missed instead of making each. Made in a burst, they'd mostly
+/// be skipped anyway (more than the encoder takes at once) and mostly repeat
+/// one picture (the capture keeps only its last few, `QUEUE_MAX`), and
+/// blending them is more work for a graphics card that's already behind.
+/// Without this, a pacer short of time fell behind for good, and quietly:
+/// measured with each frame made to take 20 ms at 60 fps, it was 1.9 s behind
+/// after 10 s and had skipped none (the file's video falls behind its sound).
+/// A quarter second is 15 frames at 60 fps, about as many as the encoder has
+/// (16).
+const MAX_BEHIND: f64 = 0.25;
 
 struct BlendPacer {
     t0: f64,
@@ -1118,14 +1151,17 @@ struct BlendPacer {
     camera: Option<camera::CameraLayer>,
     dropped: u64,
     stats: BlendStats,
-    diag: Option<EncodeDiag>,
+    diag: EncodeDiag,
 }
 
-/// `HASTECLIP_ENCODE_LOG=1`: where frames wait, logged every 5 s. How late
-/// the pacer closed frames and how long closing took (CPU), how long the GPU
-/// took to finish a frame's work after it was submitted, how long the encoder
-/// held frames, the fewest free encoder frames, and why frames were skipped.
+/// Where frames wait, logged for every 5 s in which frames were skipped
+/// (every 5 s with `HASTECLIP_ENCODE_LOG=1`), so a log from a PC that can't
+/// keep up says what it's short of: how late the pacer closed frames and how
+/// long closing took (CPU), how long the GPU took to finish a frame's work
+/// after it was submitted, how long the encoder held frames, the fewest free
+/// encoder frames, and why frames were skipped.
 struct EncodeDiag {
+    verbose: bool,
     since: Instant,
     frames: u32,
     late_max: f64,
@@ -1137,11 +1173,13 @@ struct EncodeDiag {
     free_min: usize,
     pool_empty: u32,
     queue_full: u32,
+    caught_up: u32,
 }
 
 impl EncodeDiag {
-    fn new() -> Option<Self> {
-        std::env::var_os("HASTECLIP_ENCODE_LOG").map(|_| Self {
+    fn new() -> Self {
+        Self {
+            verbose: std::env::var_os("HASTECLIP_ENCODE_LOG").is_some(),
             since: Instant::now(),
             frames: 0,
             late_max: 0.0,
@@ -1152,7 +1190,8 @@ impl EncodeDiag {
             free_min: usize::MAX,
             pool_empty: 0,
             queue_full: 0,
-        })
+            caught_up: 0,
+        }
     }
 
     fn frame(&mut self, gpu: &d3d::Gpu, late: f64, close: Duration) {
@@ -1188,26 +1227,29 @@ impl EncodeDiag {
         let held_max = h264::HELD_MAX_US.swap(0, Relaxed) as f64 / 1000.0;
         let held_n = h264::HELD_N.swap(0, Relaxed).max(1);
         let held_avg = h264::HELD_SUM_US.swap(0, Relaxed) as f64 / 1000.0 / held_n as f64;
-        self.gpu_ms.sort_by(f64::total_cmp);
-        let pct = |p: f64| self.gpu_ms.get(((self.gpu_ms.len() as f64 - 1.0) * p).round() as usize).copied().unwrap_or(f64::NAN);
-        eprintln!(
-            "encode: {} frames; closed up to {:.1} ms late, closing took up to {:.1} ms; GPU done after {:.1}/{:.1}/{:.1} ms (median/99%/max), {} unfinished; encoder held frames {:.1} ms avg, {:.1} max; fewest free frames {}; skipped {} (no free frame) + {} (queue full)",
-            self.frames,
-            self.late_max * 1000.0,
-            self.close_max.as_secs_f64() * 1000.0,
-            pct(0.5),
-            pct(0.99),
-            pct(1.0),
-            self.pending.len(),
-            held_avg,
-            held_max,
-            self.free_min,
-            self.pool_empty,
-            self.queue_full,
-        );
+        if self.verbose || self.pool_empty + self.queue_full + self.caught_up > 0 {
+            self.gpu_ms.sort_by(f64::total_cmp);
+            let pct = |p: f64| self.gpu_ms.get(((self.gpu_ms.len() as f64 - 1.0) * p).round() as usize).copied().unwrap_or(f64::NAN);
+            eprintln!(
+                "encode: {} frames; closed up to {:.1} ms late, closing took up to {:.1} ms; GPU done after {:.1}/{:.1}/{:.1} ms (median/99%/max), {} unfinished; encoder held frames {:.1} ms avg, {:.1} max; fewest free frames {}; skipped {} (no free frame) + {} (queue full) + {} (caught up)",
+                self.frames,
+                self.late_max * 1000.0,
+                self.close_max.as_secs_f64() * 1000.0,
+                pct(0.5),
+                pct(0.99),
+                pct(1.0),
+                self.pending.len(),
+                held_avg,
+                held_max,
+                self.free_min,
+                self.pool_empty,
+                self.queue_full,
+                self.caught_up,
+            );
+        }
         let pending = std::mem::take(&mut self.pending);
         let spare = std::mem::take(&mut self.spare);
-        *self = Self::new().unwrap();
+        *self = Self::new();
         self.pending = pending;
         self.spare = spare;
     }
@@ -1222,6 +1264,29 @@ impl BlendPacer {
     fn frame_end(&self) -> f64 {
         let last = (self.next.div_euclid(self.looks) + 1) * self.looks - 1;
         self.look_time(last)
+    }
+
+    /// Fallen more than `MAX_BEHIND` behind `t` (what looks are taken up
+    /// to): the frames whose time is past are skipped at once, the one being
+    /// made with them, and it goes on with the frame `t` is in.
+    fn catch_up(&mut self, t: f64) {
+        let behind = t - self.frame_end();
+        if behind < MAX_BEHIND {
+            return;
+        }
+        // The first look not due yet, and its frame.
+        let due = ((t - self.t0 - self.phase) / self.step - 0.5).ceil() as i64;
+        let frame = due.div_euclid(self.looks);
+        let missed = frame - self.next.div_euclid(self.looks);
+        self.next = frame * self.looks;
+        self.different = 0;
+        self.blend.drop_frame();
+        // Before the first picture, no frames would have been made.
+        if self.held.is_some() {
+            skipped(&mut self.dropped, missed as u64);
+            self.stats.caught_up(missed as u32, behind);
+            self.diag.caught_up += missed as u32;
+        }
     }
 
     /// Take every look before `t`: each sees the picture that's up.
@@ -1252,46 +1317,44 @@ impl BlendPacer {
         let started = Instant::now();
         let late = host_now() - self.look_time((k + 1) * self.looks - 1);
         let different = std::mem::take(&mut self.different);
-        if self.blend.finish().is_none() {
+        if self.blend.is_empty() {
             return;
         }
         self.stats.frame(different, self.looks as u32);
         if let Some(c) = self.camera.as_mut() {
             c.pull();
         }
-        if let Some(d) = self.diag.as_mut() {
-            d.free_min = d.free_min.min(self.encoder.pool.free_count());
-        }
+        self.diag.free_min = self.diag.free_min.min(self.encoder.pool.free_count());
         match self.encoder.pool.take() {
-            Some(slot) => match self.converter.convert(slot) {
-                Ok(()) => {
-                    if self.encoder.encode(slot, k) {
-                        encoded();
-                    } else {
-                        skipped(&mut self.dropped);
-                        if let Some(d) = self.diag.as_mut() {
-                            d.queue_full += 1;
+            Some(slot) => {
+                self.blend.finish();
+                match self.converter.convert(slot) {
+                    Ok(()) => {
+                        if self.encoder.encode(slot, k) {
+                            encoded();
+                        } else {
+                            skipped(&mut self.dropped, 1);
+                            self.diag.queue_full += 1;
                         }
                     }
+                    Err(e) => {
+                        self.encoder.pool.give(slot);
+                        eprintln!("{e:#}");
+                    }
                 }
-                Err(e) => {
-                    self.encoder.pool.give(slot);
-                    eprintln!("{e:#}");
-                }
-            },
+            }
+            // No frame free for the encoder: skipped, and not blended (work
+            // a graphics card that's behind can't spare).
             None => {
-                skipped(&mut self.dropped);
-                if let Some(d) = self.diag.as_mut() {
-                    d.pool_empty += 1;
-                }
+                self.blend.drop_frame();
+                skipped(&mut self.dropped, 1);
+                self.diag.pool_empty += 1;
             }
         }
         if let Err(e) = self.preview.submit() {
             eprintln!("preview: {e:#}");
         }
-        if let Some(d) = self.diag.as_mut() {
-            d.frame(&self.blend.gpu, late, started.elapsed());
-        }
+        self.diag.frame(&self.blend.gpu, late, started.elapsed());
     }
 
     /// A new picture came up at `at`: the looks before it saw the one before.
@@ -1324,8 +1387,9 @@ impl BlendPacer {
 
 /// What the blending saw, printed every few seconds (to the log): how many
 /// pictures the game showed, how many different ones each frame got (all its
-/// looks, when the game runs at least at the blend rate), and how many came
-/// too late for their frame.
+/// looks, when the game runs at least at the blend rate), how many came
+/// too late for their frame, and the frames skipped to catch up (and how
+/// far behind it was at most).
 struct BlendStats {
     since: Instant,
     pictures: u32,
@@ -1334,11 +1398,18 @@ struct BlendStats {
     fewest: u32,
     most: u32,
     late: u32,
+    caught_up: u32,
+    behind: f64,
 }
 
 impl BlendStats {
     fn new() -> Self {
-        Self { since: Instant::now(), pictures: 0, frames: 0, full: 0, fewest: u32::MAX, most: 0, late: 0 }
+        Self { since: Instant::now(), pictures: 0, frames: 0, full: 0, fewest: u32::MAX, most: 0, late: 0, caught_up: 0, behind: 0.0 }
+    }
+
+    fn caught_up(&mut self, frames: u32, behind: f64) {
+        self.caught_up += frames;
+        self.behind = self.behind.max(behind);
     }
 
     fn frame(&mut self, different: u32, looks: u32) {
@@ -1348,14 +1419,18 @@ impl BlendStats {
         self.most = self.most.max(different);
         if self.since.elapsed() >= Duration::from_secs(5) {
             eprintln!(
-                "{}: the game showed {:.0} pictures/s; {looks} looks per frame, {}-{} different pictures in each, {:.0}% of frames with {looks}; {} pictures too late, over {} frames",
+                "{}: the game showed {:.0} pictures/s; {looks} looks per frame, {}-{} different pictures in each, {:.0}% of frames with {looks}; {} pictures too late, over {} frames{}",
                 if looks == 1 { "frame timing" } else { "frame blending" },
                 self.pictures as f64 / self.since.elapsed().as_secs_f64(),
                 self.fewest,
                 self.most,
                 self.full as f64 * 100.0 / self.frames as f64,
                 self.late,
-                self.frames
+                self.frames,
+                match self.caught_up {
+                    0 => String::new(),
+                    n => format!("; fell up to {:.2} s behind, skipped {n} frames to catch up", self.behind),
+                }
             );
             *self = Self::new();
         }
@@ -1406,6 +1481,7 @@ fn spawn_blend_pacer(
         }
         let mut others = latest.others();
         while !stop2.load(Ordering::Relaxed) {
+            p.catch_up(host_now() - BLEND_LATE);
             let (seen, _) = latest.arrivals();
             let wait = p.frame_end() + BLEND_LATE - host_now();
             if wait > 0.0 && latest.queue_len() == 0 {
@@ -1433,13 +1509,15 @@ fn encoded() {
     crate::FRAMES_ENCODED.fetch_add(1, Ordering::Relaxed);
 }
 
-/// The encoder can't keep up (no free frame for it, or its queue is full):
-/// this frame is skipped, and the file shows the one before a little longer.
-/// Counted for the UI, and logged now and then.
-fn skipped(dropped: &mut u64) {
-    *dropped += 1;
-    crate::FRAMES_SKIPPED.fetch_add(1, Ordering::Relaxed);
-    if dropped.is_power_of_two() {
-        eprintln!("video encoder is behind: {dropped} frames skipped");
+/// The encoder can't keep up (no free frame for it, or its queue is full),
+/// or the pacer fell far behind: `n` frames are skipped, and the file shows
+/// the one before them longer. Counted for the UI, and logged each time the
+/// total passes a power of two.
+fn skipped(dropped: &mut u64, n: u64) {
+    let before = *dropped;
+    *dropped += n;
+    crate::FRAMES_SKIPPED.fetch_add(n, Ordering::Relaxed);
+    if n > 0 && (before == 0 || dropped.ilog2() > before.ilog2()) {
+        eprintln!("video is behind: {dropped} frames skipped");
     }
 }

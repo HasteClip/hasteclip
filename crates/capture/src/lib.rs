@@ -518,8 +518,9 @@ pub fn frames_encoded() -> u64 {
 }
 
 /// How many frames the running capture has left out because the video
-/// encoder couldn't keep up (the file shows the previous one longer). Starts
-/// from 0 with each capture; only counted on Windows so far.
+/// encoder, or the graphics card making the frames, couldn't keep up (the
+/// file shows the previous one longer). Starts from 0 with each capture; only
+/// counted on Windows so far.
 pub fn frames_skipped() -> u64 {
     FRAMES_SKIPPED.load(std::sync::atomic::Ordering::Relaxed)
 }
