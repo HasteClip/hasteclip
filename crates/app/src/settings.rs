@@ -690,7 +690,7 @@ pub struct SaveSound {
 
 impl Default for SaveSound {
     fn default() -> Self {
-        Self { enabled: true, sound: "horse".into(), volume: 0.6, custom: Vec::new(), recorded: true }
+        Self { enabled: true, sound: "horse".into(), volume: 0.5, custom: Vec::new(), recorded: true }
     }
 }
 
@@ -823,6 +823,7 @@ impl RecordSettings {
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
         s.upgrade_capture();
+        s.upgrade_save_sound();
         if let Some(old) = s.audio_tracks.take() {
             s.audio_sources = migrate(&old);
             // Persist now: sources get fresh ids, and their volumes key on them.
@@ -838,6 +839,15 @@ impl RecordSettings {
                 apps: vec![CaptureApp { id: id.clone(), name: name.clone() }],
                 away_screen: true,
             };
+        }
+    }
+
+    /// A built-in sound that's gone (Silverfish) becomes the default, so the
+    /// picker names what plays.
+    fn upgrade_save_sound(&mut self) {
+        let s = &self.save_sound.sound;
+        if !s.starts_with("file:") && !crate::sound::BUILTIN.iter().any(|(id, _)| id == s) {
+            self.save_sound.sound = SaveSound::default().sound;
         }
     }
 
