@@ -1340,20 +1340,26 @@ impl App {
 impl App {
     /// Count skipped frames over the last few seconds, for the warning.
     fn track_skips(&mut self) {
+        // Not capturing: no warning. The counts still hold the last capture's
+        // totals (until the next starts); taken as new, they showed after
+        // stopping, as all of the last few seconds' frames.
+        if self.rec_state == RecState::Idle {
+            self.skipped_seen = (0, None);
+            self.skip_counts.clear();
+            return;
+        }
         let (skipped, encoded) = (capture::frames_skipped(), capture::frames_encoded());
-        if skipped < self.skipped_seen.0 || self.rec_state == RecState::Idle {
+        if skipped < self.skipped_seen.0 {
             self.skipped_seen = (0, None);
             self.skip_counts.clear();
         }
         if skipped > self.skipped_seen.0 {
             self.skipped_seen = (skipped, Some(Instant::now()));
         }
-        if self.rec_state != RecState::Idle {
-            let now = Instant::now();
-            self.skip_counts.push_back((now, skipped, encoded));
-            while self.skip_counts.len() > 1 && self.skip_counts.front().is_some_and(|(t, ..)| now - *t > SKIP_WINDOW) {
-                self.skip_counts.pop_front();
-            }
+        let now = Instant::now();
+        self.skip_counts.push_back((now, skipped, encoded));
+        while self.skip_counts.len() > 1 && self.skip_counts.front().is_some_and(|(t, ..)| now - *t > SKIP_WINDOW) {
+            self.skip_counts.pop_front();
         }
     }
 
