@@ -964,20 +964,31 @@ fn render_video(source: &Path, info: &ClipInfo, edit: &Edit, plan: &Plan, work: 
         let rate = edit.output.frame_rate(info);
         match output.blend_fps {
             // Frames at the blend rate, each output frame the average of the
-            // ones ending at its time.
+            // ones in its slot. Only the kept averages are made: each of
+            // `looks` branches takes every `looks`th frame and `mix` averages
+            // the branches' next ones (`tmix` then `fps` averaged at every
+            // frame and kept one in `looks`: 480 to 60 fps took 2.4x as long).
             // Mixed as light (what a screen gives off), not as pixel values,
             // which are gamma-encoded: a fifth of a bright ghost's value is
             // about 3% of its light, not 20%. Recordings are BT.709, limited.
+            // 16 bits keep the faintest ghosts (72 dB from float) with half
+            // the memory to move.
             Some(b) => {
                 let light = has_filter("zscale");
                 if light {
                     filters.push("setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709".to_owned());
-                    filters.push("zscale=tin=iec61966-2-1:t=linear,format=gbrpf32le".to_owned());
+                    filters.push("zscale=tin=iec61966-2-1:t=linear,format=gbrp16le".to_owned());
                 }
                 if (b as f64) < info.fps - 0.5 {
                     filters.push(format!("fps={b}"));
                 }
-                filters.push(format!("tmix=frames={}", (b as f64 / rate).round() as u32));
+                let looks = (b as f64 / rate).round() as u32;
+                let mut graph = format!("split={looks}{}", (0..looks).map(|i| format!("[b{i}]")).collect::<String>());
+                for i in 0..looks {
+                    graph += &format!(";[b{i}]trim=start_frame={i},framestep={looks},setpts=N/{rate}/TB[g{i}]");
+                }
+                graph += &format!(";{}mix=inputs={looks}", (0..looks).map(|i| format!("[g{i}]")).collect::<String>());
+                filters.push(graph);
                 filters.push(format!("fps={rate}"));
                 if light {
                     filters.push("zscale=tin=linear:t=iec61966-2-1,format=gbrp".to_owned());
