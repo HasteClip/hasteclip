@@ -314,7 +314,7 @@ impl App {
             }
             if f.shows(&["name clips after what happened", "game events", "osu", "names", "titles", "tosu"]) {
                 let note = if self.settings.game_details { format!("Like “{example}”") } else { "Clips are named by the time they were saved".to_owned() };
-                l.row(Row::new("Name clips after what happened").tip("Name clips after what happened", "Clips get names like “3 kills on Mirage” or “412pp · 98.52% FC · FREEDOM DiVE”. Clips where nothing happened keep their time.").note(note), |ui| {
+                l.row(Row::new("Name clips after what happened").tip("Name clips after what happened", "Clips get names like “3 kills on Mirage” or “412pp 98.52% FC FREEDOM DiVE”. Clips where nothing happened keep their time.").note(note), |ui| {
                     ui_kit::switch(ui, &mut self.settings.game_details);
                     let shown = theme::toggle(ui.ctx(), egui::Id::new("names_customize"), self.settings.game_details, theme::NORMAL);
                     if shown > 0.0 {
