@@ -683,6 +683,8 @@ pub(crate) struct Converter {
     gpu: Gpu,
     width: u32,
     height: u32,
+    /// How the picture goes into the frame (see `crate::placement`).
+    framing: crate::Framing,
     video: ID3D11VideoContext,
     base: Layer,
     overlay: Option<(Layer, crate::webcam::SharedPlacement)>,
@@ -785,6 +787,7 @@ impl Layer {
 
 impl Converter {
     /// `overlay`: the webcam's picture and where it goes, drawn over `source`.
+    /// `framing`: how `source` goes into the `width`×`height` frame.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         gpu: &Gpu,
@@ -795,6 +798,7 @@ impl Converter {
         width: u32,
         height: u32,
         fps: u32,
+        framing: crate::Framing,
     ) -> Result<Self> {
         let video: ID3D11VideoContext = gpu.context.cast()?;
         let base = Layer::new(gpu, &video, source, targets, yuv, width, height, fps)?;
@@ -802,15 +806,15 @@ impl Converter {
             Some((cam, placement)) => Some((Layer::new(gpu, &video, cam, targets, yuv, width, height, fps)?, placement)),
             None => None,
         };
-        Ok(Self { gpu: gpu.clone(), width, height, video, base, overlay })
+        Ok(Self { gpu: gpu.clone(), width, height, framing, video, base, overlay })
     }
 
     /// Convert the latest captured image (and the webcam over it) into target `slot`.
     pub(crate) fn convert(&self, slot: usize) -> Result<()> {
         let (cw, ch) = self.base.source.content();
-        let source = RECT { left: 0, top: 0, right: cw as i32, bottom: ch as i32 };
-        let (x, y, w, h) = fit(cw, ch, self.width, self.height);
-        let dest = RECT { left: x as i32, top: y as i32, right: (x + w) as i32, bottom: (y + h) as i32 };
+        let rect = |[x, y, w, h]: [u32; 4]| RECT { left: x as i32, top: y as i32, right: (x + w) as i32, bottom: (y + h) as i32 };
+        let (source, dest) = crate::placement((cw, ch), (self.width, self.height), self.framing);
+        let (source, dest) = (rect(source), rect(dest));
         let full = RECT { left: 0, top: 0, right: self.width as i32, bottom: self.height as i32 };
         let result = self.base.draw(&self.video, slot, source, dest, full, (false, false)).context("couldn't convert a screen frame");
         if result.is_ok() {
@@ -891,6 +895,7 @@ impl Previewer {
         recorded_width: u32,
         recorded_height: u32,
         fps: u32,
+        framing: crate::Framing,
         generation: u64,
     ) -> Result<Self> {
         let recorded = (recorded_width, recorded_height);
@@ -902,7 +907,7 @@ impl Previewer {
             let staging = (0..Self::SLOTS)
                 .map(|_| gpu.texture(width, height, format, 0, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ.0 as u32))
                 .collect::<Result<Vec<_>>>()?;
-            let converter = Converter::new(gpu, latest, overlay.clone(), std::slice::from_ref(&target), false, width, height, fps)?;
+            let converter = Converter::new(gpu, latest, overlay.clone(), std::slice::from_ref(&target), false, width, height, fps, framing)?;
             Ok((target, staging, converter))
         };
         let (rgba, (target, staging, converter)) = match make(DXGI_FORMAT_R8G8B8A8_UNORM) {
@@ -1007,36 +1012,6 @@ fn preview_size(width: u32, height: u32) -> (u32, u32) {
 }
 
 const PREVIEW_MAX_WIDTH: u32 = 1280;
-
-/// The largest rectangle with `w`×`h`'s shape that fits in `into_w`×`into_h`,
-/// centered: (x, y, width, height). Even values, as NV12 needs.
-fn fit(w: u32, h: u32, into_w: u32, into_h: u32) -> (u32, u32, u32, u32) {
-    if w == 0 || h == 0 {
-        return (0, 0, into_w, into_h);
-    }
-    let (fw, fh) = if w as u64 * into_h as u64 > h as u64 * into_w as u64 {
-        (into_w, (h as u64 * into_w as u64 / w as u64) as u32)
-    } else {
-        ((w as u64 * into_h as u64 / h as u64) as u32, into_h)
-    };
-    let (fw, fh) = (fw & !1, fh & !1);
-    (((into_w - fw) / 2) & !1, ((into_h - fh) / 2) & !1, fw, fh)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::fit;
-
-    #[test]
-    fn fit_letterboxes_and_pillarboxes() {
-        assert_eq!(fit(2560, 1440, 1920, 1080), (0, 0, 1920, 1080));
-        // A 4:3 window in a 16:9 frame: bars left and right.
-        assert_eq!(fit(1600, 1200, 1920, 1080), (240, 0, 1440, 1080));
-        // An ultrawide window: bars top and bottom.
-        assert_eq!(fit(3440, 1440, 1920, 1080), (0, 138, 1920, 802));
-        assert_eq!(fit(0, 0, 1920, 1080), (0, 0, 1920, 1080));
-    }
-}
 
 #[cfg(test)]
 mod overlay_tests {

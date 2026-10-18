@@ -1,4 +1,4 @@
-//! Picture work on the CPU: fitting the screen into the recording's frame,
+//! Picture work on the CPU: putting the screen into the recording's frame,
 //! drawing the webcam over it, and converting to NV12 for the encoder (and to
 //! RGBA for the preview).
 //!
@@ -15,18 +15,37 @@ pub(crate) struct Canvas {
     pub width: u32,
     pub height: u32,
     pub bgra: Vec<u8>,
+    /// A picture fitted inside the canvas, scaled before it's put in its place.
+    part: Vec<u8>,
 }
 
 impl Canvas {
     pub(crate) fn new(width: u32, height: u32) -> Self {
-        Self { width, height, bgra: vec![0; width as usize * height as usize * 4] }
+        Self { width, height, bgra: vec![0; width as usize * height as usize * 4], part: Vec::new() }
     }
 
-    /// Fill with a still picture (the same layout), scaled to fit.
-    pub(crate) fn fill_from(&mut self, src: &Frame) {
-        let size = (src.width as usize, src.height as usize);
-        let to = (self.width as usize, self.height as usize);
-        resample(&src.data, size, src.stride, src.order == Order::Rgb, &mut self.bgra, to);
+    /// Fill with a picture, put in as `framing` says (see `crate::placement`):
+    /// its middle filling the canvas, all of it with black bars, or all of
+    /// it stretched.
+    pub(crate) fn fill_from(&mut self, src: &Frame, framing: crate::Framing) {
+        let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = crate::placement((src.width, src.height), (self.width, self.height), framing);
+        let data = &src.data[sy as usize * src.stride + sx as usize * 4..];
+        let (size, to) = ((sw as usize, sh as usize), (dw as usize, dh as usize));
+        let swap = src.order == Order::Rgb;
+        if (dw, dh) == (self.width, self.height) {
+            resample(data, size, src.stride, swap, &mut self.bgra, to);
+            return;
+        }
+        // Smaller than the canvas: scaled on its own, then put in the middle
+        // of black.
+        self.part.resize(dw as usize * dh as usize * 4, 0);
+        resample(data, size, src.stride, swap, &mut self.part, to);
+        self.clear();
+        let row = dw as usize * 4;
+        for (y, line) in self.part.chunks_exact(row).enumerate() {
+            let at = ((dy as usize + y) * self.width as usize + dx as usize) * 4;
+            self.bgra[at..at + row].copy_from_slice(line);
+        }
     }
 
     /// Fill with black.
@@ -341,9 +360,9 @@ mod tests {
     fn flat_colours_survive_scaling() {
         for (sw, sh, dw, dh) in [(64, 36, 64, 36), (64, 36, 32, 18), (96, 54, 64, 36), (40, 30, 64, 48)] {
             let mut c = Canvas::new(dw, dh);
-            c.fill_from(&frame(sw, sh, [10, 120, 250, 0], Order::Bgr));
+            c.fill_from(&frame(sw, sh, [10, 120, 250, 0], Order::Bgr), crate::Framing::Fit);
             assert!(c.bgra.chunks_exact(4).all(|p| p == [10, 120, 250, 255]), "{sw}x{sh} -> {dw}x{dh}");
-            c.fill_from(&frame(sw, sh, [250, 120, 10, 0], Order::Rgb));
+            c.fill_from(&frame(sw, sh, [250, 120, 10, 0], Order::Rgb), crate::Framing::Fit);
             assert!(c.bgra.chunks_exact(4).all(|p| p == [10, 120, 250, 255]), "rgb {sw}x{sh} -> {dw}x{dh}");
         }
     }
@@ -358,8 +377,34 @@ mod tests {
             }
         }
         let mut c = Canvas::new(2, 1);
-        c.fill_from(&f);
+        c.fill_from(&f, crate::Framing::Stretch);
         assert!(c.bgra.chunks_exact(4).all(|p| (127..=128).contains(&p[0])), "{:?}", c.bgra);
+    }
+
+    /// A wide picture into a square: its middle (Fill), all of it squeezed
+    /// (Stretch), or all of it between black bars (Fit).
+    #[test]
+    fn framings() {
+        // Three columns, red, green and blue (B, G, R), each 4 wide.
+        let mut f = frame(12, 4, [0, 0, 0, 0], Order::Bgr);
+        for y in 0..4 {
+            for x in 0..12 {
+                let px = [[0, 0, 255], [0, 255, 0], [255, 0, 0]][x / 4];
+                f.data[(y * 12 + x) * 4..(y * 12 + x) * 4 + 3].copy_from_slice(&px);
+            }
+        }
+        let px = |c: &Canvas, x: u32, y: u32| {
+            let at = ((y * c.width + x) * 4) as usize;
+            c.bgra[at..at + 3].to_vec()
+        };
+        let mut c = Canvas::new(4, 4);
+        c.fill_from(&f, crate::Framing::Fill);
+        assert!((0..4).all(|x| px(&c, x, 0) == [0, 255, 0]), "the green middle: {:?}", c.bgra);
+        c.fill_from(&f, crate::Framing::Stretch);
+        assert_eq!((px(&c, 0, 2), px(&c, 3, 2)), (vec![0, 0, 255], vec![255, 0, 0]));
+        let mut c = Canvas::new(12, 12);
+        c.fill_from(&f, crate::Framing::Fit);
+        assert_eq!((px(&c, 0, 0), px(&c, 0, 6), px(&c, 11, 6)), (vec![0, 0, 0], vec![0, 0, 255], vec![255, 0, 0]));
     }
 
     #[test]

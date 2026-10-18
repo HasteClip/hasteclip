@@ -382,6 +382,30 @@ impl From<BlendShape> for capture::BlendShape {
     }
 }
 
+/// How the screen goes into a recording of another shape (see
+/// `capture::Framing`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Framing {
+    /// Its middle, the edges past the shape cut off.
+    #[default]
+    Fill,
+    /// All of it, with black bars.
+    Fit,
+    /// All of it, stretched or squeezed.
+    Stretch,
+}
+
+impl From<Framing> for capture::Framing {
+    fn from(f: Framing) -> Self {
+        match f {
+            Framing::Fill => Self::Fill,
+            Framing::Fit => Self::Fit,
+            Framing::Stretch => Self::Stretch,
+        }
+    }
+}
+
 /// How much of a microphone's background noise is taken out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -598,6 +622,11 @@ pub struct RecordSettings {
     /// How the looks in a blended frame are weighed.
     pub blend_shape: BlendShape,
     pub resolution: OutputResolution,
+    /// The shape recordings are made in, width to height, when it isn't the
+    /// screen's (16:9 out of an ultrawide screen).
+    pub shape: Option<[u32; 2]>,
+    /// How the screen goes into that shape.
+    pub framing: Framing,
     pub video_bitrate_mbps: u32,
 
     pub replay_seconds: u32,
@@ -686,6 +715,8 @@ impl Default for RecordSettings {
             blend_fps: 0,
             blend_shape: BlendShape::Even,
             resolution: OutputResolution::Native,
+            shape: None,
+            framing: Framing::Fill,
             video_bitrate_mbps: 40,
 
             replay_seconds: 60,
@@ -819,6 +850,11 @@ pub const MAX_BLEND: u32 = 2000;
 impl RecordSettings {
     /// Looks at the screen per recorded frame: the blend rate over the frame
     /// rate, 1 (no blending) when off or no longer a multiple above it.
+    /// The shape recordings are made in, if it isn't the screen's.
+    pub fn capture_shape(&self) -> Option<capture::Shape> {
+        self.shape.filter(|[w, h]| *w > 0 && *h > 0).map(|[w, h]| capture::Shape { w, h, framing: self.framing.into() })
+    }
+
     pub fn blend_samples(&self) -> u32 {
         if self.blend_fps == 0 { 1 } else { (self.blend_fps as f64 / self.fps.max(1) as f64).round().max(1.0) as u32 }
     }
@@ -923,6 +959,21 @@ impl RecordSettings {
             }
             let _ = std::fs::write(path, json);
         }
+    }
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use super::*;
+
+    /// No shape unless chosen; chosen, it's saved and goes to the capture.
+    #[test]
+    fn shape_is_saved_and_given_to_the_capture() {
+        let s = RecordSettings::default();
+        assert_eq!(s.capture_shape(), None);
+        let s: RecordSettings = serde_json::from_str(r#"{"shape":[16,9],"framing":"fit"}"#).unwrap();
+        assert_eq!(s.capture_shape(), Some(capture::Shape { w: 16, h: 9, framing: capture::Framing::Fit }));
+        assert!(s.to_json().contains(r#""framing": "fit""#));
     }
 }
 

@@ -309,7 +309,8 @@ impl Session {
     fn start(s: &EncodeSettings, target: Target, live: &Arc<LiveAudio>, mov: bool) -> Result<Self> {
         let screen = open_screen(&s.video)?;
         let (canvas_w, canvas_h) = screen.latest.get().map_or((1920, 1080), |(f, _)| (f.width, f.height));
-        let (width, height) = crate::output_size(canvas_w, canvas_h, s.target_height);
+        let (width, height) = crate::recorded_size(canvas_w, canvas_h, s.target_height, s.shape);
+        let framing = s.shape.map_or(crate::Framing::Fit, |shape| shape.framing);
         let clock = Arc::new(Clock::default());
 
         let (titles, comment, has_rest) = track_layout(&s.sources);
@@ -352,7 +353,7 @@ impl Session {
             session.mixer = Some((stop, mixer));
 
             let encoder = ffmpeg::H264::start(width, height, s, session.writer_tx.clone())?;
-            let picture = Picture::new(screen.latest.clone(), width, height, s.webcam.as_ref());
+            let picture = Picture::new(screen.latest.clone(), width, height, framing, s.webcam.as_ref());
             session.pacer = Some(spawn_pacer(s.fps, picture, encoder, clock));
             Ok(())
         })();
@@ -390,11 +391,12 @@ impl Session {
     }
 }
 
-/// Makes the frame: the screen fitted to the output size, the webcam on top.
-/// Redraws only when one of them changed.
+/// Makes the frame: the screen put into the output size (`framing`), the
+/// webcam on top. Redraws only when one of them changed.
 struct Picture {
     latest: Arc<screen::Latest>,
     canvas: Canvas,
+    framing: crate::Framing,
     camera: Option<(camera::CameraLayer, SharedPlacement)>,
     /// What the canvas shows: the screen picture's number, the camera picture
     /// and where it was placed.
@@ -406,11 +408,11 @@ struct Picture {
 }
 
 impl Picture {
-    fn new(latest: Arc<screen::Latest>, width: u32, height: u32, webcam: Option<&crate::webcam::Webcam>) -> Self {
+    fn new(latest: Arc<screen::Latest>, width: u32, height: u32, framing: crate::Framing, webcam: Option<&crate::webcam::Webcam>) -> Self {
         let camera = webcam.map(|w| (camera::CameraLayer::new(w), w.placement.clone()));
         let mut canvas = Canvas::new(width, height);
         canvas.clear();
-        Self { latest, canvas, camera, shows: None, nv12: Vec::new(), version: 0 }
+        Self { latest, canvas, framing, camera, shows: None, nv12: Vec::new(), version: 0 }
     }
 
     /// Bring the canvas up to date. Returns whether there's a picture yet.
@@ -427,7 +429,7 @@ impl Picture {
         };
         let now = (seq, cam.as_ref().map(|c| Arc::as_ptr(c) as usize), place);
         if self.shows.as_ref() != Some(&now) {
-            self.canvas.fill_from(&frame);
+            self.canvas.fill_from(&frame, self.framing);
             if let (Some(cam), Some(place)) = (&cam, &place) {
                 self.canvas.draw_camera(cam, place);
             }
@@ -555,7 +557,7 @@ pub(crate) struct PreviewCapture {
 }
 
 impl PreviewCapture {
-    pub(crate) fn start(source: VideoSource, target_height: Option<u32>, fps: u32, webcam: Option<crate::webcam::Webcam>) -> Self {
+    pub(crate) fn start(source: VideoSource, target_height: Option<u32>, shape: Option<crate::Shape>, fps: u32, webcam: Option<crate::webcam::Webcam>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let error = Arc::new(Mutex::new(None));
         let (stop2, error2) = (stop.clone(), error.clone());
@@ -569,8 +571,9 @@ impl PreviewCapture {
                 }
             };
             let (w, h) = screen.latest.get().map_or((1920, 1080), |(f, _)| (f.width, f.height));
-            let (width, height) = crate::output_size(w, h, target_height);
-            let mut picture = Picture::new(screen.latest.clone(), width, height, webcam.as_ref());
+            let (width, height) = crate::recorded_size(w, h, target_height, shape);
+            let framing = shape.map_or(crate::Framing::Fit, |shape| shape.framing);
+            let mut picture = Picture::new(screen.latest.clone(), width, height, framing, webcam.as_ref());
             let mut sent = Previewed::new(generation);
             // Paced like the recording would be.
             let every = 1.0 / fps.max(1) as f64;

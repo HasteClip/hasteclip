@@ -138,32 +138,33 @@ pub struct VideoPreview {
 }
 
 impl VideoPreview {
-    /// `target_height`, `fps`, `away_screen` and `webcam` as in
+    /// `target_height`, `shape`, `fps`, `away_screen` and `webcam` as in
     /// [`crate::EncodeSettings`].
     pub fn start(
         source: &VideoSource,
         target_height: Option<u32>,
+        shape: Option<crate::Shape>,
         fps: u32,
         away_screen: Option<std::sync::Arc<crate::StillImage>>,
         webcam: Option<crate::webcam::Webcam>,
     ) -> Self {
         #[cfg(target_os = "windows")]
         {
-            Self { inner: crate::win::PreviewCapture::start(source.clone(), target_height, fps, away_screen, webcam) }
+            Self { inner: crate::win::PreviewCapture::start(source.clone(), target_height, shape, fps, away_screen, webcam) }
         }
         #[cfg(target_os = "macos")]
         {
-            Self { inner: crate::mac::preview::PreviewCapture::start(source.clone(), target_height, fps, away_screen, webcam) }
+            Self { inner: crate::mac::preview::PreviewCapture::start(source.clone(), target_height, shape, fps, away_screen, webcam) }
         }
         // No away screen: it's for games and apps, which Linux doesn't record.
         #[cfg(target_os = "linux")]
         {
             let _ = away_screen;
-            Self { inner: crate::linux::PreviewCapture::start(source.clone(), target_height, fps, webcam) }
+            Self { inner: crate::linux::PreviewCapture::start(source.clone(), target_height, shape, fps, webcam) }
         }
         #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
         {
-            let _ = (source, target_height, fps, away_screen, webcam);
+            let _ = (source, target_height, shape, fps, away_screen, webcam);
             Self {}
         }
     }
