@@ -175,13 +175,6 @@ impl Gpu {
         Some(((desc.AdapterLuid.HighPart as u32 as u64) << 32) | desc.AdapterLuid.LowPart as u64)
     }
 
-    /// The graphics card's name, for the log.
-    pub(crate) fn adapter_name(&self) -> String {
-        let dxgi: Option<IDXGIDevice> = self.device.cast().ok();
-        let desc = dxgi.and_then(|d| unsafe { d.GetAdapter().ok()?.GetDesc().ok() });
-        desc.map_or_else(|| "an unknown graphics card".into(), |d| wide_str(&d.Description))
-    }
-
     pub(crate) fn texture(&self, width: u32, height: u32, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, bind: u32, usage: D3D11_USAGE, cpu: u32) -> Result<ID3D11Texture2D> {
         let desc = D3D11_TEXTURE2D_DESC {
             Width: width,
@@ -199,27 +192,6 @@ impl Gpu {
         unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut tex))? };
         tex.context("no texture")
     }
-}
-
-/// Every graphics card's name (not Windows' software one), in the order
-/// Windows gives them: a device made without saying which goes on the first.
-/// For the log: on a laptop, that's the integrated one unless Windows'
-/// graphics settings say otherwise for the app.
-pub(crate) fn adapter_names() -> Vec<String> {
-    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory1};
-    let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else { return Vec::new() };
-    (0..)
-        .map_while(|i| unsafe { factory.EnumAdapters1(i) }.ok())
-        .filter_map(|a| unsafe { a.GetDesc1() }.ok())
-        .filter(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0)
-        .map(|d| wide_str(&d.Description))
-        .collect()
-}
-
-/// A NUL-terminated UTF-16 string from a fixed-size buffer.
-fn wide_str(s: &[u16]) -> String {
-    let len = s.iter().position(|&c| c == 0).unwrap_or(s.len());
-    String::from_utf16_lossy(&s[..len])
 }
 
 // ---------------------------------------------------------------------------

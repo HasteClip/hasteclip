@@ -216,21 +216,8 @@ impl Session {
         system::com_init();
         system::mf_startup()?;
         let gpu = d3d::Gpu::new()?;
-        eprintln!("capture on {} (graphics cards: {})", gpu.adapter_name(), d3d::adapter_names().join(", "));
         let (picture_source, (canvas_w, canvas_h)) = PictureSource::plan(&s.video)?;
         let (width, height) = crate::output_size(canvas_w, canvas_h, s.target_height);
-        // What's asked of this PC, for the log: a display showing fewer
-        // pictures than the frame rate repeats some (uneven, not skipped).
-        let screen = match &s.video {
-            VideoSource::Screen { id, .. } => Some(id.as_str()),
-            VideoSource::Apps { .. } => None,
-        };
-        eprintln!(
-            "recording {canvas_w}×{canvas_h} as {width}×{height}, {} fps{}, display at {}",
-            s.fps,
-            if s.blend_samples > 1 { format!(" blended from {}", s.fps * s.blend_samples) } else { String::new() },
-            system::display_refresh(screen).map_or("an unknown refresh rate".into(), |hz| format!("{hz} Hz")),
-        );
         let clock = Arc::new(Clock::default());
 
         let (titles, comment, has_rest) = track_layout(&s.sources);

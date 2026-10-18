@@ -135,10 +135,7 @@ fn open(gpu: &Gpu, width: u32, height: u32, s: &EncodeSettings) -> Result<Mft> {
     if s.use_hardware {
         for activate in enum_encoders(true, gpu.adapter_luid()) {
             match configure_hardware(&activate, gpu, width, height, s) {
-                Ok(m) => {
-                    eprintln!("video encoder: {}", friendly_name(&activate));
-                    return Ok(m);
-                }
+                Ok(m) => return Ok(m),
                 Err(e) => errors.push(format!("{}: {e:#}", friendly_name(&activate))),
             }
         }
@@ -151,10 +148,7 @@ fn open(gpu: &Gpu, width: u32, height: u32, s: &EncodeSettings) -> Result<Mft> {
             .map_err(anyhow::Error::from)
             .and_then(|mft| configure(&mft, width, height, s).map(|()| Mft::Sync { mft }));
         match result {
-            Ok(m) => {
-                eprintln!("video encoder: {}", friendly_name(&activate));
-                return Ok(m);
-            }
+            Ok(m) => return Ok(m),
             Err(e) => errors.push(format!("{}: {e:#}", friendly_name(&activate))),
         }
     }
