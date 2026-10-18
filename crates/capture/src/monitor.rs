@@ -77,15 +77,22 @@ impl MicMonitor {
         } + crate::mixer::Denoise::FRAME as f32 / in_rate;
 
         let q = queue.clone();
-        // You hear it as it's recorded: with noise removal, cleaned (switching
-        // fades, as in the recording). It always comes a frame, 10 ms, later.
+        // You hear it as it's recorded: its first two channels (a mono mic's
+        // one on both), with Mono as loud as the louder side, and with noise
+        // removal, cleaned (switching fades, as in the recording). It always
+        // comes a frame, 10 ms, later.
+        let mut sides = crate::mixer::Mono::new(channel.mono_flag());
         let mut denoise = crate::mixer::Denoise::new(channel.denoise_mode());
+        let mut frames = Vec::new();
         let mut mono = Vec::new();
         let in_stream = input.build_input_stream::<f32, _, _>(
             in_stream_config,
             move |data, _| {
+                frames.clear();
+                frames.extend(data.chunks(in_channels).map(|f| [f[0], f[1.min(in_channels - 1)]]));
+                sides.process(&mut frames);
                 mono.clear();
-                mono.extend(data.chunks(in_channels).map(|f| f.iter().sum::<f32>() / in_channels as f32));
+                mono.extend(frames.iter().map(|f| (f[0] + f[1]) * 0.5));
                 let out = denoise.process_mono(&mono);
                 let mut q = q.lock().unwrap();
                 q.extend(out);

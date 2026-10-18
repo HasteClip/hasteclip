@@ -579,6 +579,7 @@ impl App {
             let channel = live_audio.channel(&s.id);
             channel.set_volume(sources_ui::from_db(s.volume_db), s.muted);
             channel.set_denoise(s.noise_reduction.into());
+            channel.set_mono(s.mono);
         }
         let updater = update::Updater::new(ctx.clone(), settings.auto_update);
         let (tray_tx, tray_rx) = std::sync::mpsc::channel();

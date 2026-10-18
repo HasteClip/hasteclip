@@ -146,6 +146,9 @@ pub struct Channel {
     /// Noise removal on its sound (a microphone's), a [`NoiseReduction`]:
     /// shared with its feed, which does it as the sound arrives.
     denoise: Arc<AtomicU8>,
+    /// Its two sides made one (a microphone's, see [`Mono`]): shared with
+    /// its feed, like `denoise`.
+    mono: Arc<AtomicBool>,
 }
 
 /// How much of a microphone's background noise is taken out.
@@ -189,6 +192,7 @@ impl Channel {
             input: Meter::default(),
             tap: Mutex::new(None),
             denoise: Arc::new(AtomicU8::new(NoiseReduction::Off as u8)),
+            mono: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -200,6 +204,16 @@ impl Channel {
 
     pub(crate) fn denoise_mode(&self) -> Arc<AtomicU8> {
         self.denoise.clone()
+    }
+
+    /// Play its sound in the middle, both sides made one (for a mic heard on
+    /// one side only). Takes effect immediately, even mid-recording.
+    pub fn set_mono(&self, on: bool) {
+        self.mono.store(on, Ordering::Relaxed);
+    }
+
+    pub(crate) fn mono_flag(&self) -> Arc<AtomicBool> {
+        self.mono.clone()
     }
 
     /// Hand the source's sound, mono at [`RATE`], to `tap` (`None`: stop).
@@ -338,6 +352,9 @@ struct FeedState {
     /// Output frames still to discard: resampler delay, or audio that arrived
     /// after the mixer had already moved past it.
     skip_out: i64,
+    /// Both sides made one, when this feed is a microphone's: before noise
+    /// removal, which then cleans what's heard.
+    mono: Option<Mono>,
     /// Noise removal, when this feed is a microphone's.
     denoise: Option<Denoise>,
 }
@@ -363,6 +380,7 @@ impl SourceFeed {
                 out: VecDeque::new(),
                 out_base: 0,
                 skip_out: 0,
+                mono: None,
                 denoise: None,
             }),
             children: Mutex::new(Vec::new()),
@@ -375,6 +393,12 @@ impl SourceFeed {
     pub(crate) fn denoise_with(&self, mode: Arc<AtomicU8>) {
         let mut st = self.st.lock().unwrap();
         st.denoise = Some(Denoise::new(mode));
+    }
+
+    /// Make this feed's two sides one while `on` is set (it can change at any
+    /// moment). See [`Mono`].
+    pub(crate) fn mono_with(&self, on: Arc<AtomicBool>) {
+        self.st.lock().unwrap().mono = Some(Mono::new(on));
     }
 
     /// A new feed (at `rate`) whose audio is added to this one's.
@@ -542,9 +566,13 @@ impl FeedState {
     }
 
     fn append(&mut self, frames: impl Iterator<Item = [f32; 2]>) {
-        let frames: Vec<[f32; 2]> = match self.denoise.as_mut() {
-            Some(d) => d.process(frames),
-            None => frames.collect(),
+        let mut frames: Vec<[f32; 2]> = frames.collect();
+        if let Some(m) = self.mono.as_mut() {
+            m.process(&mut frames);
+        }
+        let frames = match self.denoise.as_mut() {
+            Some(d) => d.process(frames.into_iter()),
+            None => frames,
         };
         for f in frames {
             if self.skip_out > 0 {
@@ -552,6 +580,68 @@ impl FeedState {
             } else {
                 self.out.push_back(f);
             }
+        }
+    }
+}
+
+/// A feed's two sides made one and played on both, while `on` is set: for a
+/// microphone heard on one side only, as one in an audio interface's first
+/// input is (its left). It comes out as loud as the louder side: the sides'
+/// sum, halved when they're alike (a mic that gives both the same stays as
+/// it was), whole when one side is all there is. How alike they are is taken
+/// from the last couple of seconds, the loud parts counting most, so it's
+/// right from the first word. Kept up while off too, so it's right the
+/// moment it's turned on; a switch fades over 10 ms.
+pub(crate) struct Mono {
+    on: Arc<AtomicBool>,
+    /// Energy of the left, the right and their sum, fading over [`Self::MEMORY`].
+    energy: [f32; 3],
+    /// What the sum is multiplied by: ½ (alike) to 1 (one side).
+    scale: f32,
+    /// How far it's made one: 0 (as it came) to 1, moving across a switch.
+    amount: f32,
+}
+
+impl Mono {
+    /// Seconds of sound the sides' likeness is taken from.
+    const MEMORY: f32 = 2.0;
+    /// Frames a switch fades over: 10 ms.
+    const FADE: f32 = (RATE / 100) as f32;
+
+    pub(crate) fn new(on: Arc<AtomicBool>) -> Self {
+        Self { on, energy: [0.0; 3], scale: 0.5, amount: 0.0 }
+    }
+
+    pub(crate) fn process(&mut self, frames: &mut [[f32; 2]]) {
+        if frames.is_empty() {
+            return;
+        }
+        let fade = (-(frames.len() as f32) / (RATE as f32 * Self::MEMORY)).exp();
+        let mut block = [0f32; 3];
+        for f in frames.iter() {
+            let sum = f[0] + f[1];
+            block[0] += f[0] * f[0];
+            block[1] += f[1] * f[1];
+            block[2] += sum * sum;
+        }
+        for (e, b) in self.energy.iter_mut().zip(block) {
+            *e = *e * fade + b;
+        }
+        // Alike, the sum is twice either side (½); one side alone, it's that
+        // side (1). Never more: sides that cancel would make a quiet sum loud.
+        let [left, right, sum] = self.energy;
+        let scale = if sum > 1e-9 { (left.max(right) / sum).sqrt().clamp(0.5, 1.0) } else { self.scale };
+        let on = self.on.load(Ordering::Relaxed);
+        let from = std::mem::replace(&mut self.scale, scale);
+        if !on && self.amount == 0.0 {
+            return;
+        }
+        let step = if on { 1.0 / Self::FADE } else { -1.0 / Self::FADE };
+        let n = frames.len() as f32;
+        for (i, f) in frames.iter_mut().enumerate() {
+            self.amount = (self.amount + step).clamp(0.0, 1.0);
+            let one = (f[0] + f[1]) * (from + (scale - from) * (i + 1) as f32 / n);
+            *f = [f[0] + (one - f[0]) * self.amount, f[1] + (one - f[1]) * self.amount];
         }
     }
 }
@@ -885,6 +975,70 @@ mod tests {
         assert!(out[..960].iter().all(|f| f[0] == 0.0));
         assert!(out[960..2400].iter().all(|f| f[0] == 1.0), "{:?}", &out[950..970]);
         assert!(out[2400..2880].iter().all(|f| f[0] == 0.0));
+    }
+
+    /// A voice in 10 ms blocks, as a mic delivers it: `side` says how much of
+    /// it each side gets.
+    fn voice_blocks(side: [f32; 2], seconds: f32) -> Vec<Vec<[f32; 2]>> {
+        let frames: Vec<[f32; 2]> = (0..(RATE as f32 * seconds) as usize)
+            .map(|i| {
+                let t = i as f32 / RATE as f32;
+                let v = (std::f32::consts::TAU * 180.0 * t).sin() * 0.3 + (std::f32::consts::TAU * 410.0 * t).sin() * 0.1;
+                [v * side[0], v * side[1]]
+            })
+            .collect();
+        frames.chunks(480).map(<[_]>::to_vec).collect()
+    }
+
+    /// A mic heard on the left only: on both sides, as loud as the left was,
+    /// from the first word.
+    #[test]
+    fn mono_puts_one_side_on_both_as_loud() {
+        let mut m = Mono::new(Arc::new(AtomicBool::new(true)));
+        let rms = |s: &[[f32; 2]], c: usize| (s.iter().map(|f| f[c] * f[c]).sum::<f32>() / s.len() as f32).sqrt();
+        for (i, mut block) in voice_blocks([1.0, 0.0], 1.0).into_iter().enumerate() {
+            let was = rms(&block, 0);
+            m.process(&mut block);
+            // After the fade in (10 ms) and the first block's ramp.
+            if i >= 2 {
+                assert!(block.iter().all(|f| (f[0] - f[1]).abs() < 1e-6));
+                assert!((rms(&block, 0) / was - 1.0).abs() < 0.01, "block {i}: {was} -> {}", rms(&block, 0));
+            }
+        }
+    }
+
+    /// A mic that gives both sides the same stays as it was.
+    #[test]
+    fn mono_leaves_alike_sides_alone() {
+        let mut m = Mono::new(Arc::new(AtomicBool::new(true)));
+        for block in voice_blocks([1.0, 1.0], 1.0) {
+            let mut out = block.clone();
+            m.process(&mut out);
+            for (a, b) in out.iter().zip(&block) {
+                assert!((a[0] - b[0]).abs() < 1e-5 && (a[1] - b[1]).abs() < 1e-5);
+            }
+        }
+    }
+
+    /// Off, the sound exactly as it came; turned on, the right side comes in
+    /// over 10 ms, not with a click.
+    #[test]
+    fn mono_off_is_untouched_and_switching_fades() {
+        let on = Arc::new(AtomicBool::new(false));
+        let mut m = Mono::new(on.clone());
+        let blocks = voice_blocks([1.0, 0.0], 0.5);
+        for block in &blocks[..20] {
+            let mut out = block.clone();
+            m.process(&mut out);
+            assert_eq!(&out, block);
+        }
+        on.store(true, Ordering::Relaxed);
+        let mut out = blocks[20].clone();
+        m.process(&mut out);
+        let steps: Vec<f32> = out.windows(2).map(|w| (w[1][1] - w[0][1]).abs()).collect();
+        // The voice moves at most ~0.03 a frame; a jump to it would be ~0.3.
+        assert!(steps.iter().all(|&d| d < 0.05), "{:?}", steps.iter().cloned().fold(0.0, f32::max));
+        assert!((out[479][1] - out[479][0]).abs() < 1e-4);
     }
 
     #[test]

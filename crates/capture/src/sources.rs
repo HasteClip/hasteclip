@@ -110,6 +110,7 @@ impl Mic {
             self.feed.remove_child(&child);
         }
         let child = self.feed.add_child(native_rate(&SourceKind::Microphone { device: self.device.clone() }));
+        child.mono_with(self.channel.mono_flag());
         child.denoise_with(self.channel.denoise_mode());
         match start_mic(&self.device, child.clone()) {
             Ok(stream) => {
@@ -156,6 +157,7 @@ impl AudioCapture {
             let channel = live.channel(&source.id);
             #[cfg(target_os = "linux")]
             if matches!(source.kind, SourceKind::Microphone { .. }) {
+                feed.mono_with(channel.mono_flag());
                 feed.denoise_with(channel.denoise_mode());
             }
             match &source.kind {
