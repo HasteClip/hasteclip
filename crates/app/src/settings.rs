@@ -357,6 +357,10 @@ pub struct AudioSourceCfg {
     /// chosen.
     #[serde(default)]
     pub noise_reduction: NoiseReduction,
+    /// A microphone heard in the middle, its two sides made one: for one
+    /// heard on one side only. Off unless turned on.
+    #[serde(default)]
+    pub mono: bool,
     /// From before there were two: on, which is Strong now. Read, not written.
     #[serde(default, skip_serializing, rename = "noise_removal")]
     old_noise_removal: bool,
@@ -420,6 +424,7 @@ impl AudioSourceCfg {
             volume_db: 0.0,
             muted: false,
             noise_reduction: NoiseReduction::Off,
+            mono: false,
             old_noise_removal: false,
         }
     }

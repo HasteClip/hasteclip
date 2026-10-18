@@ -179,6 +179,7 @@ impl App {
             let s = &self.settings.audio_sources[i];
             channel.set_volume(from_db(s.volume_db), s.muted);
             channel.set_denoise(s.noise_reduction.into());
+            channel.set_mono(s.mono);
             crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
         }
         if let Some(i) = remove {
@@ -1074,6 +1075,14 @@ fn source_card(
                 }
                 ui.spacing_mut().item_spacing.x = 6.0;
                 crate::ui_kit::info(ui, "Noise reduction", "Light takes out steady noise behind your voice, like a fan, hum or hiss, and keeps sounds that come and go, like your keyboard. Strong takes out everything but your voice, your keyboard too. Changes apply straight away.");
+            });
+            // Mono: on or off, so a switch, right before its name (as the
+            // Limiter's).
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let tip = if source.mono { "On: you're heard in the middle" } else { "Off: as the mic gives it" };
+                labelled_switch(ui, &mut source.mono, "Mono", tip);
+                crate::ui_kit::info(ui, "Mono", "For a mic heard on one side only, like one in an audio interface's first input (its left): you're heard in the middle, on both sides, as loud as before.");
             });
         }
         if let Some(latency) = listening {
