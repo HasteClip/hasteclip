@@ -619,6 +619,7 @@ impl App {
                 ("← →", "One frame back or ahead"),
                 ("Shift ← →", "One second back or ahead"),
                 ("I  O", "Start or end here"),
+                ("C", "Crop the picture  (Enter when done)"),
                 ("Home  End", "Go to the start or end"),
                 ("Cmd Z", "Undo  (Shift for redo)"),
                 ("N", "Snapping on or off"),

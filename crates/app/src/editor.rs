@@ -136,6 +136,8 @@ struct Ready {
     /// The clip's kills and your markers, as pins (the editor shows the
     /// whole recording, which they're kept for).
     moments: Vec<crate::transport::Moment>,
+    /// Cropping the picture (C): the whole of it shows, to choose the part kept.
+    crop_tool: Option<crate::crop_ui::CropTool>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -343,6 +345,7 @@ impl Ready {
             confirm_revert: false,
             save_as_focused: false,
             moments: crate::moments::of(&target.clip).pins(full),
+            crop_tool: None,
         }
     }
 
@@ -452,7 +455,7 @@ impl Ready {
             let export = if narrow {
                 Btn::icon(Kind::Ghost, icon::SLIDERS_HORIZONTAL).id("export_btn").tip(format!("Export settings: {summary}")).show(ui)
             } else {
-                Btn::ghost(summary).with_icon(icon::SLIDERS_HORIZONTAL).trail(icon::CARET_DOWN).id("export_btn").tip("Export settings: resolution, frame rate, quality, a size to fit under, sound tracks").show(ui)
+                Btn::ghost(summary).with_icon(icon::SLIDERS_HORIZONTAL).trail(icon::CARET_DOWN).id("export_btn").tip("Export settings: a crop, resolution, frame rate, quality, a size to fit under, sound tracks").show(ui)
             };
             if export.clicked() {
                 self.export_open = !self.export_open;
@@ -468,15 +471,20 @@ impl Ready {
             // not when it was for an open dropdown.
             let dropdown_open = egui::Popup::is_any_open(ui.ctx());
             let before = self.edit.output;
+            let mut crop_on_picture = false;
             let shown = egui::Popup::from_response(&export)
                 .open_bool(&mut self.export_open)
                 .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
                 .align(egui::RectAlign::BOTTOM_END)
                 .gap(6.0)
                 .frame(crate::ui_kit::pop_frame(ui).inner_margin(egui::Margin::same(14)))
-                .show(|ui| crate::export_ui::ui(ui, &self.info, &mut self.edit));
+                .show(|ui| crate::export_ui::ui(ui, &self.info, &mut self.edit, &mut crop_on_picture));
             if shown.is_some_and(|r| r.response.clicked_elsewhere()) && !dropdown_open && !export.clicked() {
                 self.export_open = false;
+            }
+            if crop_on_picture {
+                self.export_open = false;
+                self.crop_tool = Some(crate::crop_ui::CropTool::new(self.crop()));
             }
             if self.edit.output != before {
                 let mut was = self.edit.clone();
@@ -532,9 +540,36 @@ impl Ready {
         let (preview_rect, preview_resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), preview_h), Sense::click());
         let size = self.player.update(&ctx, self.dragging.is_some());
         let player = &self.player;
-        crate::transport::stage(ui, preview_rect, size, |p, cover| player.paint_glow(p, cover, egui::Id::new("editor_stage")), |r| player.paint(ui, r));
-        if preview_resp.clicked() {
-            self.toggle_play();
+        let frame = (self.info.width, self.info.height);
+        if let Some(tool) = &mut self.crop_tool {
+            let before = self.edit.clone();
+            let did = tool.ui(ui, preview_rect, size, frame, &mut self.edit.output.crop, |painter, r| player.paint(painter, r));
+            if did.took_hold {
+                self.before_drag = Some(before.clone());
+            }
+            if did.changed {
+                self.push_undo(before);
+            }
+            if did.let_go
+                && let Some(was) = self.before_drag.take()
+                && !same_edit(&was, &self.edit)
+            {
+                self.push_undo(was);
+            }
+            if did.done {
+                self.crop_tool = None;
+            }
+        } else {
+            // Just the part kept, as the saved clip will be.
+            let crop = self.crop();
+            let shown = size.map(|s| crop.map_or(s, |c| crate::crop_ui::cropped_size(s, &c, frame)));
+            crate::transport::stage(ui, preview_rect, shown, |p, cover| player.paint_glow(p, cover, egui::Id::new("editor_stage")), |r| match crop {
+                Some(c) => crate::crop_ui::paint_cropped(ui, r, &c, frame, |painter, whole| player.paint(painter, whole)),
+                None => player.paint(ui.painter(), r),
+            });
+            if preview_resp.clicked() {
+                self.toggle_play();
+            }
         }
         divider(ui, preview_h, total, preview_share);
 
@@ -725,7 +760,8 @@ impl Ready {
         let t = self.player.time();
         let prev = self.moments.iter().rev().find(|m| m.t < t - 0.05).cloned();
         let next = self.moments.iter().find(|m| m.t > t + 0.05).cloned();
-        let (mut undo, mut redo, mut set_in, mut set_out, mut play, mut jump) = (false, false, false, false, false, None);
+        let (mut undo, mut redo, mut set_in, mut set_out, mut play, mut jump, mut crop) = (false, false, false, false, false, None, false);
+        let cropping = self.crop_tool.is_some();
         let (mut zoom_by, mut zoom_to) = (None, None);
         let mut frames = self.show_frames;
         let can_undo = !self.undo.is_empty();
@@ -756,6 +792,10 @@ impl Ready {
                     set_in = Btn::ghost("Start").with_icon("[").small().tip("Start the clip here  (I)").show(ui).clicked();
                     set_out = Btn::ghost("End").trail("]").small().tip("End the clip here  (O)").show(ui).clicked();
                 }
+                crate::transport::vrule(ui);
+                let kind = if cropping { Kind::On } else { Kind::Ghost };
+                let btn = if medium { Btn::icon(kind, icon::CROP) } else { Btn::new(kind, "Crop").with_icon(icon::CROP).small() };
+                crop = btn.tip("Crop the picture: keep a part of it, like 16:9 out of an ultrawide screen  (C)").show(ui).clicked();
             }
             crate::transport::Part::Centre => {
                 // Narrow: play alone (the pins and [ ] still go to moments).
@@ -794,6 +834,9 @@ impl Ready {
             }
         });
         self.show_frames = frames;
+        if crop {
+            self.toggle_crop();
+        }
         if undo {
             self.undo_step();
         }
@@ -846,6 +889,19 @@ impl Ready {
         } else {
             ctx.request_repaint();
         }
+    }
+
+    /// The part of the picture kept, if not all of it.
+    fn crop(&self) -> Option<media::Crop> {
+        self.edit.output.crop.and_then(|c| c.within(self.info.width, self.info.height))
+    }
+
+    /// Open the crop tool, or close it.
+    fn toggle_crop(&mut self) {
+        self.crop_tool = match self.crop_tool {
+            Some(_) => None,
+            None => Some(crate::crop_ui::CropTool::new(self.crop())),
+        };
     }
 
     /// Note the edit as it was before a change, for Cmd Z.
@@ -1006,6 +1062,17 @@ impl Ready {
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F2)) {
             self.rename_requested = true;
+        }
+        let (crop, done) = ctx.input_mut(|i| {
+            let crop = i.consume_key(egui::Modifiers::NONE, Key::C);
+            let done = self.crop_tool.is_some() && (i.consume_key(egui::Modifiers::NONE, Key::Enter) || i.consume_key(egui::Modifiers::NONE, Key::Escape));
+            (crop, done)
+        });
+        if crop {
+            self.toggle_crop();
+        }
+        if done {
+            self.crop_tool = None;
         }
         let (redo, undo, snap) = ctx.input_mut(|i| {
             (

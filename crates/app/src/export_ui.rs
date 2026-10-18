@@ -1,10 +1,12 @@
 //! The editor's export settings: how the saved clip is made, when it
-//! shouldn't be just like the recording. Smaller (resolution, frame rate,
-//! quality), small enough to send (fit under a size, like Discord's 10 MB),
-//! or with only the mix for audio. Saved with the edit, so they come back
-//! when the clip is opened again.
+//! shouldn't be just like the recording. A part of the picture (a crop),
+//! smaller (resolution, frame rate, quality), small enough to send (fit
+//! under a size, like Discord's 10 MB), or with only the mix for audio.
+//! Saved with the edit, so they come back when the clip is opened again.
 
-use media::{BlendShape, ClipInfo, Edit, Output};
+use media::{BlendShape, ClipInfo, Crop, Edit, Output};
+
+use crate::crop_ui::{SHAPES, shape_of};
 
 /// Common heights, offered when smaller than the clip.
 const HEIGHTS: [u32; 5] = [2160, 1440, 1080, 720, 480];
@@ -19,7 +21,10 @@ const SIZES: [(u32, &str); 4] = [(10, "10 MB (Discord)"), (25, "25 MB"), (50, "5
 pub fn summary(info: &ClipInfo, edit: &Edit) -> String {
     let o = edit.output;
     let mut parts = Vec::new();
-    if o.height.is_some_and(|h| h < info.height) {
+    if let Some(c) = o.crop.and_then(|c| c.within(info.width, info.height)) {
+        parts.push(shape_of(&c).map_or("Cropped".into(), |i| format!("{} crop", SHAPES[i].0)));
+    }
+    if o.height.is_some_and(|h| h < o.picture(info).1) {
         parts.push(format!("{}p", o.height.unwrap()));
     }
     if o.fps.is_some_and(|f| (f as f64) < info.fps - 0.5) {
@@ -40,8 +45,9 @@ pub fn summary(info: &ClipInfo, edit: &Edit) -> String {
     if parts.is_empty() { "Original quality".into() } else { parts.join(" · ") }
 }
 
-/// The settings, in a popup. True if anything changed.
-pub fn ui(ui: &mut egui::Ui, info: &ClipInfo, edit: &mut Edit) -> bool {
+/// The settings, in a popup. True if anything changed. `crop_on_picture`:
+/// set when the crop is to be chosen on the picture (the crop tool).
+pub fn ui(ui: &mut egui::Ui, info: &ClipInfo, edit: &mut Edit, crop_on_picture: &mut bool) -> bool {
     use crate::theme::{self, W};
     use crate::ui_kit::{self, Item};
     let pal = theme::pal(ui);
@@ -87,21 +93,53 @@ pub fn ui(ui: &mut egui::Ui, info: &ClipInfo, edit: &mut Edit) -> bool {
         }
     });
 
+    row(ui, "Crop", &mut |ui| {
+        let crop = o.crop.and_then(|c| c.within(info.width, info.height));
+        let shown = match crop {
+            None => "None".to_owned(),
+            Some(c) => match shape_of(&c) {
+                Some(i) => format!("{} ({}×{})", SHAPES[i].0, c.w, c.h),
+                None => format!("{}×{}", c.w, c.h),
+            },
+        };
+        let r = ui_kit::select(ui, &shown, 150.0);
+        ui_kit::menu_popup(&r, false, 240.0, |ui| {
+            if Item::new("None").check(crop.is_none()).tip("The whole picture").show(ui).clicked() {
+                o.crop = None;
+            }
+            // Each shape the biggest it can be, where the crop is (else in
+            // the middle); not one the picture already is.
+            let centre = crop.map_or((info.width as f64 / 2.0, info.height as f64 / 2.0), |c| c.centre());
+            for (i, &(name, w, h, tip)) in SHAPES.iter().enumerate() {
+                let Some(c) = Crop::largest(info.width, info.height, w, h, centre).within(info.width, info.height) else { continue };
+                if Item::new(name).check(crop.as_ref().and_then(shape_of) == Some(i)).tip(tip).show(ui).clicked() {
+                    o.crop = Some(c);
+                }
+            }
+            ui_kit::menu_sep(ui);
+            if Item::new("Adjust on the picture…").icon(egui_phosphor::regular::CROP).keys(Some(vec!["C".into()])).tip("Drag its corners and move it over the picture").show(ui).clicked() {
+                *crop_on_picture = true;
+            }
+        });
+    });
+
+    // Below the picture's height: the crop's, if there is one.
+    let ph = o.picture(info).1;
     row(ui, "Resolution", &mut |ui| {
         let label = |h: Option<u32>| match h {
             Some(h) => format!("{h}p"),
-            None => format!("Original ({}p)", info.height),
+            None => format!("Original ({ph}p)"),
         };
         let shown = match (o.height, auto) {
-            (None, Some((h, _))) if h < info.height => format!("Auto ({h}p)"),
-            (h, _) => label(h.filter(|&h| h < info.height)),
+            (None, Some((h, _))) if h < ph => format!("Auto ({h}p)"),
+            (h, _) => label(h.filter(|&h| h < ph)),
         };
         let r = ui_kit::select(ui, &shown, 150.0);
         ui_kit::menu_popup(&r, false, 200.0, |ui| {
             if Item::new(if auto.is_some() { "Auto".to_owned() } else { label(None) }).check(o.height.is_none()).show(ui).clicked() {
                 o.height = None;
             }
-            for h in HEIGHTS.into_iter().filter(|&h| h < info.height) {
+            for h in HEIGHTS.into_iter().filter(|&h| h < ph) {
                 if Item::new(label(Some(h))).check(o.height == Some(h)).show(ui).clicked() {
                     o.height = Some(h);
                 }

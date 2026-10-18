@@ -459,6 +459,59 @@ pub struct Output {
     /// How each blended frame weighs the frames in it.
     #[serde(default)]
     pub blend_shape: BlendShape,
+    /// The part of the picture kept (black bars cut off, or a 16:9 out of
+    /// an ultrawide screen); the resolution is then this part's.
+    #[serde(default)]
+    pub crop: Option<Crop>,
+}
+
+/// A part of the picture, in the recording's pixels: `w`×`h` with its top
+/// left corner `x` across and `y` down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Crop {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+impl Crop {
+    /// The smallest a side can be, in pixels.
+    pub const MIN: u32 = 32;
+
+    /// The whole of a `width`×`height` picture.
+    pub fn whole(width: u32, height: u32) -> Self {
+        Self { x: 0, y: 0, w: width, h: height }
+    }
+
+    /// The biggest part of a `width`×`height` picture shaped `aw`:`ah`, its
+    /// middle as near `centre` (in pixels) as the picture allows.
+    pub fn largest(width: u32, height: u32, aw: u32, ah: u32, centre: (f64, f64)) -> Self {
+        let (fw, fh) = (width as f64, height as f64);
+        let shape = aw as f64 / ah.max(1) as f64;
+        let (w, h) = if fw / fh > shape { (fh * shape, fh) } else { (fw, fw / shape) };
+        let x = (centre.0 - w / 2.0).clamp(0.0, fw - w);
+        let y = (centre.1 - h / 2.0).clamp(0.0, fh - h);
+        Self { x: x.round() as u32, y: y.round() as u32, w: w.round() as u32, h: h.round() as u32 }
+    }
+
+    /// Made to fit a `width`×`height` picture: inside it, at least
+    /// [`Self::MIN`] a side, and even everywhere (H.264's colour is kept for
+    /// 2×2 pixels at a time). `None` if that's the whole picture.
+    pub fn within(self, width: u32, height: u32) -> Option<Self> {
+        let even = |v: u32| v / 2 * 2;
+        let w = even(self.w.clamp(Self::MIN.min(width), width));
+        let h = even(self.h.clamp(Self::MIN.min(height), height));
+        let x = even(self.x.min(width - w));
+        let y = even(self.y.min(height - h));
+        let whole = w + 1 >= width && h + 1 >= height;
+        (!whole).then_some(Self { x, y, w, h })
+    }
+
+    /// Its middle, in pixels.
+    pub fn centre(&self) -> (f64, f64) {
+        (self.x as f64 + self.w as f64 / 2.0, self.y as f64 + self.h as f64 / 2.0)
+    }
 }
 
 /// How a blended frame weighs the frames in it, as live capture can
@@ -486,16 +539,19 @@ pub fn blend_rates(out: u32, src_fps: f64) -> Vec<u32> {
 
 impl Output {
     /// The settings that actually change something for `info` (a height or
-    /// rate at or above the source's is the source's).
+    /// rate at or above the source's is the source's, a crop of the whole
+    /// picture none).
     pub fn effective(&self, info: &ClipInfo) -> Self {
+        let (_, ph) = self.picture(info);
         let mut e = Self {
-            height: self.height.filter(|&h| h < info.height),
+            height: self.height.filter(|&h| h < ph),
             fps: self.fps.filter(|&f| (f as f64) < info.fps - 0.5),
             video_kbps: self.video_kbps.filter(|&k| info.video_kbps.is_none_or(|src| k < src)),
             max_mb: self.max_mb,
             mix_only: self.mix_only,
             blend_fps: None,
             blend_shape: BlendShape::Even,
+            crop: self.crop.and_then(|c| c.within(info.width, info.height)),
         };
         e.fit_picture(info);
         let out = e.fps.map_or(info.fps, f64::from).round() as u32;
@@ -518,37 +574,47 @@ impl Output {
         let audio = if self.mix_only { RENDER_AUDIO_KBPS } else { RENDER_AUDIO_KBPS * (info.source_tracks().len() as u32 + 1) };
         let audio = if info.audio.is_empty() { 0 } else { audio };
         let kbps = fit_kbps(mb, info.duration, audio) as f64 * 1000.0;
-        let aspect = info.width as f64 / info.height.max(1) as f64;
+        let (pw, ph) = self.picture(info);
+        let aspect = pw as f64 / ph.max(1) as f64;
         let src_fps = info.fps.round() as u32;
         // Best first: full rate down to 30, then smaller.
         let heights = [2160, 1440, 1080, 720, 540, 480, 360];
         let rates: Vec<u32> = [src_fps, 30].into_iter().filter(|&f| f <= src_fps).collect();
-        for h in heights.into_iter().filter(|&h| h <= info.height) {
+        for h in heights.into_iter().filter(|&h| h <= ph) {
             for &f in &rates {
                 let (h, f) = (self.height.unwrap_or(h), self.fps.unwrap_or(f));
                 if kbps / (h as f64 * h as f64 * aspect * f as f64) >= 0.05 {
-                    self.height = self.height.or(Some(h).filter(|&h| h < info.height));
+                    self.height = self.height.or(Some(h).filter(|&h| h < ph));
                     self.fps = self.fps.or(Some(f).filter(|&f| (f as f64) < info.fps - 0.5));
                     return;
                 }
             }
         }
-        self.height = self.height.or(Some(360).filter(|&h| h < info.height));
+        self.height = self.height.or(Some(360).filter(|&h| h < ph));
         self.fps = self.fps.or(Some(30).filter(|&f| (f as f64) < info.fps - 0.5));
     }
 
     /// Whether the video must be re-encoded whole (else it can be copied).
     pub fn changes_video(&self, info: &ClipInfo) -> bool {
         let e = self.effective(info);
-        e.height.is_some() || e.fps.is_some() || e.video_kbps.is_some() || e.max_mb.is_some()
+        e.height.is_some() || e.fps.is_some() || e.video_kbps.is_some() || e.max_mb.is_some() || e.crop.is_some()
     }
 
-    /// Output frame size for `info`: even, same shape.
-    pub fn size(&self, info: &ClipInfo) -> (u32, u32) {
-        match self.effective(info).height {
+    /// The picture before it's scaled: the crop's, else the recording's.
+    pub fn picture(&self, info: &ClipInfo) -> (u32, u32) {
+        match self.crop.and_then(|c| c.within(info.width, info.height)) {
+            Some(c) => (c.w, c.h),
             None => (info.width, info.height),
+        }
+    }
+
+    /// Output frame size for `info`: even, the picture's shape.
+    pub fn size(&self, info: &ClipInfo) -> (u32, u32) {
+        let (pw, ph) = self.picture(info);
+        match self.effective(info).height {
+            None => (pw, ph),
             Some(h) => {
-                let w = (info.width as f64 * h as f64 / info.height.max(1) as f64 / 2.0).round() as u32 * 2;
+                let w = (pw as f64 * h as f64 / ph.max(1) as f64 / 2.0).round() as u32 * 2;
                 (w.max(2), h / 2 * 2)
             }
         }
@@ -1027,8 +1093,12 @@ fn render_video(source: &Path, info: &ClipInfo, edit: &Edit, plan: &Plan, work: 
     } else {
         source_video_kbps(source).unwrap_or(20_000)
     };
-    // Smaller and fewer frames: scaled (Lanczos, sharp) and dropped evenly.
+    // Cropped first, so nothing after works on what's cut off. Smaller and
+    // fewer frames: scaled (Lanczos, sharp) and dropped evenly.
     let mut filters = Vec::new();
+    if let Some(c) = output.crop {
+        filters.push(format!("crop={}:{}:{}:{}:exact=1", c.w, c.h, c.x, c.y));
+    }
     if output.fps.is_some() {
         let rate = edit.output.frame_rate(info);
         match output.blend_fps {
@@ -1521,6 +1591,36 @@ mod tests {
         assert!(bytes < 10 * 1024 * 1024, "{bytes}");
         // ...in a picture that bitrate can carry.
         assert_eq!((fit.size(&info).1, fit.frame_rate(&info)), (720, 30.0));
+    }
+
+    #[test]
+    fn crop() {
+        // 16:9 out of an ultrawide 3440×1440: the 2560 in the middle.
+        let c = Crop::largest(3440, 1440, 16, 9, (1720.0, 720.0));
+        assert_eq!(c, Crop { x: 440, y: 0, w: 2560, h: 1440 });
+        // Pushed against the edge it's nearest.
+        assert_eq!(Crop::largest(3440, 1440, 16, 9, (100.0, 0.0)).x, 0);
+        // Even, inside the picture, and none for the whole of it.
+        assert_eq!(Crop { x: 3, y: 5, w: 641, h: 361 }.within(1920, 1080), Some(Crop { x: 2, y: 4, w: 640, h: 360 }));
+        assert_eq!(Crop { x: 1500, y: 0, w: 640, h: 360 }.within(1920, 1080).unwrap().x, 1280);
+        assert_eq!(Crop { x: 0, y: 0, w: 4000, h: 1080 }.within(1920, 1080), None);
+        assert_eq!(Crop { x: 0, y: 0, w: 4, h: 4 }.within(1920, 1080).unwrap().w, Crop::MIN);
+
+        // The output is the crop's: its size, re-encoded, and smaller sizes
+        // offered below its height.
+        let mut info = info();
+        (info.width, info.height) = (3440, 1440);
+        let o = Output { crop: Some(c), ..Default::default() };
+        assert!(o.changes_video(&info));
+        assert_eq!(o.size(&info), (2560, 1440));
+        assert_eq!(Output { height: Some(1080), ..o }.size(&info), (1920, 1080));
+        assert_eq!(Output { height: Some(1440), ..o }.effective(&info).height, None);
+        // Fewer pixels, so less bitrate for the same look.
+        let edit = Edit { start: 0.0, end: 60.0, tracks: Vec::new(), output: o };
+        assert!(o.video_kbps_for(&info, &edit).unwrap() < 20_000);
+        assert!(!edit.is_identity(&info));
+        // A crop of all of it is none.
+        assert!(!Output { crop: Some(Crop::whole(3440, 1440)), ..Default::default() }.changes_video(&info));
     }
 
     #[test]
