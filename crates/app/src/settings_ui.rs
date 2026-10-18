@@ -206,7 +206,8 @@ impl App {
         let lock = self.lock();
         let mut said = false;
         let size = self.recorded_size();
-        let native = capture::frame_size(&self.video_source(), None);
+        let native = capture::frame_size(&self.video_source(), None, self.settings.capture_shape());
+        let screen = capture::frame_size(&self.video_source(), None, None);
         let res_note = match (size, native) {
             (Some((w, h)), Some((_, nh))) if self.settings.resolution.height().is_some_and(|t| t > nh) => format!("Records at {w}×{h}: your display's size, it isn't made bigger"),
             (Some((w, h)), _) => format!("Records at {w}×{h}"),
@@ -232,6 +233,20 @@ impl App {
             if f.shows(&["resolution", "height", "size", "native"]) {
                 let (_, c) = l.row(Row::new("Resolution").tip("Resolution", "Lower makes smaller files that are quicker to share. Native keeps every pixel of your display.").note(res_note.clone()).locked(lock.clone()), |ui| self.resolution_field(ui));
                 locked_click |= c;
+            }
+            if f.shows(&["shape", "aspect ratio", "16:9", "ultrawide", "black bars", "crop", "fill", "fit", "stretch"]) {
+                let (_, c) = l.row(Row::new("Shape").tip("Shape", SHAPE_TIP).locked(lock.clone()), |ui| self.shape_field(ui, screen));
+                locked_click |= c;
+                let shape = self.settings.capture_shape();
+                l.well("shape_well", shape.is_some(), |l| {
+                    let note = shape.zip(screen).map_or(String::new(), |(shape, screen)| shape_note(shape, screen));
+                    let (_, c) = l.row(Row::new("Screen").tip("Screen", FRAMING_TIP).kid().note(note).locked(lock.clone()), |ui| {
+                        if let Some(framing) = framing_field(ui, self.settings.framing) {
+                            self.settings.framing = framing;
+                        }
+                    });
+                    locked_click |= c;
+                });
             }
             if f.shows(&["frame rate", "fps"]) {
                 let (_, c) = l.row(Row::new("Frame rate").note(fps_note.clone()).locked(lock.clone()), |ui| self.fps_field(ui));
@@ -594,9 +609,31 @@ impl App {
         }
     }
 
+    /// The shape recordings are made in: the screen's, or one of the
+    /// editor's crop shapes.
+    fn shape_field(&mut self, ui: &mut egui::Ui, screen: Option<(u32, u32)>) {
+        use crate::crop_ui::SHAPES;
+        let shown = match self.settings.shape {
+            None => "As the screen".to_owned(),
+            Some([w, h]) => SHAPES.iter().find(|s| (s.1, s.2) == (w, h)).map_or(format!("{w}:{h}"), |s| s.0.to_owned()),
+        };
+        let r = ui_kit::select(ui, &shown, 150.0);
+        ui_kit::menu_popup(&r, false, 260.0, |ui| {
+            let own = screen.map_or("As the screen".to_owned(), |(w, h)| format!("As the screen ({w}×{h})"));
+            if Item::new(own).check(self.settings.shape.is_none()).tip("All of it, in its own shape").show(ui).clicked() {
+                self.settings.shape = None;
+            }
+            for &(name, w, h, tip) in &SHAPES {
+                if Item::new(name).check(self.settings.shape == Some([w, h])).tip(tip).show(ui).clicked() {
+                    self.settings.shape = Some([w, h]);
+                }
+            }
+        });
+    }
+
     fn resolution_field(&mut self, ui: &mut egui::Ui) {
         let r = self.settings.resolution;
-        let native = capture::frame_size(&self.video_source(), None);
+        let native = capture::frame_size(&self.video_source(), None, self.settings.capture_shape());
         let presets: Vec<(String, String, String)> = OutputResolution::PRESETS
             .iter()
             .map(|p| {
@@ -794,7 +831,7 @@ impl App {
     /// The size recordings come out at with the chosen resolution, when the
     /// display is known.
     fn recorded_size(&self) -> Option<(u32, u32)> {
-        capture::frame_size(&self.video_source(), self.settings.resolution.height())
+        capture::frame_size(&self.video_source(), self.settings.resolution.height(), self.settings.capture_shape())
     }
 
     /// A bitrate that looks good for the recorded size and frame rate, in
@@ -1157,6 +1194,39 @@ fn osu_parts_editor(ui: &mut egui::Ui, t: &mut crate::settings::GameTitles) {
 pub const BLEND_TIP: &str = "How the pictures in each frame are weighed. Even: all the same, so a frame shows just its own moment, and a moving thing's trail ends sharply where the next frame's starts. Soft: the middle of the frame's moment counts most, fading out into the frames either side, so one frame hands over smoothly to the next, a little blurrier.";
 pub const BLEND_EVEN_TIP: &str = "Every picture counts the same: each frame's trail ends sharply";
 pub const BLEND_SOFT_TIP: &str = "The middle of each frame counts most, fading into the frames either side: smoother, a little blurrier";
+
+/// Shape's and its Screen's tips.
+const SHAPE_TIP: &str = "Record in another shape than your screen's: 16:9 out of an ultrawide screen, say, or upright for phones. Every recording and clip is made in it.";
+const FRAMING_TIP: &str = "How your screen goes into the shape. Fill: its middle, with what's past the shape cut off (an ultrawide screen's sides, for 16:9). Fit: all of it, with black bars. Stretch: all of it, stretched or squeezed.";
+
+/// Fill, Fit or Stretch: the one clicked, if one was.
+fn framing_field(ui: &mut egui::Ui, now: settings::Framing) -> Option<settings::Framing> {
+    use settings::Framing;
+    const ALL: [Framing; 3] = [Framing::Fill, Framing::Fit, Framing::Stretch];
+    let opts = [
+        Seg { icon: None, label: "Fill", tip: Some("Its middle, as much as fills the shape: the edges past it are cut off") },
+        Seg { icon: None, label: "Fit", tip: Some("All of it, with black bars where the shapes differ") },
+        Seg { icon: None, label: "Stretch", tip: Some("All of it, stretched or squeezed into the shape") },
+    ];
+    let chosen = ALL.iter().position(|f| *f == now).unwrap_or(0);
+    ui_kit::segmented_opts(ui, "framing", &opts, chosen, None, ui.is_enabled()).map(|i| ALL[i])
+}
+
+/// What recording in `shape` does to a `w`×`h` screen, in words.
+fn shape_note(shape: capture::Shape, (w, h): (u32, u32)) -> String {
+    let (sw, sh) = shape.of(w, h);
+    let screen = w as f64 / h.max(1) as f64;
+    let wanted = shape.w as f64 / shape.h.max(1) as f64;
+    if (screen / wanted - 1.0).abs() < 0.01 {
+        return format!("Your {w}×{h} screen is already this shape");
+    }
+    let wider = screen > wanted;
+    match shape.framing {
+        capture::Framing::Fill => format!("Records the middle {sw}×{sh} of your {w}×{h} screen: its {} cut off", if wider { "sides are" } else { "top and bottom are" }),
+        capture::Framing::Fit => format!("Records all of your {w}×{h} screen, with black bars {}", if wider { "above and below" } else { "at the sides" }),
+        capture::Framing::Stretch => format!("Records all of your {w}×{h} screen, {}", if wider { "squeezed narrower" } else { "stretched wider" }),
+    }
+}
 
 /// Even or Soft: the one clicked, if one was.
 fn blend_shape_field(ui: &mut egui::Ui, now: settings::BlendShape) -> Option<settings::BlendShape> {

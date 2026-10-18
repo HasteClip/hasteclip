@@ -222,10 +222,10 @@ pub(crate) fn display_pixels(display: &SCDisplay) -> (usize, usize) {
     if w == 0 || h == 0 { unsafe { (display.width() as usize, display.height() as usize) } } else { (w, h) }
 }
 
-/// What to record and the frame size: a display's own, or for games and
-/// apps the main display's (so it can't change mid-file, whatever the
-/// windows do).
-pub(crate) fn plan(source: &VideoSource, target_height: Option<u32>) -> Result<(Retained<SCShareableContent>, Retained<SCDisplay>, (usize, usize))> {
+/// What to record and the frame size: a display's own (in `shape`, if
+/// there is one), or for games and apps the main display's (so it can't
+/// change mid-file, whatever the windows do).
+pub(crate) fn plan(source: &VideoSource, target_height: Option<u32>, shape: Option<crate::Shape>) -> Result<(Retained<SCShareableContent>, Retained<SCDisplay>, (usize, usize))> {
     let content = shareable_content()?;
     let id = match source {
         VideoSource::Screen { id, .. } => id.as_str(),
@@ -233,7 +233,7 @@ pub(crate) fn plan(source: &VideoSource, target_height: Option<u32>) -> Result<(
     };
     let display = pick_display(&content, id).context("no display to capture")?;
     let (w, h) = display_pixels(&display);
-    let (w, h) = crate::output_size(w as u32, h as u32, target_height);
+    let (w, h) = crate::recorded_size(w as u32, h as u32, target_height, shape);
     Ok((content, display, (w as usize, h as usize)))
 }
 
@@ -249,6 +249,11 @@ pub(crate) struct Picture {
     /// The display shown while recording the whole screen (by id).
     display: String,
     size: (usize, usize),
+    /// Looks a second, and how what's recorded goes into the frame: the
+    /// stream's settings, made again for each display or window (Fill cuts
+    /// each to the frame's shape).
+    fps: u32,
+    framing: crate::Framing,
     away: Option<Arc<Buffer>>,
 }
 
@@ -270,9 +275,10 @@ impl AppsConfig {
 }
 
 impl Picture {
-    /// Start capturing `source` at `width`×`height`, `fps`. For a display,
-    /// waits for its first frame (so a capture that can't see the screen
-    /// fails visibly, not with an empty file).
+    /// Start capturing `source` at `width`×`height`, `fps`, put into the
+    /// frame as `framing` says. For a display, waits for its first frame (so
+    /// a capture that can't see the screen fails visibly, not with an empty
+    /// file).
     pub(crate) fn start(
         source: &VideoSource,
         content: &SCShareableContent,
@@ -280,11 +286,12 @@ impl Picture {
         (width, height): (usize, usize),
         fps: u32,
         away: Option<Arc<Buffer>>,
+        framing: crate::Framing,
     ) -> Result<Self> {
         let latest = Arc::new(Latest::default());
         let out = Arc::new(Output { latest: latest.clone(), paused: AtomicBool::new(false), frames: AtomicU64::new(0) });
         let output = ScreenOutput::new(out.clone());
-        let config = stream_config(width, height, fps);
+        let config = stream_config(width, height, fps, framing, Some(points(display)));
         // Games and apps start on the away screen (the stream shows the
         // display until a window is picked, but nothing of it is used).
         let apps = AppsConfig::of(source);
@@ -307,7 +314,7 @@ impl Picture {
             VideoSource::Apps { .. } => String::new(),
         };
         let _ = content;
-        let mut picture = Self { latest, stream, _output: output, out, follow: None, display: display_id, size: (width, height), away };
+        let mut picture = Self { latest, stream, _output: output, out, follow: None, display: display_id, size: (width, height), fps, framing, away };
         match apps {
             None => {
                 let deadline = Instant::now() + Duration::from_secs(3);
@@ -329,8 +336,8 @@ impl Picture {
         let list = Arc::new(Mutex::new(config));
         let stop = Arc::new(AtomicBool::new(false));
         let stream = SendStream(self.stream.clone());
-        let (out, latest, list2, stop2, away, size) = (self.out.clone(), self.latest.clone(), list.clone(), stop.clone(), self.away.clone(), self.size);
-        let handle = thread::spawn(move || follow_apps(stream, out, latest, list2, stop2, away, size));
+        let (out, latest, list2, stop2, away, size, fps, framing) = (self.out.clone(), self.latest.clone(), list.clone(), stop.clone(), self.away.clone(), self.size, self.fps, self.framing);
+        let handle = thread::spawn(move || follow_apps(stream, out, latest, list2, stop2, away, size, fps, framing));
         self.follow = Some((stop, handle, list));
     }
 
@@ -363,7 +370,7 @@ impl Picture {
                     return true;
                 }
                 self.stop_following();
-                match show_display(&self.stream, id) {
+                match show_display(&self.stream, id, self.size, self.fps, self.framing) {
                     Ok(()) => {
                         self.display = id.clone();
                         *self.latest.app.lock().unwrap() = None;
@@ -386,18 +393,37 @@ impl Picture {
     }
 }
 
-/// Point the stream at a whole display (by id; the main one if it's gone).
-fn show_display(stream: &SCStream, id: &str) -> Result<()> {
+/// Point the stream at a whole display (by id; the main one if it's gone),
+/// at a `size` frame, `fps`, put in as `framing` says.
+fn show_display(stream: &SCStream, id: &str, size: (usize, usize), fps: u32, framing: crate::Framing) -> Result<()> {
     let content = shareable_content()?;
     let display = pick_display(&content, id).context("no display to capture")?;
     let filter = unsafe { SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), &display, &NSArray::new()) };
-    await_completion(|h| unsafe { stream.updateContentFilter_completionHandler(&filter, Some(h)) }).map_err(|e| anyhow::anyhow!("{e}"))
+    await_completion(|h| unsafe { stream.updateContentFilter_completionHandler(&filter, Some(h)) }).map_err(|e| anyhow::anyhow!("{e}"))?;
+    reconfigure(stream, size, fps, framing, points(&display))
+}
+
+/// A display's size in points, what the stream's source rect is in.
+fn points(display: &SCDisplay) -> (f64, f64) {
+    unsafe { (display.width() as f64, display.height() as f64) }
+}
+
+/// Set the stream up again for what it now shows, `content` points big:
+/// filling, the middle of it, cut to the frame's shape.
+fn reconfigure(stream: &SCStream, (width, height): (usize, usize), fps: u32, framing: crate::Framing, content: (f64, f64)) -> Result<()> {
+    let config = stream_config(width, height, fps, framing, Some(content));
+    await_completion(|h| unsafe { stream.updateConfiguration_completionHandler(&config, Some(h)) }).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 struct SendStream(Retained<SCStream>);
 unsafe impl Send for SendStream {}
 
-fn stream_config(width: usize, height: usize, fps: u32) -> Retained<SCStreamConfiguration> {
+/// The stream's settings for a `width`×`height` frame at `fps`. What's
+/// recorded (`content` points big: a display, or a window) goes in as
+/// `framing` says: its middle, cut to the frame's shape (Fill); all of it,
+/// with black around (Fit); or all of it, stretched.
+fn stream_config(width: usize, height: usize, fps: u32, framing: crate::Framing, content: Option<(f64, f64)>) -> Retained<SCStreamConfiguration> {
+    use objc2_core_foundation::{CGPoint, CGRect, CGSize};
     unsafe {
         let config = SCStreamConfiguration::new();
         config.setWidth(width);
@@ -407,9 +433,17 @@ fn stream_config(width: usize, height: usize, fps: u32) -> Retained<SCStreamConf
         config.setColorMatrix(kCGDisplayStreamYCbCrMatrix_ITU_R_709_2);
         config.setShowsCursor(true);
         // A window fills the frame as far as its shape allows (up and down),
-        // centred, with black around it.
+        // centred, with black around it; stretched, all of the frame.
         config.setScalesToFit(true);
-        config.setPreservesAspectRatio(true);
+        config.setPreservesAspectRatio(framing != crate::Framing::Stretch);
+        if let (crate::Framing::Fill, Some((cw, ch))) = (framing, content)
+            && cw > 0.0
+            && ch > 0.0
+        {
+            let shape = width as f64 / height.max(1) as f64;
+            let (w, h) = if cw / ch > shape { (ch * shape, ch) } else { (cw, cw / shape) };
+            config.setSourceRect(CGRect::new(CGPoint::new((cw - w) / 2.0, (ch - h) / 2.0), CGSize::new(w, h)));
+        }
         if let Some(black) = CGColor::constant_color(Some(objc2_core_graphics::kCGColorBlack)) {
             config.setBackgroundColor(&black);
         }
@@ -449,8 +483,12 @@ fn follow_apps(
     stop: Arc<AtomicBool>,
     away: Option<Arc<Buffer>>,
     (width, height): (usize, usize),
+    fps: u32,
+    framing: crate::Framing,
 ) {
     let stream = stream.0;
+    // Filling: the size (points) of the window the stream is cut to.
+    let mut cut_to: Option<(f64, f64)> = None;
     let mut config = AppsConfig::default();
     // The listed app last in front: recorded until another one is.
     let mut active: Option<String> = None;
@@ -518,6 +556,7 @@ fn follow_apps(
                     None => hold(&mut away_up, &mut held),
                     Some((w, app)) => match record_window(&stream, w.id) {
                         Ok(()) => {
+                            cut_to = None;
                             *latest.app.lock().unwrap() = Some(app.clone());
                             active = Some(app.clone());
                             current = Some((w.id, app));
@@ -533,6 +572,19 @@ fn follow_apps(
                         }
                     },
                 }
+            }
+        }
+        // Filling the frame: the window cut to its shape, and cut again when
+        // it changes size.
+        if framing == crate::Framing::Fill
+            && let Some((w, _)) = &current
+            && let Some(win) = all.iter().find(|x| x.id == *w)
+            && cut_to != Some((win.width, win.height))
+        {
+            // Not tried again until it changes size.
+            cut_to = Some((win.width, win.height));
+            if let Err(e) = reconfigure(&stream, (width, height), fps, framing, (win.width, win.height)) {
+                eprintln!("can't cut the window to the recording's shape: {e:#}");
             }
         }
         // The setting changed while nothing listed is open.

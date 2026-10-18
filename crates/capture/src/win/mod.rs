@@ -217,7 +217,9 @@ impl Session {
         system::mf_startup()?;
         let gpu = d3d::Gpu::new()?;
         let (picture_source, (canvas_w, canvas_h)) = PictureSource::plan(&s.video)?;
-        let (width, height) = crate::output_size(canvas_w, canvas_h, s.target_height);
+        let (width, height) = crate::recorded_size(canvas_w, canvas_h, s.target_height, s.shape);
+        // Without a shape, a window that isn't the screen's goes in whole.
+        let framing = s.shape.map_or(crate::Framing::Fit, |shape| shape.framing);
         let clock = Arc::new(Clock::default());
 
         let (titles, comment, has_rest) = track_layout(&s.sources);
@@ -292,8 +294,8 @@ impl Session {
             let shutter = crate::shutter::Shutter::new(looks, s.blend_shape);
             let blend = FrameBlend::new(&gpu, &latest, looks, shutter.frames_open())?;
             latest.set_wants_queue(true);
-            let converter = d3d::Converter::new(&gpu, &blend.average, overlay.clone(), &encoder.pool.textures, true, width, height, s.fps)?;
-            let preview = d3d::Previewer::new(&gpu, &latest, overlay, width, height, s.fps, crate::preview::new_producer())?;
+            let converter = d3d::Converter::new(&gpu, &blend.average, overlay.clone(), &encoder.pool.textures, true, width, height, s.fps, framing)?;
+            let preview = d3d::Previewer::new(&gpu, &latest, overlay, width, height, s.fps, framing, crate::preview::new_producer())?;
             session.pacer = Some(spawn_blend_pacer(s.fps, looks, shutter, latest, blend, converter, encoder, preview, camera, clock));
             Ok(())
         })();
@@ -522,6 +524,7 @@ impl PreviewCapture {
     pub(crate) fn start(
         source: VideoSource,
         target_height: Option<u32>,
+        shape: Option<crate::Shape>,
         fps: u32,
         away: Option<Arc<crate::StillImage>>,
         webcam: Option<crate::webcam::Webcam>,
@@ -541,10 +544,11 @@ impl PreviewCapture {
                     *list = shared; // so `update` reaches the running follower
                 }
                 let picture = source.open(&gpu, w, h, fps, away)?;
-                let (width, height) = crate::output_size(w, h, target_height);
+                let (width, height) = crate::recorded_size(w, h, target_height, shape);
+                let framing = shape.map_or(crate::Framing::Fit, |shape| shape.framing);
                 let cam = webcam.as_ref().and_then(|wc| camera::CameraLayer::new(&gpu, wc).ok());
                 let overlay = cam.as_ref().zip(webcam.as_ref()).map(|(c, wc)| (&c.latest, wc.placement.clone()));
-                let preview = d3d::Previewer::new(&gpu, &picture.latest, overlay, width, height, fps, generation)?;
+                let preview = d3d::Previewer::new(&gpu, &picture.latest, overlay, width, height, fps, framing, generation)?;
                 Ok((picture, preview, cam))
             })();
             let (picture, preview, mut cam) = match opened {

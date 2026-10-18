@@ -68,6 +68,7 @@ impl PreviewCapture {
     pub(crate) fn start(
         source: VideoSource,
         target_height: Option<u32>,
+        shape: Option<crate::Shape>,
         fps: u32,
         away: Option<Arc<StillImage>>,
         webcam: Option<crate::webcam::Webcam>,
@@ -80,12 +81,13 @@ impl PreviewCapture {
         let apps = matches!(source, VideoSource::Apps { .. });
         thread::spawn(move || {
             let opened = (|| -> Result<(Picture, Frames)> {
-                let (content, display, size) = video::plan(&source, target_height)?;
+                let (content, display, size) = video::plan(&source, target_height, shape)?;
                 let away = match &away {
                     Some(img) => Some(Arc::new(video::still_buffer(Some(img), size.0, size.1)?)),
                     None => None,
                 };
-                let picture = Picture::start(&source, &content, &display, size, fps, away)?;
+                let framing = shape.map_or(crate::Framing::Fit, |shape| shape.framing);
+                let picture = Picture::start(&source, &content, &display, size, fps, away, framing)?;
                 let frames = Frames::new(picture.latest.clone(), webcam.as_ref(), size.0, size.1, generation)?;
                 Ok((picture, frames))
             })();

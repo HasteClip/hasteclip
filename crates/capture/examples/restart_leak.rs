@@ -17,6 +17,7 @@ fn main() -> anyhow::Result<()> {
         blend_shape: Default::default(),
         video_bitrate_kbps: 20000,
         target_height: Some(num("HEIGHT", 1080)),
+        shape: None,
         use_hardware: true,
         replay_seconds: 30,
         video: capture::VideoSource::Screen { id: String::new(), hook: capture::GameHook { auto: false, allowed: Vec::new() } },

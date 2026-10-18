@@ -397,7 +397,7 @@ struct App {
     screens: Vec<capture::Device>,
     /// The recording's frame size for (what's recorded, resolution), cached:
     /// for keeping the webcam's box its shape.
-    frame_size: Option<((capture::VideoSource, Option<u32>), Option<(u32, u32)>, Instant)>,
+    frame_size: Option<((capture::VideoSource, Option<u32>, Option<capture::Shape>), Option<(u32, u32)>, Instant)>,
     /// Apps with a window, for the games-and-apps list: to add, and to show
     /// which are open. Refreshed while the Sources page shows.
     pub(crate) windowed_apps: Vec<capture::Device>,
@@ -838,6 +838,7 @@ impl App {
             blend_shape: self.settings.blend_shape.into(),
             video_bitrate_kbps: self.settings.video_bitrate_mbps * 1000,
             target_height: self.settings.resolution.height(),
+            shape: self.settings.capture_shape(),
             use_hardware: self.settings.encoder != Encoder::Software,
             replay_seconds: self.settings.replay_seconds,
             video: self.video_source(),
@@ -862,11 +863,11 @@ impl App {
         if self.settings.webcam.is_none() {
             return;
         }
-        let key = (self.video_source(), self.settings.resolution.height());
+        let key = (self.video_source(), self.settings.resolution.height(), self.settings.capture_shape());
         // Asked again now and then too: a display's mode can change, or it
         // can be plugged in, under the same choice.
         if self.frame_size.as_ref().is_none_or(|(k, _, at)| *k != key || at.elapsed() > Duration::from_secs(2)) {
-            let size = capture::frame_size(&key.0, key.1);
+            let size = capture::frame_size(&key.0, key.1, key.2);
             self.frame_size = Some((key, size, Instant::now()));
         }
         let Some((_, Some((fw, fh)), _)) = &self.frame_size else { return };

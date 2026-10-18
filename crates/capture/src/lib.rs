@@ -118,11 +118,86 @@ pub fn output_size(w: u32, h: u32, target_height: Option<u32>) -> (u32, u32) {
     (even(w * scale), even(h * scale))
 }
 
+/// How the screen goes into a recording of another shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Framing {
+    /// Its middle, as much as fills the shape: what's past that is cut off
+    /// (an ultrawide screen's sides, recorded 16:9).
+    #[default]
+    Fill,
+    /// All of it, with black bars where the shapes differ.
+    Fit,
+    /// All of it, stretched or squeezed into the shape.
+    Stretch,
+}
+
+/// A recording's shape when it isn't the screen's: `w`:`h`, and how the
+/// screen goes into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shape {
+    pub w: u32,
+    pub h: u32,
+    pub framing: Framing,
+}
+
+impl Shape {
+    /// A `w`×`h` screen in this shape, at the screen's own scale: the part
+    /// of it kept (Fill), all of it with bars (Fit), or as tall (Stretch).
+    pub fn of(&self, w: u32, h: u32) -> (u32, u32) {
+        let shape = self.w.max(1) as f64 / self.h.max(1) as f64;
+        let (w, h) = (w as f64, h as f64);
+        let wider = w / h > shape;
+        let (w, h) = match self.framing {
+            Framing::Fill if wider => (h * shape, h),
+            Framing::Fill => (w, w / shape),
+            Framing::Fit if wider => (w, w / shape),
+            Framing::Fit => (h * shape, h),
+            Framing::Stretch => (h * shape, h),
+        };
+        (w.round() as u32, h.round() as u32)
+    }
+}
+
+/// The size a `w`×`h` screen is recorded at: in `shape` if there is one,
+/// then as [`output_size`] makes it.
+pub fn recorded_size(w: u32, h: u32, target_height: Option<u32>, shape: Option<Shape>) -> (u32, u32) {
+    let (w, h) = shape.map_or((w, h), |s| s.of(w, h));
+    output_size(w, h, target_height)
+}
+
+/// Where a picture of `content`'s size goes in a frame of `frame`'s, each
+/// as (left, top, width, height): the part of the picture used, and where
+/// it's drawn. Fit uses all of it, black around it (what a recording
+/// without a shape does with a window that isn't the screen's shape); Fill
+/// cuts off what's past the frame's shape; Stretch draws all of it over all
+/// of the frame. Where it's drawn is even, for the encoder's 4:2:0 colour.
+#[cfg_attr(not(any(target_os = "windows", target_os = "linux", target_os = "macos")), allow(dead_code))]
+pub(crate) fn placement((cw, ch): (u32, u32), (fw, fh): (u32, u32), framing: Framing) -> ([u32; 4], [u32; 4]) {
+    let (all, whole) = ([0, 0, cw, ch], [0, 0, fw, fh]);
+    if cw == 0 || ch == 0 || fw == 0 || fh == 0 {
+        return (all, whole);
+    }
+    // Wider than the frame, as shapes go.
+    let wider = cw as u64 * fh as u64 > ch as u64 * fw as u64;
+    match framing {
+        Framing::Stretch => (all, whole),
+        Framing::Fit => {
+            let (w, h) = if wider { (fw, (ch as u64 * fw as u64 / cw as u64) as u32) } else { ((cw as u64 * fh as u64 / ch as u64) as u32, fh) };
+            let (w, h) = (w & !1, h & !1);
+            (all, [((fw - w) / 2) & !1, ((fh - h) / 2) & !1, w, h])
+        }
+        Framing::Fill => {
+            let (w, h) = if wider { ((ch as u64 * fw as u64 / fh as u64) as u32, ch) } else { (cw, (cw as u64 * fh as u64 / fw as u64) as u32) };
+            ([(cw - w) / 2, (ch - h) / 2, w, h], whole)
+        }
+    }
+}
+
 /// The size a recording of `source` will be, without starting anything
 /// (cheap: asks the system for display sizes). Games and apps record at the
 /// main display's size. `None` if the display isn't known (on Linux, until
 /// the screen has been picked in the system's dialog once).
-pub fn frame_size(source: &VideoSource, target_height: Option<u32>) -> Option<(u32, u32)> {
+pub fn frame_size(source: &VideoSource, target_height: Option<u32>, shape: Option<Shape>) -> Option<(u32, u32)> {
     let id = match source {
         VideoSource::Screen { id, .. } => Some(id.as_str()),
         VideoSource::Apps { .. } => None,
@@ -138,7 +213,7 @@ pub fn frame_size(source: &VideoSource, target_height: Option<u32>) -> Option<(u
         let _ = id;
         None
     };
-    native.map(|(w, h)| output_size(w, h, target_height))
+    native.map(|(w, h)| recorded_size(w, h, target_height, shape))
 }
 
 /// The fastest a recording of `source` can look at the screen for frame
@@ -560,6 +635,8 @@ pub struct EncodeSettings {
     pub video_bitrate_kbps: u32,
     /// Downscale target height, or `None` to keep native resolution.
     pub target_height: Option<u32>,
+    /// A shape to record in, when not the screen's.
+    pub shape: Option<Shape>,
     /// Use a hardware encoder (VideoToolbox, or the GPU's Media Foundation
     /// encoder on Windows) vs. software.
     pub use_hardware: bool,
@@ -634,7 +711,7 @@ pub trait Recorder {
 
 #[cfg(test)]
 mod size_tests {
-    use super::output_size;
+    use super::{Framing, Shape, output_size, placement, recorded_size};
 
     #[test]
     fn output_size_keeps_aspect_and_even() {
@@ -652,6 +729,33 @@ mod size_tests {
         // Portrait.
         assert_eq!(output_size(2160, 7680, None), (1152, 4096));
         assert_eq!(output_size(4096, 2304, None), (4096, 2304));
+    }
+
+    /// An ultrawide screen recorded 16:9 three ways, and at 1080p.
+    #[test]
+    fn shapes() {
+        let wide = |framing| Some(Shape { w: 16, h: 9, framing });
+        assert_eq!(recorded_size(3440, 1440, None, wide(Framing::Fill)), (2560, 1440));
+        assert_eq!(recorded_size(3440, 1440, None, wide(Framing::Fit)), (3440, 1934));
+        assert_eq!(recorded_size(3440, 1440, None, wide(Framing::Stretch)), (2560, 1440));
+        assert_eq!(recorded_size(3440, 1440, Some(1080), wide(Framing::Fill)), (1920, 1080));
+        // Upright from a 16:9 screen: its middle.
+        assert_eq!(recorded_size(1920, 1080, None, Some(Shape { w: 9, h: 16, framing: Framing::Fill })), (608, 1080));
+        assert_eq!(recorded_size(3440, 1440, None, None), (3440, 1440));
+    }
+
+    #[test]
+    fn where_the_picture_goes() {
+        // Fill: the middle 2560 of 3440, over all of the frame.
+        assert_eq!(placement((3440, 1440), (2560, 1440), Framing::Fill), ([440, 0, 2560, 1440], [0, 0, 2560, 1440]));
+        // Fit: all of it, bars above and below.
+        assert_eq!(placement((3440, 1440), (1920, 1080), Framing::Fit), ([0, 0, 3440, 1440], [0, 138, 1920, 802]));
+        assert_eq!(placement((1600, 1200), (1920, 1080), Framing::Fit), ([0, 0, 1600, 1200], [240, 0, 1440, 1080]));
+        assert_eq!(placement((2560, 1440), (1920, 1080), Framing::Fit), ([0, 0, 2560, 1440], [0, 0, 1920, 1080]));
+        // Stretch: all of it everywhere.
+        assert_eq!(placement((3440, 1440), (1920, 1080), Framing::Stretch), ([0, 0, 3440, 1440], [0, 0, 1920, 1080]));
+        // Nothing to place yet.
+        assert_eq!(placement((0, 0), (1920, 1080), Framing::Fit), ([0, 0, 0, 0], [0, 0, 1920, 1080]));
     }
 }
 
