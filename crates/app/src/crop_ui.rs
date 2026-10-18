@@ -15,7 +15,7 @@ use crate::theme::{self, W};
 /// The shapes offered: a name, width to height, and what it's for.
 pub const SHAPES: [(&str, u32, u32, &str); 4] = [
     ("16:9", 16, 9, "Widescreen, as most videos are: a game out of an ultrawide screen"),
-    ("4:3", 4, 3, "Older games' and screens' shape"),
+    ("4:3", 4, 3, "Older games' and screens' aspect ratio"),
     ("1:1", 1, 1, "Square"),
     ("9:16", 9, 16, "Upright, for phones: Shorts, TikTok, Reels"),
 ];
@@ -179,7 +179,7 @@ impl CropTool {
             let size = format!("{} × {}", c.w, c.h);
             ui.painter().text(pos2(rect.left() + PAD, rect.center().y), egui::Align2::LEFT_CENTER, size, theme::font(13.0, W::Medium), pal.text2);
         }
-        let opts: Vec<Seg> = std::iter::once(Seg { icon: None, label: "Any", tip: Some("Any shape: its sides can be dragged too") })
+        let opts: Vec<Seg> = std::iter::once(Seg { icon: None, label: "Any", tip: Some("Any aspect ratio: its sides can be dragged too") })
             .chain(SHAPES.iter().map(|&(name, _, _, tip)| Seg { icon: None, label: name, tip: Some(tip) }))
             .collect();
         let mut mid = ui.new_child(egui::UiBuilder::new().max_rect(middle).layout(egui::Layout::left_to_right(egui::Align::Center)));

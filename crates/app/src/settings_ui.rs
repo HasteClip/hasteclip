@@ -234,8 +234,8 @@ impl App {
                 let (_, c) = l.row(Row::new("Resolution").tip("Resolution", "Lower makes smaller files that are quicker to share. Native keeps every pixel of your display.").note(res_note.clone()).locked(lock.clone()), |ui| self.resolution_field(ui));
                 locked_click |= c;
             }
-            if f.shows(&["shape", "aspect ratio", "16:9", "ultrawide", "black bars", "crop", "fill", "fit", "stretch"]) {
-                let (_, c) = l.row(Row::new("Shape").tip("Shape", SHAPE_TIP).locked(lock.clone()), |ui| self.shape_field(ui, screen));
+            if f.shows(&["aspect ratio", "shape", "same as screen", "16:9", "21:9", "ultrawide", "black bars", "crop", "fill", "fit", "stretch"]) {
+                let (_, c) = l.row(Row::new("Aspect ratio").tip("Aspect ratio", SHAPE_TIP).locked(lock.clone()), |ui| self.shape_field(ui, screen));
                 locked_click |= c;
                 let shape = self.settings.capture_shape();
                 l.well("shape_well", shape.is_some(), |l| {
@@ -609,26 +609,60 @@ impl App {
         }
     }
 
-    /// The shape recordings are made in: the screen's, or one of the
-    /// editor's crop shapes.
+    /// The aspect ratio recordings are made in: picked, nothing to type (the
+    /// screen's, or a common one), or two numbers of your own (Custom), each
+    /// in its own box.
     fn shape_field(&mut self, ui: &mut egui::Ui, screen: Option<(u32, u32)>) {
-        use crate::crop_ui::SHAPES;
-        let shown = match self.settings.shape {
-            None => "As the screen".to_owned(),
-            Some([w, h]) => SHAPES.iter().find(|s| (s.1, s.2) == (w, h)).map_or(format!("{w}:{h}"), |s| s.0.to_owned()),
+        let pal = theme::pal(ui);
+        let custom_id = egui::Id::new("aspect_custom");
+        let shape = self.settings.shape;
+        // Custom: picked from the menu, or a ratio that isn't a common one.
+        let custom = ui.data(|d| d.get_temp::<bool>(custom_id)).unwrap_or(false) || shape.is_some_and(|s| !RATIOS.iter().any(|r| [r.0, r.1] == s));
+        let shown = match shape {
+            _ if custom => "Custom".to_owned(),
+            None => SAME_AS_SCREEN.to_owned(),
+            Some([w, h]) => format!("{w}:{h}"),
         };
-        let r = ui_kit::select(ui, &shown, 150.0);
-        ui_kit::menu_popup(&r, false, 260.0, |ui| {
-            let own = screen.map_or("As the screen".to_owned(), |(w, h)| format!("As the screen ({w}×{h})"));
-            if Item::new(own).check(self.settings.shape.is_none()).tip("All of it, in its own shape").show(ui).clicked() {
-                self.settings.shape = None;
+        let r = ui_kit::select(ui, &shown, if custom { 100.0 } else { 150.0 });
+        let (mut picked, mut to_custom) = (None, false);
+        ui_kit::menu_popup(&r, false, 250.0, |ui| {
+            let mut same = Item::new(SAME_AS_SCREEN).check(!custom && shape.is_none());
+            if let Some((w, h)) = screen {
+                same = same.value(format!("{w}×{h}"));
             }
-            for &(name, w, h, tip) in &SHAPES {
-                if Item::new(name).check(self.settings.shape == Some([w, h])).tip(tip).show(ui).clicked() {
-                    self.settings.shape = Some([w, h]);
+            if same.show(ui).clicked() {
+                picked = Some(None);
+            }
+            for &(w, h, note) in &RATIOS {
+                if Item::new(format!("{w}:{h}")).check(!custom && shape == Some([w, h])).value(note).show(ui).clicked() {
+                    picked = Some(Some([w, h]));
                 }
             }
+            ui_kit::menu_sep(ui);
+            to_custom = Item::new("Custom…").check(custom).tip("Two numbers of your own, like 5:4").show(ui).clicked();
         });
+        if let Some(p) = picked {
+            ui.data_mut(|d| d.remove::<bool>(custom_id));
+            self.settings.shape = p;
+        }
+        if to_custom {
+            // From the ratio there is (or 16:9), to change.
+            ui.data_mut(|d| d.insert_temp(custom_id, true));
+            self.settings.shape = Some(shape.unwrap_or([16, 9]));
+        }
+        if custom || to_custom {
+            let [w, h] = self.settings.shape.unwrap_or([16, 9]);
+            // The width's box, then the height's, left to right, so Tab goes
+            // from one to the other.
+            let boxes = ui.allocate_ui_with_layout(egui::vec2(2.0 * 46.0 + 16.0, ui_kit::CONTROL_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let w = ui_kit::number_box(ui, egui::Id::new("aspect_w"), w, 1..=99, 46.0).unwrap_or(w);
+                ui.label(theme::text(":", 13.5, W::Medium).color(pal.text2));
+                let h = ui_kit::number_box(ui, egui::Id::new("aspect_h"), h, 1..=99, 46.0).unwrap_or(h);
+                [w, h]
+            });
+            self.settings.shape = Some(kept_ratio(boxes.inner));
+        }
     }
 
     fn resolution_field(&mut self, ui: &mut egui::Ui) {
@@ -1195,18 +1229,18 @@ pub const BLEND_TIP: &str = "How the pictures in each frame are weighed. Even: a
 pub const BLEND_EVEN_TIP: &str = "Every picture counts the same: each frame's trail ends sharply";
 pub const BLEND_SOFT_TIP: &str = "The middle of each frame counts most, fading into the frames either side: smoother, a little blurrier";
 
-/// Shape's and its Screen's tips.
-const SHAPE_TIP: &str = "Record in another shape than your screen's: 16:9 out of an ultrawide screen, say, or upright for phones. Every recording and clip is made in it.";
-const FRAMING_TIP: &str = "How your screen goes into the shape. Fill: its middle, with what's past the shape cut off (an ultrawide screen's sides, for 16:9). Fit: all of it, with black bars. Stretch: all of it, stretched or squeezed.";
+/// Aspect ratio's and its Screen's tips.
+const SHAPE_TIP: &str = "Record in another aspect ratio than your screen's: 16:9 out of an ultrawide screen, say, or 9:16 for phones. Type any other, like 21:9. Every recording and clip is made in it.";
+const FRAMING_TIP: &str = "How your screen goes into the aspect ratio. Fill: its middle, with what's past it cut off (an ultrawide screen's sides, for 16:9). Fit: all of it, with black bars. Stretch: all of it, stretched or squeezed.";
 
 /// Fill, Fit or Stretch: the one clicked, if one was.
 fn framing_field(ui: &mut egui::Ui, now: settings::Framing) -> Option<settings::Framing> {
     use settings::Framing;
     const ALL: [Framing; 3] = [Framing::Fill, Framing::Fit, Framing::Stretch];
     let opts = [
-        Seg { icon: None, label: "Fill", tip: Some("Its middle, as much as fills the shape: the edges past it are cut off") },
-        Seg { icon: None, label: "Fit", tip: Some("All of it, with black bars where the shapes differ") },
-        Seg { icon: None, label: "Stretch", tip: Some("All of it, stretched or squeezed into the shape") },
+        Seg { icon: None, label: "Fill", tip: Some("Its middle, as much as fills the aspect ratio: the edges past it are cut off") },
+        Seg { icon: None, label: "Fit", tip: Some("All of it, with black bars where the aspect ratios differ") },
+        Seg { icon: None, label: "Stretch", tip: Some("All of it, stretched or squeezed into the aspect ratio") },
     ];
     let chosen = ALL.iter().position(|f| *f == now).unwrap_or(0);
     ui_kit::segmented_opts(ui, "framing", &opts, chosen, None, ui.is_enabled()).map(|i| ALL[i])
@@ -1218,7 +1252,7 @@ fn shape_note(shape: capture::Shape, (w, h): (u32, u32)) -> String {
     let screen = w as f64 / h.max(1) as f64;
     let wanted = shape.w as f64 / shape.h.max(1) as f64;
     if (screen / wanted - 1.0).abs() < 0.01 {
-        return format!("Your {w}×{h} screen is already this shape");
+        return format!("Your {w}×{h} screen is already this aspect ratio");
     }
     let wider = screen > wanted;
     match shape.framing {
@@ -1233,6 +1267,27 @@ fn blend_shape_field(ui: &mut egui::Ui, now: settings::BlendShape) -> Option<set
     let opts = [Seg { icon: None, label: "Even", tip: Some(BLEND_EVEN_TIP) }, Seg { icon: None, label: "Soft", tip: Some(BLEND_SOFT_TIP) }];
     let chosen = usize::from(now == settings::BlendShape::Soft);
     ui_kit::segmented_opts(ui, "blend_shape", &opts, chosen, None, ui.is_enabled()).map(|i| if i == 0 { settings::BlendShape::Even } else { settings::BlendShape::Soft })
+}
+
+/// What the aspect ratio is called when it's the screen's own.
+const SAME_AS_SCREEN: &str = "Same as screen";
+
+/// The aspect ratios offered for recording: width, height, and what it is.
+const RATIOS: [(u32, u32, &str); 7] = [
+    (16, 9, "widescreen"),
+    (21, 9, "ultrawide"),
+    (32, 9, "super ultrawide"),
+    (16, 10, ""),
+    (4, 3, "older games"),
+    (1, 1, "square"),
+    (9, 16, "upright, for phones"),
+];
+
+/// A custom ratio kept from 1:4 to 4:1: a side that's too long is cut to
+/// four times the other.
+fn kept_ratio([w, h]: [u32; 2]) -> [u32; 2] {
+    let w = w.clamp(1, 4 * h.max(1));
+    [w, h.clamp(1, 4 * w)]
 }
 
 /// "48 MB", "1.2 GB".
@@ -1285,5 +1340,17 @@ mod length_tests {
         assert_eq!(round_mbps(12.4), 12);
         assert_eq!(round_mbps(26.5), 25);
         assert_eq!(round_mbps(0.4), 2);
+    }
+}
+
+#[cfg(test)]
+mod ratio_tests {
+    use super::*;
+
+    #[test]
+    fn custom_ratios_stay_within_four_to_one() {
+        assert_eq!(kept_ratio([21, 9]), [21, 9]);
+        assert_eq!(kept_ratio([99, 1]), [4, 1]);
+        assert_eq!(kept_ratio([1, 99]), [1, 4]);
     }
 }

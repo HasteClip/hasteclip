@@ -1721,10 +1721,12 @@ pub fn text_field(ui: &mut egui::Ui, text: &mut String, hint: &str) -> egui::tex
 
 // --- Value fields ---
 
-/// A number you type in place ("90", "2:30", "1080", "Native"), with its unit
-/// after it and the common values under its ∨. Enter or clicking away
-/// applies; Esc puts it back; arrow keys step through the common values. A
-/// value that isn't one of them just shows as itself.
+/// A number you type in place ("90", "2:30", "1080", "Native"), with
+/// its unit after it and the common values under its ∨. Clicking it chooses
+/// all of it, so typing replaces it, and a word's first letters are enough
+/// ("n" is Native). Enter or clicking away applies; Esc puts it back; arrow
+/// keys step through the common values. A value that isn't one of them just
+/// shows as itself.
 pub struct ValueField<'a> {
     pub id: egui::Id,
     /// What it shows now.
@@ -1796,18 +1798,26 @@ impl ValueField<'_> {
         let unit_w = if self.unit.is_empty() { 0.0 } else { ui.painter().layout_no_wrap(self.unit.to_owned(), font.clone(), p.text3).size().x + 4.0 };
         let input_w = (tw + 1.0).min(field.width() - unit_w).max(14.0);
         let mut fui = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(field.min, vec2(input_w, field.height()))).layout(egui::Layout::left_to_right(egui::Align::Center)));
-        let resp = egui::TextEdit::singleline(&mut text)
+        let edited = egui::TextEdit::singleline(&mut text)
             .id(edit_id)
             .frame(egui::Frame::NONE)
             .font(font.clone())
             .text_color(p.text)
             .desired_width(input_w)
             .margin(Margin::ZERO)
-            .show(&mut fui)
-            .response
-            .response;
-        let resp = resp.on_hover_text(self.hint).on_hover_cursor(egui::CursorIcon::Text);
-        if !self.unit.is_empty() {
+            .show(&mut fui);
+        let resp = edited.response.response.clone().on_hover_text(self.hint).on_hover_cursor(egui::CursorIcon::Text);
+        // A word typed: the common value it's the start of, finished with
+        // Enter ("n" is Native).
+        let completes = |t: &str| {
+            let t = t.trim().to_lowercase();
+            (t.chars().any(char::is_alphabetic)).then(|| self.presets.iter().position(|(_, v, _)| v.to_lowercase().starts_with(&t))).flatten()
+        };
+        if let Some(i) = completes(&text).filter(|_| resp.has_focus()) {
+            // The rest of it, dim, after what's typed.
+            let rest: String = self.presets[i].1.chars().skip(text.trim().chars().count()).collect();
+            ui.painter().text(Pos2::new(field.left() + tw, rect.center().y), Align2::LEFT_CENTER, rest, font.clone(), p.text3);
+        } else if !self.unit.is_empty() {
             ui.painter().text(Pos2::new(field.left() + input_w + 2.0, rect.center().y), Align2::LEFT_CENTER, self.unit, font, p.text3);
         }
         // Clicking anywhere in the box (not just on the digits) types.
@@ -1817,6 +1827,10 @@ impl ValueField<'_> {
         }
         if resp.gained_focus() {
             editing = Some(self.text.clone());
+            // All of it chosen: what's typed replaces it.
+            let mut state = edited.state.clone();
+            state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(self.text.chars().count()))));
+            state.store(ui.ctx(), edit_id);
         }
         if resp.has_focus() {
             editing = Some(text.clone());
@@ -1837,7 +1851,10 @@ impl ValueField<'_> {
         if resp.lost_focus() {
             if let Some(t) = editing.take() {
                 if t.trim() != self.text.trim() {
-                    out = Typed::Text(t);
+                    out = match completes(&t) {
+                        Some(i) => Typed::Preset(i),
+                        None => Typed::Text(t),
+                    };
                 }
             }
         }
@@ -1883,6 +1900,122 @@ impl ValueField<'_> {
         }
         out
     }
+}
+
+/// A whole number in a box of its own, typed or stepped: clicking it
+/// chooses all of it, so the digits typed replace it; ↑ ↓ (and the wheel
+/// over it) add or take one, with Shift ten. Enter, Tab or clicking away
+/// applies what's typed; Esc puts it back. Kept within `range`. The new
+/// number, when it changes.
+pub fn number_box(ui: &mut egui::Ui, id: egui::Id, value: u32, range: std::ops::RangeInclusive<u32>, width: f32) -> Option<u32> {
+    use egui::{Event, EventFilter, Key};
+    let p = theme::pal(ui);
+    let (rect, _) = ui.allocate_exact_size(vec2(width, CONTROL_H), Sense::hover());
+    let resp = ui.interact(rect, id, Sense::click()).on_hover_cursor(egui::CursorIcon::Text);
+    if resp.clicked() {
+        resp.request_focus();
+    }
+    let key = id.with("typed");
+    let mut typed: Option<String> = ui.data(|d| d.get_temp(key));
+    let kept = |v: i64| v.clamp(i64::from(*range.start()), i64::from(*range.end())) as u32;
+    let mut out = None;
+    if resp.has_focus() {
+        ui.memory_mut(|m| m.set_focus_lock_filter(id, EventFilter { tab: false, horizontal_arrows: false, vertical_arrows: true, escape: true }));
+        let t = typed.get_or_insert_with(String::new);
+        let now = |t: &String, out: Option<u32>| t.parse::<i64>().unwrap_or(i64::from(out.unwrap_or(value)));
+        let mut done = false;
+        for ev in ui.input(|i| i.events.clone()) {
+            match ev {
+                Event::Text(s) => {
+                    for c in s.chars().filter(char::is_ascii_digit) {
+                        // No zeros in front, and no more digits than the
+                        // biggest has.
+                        if !(c == '0' && t.is_empty()) && t.len() < range.end().to_string().len() {
+                            t.push(c);
+                        }
+                    }
+                }
+                Event::Key { key, pressed: true, modifiers, .. } => {
+                    let by = if modifiers.shift { 10 } else { 1 };
+                    match key {
+                        Key::Backspace => {
+                            t.pop();
+                        }
+                        Key::ArrowUp | Key::ArrowDown => {
+                            out = Some(kept(now(t, out) + if key == Key::ArrowUp { by } else { -by }));
+                            t.clear();
+                        }
+                        Key::Enter => done = true,
+                        Key::Escape => {
+                            t.clear();
+                            done = true;
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        // The wheel steps while the pointer's on it (and isn't scrolling
+        // the page then).
+        if resp.hovered() {
+            let dy = ui.input(|i| i.smooth_scroll_delta.y);
+            if dy != 0.0 {
+                ui.input_mut(|i| i.smooth_scroll_delta = Vec2::ZERO);
+                let wheel = ui.data(|d| d.get_temp::<f32>(id.with("wheel"))).unwrap_or(0.0) + dy;
+                let steps = (wheel / 40.0).trunc();
+                if steps != 0.0 {
+                    out = Some(kept(now(t, out) + steps as i64));
+                    t.clear();
+                }
+                ui.data_mut(|d| d.insert_temp(id.with("wheel"), wheel - steps * 40.0));
+            }
+        }
+        if done {
+            if let Ok(v) = t.parse::<i64>() {
+                out = Some(kept(v));
+            }
+            typed = None;
+            resp.surrender_focus();
+        }
+    } else if let Some(t) = typed.take() {
+        // Clicked away or tabbed on: what was typed counts.
+        if let Ok(v) = t.parse::<i64>() {
+            out = Some(kept(v));
+        }
+    }
+    ui.data_mut(|d| match &typed {
+        Some(t) => {
+            d.insert_temp(key, t.clone());
+        }
+        None => d.remove::<String>(key),
+    });
+
+    // The box; the number, chosen until typing starts, then what's typed
+    // with a caret after it.
+    let focused = resp.has_focus();
+    let hv = theme::toggle(ui.ctx(), id.with("hv"), resp.hovered() && !focused, theme::FAST);
+    let fc = theme::toggle(ui.ctx(), id.with("fc"), focused, theme::FAST);
+    let painter = ui.painter_at(rect.expand(2.0));
+    painter.rect_filled(rect, RADIUS, theme::mix(p.control, p.control_h, hv));
+    if fc > 0.0 {
+        painter.rect_stroke(rect, RADIUS, Stroke::new(1.5, theme::fade(p.text2, fc)), StrokeKind::Inside);
+    }
+    let typing = typed.as_ref().filter(|t| !t.is_empty());
+    let text = typing.cloned().unwrap_or_else(|| out.unwrap_or(value).to_string());
+    let font = theme::font(13.0, W::Medium);
+    let g = painter.layout_no_wrap(text, font.clone(), p.text);
+    let at = Pos2::new(rect.center().x - g.size().x / 2.0, rect.center().y - g.size().y / 2.0);
+    if focused && typing.is_none() {
+        painter.rect_filled(Rect::from_min_size(at - vec2(3.0, 2.0), g.size() + vec2(6.0, 4.0)), 3, p.seg_on);
+    }
+    let x = at.x + g.size().x;
+    painter.galley(at, g, p.text);
+    if focused && typing.is_some() {
+        let h = font.size * 0.6;
+        painter.vline(x + 1.5, rect.center().y - h..=rect.center().y + h, Stroke::new(1.5, p.text));
+    }
+    out.filter(|v| *v != value)
 }
 
 // --- Pointer ---
@@ -2119,6 +2252,95 @@ mod tests {
         assert_eq!(clicks, 1, "the replay clicks");
         frame(vec![], &mut clicks);
         assert_eq!(clicks, 1, "once");
+    }
+
+    /// A value field, clicked and typed into as a person would: what each
+    /// frame gave back.
+    fn type_into(text: &str, frames: Vec<Vec<egui::Event>>) -> Vec<String> {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let presets = vec![("Native".to_owned(), "Native".to_owned(), String::new()), ("1080p".to_owned(), "1080".to_owned(), String::new())];
+        let mut got = Vec::new();
+        for events in frames {
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0))), events, ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| {
+                let mut at = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(Pos2::new(10.0, 10.0), vec2(150.0, CONTROL_H))));
+                let field = ValueField { id: egui::Id::new("vf"), text: text.to_owned(), unit: "", width: 150.0, hint: "", presets: presets.clone(), current: None, range: "" };
+                got.push(match field.show(&mut at) {
+                    Typed::None => String::new(),
+                    Typed::Text(t) => format!("text {t}"),
+                    Typed::Preset(i) => format!("preset {i}"),
+                    Typed::Secs(s) => format!("secs {s}"),
+                });
+            });
+            out.textures_delta.clear();
+        }
+        got.into_iter().filter(|g| !g.is_empty()).collect()
+    }
+
+    /// Clicked, typed into, Enter.
+    fn click_type_enter(text: &str) -> Vec<Vec<egui::Event>> {
+        let at = Pos2::new(40.0, 10.0 + CONTROL_H / 2.0);
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        let key = |key| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() };
+        vec![vec![egui::Event::PointerMoved(at)], vec![button(true)], vec![button(false)], vec![], vec![egui::Event::Text(text.to_owned())], vec![key(egui::Key::Enter)], vec![]]
+    }
+
+    /// Clicked, typing replaces what was there, and a word's first letter is
+    /// enough.
+    #[test]
+    fn a_value_field_types_over_its_value() {
+        assert_eq!(type_into("Native", click_type_enter("1440")), ["text 1440"]);
+        assert_eq!(type_into("1440", click_type_enter("n")), ["preset 0"]);
+    }
+
+    /// Two number boxes, clicked and typed into as a person would: each
+    /// one's number at the end.
+    fn number_boxes(frames: Vec<Vec<egui::Event>>) -> [u32; 2] {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let mut nums = [16, 9];
+        for events in frames {
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0))), events, ..Default::default() };
+            let mut out = ctx.run_ui(raw, |ui| {
+                let mut at = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(Pos2::new(10.0, 10.0), vec2(200.0, CONTROL_H))).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                for (i, n) in nums.iter_mut().enumerate() {
+                    if let Some(v) = number_box(&mut at, egui::Id::new(("nb", i)), *n, 1..=99, 46.0) {
+                        *n = v;
+                    }
+                }
+            });
+            out.textures_delta.clear();
+        }
+        nums
+    }
+
+    fn key(key: egui::Key, shift: bool) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers { shift, ..Default::default() } }
+    }
+
+    /// The first box clicked, then what `then` does, a frame each.
+    fn first_box_then(then: Vec<egui::Event>) -> Vec<Vec<egui::Event>> {
+        let at = Pos2::new(30.0, 10.0 + CONTROL_H / 2.0);
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        let mut frames = vec![vec![egui::Event::PointerMoved(at)], vec![button(true)], vec![button(false)], vec![]];
+        frames.extend(then.into_iter().map(|e| vec![e]));
+        frames.push(vec![]);
+        frames
+    }
+
+    /// Typing replaces the number; arrows add or take one (Shift: ten); Tab
+    /// goes on to the next box; Esc puts it back.
+    #[test]
+    fn number_boxes_type_and_step() {
+        use egui::{Event, Key};
+        assert_eq!(number_boxes(first_box_then(vec![Event::Text("21".into()), key(Key::Enter, false)])), [21, 9]);
+        assert_eq!(number_boxes(first_box_then(vec![key(Key::ArrowUp, false), key(Key::ArrowUp, true)])), [27, 9]);
+        assert_eq!(number_boxes(first_box_then(vec![key(Key::ArrowDown, false)])), [15, 9]);
+        assert_eq!(number_boxes(first_box_then(vec![Event::Text("21".into()), key(Key::Tab, false), Event::Text("10".into()), key(Key::Enter, false)])), [21, 10]);
+        assert_eq!(number_boxes(first_box_then(vec![Event::Text("5".into()), key(Key::Escape, false)])), [16, 9]);
+        // Kept within its range.
+        assert_eq!(number_boxes(first_box_then(vec![key(Key::ArrowUp, true); 10])), [99, 9]);
     }
 
     /// Shortcuts read as compact keys.
