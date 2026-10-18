@@ -112,9 +112,10 @@ impl Planes {
 }
 
 impl Shown {
-    /// Draw it into `rect` (with the high-quality filter).
-    pub fn paint(&self, ui: &egui::Ui, rect: egui::Rect) {
-        ui.painter().add(egui_wgpu::Callback::new_paint_callback(rect, Draw(self.clone(), rect)));
+    /// Draw it into `rect` (with the high-quality filter), cut to
+    /// `painter`'s clip.
+    pub fn paint(&self, painter: &egui::Painter, rect: egui::Rect) {
+        painter.add(egui_wgpu::Callback::new_paint_callback(rect, Draw(self.clone(), rect)));
     }
 
     /// Its colours, blurred very wide, over `cover` (clipped to `painter`'s

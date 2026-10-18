@@ -537,7 +537,7 @@ impl Ready {
         self.player.set_stepping(self.stepping_back);
         let size = self.player.update(&ctx, scrubbing);
         let player = &self.player;
-        crate::transport::stage(ui, preview, size, |p, cover| player.paint_glow(p, cover, egui::Id::new("viewer_stage")), |r| player.paint(ui, r));
+        crate::transport::stage(ui, preview, size, |p, cover| player.paint_glow(p, cover, egui::Id::new("viewer_stage")), |r| player.paint(ui.painter(), r));
         if let Some(f) = self.flash_play.filter(|(_, at)| at.elapsed() < Duration::from_millis(450)) {
             // A big play / pause sign that grows and fades where you clicked.
             let t = f.1.elapsed().as_secs_f32() / 0.45;

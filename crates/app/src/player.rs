@@ -579,13 +579,17 @@ impl Player {
         crate::ui_kit::repaint_after(ctx, self.shared.until(next));
     }
 
-    /// Draw the picture into `rect`: a decoded frame through the sharp
-    /// filter (`gpu_frames.rs`), anything else as an image.
-    pub fn paint(&self, ui: &egui::Ui, rect: egui::Rect) {
+    /// Draw the picture into `rect`, cut to `painter`'s clip: a decoded frame
+    /// through the sharp filter (`gpu_frames.rs`), anything else as an image.
+    pub fn paint(&self, painter: &egui::Painter, rect: egui::Rect) {
         match &self.display {
-            Some(Display::Image(id, _)) => egui::Image::from_texture((*id, rect.size())).paint_at(ui, rect),
+            Some(Display::Image(id, _)) => {
+                use egui::emath::GuiRounding as _;
+                let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+                painter.image(*id, rect.round_to_pixels(painter.pixels_per_point()), uv, egui::Color32::WHITE);
+            }
             #[cfg(hw_decode)]
-            Some(Display::Gpu(shown, _)) => shown.paint(ui, rect),
+            Some(Display::Gpu(shown, _)) => shown.paint(painter, rect),
             None => {}
         }
     }

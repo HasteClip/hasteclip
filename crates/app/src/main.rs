@@ -13,6 +13,7 @@ mod autostart;
 mod away;
 mod clips;
 mod collections;
+mod crop_ui;
 mod demo;
 mod webcam_ui;
 mod discord;
