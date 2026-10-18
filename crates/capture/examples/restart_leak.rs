@@ -14,6 +14,7 @@ fn main() -> anyhow::Result<()> {
         container_ext: "mp4".into(),
         fps: num("FPS", 60),
         blend_samples: num("BLEND", 3),
+        blend_shape: Default::default(),
         video_bitrate_kbps: 20000,
         target_height: Some(num("HEIGHT", 1080)),
         use_hardware: true,

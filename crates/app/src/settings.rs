@@ -362,6 +362,26 @@ pub struct AudioSourceCfg {
     old_noise_removal: bool,
 }
 
+/// How the looks in a blended frame are weighed (see `capture::BlendShape`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlendShape {
+    /// Each look in the frame's own time the same.
+    #[default]
+    Even,
+    /// The middle of the frame's time most, fading into the frames either side.
+    Soft,
+}
+
+impl From<BlendShape> for capture::BlendShape {
+    fn from(b: BlendShape) -> Self {
+        match b {
+            BlendShape::Even => Self::Even,
+            BlendShape::Soft => Self::Soft,
+        }
+    }
+}
+
 /// How much of a microphone's background noise is taken out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -575,6 +595,8 @@ pub struct RecordSettings {
     /// record the average of the looks in each frame (a whole multiple of
     /// `fps`), for smoother, motion-blurred video. 0 is off.
     pub blend_fps: u32,
+    /// How the looks in a blended frame are weighed.
+    pub blend_shape: BlendShape,
     pub resolution: OutputResolution,
     pub video_bitrate_mbps: u32,
 
@@ -662,6 +684,7 @@ impl Default for RecordSettings {
             display_index: 0,
             fps: 60,
             blend_fps: 0,
+            blend_shape: BlendShape::Even,
             resolution: OutputResolution::Native,
             video_bitrate_mbps: 40,
 

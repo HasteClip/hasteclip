@@ -1,7 +1,10 @@
 //! Live frame blending on macOS: each frame is the average of a fixed number
 //! of looks at the screen, evenly spaced over the frame's time (the blend
 //! rate over the frame rate: 120 fps blending at 40 fps is 3), each weighed
-//! the same, so every frame shows the same number of steps of motion.
+//! the same, so every frame shows the same number of steps of motion. Or,
+//! blended softly, of the looks from the middle of the frame before to the
+//! middle of the one after, the nearer the frame's middle the more (see
+//! [`crate::BlendShape`]): two frames are made at once.
 //!
 //! ScreenCaptureKit only sees what the display shows, so the blend rate is
 //! at most the display's refresh rate (`super::display_refresh`): a game
@@ -49,19 +52,20 @@ pub(crate) struct Blender {
     add_pass: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     luma_pass: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     chroma_pass: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    /// The average so far, as light (16-bit float, so faint ghosts and dark
-    /// colours keep their precision).
-    light: Retained<ProtocolObject<dyn MTLTexture>>,
+    /// The averages being made, as light (16-bit float, so faint ghosts and
+    /// dark colours keep their precision): one per frame open at once, by
+    /// its number (even and odd, blended softly).
+    light: Vec<Retained<ProtocolObject<dyn MTLTexture>>>,
     /// Finished frames (the encoder holds each a while).
     pool: FramePool,
     /// The picture that's up.
     held: Option<Arc<Buffer>>,
-    /// Looks in the average so far.
-    count: u32,
-    /// Looks at the picture that's up not added yet: added in one pass when
-    /// another comes up or the frame is done (a screen slower than the blend
-    /// rate is seen several times in a row).
-    pending: u32,
+    /// Per average: the looks' weight in it so far.
+    weight: [f32; 2],
+    /// Per average: the weight of looks at the picture that's up not added
+    /// yet: added in one pass when another comes up or the frame is done (a
+    /// screen slower than the blend rate is seen several times in a row).
+    pending: [f32; 2],
 }
 
 // Metal devices, queues, pipelines and textures are thread-safe; the buffers
@@ -69,16 +73,19 @@ pub(crate) struct Blender {
 unsafe impl Send for Blender {}
 
 impl Blender {
-    pub(crate) fn new(width: usize, height: usize) -> Result<Self> {
+    /// `open` frames made at once.
+    pub(crate) fn new(width: usize, height: usize, open: usize) -> Result<Self> {
         let device = MTLCreateSystemDefaultDevice().context("no Metal device")?;
         let queue = device.newCommandQueue().context("no Metal command queue")?;
         let mut k = kernels(&device, KERNELS, &["add_look", "light_to_luma", "light_to_chroma"])?.into_iter();
-        let light = unsafe {
-            let desc = MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(MTLPixelFormat::RGBA16Float, width, height, false);
-            desc.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite);
-            desc.setStorageMode(MTLStorageMode::Private);
-            device.newTextureWithDescriptor(&desc).context("no GPU memory for frame blending")?
-        };
+        let light = (0..open.clamp(1, 2))
+            .map(|_| unsafe {
+                let desc = MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(MTLPixelFormat::RGBA16Float, width, height, false);
+                desc.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite);
+                desc.setStorageMode(MTLStorageMode::Private);
+                device.newTextureWithDescriptor(&desc).context("no GPU memory for frame blending")
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             add_pass: k.next().unwrap(),
             luma_pass: k.next().unwrap(),
@@ -86,8 +93,8 @@ impl Blender {
             light,
             pool: FramePool::new(width, height)?,
             held: None,
-            count: 0,
-            pending: 0,
+            weight: [0.0; 2],
+            pending: [0.0; 2],
             device,
             queue,
         })
@@ -99,43 +106,56 @@ impl Blender {
         self.held = Some(picture);
     }
 
-    /// Add a look at the picture that's up to the frame's average.
-    pub(crate) fn add(&mut self) {
+    /// Which average frame `k` is made in.
+    fn slot(&self, k: i64) -> usize {
+        k.rem_euclid(self.light.len() as i64) as usize
+    }
+
+    /// Add a look at the picture that's up to frame `k`'s average, by `weight`.
+    pub(crate) fn add(&mut self, k: i64, weight: f32) {
         if self.held.is_some() {
-            self.pending += 1;
+            let i = self.slot(k);
+            self.pending[i] += weight;
         }
     }
 
-    /// Mix the looks at the picture that's up into the average, at once.
+    /// Mix the looks at the picture that's up into the averages, at once.
     /// Waits for the GPU, so the picture's buffer can go back to the stream.
     fn flush(&mut self) {
-        let steps = std::mem::take(&mut self.pending);
-        let Some(held) = self.held.as_ref().filter(|_| steps > 0) else { return };
-        self.count += steps;
+        let pending = std::mem::take(&mut self.pending);
+        let Some(held) = self.held.as_ref().filter(|_| pending.iter().any(|w| *w > 0.0)) else { return };
         // Mixing in by its share of the total so far keeps it the average.
-        let weight = steps as f32 / self.count as f32;
+        let mut mixes = Vec::new();
+        for (i, weight) in pending.into_iter().enumerate().filter(|(_, w)| *w > 0.0) {
+            self.weight[i] += weight;
+            mixes.push((i, weight / self.weight[i]));
+        }
         if let Err(e) = self.run(|enc, this| {
             let luma = plane_texture(&this.device, &held.0, 0, false)?;
             let chroma = plane_texture(&this.device, &held.0, 1, false)?;
             enc.setComputePipelineState(&this.add_pass);
-            unsafe {
-                enc.setTexture_atIndex(Some(&luma), 0);
-                enc.setTexture_atIndex(Some(&chroma), 1);
-                enc.setTexture_atIndex(Some(&this.light), 2);
-                enc.setBytes_length_atIndex(NonNull::from(&weight).cast::<c_void>(), 4, 0);
+            for (i, share) in &mixes {
+                unsafe {
+                    enc.setTexture_atIndex(Some(&luma), 0);
+                    enc.setTexture_atIndex(Some(&chroma), 1);
+                    enc.setTexture_atIndex(Some(&this.light[*i]), 2);
+                    enc.setBytes_length_atIndex(NonNull::from(share).cast::<c_void>(), 4, 0);
+                }
+                dispatch(enc, luma.width(), luma.height());
             }
-            dispatch(enc, luma.width(), luma.height());
             Ok(())
         }) {
             eprintln!("frame blending: {e:#}");
         }
     }
 
-    /// The frame is done: its average as a frame to encode, and the next
-    /// starts empty. None if nothing was added (no picture yet).
-    pub(crate) fn finish(&mut self) -> Option<Arc<Buffer>> {
+    /// Frame `k` is done: its average as a frame to encode, and the average
+    /// starts empty for the frame after next. None if nothing was added (no
+    /// picture yet).
+    pub(crate) fn finish(&mut self, k: i64) -> Option<Arc<Buffer>> {
         self.flush();
-        if std::mem::take(&mut self.count) == 0 {
+        let i = self.slot(k);
+        if std::mem::take(&mut self.weight[i]) == 0.0 {
             return None;
         }
         let made = self.pool.take().and_then(|out| {
@@ -144,7 +164,7 @@ impl Blender {
                     let dst = plane_texture(&this.device, &out, plane, true)?;
                     enc.setComputePipelineState(pass);
                     unsafe {
-                        enc.setTexture_atIndex(Some(&this.light), 0);
+                        enc.setTexture_atIndex(Some(&this.light[i]), 0);
                         enc.setTexture_atIndex(Some(&dst), 1);
                     }
                     dispatch(enc, dst.width(), dst.height());
@@ -252,15 +272,19 @@ struct BlendPacer {
     /// Seconds between looks (one over the blend rate), and looks per frame.
     step: f64,
     looks: i64,
-    /// Look `m` is at `t0 + phase + (m + 0.5) * step`; frame `k` is looks
-    /// `k * looks` to `(k + 1) * looks - 1`.
+    /// Look `m` is at `t0 + phase + (m + 0.5) * step`; frame `k`'s own time
+    /// is looks `k * looks` to `(k + 1) * looks - 1`.
     phase: f64,
+    /// Which frames each look counts toward.
+    shutter: crate::shutter::Shutter,
     /// The next look to take.
     next: i64,
+    /// The last frame done (made or empty): later looks don't count toward it.
+    closed: i64,
     /// The picture that's up (its number), and the one the last look took.
     held: Option<u64>,
     last_taken: Option<u64>,
-    /// Different pictures in the frame being made.
+    /// Different pictures in the frame's own time so far.
     different: u32,
     blender: Blender,
     frames: Frames,
@@ -277,10 +301,9 @@ impl BlendPacer {
         self.t0 + self.phase + (m as f64 + 0.5) * self.step
     }
 
-    /// When the frame being made is done: its last look.
+    /// When the next frame to make is done: its last look.
     fn frame_end(&self) -> f64 {
-        let last = (self.next.div_euclid(self.looks) + 1) * self.looks - 1;
-        self.look_time(last)
+        self.look_time(self.shutter.last_look(self.closed + 1))
     }
 
     /// Take every look before `t`: each sees the picture that's up.
@@ -293,8 +316,13 @@ impl BlendPacer {
     }
 
     fn look(&mut self) {
+        let (first, weights) = self.shutter.split(self.next);
         if let Some(id) = self.held {
-            self.blender.add();
+            for (k, weight) in [(first, weights[0]), (first + 1, weights[1])] {
+                if k > self.closed && weight > 0.0 {
+                    self.blender.add(k, weight);
+                }
+            }
             if self.last_taken != Some(id) {
                 self.different += 1;
                 self.last_taken = Some(id);
@@ -302,15 +330,22 @@ impl BlendPacer {
         }
         self.next += 1;
         if self.next % self.looks == 0 {
-            self.close(self.next / self.looks - 1);
+            let different = std::mem::take(&mut self.different);
+            if self.held.is_some() {
+                self.stats.frame(different, self.looks as u32);
+            }
+        }
+        // The frames no later look counts toward are done.
+        let (first, _) = self.shutter.split(self.next);
+        while self.closed < first - 1 {
+            self.close(self.closed + 1);
         }
     }
 
     /// Frame `k` is done: encode it (with the webcam over it).
     fn close(&mut self, k: i64) {
-        let different = std::mem::take(&mut self.different);
-        let Some(average) = self.blender.finish() else { return };
-        self.stats.frame(different, self.looks as u32);
+        self.closed = k;
+        let Some(average) = self.blender.finish(k) else { return };
         let frame = self.frames.make(average);
         if !self.encoder.0.encode(&frame.0, k, self.fps) {
             self.skipped += 1;
@@ -383,9 +418,11 @@ impl BlendStats {
 
 /// Like `sck::spawn_pacer`, for frame blending: `looks` looks at the screen
 /// per frame, averaged.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_blend_pacer(
     fps: u32,
     looks: u32,
+    shutter: crate::shutter::Shutter,
     latest: Arc<Latest>,
     blender: Blender,
     frames: Frames,
@@ -405,7 +442,9 @@ pub(crate) fn spawn_blend_pacer(
             step: 1.0 / (fps.max(1) * looks.max(1)) as f64,
             looks: looks.max(1) as i64,
             phase: 0.0,
+            shutter,
             next: 0,
+            closed: -1,
             held: None,
             last_taken: None,
             different: 0,
@@ -485,30 +524,48 @@ mod tests {
     /// One picture blended with itself comes out as it went in.
     #[test]
     fn one_picture_is_unchanged() {
-        let mut b = Blender::new(64, 32).unwrap();
+        let mut b = Blender::new(64, 32, 1).unwrap();
         b.hold(filled(64, 32, 120, 100, 150));
-        b.add();
-        b.add();
-        let out = b.finish().unwrap();
+        b.add(0, 1.0);
+        b.add(0, 1.0);
+        let out = b.finish(0).unwrap();
         let (y, cb, cr) = sample(&out.0);
         assert!(y.abs_diff(120) <= 1 && cb.abs_diff(100) <= 1 && cr.abs_diff(150) <= 1, "{y} {cb} {cr}");
-        assert!(b.finish().is_none(), "the next frame starts empty");
+        assert!(b.finish(1).is_none(), "the next frame starts empty");
     }
 
     /// White seen one look in four over black: a quarter of white's light,
     /// which is far brighter than a quarter of its value.
     #[test]
     fn averages_light() {
-        let mut b = Blender::new(64, 32).unwrap();
+        let mut b = Blender::new(64, 32, 1).unwrap();
         b.hold(filled(64, 32, 235, 128, 128));
-        b.add();
+        b.add(0, 1.0);
         b.hold(filled(64, 32, 16, 128, 128));
-        b.add();
-        b.add();
-        b.add();
-        let (y, cb, cr) = sample(&b.finish().unwrap().0);
+        b.add(0, 1.0);
+        b.add(0, 1.0);
+        b.add(0, 1.0);
+        let (y, cb, cr) = sample(&b.finish(0).unwrap().0);
         // sRGB of 0.25 light is 0.537: 16 + 219 * 0.537 = 134.
         assert!(y.abs_diff(134) <= 1, "{y}");
         assert_eq!((cb, cr), (128, 128));
+    }
+
+    /// Two frames made at once (blended softly) each get their own looks,
+    /// by their own weights.
+    #[test]
+    fn two_frames_at_once() {
+        let mut b = Blender::new(64, 32, 2).unwrap();
+        b.hold(filled(64, 32, 235, 128, 128));
+        b.add(0, 0.25);
+        b.add(1, 0.75);
+        b.hold(filled(64, 32, 16, 128, 128));
+        b.add(0, 0.75);
+        b.add(1, 0.25);
+        let (y0, _, _) = sample(&b.finish(0).unwrap().0);
+        let (y1, _, _) = sample(&b.finish(1).unwrap().0);
+        // sRGB of 0.75 light is 0.881: 16 + 219 * 0.881 = 209.
+        assert!(y0.abs_diff(134) <= 1, "{y0}");
+        assert!(y1.abs_diff(209) <= 1, "{y1}");
     }
 }

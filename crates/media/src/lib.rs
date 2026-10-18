@@ -456,6 +456,23 @@ pub struct Output {
     /// drops the in-between frames.
     #[serde(default)]
     pub blend_fps: Option<u32>,
+    /// How each blended frame weighs the frames in it.
+    #[serde(default)]
+    pub blend_shape: BlendShape,
+}
+
+/// How a blended frame weighs the frames in it, as live capture can
+/// (`capture::BlendShape`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlendShape {
+    /// The frames in its own slot, each the same.
+    #[default]
+    Even,
+    /// The frames from the middle of the slot before to the middle of the
+    /// one after, the nearer its own middle the more (by cos² of how far):
+    /// trails fade out at their ends, so frames hand over smoothly.
+    Soft,
 }
 
 /// AAC bitrate of each audio track a render writes.
@@ -478,10 +495,14 @@ impl Output {
             max_mb: self.max_mb,
             mix_only: self.mix_only,
             blend_fps: None,
+            blend_shape: BlendShape::Even,
         };
         e.fit_picture(info);
         let out = e.fps.map_or(info.fps, f64::from).round() as u32;
         e.blend_fps = self.blend_fps.filter(|b| e.fps.is_some() && blend_rates(out, info.fps).contains(b));
+        if e.blend_fps.is_some() {
+            e.blend_shape = self.blend_shape;
+        }
         e
     }
 
@@ -950,6 +971,54 @@ fn has_filter(name: &str) -> bool {
     list.lines().any(|l| l.split_whitespace().nth(1) == Some(name))
 }
 
+/// The frames it takes to blend `looks` frames into each at `rate`, and
+/// each one's weight: its offset from the output frame's slot (in frames) and
+/// weight. Even: the slot's own frames, the same. Soft: from the middle of
+/// the slot before to the middle of the one after, by cos² of how far from
+/// its own middle (live capture's soft blending: `capture::BlendShape`).
+fn blend_taps(looks: u32, shape: BlendShape) -> Vec<(i64, f64)> {
+    let n = looks as i64;
+    match shape {
+        BlendShape::Even => (0..n).map(|i| (i, 1.0)).collect(),
+        BlendShape::Soft => (n / 2 - n..n / 2 + n)
+            .map(|i| {
+                // How far from the slot's middle, in slots (-1 to 1).
+                let off = (2 * i + 1 - n) as f64 / (2 * n) as f64;
+                (i, (std::f64::consts::FRAC_PI_2 * off).cos().powi(2))
+            })
+            .filter(|(_, w)| *w > 1e-9)
+            .collect(),
+    }
+}
+
+/// The filter graph that blends `looks` frames into each at `rate` (see
+/// `blend_taps`). Only the kept averages are made: each tap's branch takes
+/// every `looks`th frame from its offset and `mix` averages the branches'
+/// next ones (`tmix` then `fps` averaged at every frame and kept one in
+/// `looks`: 480 to 60 fps took 2.4x as long). Taps before the first frame see
+/// it (padded with copies of it); taps after the last, the last.
+fn blend_graph(looks: u32, rate: f64, shape: BlendShape) -> String {
+    let taps = blend_taps(looks, shape);
+    let pad = taps.iter().map(|t| -t.0).max().unwrap_or(0).max(0);
+    let mut graph = if pad > 0 { format!("tpad=start={pad}:start_mode=clone,") } else { String::new() };
+    graph += &format!("split={}{}", taps.len(), (0..taps.len()).map(|i| format!("[b{i}]")).collect::<String>());
+    for (i, (off, _)) in taps.iter().enumerate() {
+        graph += &format!(";[b{i}]trim=start_frame={},framestep={looks},setpts=N/{rate}/TB[g{i}]", off + pad);
+    }
+    // As many frames as the slots: the branch at offset 0 has one per slot,
+    // and goes first (`duration=first`); one ending sooner holds its last.
+    let order: Vec<usize> = (0..taps.len()).filter(|&i| taps[i].0 == 0).chain((0..taps.len()).filter(|&i| taps[i].0 != 0)).collect();
+    let inputs: String = order.iter().map(|i| format!("[g{i}]")).collect();
+    match shape {
+        BlendShape::Even => graph += &format!(";{inputs}mix=inputs={}", taps.len()),
+        BlendShape::Soft => {
+            let weights: Vec<String> = order.iter().map(|&i| format!("{:.6}", taps[i].1)).collect();
+            graph += &format!(";{inputs}mix=inputs={}:weights='{}':duration=first", taps.len(), weights.join(" "));
+        }
+    }
+    graph
+}
+
 /// Video only, trimmed frame-exactly, into `out`. `progress` gets 0..=1.
 fn render_video(source: &Path, info: &ClipInfo, edit: &Edit, plan: &Plan, work: &Path, out: &Path, progress: &dyn Fn(f32)) -> Result<()> {
     let output = edit.output.effective(info);
@@ -964,15 +1033,12 @@ fn render_video(source: &Path, info: &ClipInfo, edit: &Edit, plan: &Plan, work: 
         let rate = edit.output.frame_rate(info);
         match output.blend_fps {
             // Frames at the blend rate, each output frame the average of the
-            // ones in its slot. Only the kept averages are made: each of
-            // `looks` branches takes every `looks`th frame and `mix` averages
-            // the branches' next ones (`tmix` then `fps` averaged at every
-            // frame and kept one in `looks`: 480 to 60 fps took 2.4x as long).
-            // Mixed as light (what a screen gives off), not as pixel values,
-            // which are gamma-encoded: a fifth of a bright ghost's value is
-            // about 3% of its light, not 20%. Recordings are BT.709, limited.
-            // 16 bits keep the faintest ghosts (72 dB from float) with half
-            // the memory to move.
+            // ones in its slot (or around it, softly: `blend_graph`). Mixed
+            // as light (what a screen gives off), not as pixel values, which
+            // are gamma-encoded: a fifth of a bright ghost's value is about
+            // 3% of its light, not 20%. Recordings are BT.709, limited. 16
+            // bits keep the faintest ghosts (72 dB from float) with half the
+            // memory to move.
             Some(b) => {
                 let light = has_filter("zscale");
                 if light {
@@ -983,13 +1049,11 @@ fn render_video(source: &Path, info: &ClipInfo, edit: &Edit, plan: &Plan, work: 
                     filters.push(format!("fps={b}"));
                 }
                 let looks = (b as f64 / rate).round() as u32;
-                let mut graph = format!("split={looks}{}", (0..looks).map(|i| format!("[b{i}]")).collect::<String>());
-                for i in 0..looks {
-                    graph += &format!(";[b{i}]trim=start_frame={i},framestep={looks},setpts=N/{rate}/TB[g{i}]");
-                }
-                graph += &format!(";{}mix=inputs={looks}", (0..looks).map(|i| format!("[g{i}]")).collect::<String>());
-                filters.push(graph);
-                filters.push(format!("fps={rate}"));
+                filters.push(blend_graph(looks, rate, output.blend_shape));
+                // One frame per slot already: in the rate's time base. (`fps`
+                // took soft's last frame off, its end then the last frame's
+                // time.)
+                filters.push(format!("settb=1/{rate}"));
                 if light {
                     filters.push("zscale=tin=linear:t=iec61966-2-1,format=gbrp".to_owned());
                     filters.push("scale=out_color_matrix=bt709:out_range=tv,format=yuv420p".to_owned());
@@ -1468,6 +1532,38 @@ mod tests {
         e.output = Output { height: Some(720), max_mb: Some(10), mix_only: true, ..Default::default() };
         let back: Edit = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
         assert_eq!(back.output, e.output);
+    }
+
+    /// Soft blending weighs as much in all as even, centred on the slot's
+    /// middle (so the picture stays in time with the sound), from the middle
+    /// of the slot before to the middle of the one after.
+    #[test]
+    fn soft_blend_taps() {
+        let sum = |t: &[(i64, f64)]| t.iter().map(|x| x.1).sum::<f64>();
+        let centre = |t: &[(i64, f64)]| t.iter().map(|(o, w)| *o as f64 * w).sum::<f64>() / sum(t);
+        for looks in [2, 3, 4, 8, 16] {
+            let even = blend_taps(looks, BlendShape::Even);
+            let soft = blend_taps(looks, BlendShape::Soft);
+            assert!((sum(&soft) - looks as f64).abs() < 1e-9, "{looks}: weighs {}", sum(&soft));
+            assert!((centre(&soft) - centre(&even)).abs() < 1e-9, "{looks}: centred at {}", centre(&soft));
+            let (first, last) = (soft[0].0, soft[soft.len() - 1].0);
+            assert!(first >= -(looks as i64 + 1) / 2 && last < looks as i64 * 3 / 2, "{looks}: {first}..={last}");
+        }
+    }
+
+    /// Even blending's graph is as it was; soft's starts with copies of the
+    /// first frame and goes on as long as the branch at the slots' starts.
+    #[test]
+    fn blend_graphs() {
+        assert_eq!(
+            blend_graph(3, 60.0, BlendShape::Even),
+            "split=3[b0][b1][b2];[b0]trim=start_frame=0,framestep=3,setpts=N/60/TB[g0];[b1]trim=start_frame=1,framestep=3,setpts=N/60/TB[g1];[b2]trim=start_frame=2,framestep=3,setpts=N/60/TB[g2];[g0][g1][g2]mix=inputs=3"
+        );
+        let soft = blend_graph(4, 60.0, BlendShape::Soft);
+        assert!(soft.starts_with("tpad=start=2:start_mode=clone,split=8[b0]"), "{soft}");
+        assert!(soft.contains("[b2]trim=start_frame=2,framestep=4,"), "{soft}");
+        assert!(soft.contains(";[g2][g0][g1][g3]"), "the slots' own branch first: {soft}");
+        assert!(soft.ends_with(":duration=first"), "{soft}");
     }
 
     #[test]

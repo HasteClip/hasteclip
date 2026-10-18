@@ -4,7 +4,7 @@
 //! or with only the mix for audio. Saved with the edit, so they come back
 //! when the clip is opened again.
 
-use media::{ClipInfo, Edit, Output};
+use media::{BlendShape, ClipInfo, Edit, Output};
 
 /// Common heights, offered when smaller than the clip.
 const HEIGHTS: [u32; 5] = [2160, 1440, 1080, 720, 480];
@@ -23,9 +23,10 @@ pub fn summary(info: &ClipInfo, edit: &Edit) -> String {
         parts.push(format!("{}p", o.height.unwrap()));
     }
     if o.fps.is_some_and(|f| (f as f64) < info.fps - 0.5) {
-        parts.push(match o.blend_fps {
-            Some(b) => format!("{} fps blended from {b}", o.fps.unwrap()),
-            None => format!("{} fps", o.fps.unwrap()),
+        parts.push(match (o.blend_fps, o.blend_shape) {
+            (Some(b), BlendShape::Even) => format!("{} fps blended from {b}", o.fps.unwrap()),
+            (Some(b), BlendShape::Soft) => format!("{} fps blended softly from {b}", o.fps.unwrap()),
+            (None, _) => format!("{} fps", o.fps.unwrap()),
         });
     }
     if let Some(mb) = o.max_mb {
@@ -148,6 +149,16 @@ pub fn ui(ui: &mut egui::Ui, info: &ClipInfo, edit: &mut Edit) -> bool {
                 }
             });
         });
+        if o.blend_fps.is_some_and(|b| rates.contains(&b)) {
+            row(ui, "Blend", &mut |ui| {
+                use crate::settings_ui::{BLEND_EVEN_TIP, BLEND_SOFT_TIP};
+                let opts = [ui_kit::Seg { icon: None, label: "Even", tip: Some(BLEND_EVEN_TIP) }, ui_kit::Seg { icon: None, label: "Soft", tip: Some(BLEND_SOFT_TIP) }];
+                let chosen = usize::from(o.blend_shape == BlendShape::Soft);
+                if let Some(i) = ui_kit::segmented_opts(ui, "export_blend_shape", &opts, chosen, None, true) {
+                    o.blend_shape = if i == 0 { BlendShape::Even } else { BlendShape::Soft };
+                }
+            });
+        }
     }
 
     row(ui, "Quality", &mut |ui| {

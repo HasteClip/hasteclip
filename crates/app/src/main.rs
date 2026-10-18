@@ -833,6 +833,7 @@ impl App {
             container_ext: self.settings.container.ext().to_owned(),
             fps: self.settings.fps,
             blend_samples: self.settings.blend_samples(),
+            blend_shape: self.settings.blend_shape.into(),
             video_bitrate_kbps: self.settings.video_bitrate_mbps * 1000,
             target_height: self.settings.resolution.height(),
             use_hardware: self.settings.encoder != Encoder::Software,

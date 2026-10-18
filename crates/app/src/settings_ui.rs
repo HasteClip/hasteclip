@@ -244,6 +244,15 @@ impl App {
             if cfg!(any(windows, target_os = "macos")) && f.shows(&["frame blending", "motion blur"]) {
                 let (_, c) = l.row(Row::new("Frame blending").tip("Frame blending", "Captures faster than the frame rate and averages the pictures into each frame, for smooth motion like motion blur. On macOS, up to your display's refresh rate.").note(blend_note.clone()).locked(lock.clone()), |ui| self.blend_field(ui, &blends));
                 locked_click |= c;
+                let on = samples > 1;
+                l.well("blend_well", on, |l| {
+                    let (_, c) = l.row(Row::new("Blend").tip("Blend", BLEND_TIP).kid().locked(lock.clone()), |ui| {
+                        if let Some(s) = blend_shape_field(ui, self.settings.blend_shape) {
+                            self.settings.blend_shape = s;
+                        }
+                    });
+                    locked_click |= c;
+                });
             }
             if f.shows(&["encoder", "hardware", "software", "gpu"]) {
                 let (_, c) = l.row(Row::new("Encoder").tip("Encoder", "Hardware encoding barely affects your game's frame rate. Software is slower and uses the CPU.").locked(lock.clone()), |ui| {
@@ -1141,6 +1150,19 @@ fn osu_parts_editor(ui: &mut egui::Ui, t: &mut crate::settings::GameTitles) {
         }
         None => d.remove::<(OsuPart, f32)>(drag_id),
     });
+}
+
+/// Blend's tips: how each frame's pictures are weighed (Settings, and Export
+/// in the editor).
+pub const BLEND_TIP: &str = "How the pictures in each frame are weighed. Even: all the same, so a frame shows just its own moment, and a moving thing's trail ends sharply where the next frame's starts. Soft: the middle of the frame's moment counts most, fading out into the frames either side, so one frame hands over smoothly to the next, a little blurrier.";
+pub const BLEND_EVEN_TIP: &str = "Every picture counts the same: each frame's trail ends sharply";
+pub const BLEND_SOFT_TIP: &str = "The middle of each frame counts most, fading into the frames either side: smoother, a little blurrier";
+
+/// Even or Soft: the one clicked, if one was.
+fn blend_shape_field(ui: &mut egui::Ui, now: settings::BlendShape) -> Option<settings::BlendShape> {
+    let opts = [Seg { icon: None, label: "Even", tip: Some(BLEND_EVEN_TIP) }, Seg { icon: None, label: "Soft", tip: Some(BLEND_SOFT_TIP) }];
+    let chosen = usize::from(now == settings::BlendShape::Soft);
+    ui_kit::segmented_opts(ui, "blend_shape", &opts, chosen, None, ui.is_enabled()).map(|i| if i == 0 { settings::BlendShape::Even } else { settings::BlendShape::Soft })
 }
 
 /// "48 MB", "1.2 GB".

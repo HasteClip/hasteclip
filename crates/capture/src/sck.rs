@@ -287,8 +287,9 @@ impl Session {
             let latest = picture.latest.clone();
             session.video = Some(picture);
             session.pacer = Some(if looks > 1 {
-                let blender = Blender::new(width, height)?;
-                spawn_blend_pacer(s.fps, looks, latest, blender, frames, encoder, clock)
+                let shutter = crate::shutter::Shutter::new(looks, s.blend_shape);
+                let blender = Blender::new(width, height, shutter.frames_open())?;
+                spawn_blend_pacer(s.fps, looks, shutter, latest, blender, frames, encoder, clock)
             } else {
                 spawn_pacer(s.fps, frames, encoder, clock)
             });
@@ -908,7 +909,7 @@ fn is_keyframe(sample: &CMSampleBuffer) -> bool {
 /// For `examples/vt_limits`: can the hardware encoder open at this size?
 pub(crate) fn probe_encoder(width: usize, height: usize) -> String {
     let s = EncodeSettings {
-        output_dir: std::env::temp_dir(), container_ext: "mp4".into(), fps: 60, blend_samples: 1, video_bitrate_kbps: 20000, target_height: None,
+        output_dir: std::env::temp_dir(), container_ext: "mp4".into(), fps: 60, blend_samples: 1, blend_shape: Default::default(), video_bitrate_kbps: 20000, target_height: None,
         use_hardware: true, replay_seconds: 5, video: crate::VideoSource::Screen { id: String::new(), hook: Default::default() },
         away_screen: None, webcam: None, sources: Vec::new(),
     };

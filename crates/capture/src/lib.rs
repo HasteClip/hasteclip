@@ -27,6 +27,7 @@ pub mod output;
 pub mod preview;
 pub mod webcam;
 pub mod sources;
+mod shutter;
 mod steady;
 pub mod stores;
 
@@ -44,6 +45,7 @@ pub mod linux;
 mod writer;
 
 /// The in-process hardware video decoder, for playback (same API on both).
+pub use shutter::BlendShape;
 #[cfg(target_os = "macos")]
 pub use mac::decode;
 #[cfg(target_os = "windows")]
@@ -553,6 +555,8 @@ pub struct EncodeSettings {
     /// Windows and macOS: look at the picture this many times per frame and record the
     /// average (smooth, like motion blur). 1 records the newest picture as is.
     pub blend_samples: u32,
+    /// How the looks in a blended frame are weighed.
+    pub blend_shape: BlendShape,
     pub video_bitrate_kbps: u32,
     /// Downscale target height, or `None` to keep native resolution.
     pub target_height: Option<u32>,

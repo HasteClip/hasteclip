@@ -30,6 +30,7 @@ fn settings(fps: u32, kbps: u32) -> EncodeSettings {
         container_ext: "mp4".into(),
         fps,
         blend_samples: 1,
+        blend_shape: Default::default(),
         video_bitrate_kbps: kbps,
         target_height: None,
         use_hardware: true,
