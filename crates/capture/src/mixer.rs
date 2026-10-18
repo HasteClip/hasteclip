@@ -143,9 +143,40 @@ pub struct Channel {
     /// [`RATE`], when set: for listening to the microphone ("HasteClip
     /// that").
     tap: Mutex<Option<std::sync::mpsc::Sender<Vec<f32>>>>,
-    /// Noise removal on its sound (a microphone's): shared with its feed,
-    /// which does it as the sound arrives.
-    denoise: Arc<AtomicBool>,
+    /// Noise removal on its sound (a microphone's), a [`NoiseReduction`]:
+    /// shared with its feed, which does it as the sound arrives.
+    denoise: Arc<AtomicU8>,
+}
+
+/// How much of a microphone's background noise is taken out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NoiseReduction {
+    #[default]
+    Off,
+    /// The noise that stays the same (fans, hum, hiss): what comes and goes
+    /// stays, a keyboard as well as a voice.
+    Light,
+    /// Everything but a voice (RNNoise), a keyboard too.
+    Strong,
+}
+
+impl NoiseReduction {
+    fn from_u8(n: u8) -> Self {
+        match n {
+            1 => Self::Light,
+            2 => Self::Strong,
+            _ => Self::Off,
+        }
+    }
+
+    /// How much of the sound as it came, Light's and Strong's make up the sound.
+    fn weights(self) -> [f32; 3] {
+        match self {
+            Self::Off => [1.0, 0.0, 0.0],
+            Self::Light => [0.0, 1.0, 0.0],
+            Self::Strong => [0.0, 0.0, 1.0],
+        }
+    }
 }
 
 impl Channel {
@@ -157,17 +188,17 @@ impl Channel {
             meter: Meter::default(),
             input: Meter::default(),
             tap: Mutex::new(None),
-            denoise: Arc::new(AtomicBool::new(false)),
+            denoise: Arc::new(AtomicU8::new(NoiseReduction::Off as u8)),
         }
     }
 
-    /// Remove background noise (fans, keyboards, hum) from its sound. Takes
-    /// effect immediately, even mid-recording.
-    pub fn set_denoise(&self, on: bool) {
-        self.denoise.store(on, Ordering::Relaxed);
+    /// Take background noise out of its sound: steady noise (fans, hum), or
+    /// everything but a voice. Takes effect immediately, even mid-recording.
+    pub fn set_denoise(&self, mode: NoiseReduction) {
+        self.denoise.store(mode as u8, Ordering::Relaxed);
     }
 
-    pub(crate) fn denoise_flag(&self) -> Arc<AtomicBool> {
+    pub(crate) fn denoise_mode(&self) -> Arc<AtomicU8> {
         self.denoise.clone()
     }
 
@@ -338,12 +369,12 @@ impl SourceFeed {
         })
     }
 
-    /// Remove noise from this feed's sound while `on` is set (it can change
-    /// at any moment). Delays it by one RNNoise frame, 10 ms, whether on or
-    /// off, so switching doesn't shift it in time.
-    pub(crate) fn denoise_with(&self, on: Arc<AtomicBool>) {
+    /// Take noise out of this feed's sound as `mode` says (a
+    /// [`NoiseReduction`]; it can change at any moment). Delays it by one
+    /// RNNoise frame, 10 ms, on or off, so switching doesn't shift it in time.
+    pub(crate) fn denoise_with(&self, mode: Arc<AtomicU8>) {
         let mut st = self.st.lock().unwrap();
-        st.denoise = Some(Denoise::new(on));
+        st.denoise = Some(Denoise::new(mode));
     }
 
     /// A new feed (at `rate`) whose audio is added to this one's.
@@ -525,20 +556,23 @@ impl FeedState {
     }
 }
 
-/// RNNoise on a feed's 48 kHz sound, in its 10 ms frames: both sides are
-/// made one (a microphone is mono) and cleaned together. RNNoise hands each
-/// frame back one frame later, so the sound always comes out a frame late,
-/// on or off, and turning it on or off never shifts it; across a switch it
-/// fades from one to the other over a frame.
+/// Noise removal on a feed's 48 kHz sound, in 10 ms frames: both sides are
+/// made one (a microphone is mono) and cleaned together, by RNNoise (Strong)
+/// and by taking out steady noise (Light, [`crate::steady`]). Both run all
+/// the time, so each knows the noise the moment it's chosen, and both hand
+/// each frame back one frame later: the sound always comes out a frame late,
+/// whatever's chosen, and a switch never shifts it. Across a switch it fades
+/// from one to the other over a frame.
 pub(crate) struct Denoise {
-    on: Arc<AtomicBool>,
+    mode: Arc<AtomicU8>,
     state: Box<nnnoiseless::DenoiseState<'static>>,
+    steady: crate::steady::Steady,
     /// Waiting for a full frame.
     pending: Vec<[f32; 2]>,
-    /// The previous frame as it came: what RNNoise's output lines up with.
+    /// The previous frame as it came: what the cleaned ones line up with.
     dry: Vec<[f32; 2]>,
-    /// Whether the last frame was cleaned.
-    was_on: bool,
+    /// What the last frame was.
+    was: NoiseReduction,
 }
 
 impl Denoise {
@@ -546,13 +580,14 @@ impl Denoise {
     /// How late the sound comes out, in frames of sound.
     const DELAY: usize = Self::FRAME;
 
-    pub(crate) fn new(on: Arc<AtomicBool>) -> Self {
+    pub(crate) fn new(mode: Arc<AtomicU8>) -> Self {
         Self {
-            on,
+            mode,
             state: nnnoiseless::DenoiseState::new(),
+            steady: crate::steady::Steady::new(),
             pending: Vec::with_capacity(Self::FRAME * 2),
             dry: vec![[0.0; 2]; Self::FRAME],
-            was_on: false,
+            was: NoiseReduction::Off,
         }
     }
 
@@ -565,28 +600,32 @@ impl Denoise {
         self.pending.extend(frames);
         let whole = self.pending.len() / Self::FRAME * Self::FRAME;
         let mut out = Vec::with_capacity(whole);
+        let mut mono = [0f32; Self::FRAME];
         let mut input = [0f32; Self::FRAME];
-        let mut cleaned = [0f32; Self::FRAME];
+        let mut strong = [0f32; Self::FRAME];
+        let mut light = [0f32; Self::FRAME];
         for chunk in self.pending[..whole].chunks_exact(Self::FRAME) {
-            // Run even while off, so it knows the noise the moment it's turned on.
-            for (i, f) in input.iter_mut().zip(chunk) {
-                *i = (f[0] + f[1]) * 0.5 * 32768.0;
+            for ((m, i), f) in mono.iter_mut().zip(&mut input).zip(chunk) {
+                *m = (f[0] + f[1]) * 0.5;
+                *i = *m * 32768.0;
             }
-            self.state.process_frame(&mut cleaned, &input);
-            let on = self.on.load(Ordering::Relaxed);
-            for (k, (f, c)) in self.dry.iter().zip(&cleaned).enumerate() {
-                let c = (c / 32768.0).clamp(-1.0, 1.0);
-                let t = (k + 1) as f32 / Self::FRAME as f32;
-                let wet = match (self.was_on, on) {
-                    (true, true) => 1.0,
-                    (false, false) => 0.0,
-                    (false, true) => t,
-                    (true, false) => 1.0 - t,
-                };
-                out.push([f[0] + (c - f[0]) * wet, f[1] + (c - f[1]) * wet]);
+            self.state.process_frame(&mut strong, &input);
+            self.steady.process(&mono, &mut light);
+            let mode = NoiseReduction::from_u8(self.mode.load(Ordering::Relaxed));
+            if mode == NoiseReduction::Off && self.was == NoiseReduction::Off {
+                // Off and staying off: the sound exactly as it came.
+                out.extend_from_slice(&self.dry);
+            } else {
+                let (from, to) = (self.was.weights(), mode.weights());
+                for (k, f) in self.dry.iter().enumerate() {
+                    let t = (k + 1) as f32 / Self::FRAME as f32;
+                    let w: [f32; 3] = std::array::from_fn(|i| from[i] + (to[i] - from[i]) * t);
+                    let cleaned = light[k] * w[1] + (strong[k] / 32768.0).clamp(-1.0, 1.0) * w[2];
+                    out.push([f[0] * w[0] + cleaned, f[1] * w[0] + cleaned]);
+                }
             }
             self.dry.copy_from_slice(chunk);
-            self.was_on = on;
+            self.was = mode;
         }
         self.pending.drain(..whole);
         out
@@ -776,10 +815,9 @@ mod tests {
     }
 
     /// Hiss under a voice that comes and goes: the hiss between words much
-    /// quieter, and the sound a frame late, on or off.
+    /// quieter, Light or Strong, and the sound a frame late, on or off.
     #[test]
     fn denoise_removes_noise_and_keeps_timing() {
-        let on = Arc::new(AtomicBool::new(true));
         let mut seed = 1u32;
         let mut noise = || {
             seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
@@ -796,29 +834,49 @@ mod tests {
                 [v, v]
             })
             .collect();
-        let mut d = Denoise::new(on.clone());
-        let out = d.process(input.iter().copied());
-        assert_eq!(out.len(), input.len());
         let rms = |s: &[[f32; 2]]| (s.iter().map(|f| f[0] * f[0]).sum::<f32>() / s.len() as f32).sqrt();
         // A gap between words (well inside it), and a word, in the last second.
         let gap = 3 * 48_000 + 30_000..3 * 48_000 + 46_000;
         let word = 3 * 48_000 + 4_000..3 * 48_000 + 20_000;
-        let (before, after) = (rms(&input[gap.clone()]), rms(&out[gap]));
-        assert!(after < before * 0.2, "hiss between words {before} -> {after}");
-        let (before, after) = (rms(&input[word.clone()]), rms(&out[word]));
-        assert!(after > before * 0.5, "voice {before} -> {after}");
+        // Light only turns the hiss down (to `steady::FLOOR`), Strong takes it out.
+        for (mode, hiss_left) in [(NoiseReduction::Light, 0.3), (NoiseReduction::Strong, 0.2)] {
+            let mut d = Denoise::new(Arc::new(AtomicU8::new(mode as u8)));
+            let out = d.process(input.iter().copied());
+            assert_eq!(out.len(), input.len());
+            let (before, after) = (rms(&input[gap.clone()]), rms(&out[gap.clone()]));
+            assert!(after < before * hiss_left, "{mode:?}: hiss between words {before} -> {after}");
+            let (before, after) = (rms(&input[word.clone()]), rms(&out[word.clone()]));
+            assert!(after > before * 0.5, "{mode:?}: voice {before} -> {after}");
+        }
 
         // Off: the sound as it came, a frame late.
-        on.store(false, Ordering::Relaxed);
-        let mut d = Denoise::new(on);
+        let mut d = Denoise::new(Arc::new(AtomicU8::new(NoiseReduction::Off as u8)));
         let out = d.process(input.iter().copied());
         assert_eq!(out[Denoise::DELAY..], input[..input.len() - Denoise::DELAY]);
+    }
+
+    /// A recording through each noise reduction, to listen to: with
+    /// `DENOISE_IN=<raw f32 stereo, 48 kHz>`, `cargo test --release -p capture
+    /// -- --ignored denoise_file` writes `<it>.light` and `<it>.strong`, the same.
+    #[test]
+    #[ignore]
+    fn denoise_file() {
+        let path = std::env::var("DENOISE_IN").expect("DENOISE_IN");
+        let input: Vec<[f32; 2]> = std::fs::read(&path)
+            .unwrap()
+            .chunks_exact(8)
+            .map(|b| [f32::from_le_bytes(b[..4].try_into().unwrap()), f32::from_le_bytes(b[4..].try_into().unwrap())])
+            .collect();
+        for (mode, name) in [(NoiseReduction::Light, "light"), (NoiseReduction::Strong, "strong")] {
+            let out = Denoise::new(Arc::new(AtomicU8::new(mode as u8))).process(input.iter().copied());
+            std::fs::write(format!("{path}.{name}"), out.iter().flatten().flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+        }
     }
 
     #[test]
     fn denoised_feed_stays_on_time() {
         let feed = SourceFeed::new(RATE, clock_at_zero());
-        feed.denoise_with(Arc::new(AtomicBool::new(false)));
+        feed.denoise_with(Arc::new(AtomicU8::new(NoiseReduction::Off as u8)));
         // 30 ms of ones, captured 20 ms after t0: still at 20 ms, though it
         // comes out of the denoiser a frame late.
         feed.push(1000.02, &vec![1.0; 1440 * 2], 2);

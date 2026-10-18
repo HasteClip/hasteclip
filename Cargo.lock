@@ -840,6 +840,7 @@ dependencies = [
  "objc2-video-toolbox",
  "pipewire",
  "pollster 1.0.1",
+ "realfft",
  "rubato",
  "serde_json",
  "wayland-client",

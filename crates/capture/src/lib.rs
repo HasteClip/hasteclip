@@ -27,6 +27,7 @@ pub mod output;
 pub mod preview;
 pub mod webcam;
 pub mod sources;
+mod steady;
 pub mod stores;
 
 #[cfg(target_os = "macos")]

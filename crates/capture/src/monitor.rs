@@ -79,7 +79,7 @@ impl MicMonitor {
         let q = queue.clone();
         // You hear it as it's recorded: with noise removal, cleaned (switching
         // fades, as in the recording). It always comes a frame, 10 ms, later.
-        let mut denoise = crate::mixer::Denoise::new(channel.denoise_flag());
+        let mut denoise = crate::mixer::Denoise::new(channel.denoise_mode());
         let mut mono = Vec::new();
         let in_stream = input.build_input_stream::<f32, _, _>(
             in_stream_config,

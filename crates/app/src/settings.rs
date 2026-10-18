@@ -353,10 +353,35 @@ pub struct AudioSourceCfg {
     pub volume_db: f32,
     #[serde(default)]
     pub muted: bool,
-    /// A microphone's background noise (fans, keyboard, hum) removed. Off
-    /// unless turned on.
+    /// How much of a microphone's background noise is taken out. Off unless
+    /// chosen.
     #[serde(default)]
-    pub noise_removal: bool,
+    pub noise_reduction: NoiseReduction,
+    /// From before there were two: on, which is Strong now. Read, not written.
+    #[serde(default, skip_serializing, rename = "noise_removal")]
+    old_noise_removal: bool,
+}
+
+/// How much of a microphone's background noise is taken out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoiseReduction {
+    #[default]
+    Off,
+    /// Steady noise (fans, hum, hiss): a keyboard stays.
+    Light,
+    /// Everything but a voice, a keyboard too.
+    Strong,
+}
+
+impl From<NoiseReduction> for capture::mixer::NoiseReduction {
+    fn from(n: NoiseReduction) -> Self {
+        match n {
+            NoiseReduction::Off => Self::Off,
+            NoiseReduction::Light => Self::Light,
+            NoiseReduction::Strong => Self::Strong,
+        }
+    }
 }
 
 fn yes() -> bool {
@@ -374,7 +399,8 @@ impl AudioSourceCfg {
             own_track: true,
             volume_db: 0.0,
             muted: false,
-            noise_removal: false,
+            noise_reduction: NoiseReduction::Off,
+            old_noise_removal: false,
         }
     }
 }
@@ -824,6 +850,7 @@ impl RecordSettings {
             .unwrap_or_default();
         s.upgrade_capture();
         s.upgrade_save_sound();
+        s.upgrade_noise_reduction();
         if let Some(old) = s.audio_tracks.take() {
             s.audio_sources = migrate(&old);
             // Persist now: sources get fresh ids, and their volumes key on them.
@@ -851,6 +878,16 @@ impl RecordSettings {
         }
     }
 
+    /// Noise removal that was on, from before there were two, is the one it
+    /// was: Strong.
+    fn upgrade_noise_reduction(&mut self) {
+        for s in &mut self.audio_sources {
+            if std::mem::take(&mut s.old_noise_removal) && s.noise_reduction == NoiseReduction::Off {
+                s.noise_reduction = NoiseReduction::Strong;
+            }
+        }
+    }
+
     /// Serialized form, used both to save and to detect changes cheaply.
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_default()
@@ -863,6 +900,24 @@ impl RecordSettings {
             }
             let _ = std::fs::write(path, json);
         }
+    }
+}
+
+#[cfg(test)]
+mod noise_reduction_tests {
+    use super::*;
+
+    /// Noise removal that was on is Strong, and the old switch isn't written back.
+    #[test]
+    fn old_noise_removal_is_strong() {
+        let mut s = RecordSettings::default();
+        let old = |on: bool| serde_json::from_str(&format!(r#"{{"id":"a","name":"Mic","kind":{{"type":"microphone","device":"default"}},"noise_removal":{on}}}"#)).unwrap();
+        s.audio_sources = vec![old(true), old(false)];
+        s.upgrade_noise_reduction();
+        assert_eq!(s.audio_sources[0].noise_reduction, NoiseReduction::Strong);
+        assert_eq!(s.audio_sources[1].noise_reduction, NoiseReduction::Off);
+        assert!(!s.to_json().contains("noise_removal"));
+        assert!(s.to_json().contains(r#""noise_reduction": "strong""#));
     }
 }
 

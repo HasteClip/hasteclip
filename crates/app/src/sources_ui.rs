@@ -178,7 +178,7 @@ impl App {
             // Volume applies live, even mid-recording.
             let s = &self.settings.audio_sources[i];
             channel.set_volume(from_db(s.volume_db), s.muted);
-            channel.set_denoise(s.noise_removal);
+            channel.set_denoise(s.noise_reduction.into());
             crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
         }
         if let Some(i) = remove {
@@ -1051,16 +1051,29 @@ fn source_card(
                 });
             }
         });
-        // Noise reduction: a setting of the mic that stays on, so a switch.
-        // The switch right before its name (as the clip mix's Limiter), not
-        // across the card from it: there, among the card's other controls,
-        // the two read as unrelated things. Its name switches it too.
+        // Noise reduction: a setting of the mic that stays as set, of three,
+        // so a segmented control, right after its name, not across the card
+        // from it: there, among the card's other controls, the two read as
+        // unrelated things.
         if matches!(source.kind, SourceKind::Microphone { .. }) {
+            use crate::settings::NoiseReduction;
+            use crate::ui_kit::Seg;
             ui.add_space(10.0);
-            let tip = if source.noise_removal { "On: background noise is taken out" } else { "Off" };
             ui.horizontal(|ui| {
-                labelled_switch(ui, &mut source.noise_removal, "Noise reduction", tip);
-                crate::ui_kit::info(ui, "Noise reduction", "Takes out steady sounds behind your voice (fans, a keyboard, hum) and keeps your voice. Changes apply straight away.");
+                ui.spacing_mut().item_spacing.x = 10.0;
+                ui.label(theme::text("Noise reduction", 13.5, W::Regular).color(pal.text));
+                const MODES: [NoiseReduction; 3] = [NoiseReduction::Off, NoiseReduction::Light, NoiseReduction::Strong];
+                let opts = [
+                    Seg::from("Off"),
+                    Seg { icon: None, label: "Light", tip: Some("Takes out steady noise: fans, hum, hiss. Your keyboard stays") },
+                    Seg { icon: None, label: "Strong", tip: Some("Takes out everything but your voice, your keyboard too") },
+                ];
+                let chosen = MODES.iter().position(|m| *m == source.noise_reduction).unwrap_or(0);
+                if let Some(i) = crate::ui_kit::segmented_opts(ui, ("noise_reduction", source.id.as_str()), &opts, chosen, None, true) {
+                    source.noise_reduction = MODES[i];
+                }
+                ui.spacing_mut().item_spacing.x = 6.0;
+                crate::ui_kit::info(ui, "Noise reduction", "Light takes out steady noise behind your voice, like a fan, hum or hiss, and keeps sounds that come and go, like your keyboard. Strong takes out everything but your voice, your keyboard too. Changes apply straight away.");
             });
         }
         if let Some(latency) = listening {
