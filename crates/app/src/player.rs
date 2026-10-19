@@ -72,6 +72,48 @@ macro_rules! trace {
     };
 }
 
+/// How evenly new frames reach the screen while playing, for the debug log:
+/// the time from one frame to the next, each second. Even playback of a 60
+/// fps clip is 16.7 ms apart, give or take a display refresh.
+#[derive(Default)]
+struct Pacing {
+    last: Option<(std::time::Instant, u64)>,
+    since: Option<std::time::Instant>,
+    /// Milliseconds between frames that follow each other.
+    gaps: Vec<f64>,
+    /// Frames never shown.
+    skipped: u64,
+}
+
+impl Pacing {
+    /// Frame `idx` just went on screen. Once a second: how it's been.
+    fn frame(&mut self, idx: u64, fps: f64) -> Option<String> {
+        let now = std::time::Instant::now();
+        match self.last {
+            Some((at, i)) if idx == i + 1 => self.gaps.push((now - at).as_secs_f64() * 1000.0),
+            Some((_, i)) if idx > i + 1 => self.skipped += idx - i - 1,
+            _ => {}
+        }
+        self.last = Some((now, idx));
+        let since = *self.since.get_or_insert(now);
+        if now - since < std::time::Duration::from_secs(1) || self.gaps.is_empty() {
+            return None;
+        }
+        let n = self.gaps.len() as f64;
+        let mean = self.gaps.iter().sum::<f64>() / n;
+        let sd = (self.gaps.iter().map(|g| (g - mean).powi(2)).sum::<f64>() / n).sqrt();
+        let (min, max) = self.gaps.iter().fold((f64::MAX, 0.0f64), |(a, b), g| (a.min(*g), b.max(*g)));
+        let line = format!(
+            "pacing {} frames {mean:.1} ± {sd:.1} ms apart ({min:.1}–{max:.1}, even is {:.1}), {} skipped",
+            self.gaps.len(),
+            1000.0 / fps.max(1.0),
+            self.skipped
+        );
+        *self = Self { last: self.last, ..Self::default() };
+        Some(line)
+    }
+}
+
 /// Seconds since the app started, for debug logs.
 pub fn uptime() -> f64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -179,23 +221,30 @@ impl Shared {
         f64::from(f32::from_bits(self.speed.load(Ordering::Relaxed)))
     }
 
-    /// How long until the clock (`pos`) shows `t` seconds or later: the first
-    /// audio callback after it gets there, plus a little. Playing only.
+    /// The playhead, in seconds. Playing, it moves smoothly: the audio
+    /// callback moves `pos` a buffer at a time (480 frames, 10 ms), and the
+    /// picture timed by those steps changed 8 to 23 ms apart at 60 fps
+    /// instead of every 16.7 (a stutter frame blending shows up). So between
+    /// steps it's carried on by the time since the last one, from a step
+    /// behind: it gets where the callback put it just as the next one comes,
+    /// and never jumps or goes back. A late callback holds it there.
+    fn now(&self) -> f64 {
+        let pos = self.pos.load(Ordering::Relaxed) as f64;
+        let step_us = self.step_us.load(Ordering::Relaxed) as f64;
+        if !self.playing.load(Ordering::Relaxed) || step_us <= 0.0 {
+            return pos / PREVIEW_RATE as f64;
+        }
+        let since = (uptime() * 1e6 - self.moved_at_us.load(Ordering::Relaxed) as f64).clamp(0.0, step_us);
+        // Source frames per µs.
+        let rate = PREVIEW_RATE as f64 * self.speed() / 1e6;
+        ((pos - (step_us - since) * rate) / PREVIEW_RATE as f64).max(0.0)
+    }
+
+    /// How long until the playhead ([`Self::now`]) shows `t` seconds.
+    /// Playing only.
     fn until(&self, t: f64) -> std::time::Duration {
-        let now = uptime();
-        let pos = self.pos.load(Ordering::Relaxed) as f64 / PREVIEW_RATE as f64;
-        let ahead = (t - pos).max(0.0) / self.speed().max(0.01);
-        let step = self.step_us.load(Ordering::Relaxed) as f64 / 1e6;
-        let wake = if step > 0.0 {
-            // The callback that moved it to `pos`, then whole steps on.
-            let moved = self.moved_at_us.load(Ordering::Relaxed) as f64 / 1e6;
-            moved + (ahead / step).ceil().max(1.0) * step
-        } else {
-            now + ahead
-        };
-        // A guess: callbacks come a little late now and then; waking 2 ms
-        // after one is due finds it done.
-        std::time::Duration::from_secs_f64((wake - now + 0.002).clamp(0.001, 0.1))
+        let ahead = (t - self.now()).max(0.0) / self.speed().max(0.01);
+        std::time::Duration::from_secs_f64(ahead.clamp(0.001, 0.1))
     }
 }
 
@@ -248,7 +297,8 @@ pub struct Player {
     /// When the full-quality frame was last asked for (debug log).
     asked_at: Option<std::time::Instant>,
     /// Frames shown while playing, per second (debug log).
-    shown_count: Option<(std::time::Instant, u32)>,
+    /// How evenly new frames reach the screen while playing (debug log).
+    pacing: Pacing,
     /// The frame whose picture is on screen, whatever kind (debug log).
     screen_index: Option<u64>,
     /// How the picture keeps up while scrubbing (debug log).
@@ -343,7 +393,7 @@ impl Player {
             pending_start: None,
             video_playing: false,
             played_at: None,
-            shown_count: None,
+            pacing: Pacing::default(),
             asked_at: None,
             screen_index: None,
             scrub_stats: ScrubStats::default(),
@@ -361,7 +411,7 @@ impl Player {
     }
 
     pub fn time(&self) -> f64 {
-        self.shared.pos.load(Ordering::Relaxed) as f64 / PREVIEW_RATE as f64
+        self.shared.now()
     }
 
     /// Playing, or about to (waiting for the first frame).
@@ -416,7 +466,14 @@ impl Player {
     }
 
     pub fn pause(&mut self) {
+        // Stopped where the picture is, the smooth playhead (`Shared::now`),
+        // not up to a buffer ahead where the callback last put it: the frame
+        // on screen stays.
+        let at = self.sound_playing().then(|| (self.time() * PREVIEW_RATE as f64) as u64);
         self.shared.playing.store(false, Ordering::Relaxed);
+        if let Some(at) = at {
+            self.shared.pos.store(at, Ordering::Relaxed);
+        }
         self.pending_start = None;
         self.decoder = None;
         // Only when it was playing: the decoder acts on its newest command, so
@@ -731,14 +788,12 @@ impl Player {
         if let Some(at) = self.played_at.take() {
             trace!("first frame after play: {idx}, {:.0} ms after pressing", at.elapsed().as_secs_f64() * 1000.0);
         }
-        // Counts frames that change the picture, not frames handed over.
+        // Frames that change the picture, not frames handed over: how evenly
+        // they come, each second.
         if debug() && self.sound_playing() && self.shown_frame != Some(idx) {
-            let (now, ready) = (self.time(), self.proxy.as_ref().map_or(0, |p| p.ready()));
-            let (since, n) = self.shown_count.get_or_insert((std::time::Instant::now(), 0));
-            *n += 1;
-            if since.elapsed().as_secs_f64() >= 1.0 {
-                trace!("playing: {n} new frames in the last second, now {idx} at {now:.2} s (proxy {ready} ready)");
-                self.shown_count = None;
+            let fps = self.info.fps;
+            if let Some(line) = self.pacing.frame(idx, fps) {
+                trace!("playing: {line}, now {idx} at {:.2} s", self.time());
             }
         }
         self.put_picture(ctx, p);
