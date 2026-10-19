@@ -872,6 +872,40 @@ impl Route {
 /// number to type a value; mute; where it goes; and for a microphone, noise
 /// removal and Listen.
 #[allow(clippy::too_many_arguments)]
+/// A name edited in place: focused as it opens (once: taking the focus
+/// back every frame left no way out of it). Enter or clicking away keeps
+/// what's typed, trimmed; Esc, or leaving it empty, puts back what it was.
+/// Returns whether editing is over.
+fn name_field(ui: &mut egui::Ui, id: egui::Id, name: &mut String, font: egui::FontId, width: f32) -> bool {
+    let was_id = id.with("was");
+    let was = ui.data(|d| d.get_temp::<String>(was_id));
+    let opening = was.is_none();
+    if opening {
+        ui.data_mut(|d| d.insert_temp(was_id, name.clone()));
+    }
+    let r = ui.add(egui::TextEdit::singleline(name).id(id).font(font).desired_width(width));
+    if opening {
+        r.request_focus();
+        return false;
+    }
+    if !r.lost_focus() {
+        return false;
+    }
+    let was = was.unwrap_or_default();
+    if ui.input(|i| i.key_pressed(egui::Key::Escape)) || name.trim().is_empty() {
+        *name = was;
+    } else {
+        *name = name.trim().to_owned();
+    }
+    forget_name_field(ui, id);
+    true
+}
+
+/// A [`name_field`] that isn't open: the next one starts afresh.
+fn forget_name_field(ui: &egui::Ui, id: egui::Id) {
+    ui.data_mut(|d| d.remove::<String>(id.with("was")));
+}
+
 fn source_card(
     ui: &mut egui::Ui,
     source: &mut AudioSourceCfg,
@@ -919,13 +953,13 @@ fn source_card(
             }
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 1.0;
+                let name_id = egui::Id::new(("source_name", &source.id));
                 if renaming.as_deref() == Some(source.id.as_str()) {
-                    let r = ui.add(egui::TextEdit::singleline(&mut source.name).font(theme::font(14.0, W::Medium)).desired_width(170.0));
-                    r.request_focus();
-                    if r.lost_focus() {
+                    if name_field(ui, name_id, &mut source.name, theme::font(14.0, W::Medium), 170.0) {
                         *renaming = None;
                     }
                 } else {
+                    forget_name_field(ui, name_id);
                     let r = ui.add(egui::Label::new(theme::text(&source.name, 14.0, W::Medium).color(if source.muted { pal.text2 } else { pal.text })).truncate().sense(Sense::click()));
                     if r.on_hover_text("Double-click to rename").double_clicked() {
                         *renaming = Some(source.id.clone());
@@ -1253,4 +1287,89 @@ pub(crate) fn column_head(ui: &mut egui::Ui, title: &str, right: impl FnOnce(&mu
 
 pub(crate) fn from_db(db: f32) -> f32 {
     if db <= FADER_MIN_DB + 0.05 { 0.0 } else { 10f32.powf(db / 20.0) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A name field being edited, frame by frame, with what was pressed.
+    struct Field {
+        ctx: egui::Context,
+        name: String,
+        done: bool,
+    }
+
+    impl Field {
+        fn open(name: &str) -> Self {
+            let mut f = Self { ctx: egui::Context::default(), name: name.to_owned(), done: false };
+            crate::theme::install_fonts(&f.ctx);
+            f.frame(Vec::new());
+            f.frame(Vec::new());
+            f
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0))), events, ..Default::default() };
+            let (name, done) = (&mut self.name, &mut self.done);
+            self.ctx
+                .run_ui(input, |ui| {
+                    if !*done {
+                        *done = name_field(ui, egui::Id::new("name"), name, egui::FontId::proportional(14.0), 170.0);
+                    }
+                })
+                .textures_delta
+                .clear();
+        }
+
+        fn key(&mut self, key: egui::Key) {
+            let press = |pressed| egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: Default::default() };
+            self.frame(vec![press(true), press(false)]);
+            self.frame(Vec::new());
+        }
+
+        fn typed(&mut self, text: &str) {
+            self.frame(vec![egui::Event::Text(text.to_owned())]);
+        }
+    }
+
+    #[test]
+    fn enter_keeps_the_new_name() {
+        let mut f = Field::open("Mic");
+        f.typed(" 2  ");
+        assert!(!f.done, "still editing while typing");
+        f.key(egui::Key::Enter);
+        assert!(f.done, "Enter ends editing");
+        assert_eq!(f.name, "Mic 2");
+    }
+
+    #[test]
+    fn escape_or_nothing_puts_the_name_back() {
+        let mut f = Field::open("Mic");
+        f.typed(" 2");
+        f.key(egui::Key::Escape);
+        assert!(f.done, "Esc ends editing");
+        assert_eq!(f.name, "Mic");
+
+        let mut f = Field::open("Mic");
+        for _ in 0..3 {
+            f.key(egui::Key::Backspace);
+        }
+        assert_eq!(f.name, "");
+        f.key(egui::Key::Enter);
+        assert_eq!((f.done, f.name.as_str()), (true, "Mic"));
+    }
+
+    #[test]
+    fn clicking_away_keeps_it() {
+        let mut f = Field::open("Desktop");
+        f.typed(" sound");
+        let at = egui::pos2(500.0, 300.0);
+        let click = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        f.frame(vec![egui::Event::PointerMoved(at), click(true)]);
+        f.frame(vec![click(false)]);
+        f.frame(Vec::new());
+        assert!(f.done, "clicking away ends editing");
+        assert_eq!(f.name, "Desktop sound");
+    }
 }
