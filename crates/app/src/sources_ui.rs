@@ -498,7 +498,7 @@ impl App {
             let drawn = match (&gpu, &self.sources_view.preview) {
                 #[cfg(target_os = "macos")]
                 (Some(shown), _) => {
-                    shown.paint(ui, rect);
+                    shown.paint(p, rect);
                     true
                 }
                 (_, Some((tex, _))) => {
