@@ -1506,12 +1506,36 @@ mod tests {
     #[test]
     fn scrubbing_is_cheap_enough_for_the_audio_callback() {
         // Six tracks (an editor clip), one second of output: well under a
-        // second even unoptimized.
+        // second even unoptimized (half of it, here). Timed by the work this
+        // thread does, not the clock: with the other tests running beside it,
+        // the clock said 2.5 times as long. Its work grows too, as they share
+        // the cores (measured unoptimized: 140 ms alone, up to 270 ms
+        // beside them).
         let pcm: Vec<Vec<f32>> = (0..6).map(|_| tone(440.0, 20.0)).collect();
-        let t = std::time::Instant::now();
+        let t = thread_cpu();
         let _ = scrub(&pcm, 1.5, 1.0, 5.0 * PREVIEW_RATE as f64);
-        let took = t.elapsed();
-        eprintln!("one second of scrub sound, 6 tracks: {took:?}");
-        assert!(took.as_secs_f64() < 0.25, "took {took:?}");
+        let took = thread_cpu() - t;
+        eprintln!("one second of scrub sound, 6 tracks: {took:?} of work");
+        assert!(took.as_secs_f64() < 0.5, "took {took:?}");
+    }
+
+    /// The CPU time this thread has used so far.
+    fn thread_cpu() -> std::time::Duration {
+        #[cfg(windows)]
+        {
+            use windows::Win32::Foundation::FILETIME;
+            use windows::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+            let (mut created, mut exited, mut kernel, mut user) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+            unsafe { GetThreadTimes(GetCurrentThread(), &mut created, &mut exited, &mut kernel, &mut user) }.expect("the thread's times");
+            let ticks = |f: FILETIME| (f.dwHighDateTime as u64) << 32 | f.dwLowDateTime as u64;
+            // In 100 ns ticks.
+            std::time::Duration::from_nanos((ticks(kernel) + ticks(user)) * 100)
+        }
+        #[cfg(unix)]
+        {
+            let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+            std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+        }
     }
 }
