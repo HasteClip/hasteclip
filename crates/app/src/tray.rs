@@ -99,7 +99,7 @@ impl Tray {
 
             let open = MenuItem::new("Open HasteClip", true, None);
             let save = MenuItem::new("Save clip", false, None);
-            let buffer = MenuItem::new("Start replay buffer", true, None);
+            let buffer = MenuItem::new("Start clipping", true, None);
             let quit = MenuItem::new("Quit HasteClip", true, None);
             let menu = Menu::new();
             menu.append_items(&[&open, &PredefinedMenuItem::separator(), &save, &buffer, &PredefinedMenuItem::separator(), &quit]).ok()?;
@@ -163,7 +163,7 @@ impl Tray {
             if i.buffering.get() != Some(buffering) {
                 i.buffering.set(Some(buffering));
                 i.save.set_enabled(buffering);
-                i.buffer.set_text(if buffering { "Stop replay buffer" } else { "Start replay buffer" });
+                i.buffer.set_text(if buffering { "Stop clipping" } else { "Start clipping" });
             }
         }
         // Only when it changed: each update tells the desktop to redraw the menu.
@@ -240,7 +240,7 @@ mod linux {
                 item("Open HasteClip", true, Cmd::Open),
                 ksni::MenuItem::Separator,
                 item("Save clip", self.buffering, Cmd::SaveClip),
-                item(if self.buffering { "Stop replay buffer" } else { "Start replay buffer" }, true, Cmd::ToggleBuffer),
+                item(if self.buffering { "Stop clipping" } else { "Start clipping" }, true, Cmd::ToggleBuffer),
                 ksni::MenuItem::Separator,
                 item("Quit HasteClip", true, Cmd::Quit),
             ]
