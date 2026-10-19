@@ -1588,15 +1588,22 @@ impl App {
             self.toast_error("Stop recording before editing a clip.");
             return;
         }
+        self.listen_as_set();
         self.editor = Some(editor::Editor::open(&self.ctx(), &clip, self.settings.editor_preview_share, self.settings.editor_snap));
         self.page = Page::Edit;
     }
 
-    /// Play a clip in the app's own viewer.
-    pub(crate) fn open_viewer(&mut self, clip: PathBuf) {
+    /// The volume and mute you listen at, as last set (the player and the
+    /// editor share them), the first time either opens.
+    fn listen_as_set(&self) {
         if viewer::volume(&self.ctx()).is_none() {
             viewer::set_volume(&self.ctx(), (self.settings.player_volume.clamp(0.0, 1.0), self.settings.player_muted));
         }
+    }
+
+    /// Play a clip in the app's own viewer.
+    pub(crate) fn open_viewer(&mut self, clip: PathBuf) {
+        self.listen_as_set();
         self.viewer = Some(self.viewer_for(&clip));
         self.page = Page::View;
     }
@@ -1718,6 +1725,9 @@ impl App {
         let outcome = ed.ui(ui);
         self.settings.editor_preview_share = ed.preview_share();
         self.settings.editor_snap = ed.snap();
+        if let Some((volume, muted)) = viewer::volume(ui.ctx()) {
+            (self.settings.player_volume, self.settings.player_muted) = (volume, muted);
+        }
         match outcome {
             editor::EditorOutcome::Stay => {}
             editor::EditorOutcome::Keys => self.show_keys = Some(shell::Keys::Editor),

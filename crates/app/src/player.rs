@@ -154,6 +154,10 @@ struct Shared {
     step_us: AtomicU64,
     /// How fast it plays (1.0 = as recorded), as `f32` bits.
     speed: AtomicU32,
+    /// How loud you listen (the volume and mute shared by the player and the
+    /// editor), as `f32` bits: applied to what's heard after the meters, so
+    /// they show the edit's own levels.
+    listen: AtomicU32,
 }
 
 impl Shared {
@@ -167,6 +171,7 @@ impl Shared {
             moved_at_us: AtomicU64::new(0),
             step_us: AtomicU64::new(0),
             speed: AtomicU32::new(1.0f32.to_bits()),
+            listen: AtomicU32::new(1.0f32.to_bits()),
         }
     }
 
@@ -448,6 +453,11 @@ impl Player {
         if let Ok(mut m) = self.shared.mix.lock() {
             m.tracks = gains;
         }
+    }
+
+    /// How loud you listen, 0 (muted) to 1: the mix as it is, quieter.
+    pub fn set_listening(&self, gain: f32) {
+        self.shared.listen.store(gain.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
 
     /// Current meter readings: per track, then master.
@@ -1103,6 +1113,7 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
     let n_tracks = pcm.len();
     let mut was_playing = false;
     let mut scrub = Scrub::new(out_rate);
+    let listen = shared.clone();
     trace!("audio output: {} Hz, {} channels, buffer {:?}", out_rate, channels, supported.buffer_size());
 
     let mut mix = move |out: &mut [f32], info: &cpal::OutputCallbackInfo| {
@@ -1228,8 +1239,11 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
             config,
             move |out: &mut [f32], info: &cpal::OutputCallbackInfo| {
                 mix(out, info);
-                if muted {
+                let gain = f32::from_bits(listen.listen.load(Ordering::Relaxed));
+                if muted || gain == 0.0 {
                     out.fill(0.0);
+                } else if gain < 1.0 {
+                    out.iter_mut().for_each(|x| *x *= gain);
                 }
                 // Silence needn't be handed over: a gap is silent.
                 if out.iter().any(|&x| x != 0.0) {

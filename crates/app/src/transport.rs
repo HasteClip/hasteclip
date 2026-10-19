@@ -394,6 +394,71 @@ pub fn bar(ui: &mut egui::Ui, rect: Rect, centre_w: f32, mut part: impl FnMut(&m
     part(&mut rui, Part::Right);
 }
 
+/// How loud you listen: the volume (0..=1 on its slider) and mute the
+/// player and the editor share, kept between runs (see `viewer::volume`).
+pub fn listening(ctx: &egui::Context) -> (f32, bool) {
+    crate::viewer::volume(ctx).unwrap_or((1.0, false))
+}
+
+/// The gain to listen at: 0 muted, else the slider squared (a squared
+/// slider feels even).
+pub fn listening_gain(ctx: &egui::Context) -> f32 {
+    let (volume, muted) = listening(ctx);
+    if muted { 0.0 } else { volume * volume }
+}
+
+/// Nothing to hear: muted, or the volume all the way down.
+fn silent(ctx: &egui::Context) -> bool {
+    let (volume, muted) = listening(ctx);
+    muted || volume == 0.0
+}
+
+/// Mute (M), or unmute: back to the volume it was, or halfway if that was
+/// all the way down.
+pub fn toggle_mute(ctx: &egui::Context) {
+    let (volume, _) = listening(ctx);
+    let now = if silent(ctx) { (if volume == 0.0 { 0.5 } else { volume }, false) } else { (volume, true) };
+    crate::viewer::set_volume(ctx, now);
+}
+
+/// The speaker that mutes (M) and, given room (`slider`), the volume slider
+/// beside it: the player's and the editor's alike, in a bar's right part
+/// (laid out right to left).
+pub fn volume(ui: &mut egui::Ui, slider_w: Option<f32>) {
+    let ctx = ui.ctx().clone();
+    let (volume, muted) = listening(&ctx);
+    if let Some(w) = slider_w {
+        let mut v = if muted { 0.0 } else { volume };
+        if slider(ui, &mut v, w).on_hover_text("Volume").changed() {
+            crate::viewer::set_volume(&ctx, (v, false));
+        }
+    }
+    let speaker = if silent(&ctx) { icon::SPEAKER_X } else { icon::SPEAKER_HIGH };
+    if Btn::icon(Kind::Ghost, speaker).small().tip(if silent(&ctx) { "Unmute  (M)" } else { "Mute  (M)" }).show(ui).clicked() {
+        toggle_mute(&ctx);
+    }
+}
+
+/// "Muted" on a picture that's playing with nothing to hear (top left),
+/// which is otherwise easy to take for a clip with no sound. Click to unmute.
+pub fn muted_note(ui: &mut egui::Ui, picture: Rect) {
+    let ctx = ui.ctx().clone();
+    let shown = theme::toggle(&ctx, egui::Id::new("muted_note"), silent(&ctx), theme::FAST);
+    if shown <= 0.0 {
+        return;
+    }
+    let painter = ui.painter_at(picture);
+    let g = painter.layout_no_wrap(format!("{}  Muted", icon::SPEAKER_X), theme::font(12.5, W::Semibold), Color32::WHITE);
+    let r = Rect::from_min_size(picture.left_top() + vec2(12.0, 12.0), g.size() + vec2(18.0, 10.0));
+    let resp = ui.interact(r, egui::Id::new("muted_note_click"), Sense::click());
+    let hv = theme::toggle(&ctx, resp.id.with("hv"), resp.hovered(), theme::FAST);
+    painter.rect_filled(r, ui_kit::RADIUS, Color32::from_black_alpha(((150.0 + 60.0 * hv) * shown) as u8));
+    painter.galley(r.min + vec2(9.0, 5.0), g, theme::fade(Color32::WHITE, shown));
+    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Unmute  (M)").clicked() {
+        toggle_mute(&ctx);
+    }
+}
+
 /// A slim slider: a track filled to `value` (0..=1) and a round knob.
 pub fn slider(ui: &mut egui::Ui, value: &mut f32, width: f32) -> egui::Response {
     let p = theme::pal(ui);

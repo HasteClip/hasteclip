@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use egui::{Align2, Color32, FontId, Key, Pos2, Rect, Sense, Stroke, Vec2};
 use media::pcm::Pcm;
-use media::{ClipInfo, TrackEdit};
+use media::ClipInfo;
 
 use crate::filmstrip::Filmstrip;
 use crate::player::Player;
@@ -130,8 +130,6 @@ struct Ready {
     scroll_to: Option<f64>,
     /// Hover preview: the frame shown and its texture.
     hover: Option<(u64, egui::TextureHandle)>,
-    volume: f32,
-    muted: bool,
     /// How fast it plays (1.0 as recorded).
     speed: f32,
     /// The picture was dragged this frame: share the clip by drag and drop.
@@ -464,7 +462,6 @@ impl Viewer {
 
 impl Ready {
     fn new(ctx: &egui::Context, clip: &Path, l: Loaded) -> Self {
-        let volume = volume(ctx).unwrap_or((1.0, false));
         let wave = crate::waveform::follow(l.pcm.clone(), 0, ctx);
         let mut player = Player::new(ctx, clip, l.info.clone(), l.pcm, Vec::new());
         // Dev aid: `HASTECLIP_START_AT=<seconds>` starts there (to check a
@@ -486,8 +483,6 @@ impl Ready {
             last_activity: Instant::now(),
             scroll_to: None,
             hover: None,
-            volume: volume.0,
-            muted: volume.1,
             speed: speed(ctx),
             drag_out: false,
             show_frames: false,
@@ -496,7 +491,7 @@ impl Ready {
             span: l.span,
             clip: clip.to_path_buf(),
         };
-        r.apply_volume(ctx);
+        r.player.set_listening(crate::transport::listening_gain(ctx));
         r.player.set_speed(r.speed);
         r
     }
@@ -542,11 +537,6 @@ impl Ready {
         }
     }
 
-    fn apply_volume(&self, ctx: &egui::Context) {
-        let gain = if self.muted { 0.0 } else { self.volume * self.volume }; // a squared slider feels even
-        self.player.set_mix(vec![TrackEdit { index: 0, gain, muted: false, points: Vec::new() }]);
-        set_volume(ctx, (self.volume, self.muted));
-    }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
@@ -593,7 +583,12 @@ impl Ready {
         self.player.set_stepping(self.stepping_back);
         let size = self.player.update(&ctx, scrubbing);
         let player = &self.player;
-        crate::transport::stage(ui, preview, size, |p, cover| player.paint_glow(p, cover, egui::Id::new("viewer_stage")), |r| player.paint(ui.painter(), r));
+        let picture = crate::transport::stage(ui, preview, size, |p, cover| player.paint_glow(p, cover, egui::Id::new("viewer_stage")), |r| player.paint(ui.painter(), r));
+        // As loud as you listen, in the editor too (they share it).
+        self.player.set_listening(crate::transport::listening_gain(&ctx));
+        if let Some(picture) = picture.filter(|_| self.player.is_playing()) {
+            crate::transport::muted_note(ui, picture);
+        }
         if let Some(f) = self.flash_play.filter(|(_, at)| at.elapsed() < Duration::from_millis(450)) {
             // A big play / pause sign that grows and fades where you clicked.
             let t = f.1.elapsed().as_secs_f32() / 0.45;
@@ -740,18 +735,7 @@ impl Ready {
                 if Btn::icon(Kind::Ghost, fs_icon).tip(if full { "Exit fullscreen  (F or Esc)" } else { "Fullscreen  (F, or double-click the picture)" }).show(ui).clicked() {
                     set_fullscreen(ui.ctx(), !full);
                 }
-                let mut v = if self.muted { 0.0 } else { self.volume };
-                let changed = crate::transport::slider(ui, &mut v, 100.0).on_hover_text("Volume").changed();
-                if changed {
-                    self.volume = v;
-                    self.muted = false;
-                    self.apply_volume(ui.ctx());
-                }
-                let speaker = if self.muted || self.volume == 0.0 { egui_phosphor::regular::SPEAKER_X } else { egui_phosphor::regular::SPEAKER_HIGH };
-                if Btn::icon(Kind::Ghost, speaker).small().tip(if self.muted { "Unmute  (M)" } else { "Mute  (M)" }).show(ui).clicked() {
-                    self.muted = !self.muted;
-                    self.apply_volume(ui.ctx());
-                }
+                crate::transport::volume(ui, Some(100.0));
                 // How fast it plays: lit when it isn't as recorded.
                 let kind = if self.speed == 1.0 { Kind::Ghost } else { Kind::On };
                 let r = Btn::new(kind, speed_label(self.speed)).small().id("viewer_speed").tip("Playback speed  (< >)").show(ui);
@@ -972,8 +956,7 @@ impl Ready {
             self.seek(self.info.duration - self.info.frame_duration());
         }
         if m {
-            self.muted = !self.muted;
-            self.apply_volume(ctx);
+            crate::transport::toggle_mute(ctx);
         }
     }
 

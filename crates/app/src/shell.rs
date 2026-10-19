@@ -626,6 +626,7 @@ impl App {
                 ("Home  End", "Go to the start or end"),
                 ("Cmd Z", "Undo  (Shift for redo)"),
                 ("N", "Snapping on or off"),
+                ("M", "Mute (as in the player)"),
                 ("+  −  \\", "Zoom in, out, or to fit"),
                 ("Ctrl scroll", "Zoom the timeline"),
                 ("Shift scroll", "Move along the timeline"),

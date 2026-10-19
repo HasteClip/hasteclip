@@ -362,6 +362,9 @@ impl Ready {
             }
         }
         self.player.set_mix(mix);
+        // As loud as you listen, in the player too (they share it): the
+        // edit's own levels stay as they are.
+        self.player.set_listening(crate::transport::listening_gain(&ctx));
         // Looping: back to the start at the end.
         if self.looping && !self.player.is_playing() && self.was_playing && self.player.time() >= self.edit.end - self.info.frame_duration() * 1.5 {
             self.player.seek(self.edit.start);
@@ -563,10 +566,13 @@ impl Ready {
             // Just the part kept, as the saved clip will be.
             let crop = self.crop();
             let shown = size.map(|s| crop.map_or(s, |c| crate::crop_ui::cropped_size(s, &c, frame)));
-            crate::transport::stage(ui, preview_rect, shown, |p, cover| player.paint_glow(p, cover, egui::Id::new("editor_stage")), |r| match crop {
+            let picture = crate::transport::stage(ui, preview_rect, shown, |p, cover| player.paint_glow(p, cover, egui::Id::new("editor_stage")), |r| match crop {
                 Some(c) => crate::crop_ui::paint_cropped(ui, r, &c, frame, |painter, whole| player.paint(painter, whole)),
                 None => player.paint(ui.painter(), r),
             });
+            if let Some(picture) = picture.filter(|_| self.player.is_playing()) {
+                crate::transport::muted_note(ui, picture);
+            }
             if preview_resp.clicked() {
                 self.toggle_play();
             }
@@ -831,6 +837,10 @@ impl Ready {
                 if Btn::icon(kind(self.snap), icon::MAGNET).tip("Snapping  (N): edges snap to the playhead, the clip's ends and its moments").show(ui).clicked() {
                     self.snap = !self.snap;
                 }
+                // How loud you listen (not the edit's levels, which are on
+                // the tracks): the player's, shared.
+                crate::transport::vrule(ui);
+                crate::transport::volume(ui, (!medium).then_some(80.0));
             }
         });
         self.show_frames = frames;
@@ -1074,13 +1084,17 @@ impl Ready {
         if done {
             self.crop_tool = None;
         }
-        let (redo, undo, snap) = ctx.input_mut(|i| {
+        let (redo, undo, snap, mute) = ctx.input_mut(|i| {
             (
                 i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::Z),
                 i.consume_key(egui::Modifiers::COMMAND, Key::Z),
                 i.consume_key(egui::Modifiers::NONE, Key::N),
+                i.consume_key(egui::Modifiers::NONE, Key::M),
             )
         });
+        if mute {
+            crate::transport::toggle_mute(ctx);
+        }
         if undo {
             self.undo_step();
         }
