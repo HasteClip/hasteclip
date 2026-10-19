@@ -176,6 +176,7 @@ fn id(action: ShortcutAction) -> &'static str {
         ShortcutAction::SaveClip => "save-clip",
         ShortcutAction::ToggleBuffer => "toggle-replay-buffer",
         ShortcutAction::ToggleRecord => "toggle-recording",
+        ShortcutAction::Screenshot => "take-screenshot",
     }
 }
 

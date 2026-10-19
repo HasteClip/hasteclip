@@ -17,6 +17,9 @@
 //! Previous clip / Next clip (P / N) step through the library in its order
 //! without going back to it, and F, double-click or ⛶ go fullscreen, so a
 //! session's clips can be reviewed one after another.
+//!
+//! A screenshot opens here too, as a picture to look at (`picture.rs`): the
+//! arrow keys step through as well, and Ctrl+C copies it.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -93,6 +96,9 @@ enum State {
     Loading(Receiver<Result<Loaded, String>>),
     Failed(String),
     Ready(Box<Ready>),
+    /// A screenshot, being read, and shown.
+    LoadingPicture(Receiver<Result<crate::picture::Loaded, String>>),
+    Picture(Box<crate::picture::Picture>),
 }
 
 pub struct Viewer {
@@ -141,6 +147,9 @@ struct Ready {
 
 impl Viewer {
     pub fn open(ctx: &egui::Context, clip: &Path) -> Self {
+        if crate::clips::is_image(clip) {
+            return Self { clip: clip.to_path_buf(), state: State::LoadingPicture(crate::picture::load(ctx, clip)) };
+        }
         if crate::player::debug() {
             eprintln!("{:>8.3} viewer: opening {}", crate::player::uptime(), clip.display());
         }
@@ -204,6 +213,8 @@ impl Viewer {
                 r.player.renamed(ctx, to);
                 r.strip.renamed(to);
             }
+            // On screen already: nothing reads it again.
+            State::Picture(_) => {}
             // Still loading from the old name: start again.
             _ => *self = Self::open(ctx, to),
         }
@@ -218,7 +229,16 @@ impl Viewer {
                 };
             }
         }
+        if let State::LoadingPicture(rx) = &self.state
+            && let Ok(result) = rx.try_recv()
+        {
+            self.state = match result {
+                Ok(l) => State::Picture(Box::new(crate::picture::Picture::new(ui.ctx(), &self.clip, l))),
+                Err(e) => State::Failed(e),
+            };
+        }
         let ctx = ui.ctx().clone();
+        let image = crate::clips::is_image(&self.clip);
         let mut out = if is_fullscreen(&ctx) { ViewerOutcome::Stay } else { self.header(ui, nav) };
         match &mut self.state {
             State::Saving => {
@@ -237,7 +257,7 @@ impl Viewer {
                 });
                 ctx.request_repaint_after(Duration::from_millis(100));
             }
-            State::Loading(_) => {
+            State::Loading(_) | State::LoadingPicture(_) => {
                 let rect = ui.available_rect_before_wrap();
                 ui.painter().rect_filled(rect, 0, crate::theme::pal(ui).stage);
                 ui.put(Rect::from_center_size(rect.center(), Vec2::splat(24.0)), egui::Spinner::new().size(22.0).color(Color32::from_white_alpha(170)));
@@ -246,28 +266,39 @@ impl Viewer {
                 let p = crate::theme::pal(ui);
                 ui.vertical_centered(|ui| {
                     ui.add_space(80.0);
-                    ui.label(crate::theme::text("Couldn't play this clip", 15.0, crate::theme::W::Semibold).color(p.text));
+                    ui.label(crate::theme::text(if image { "Couldn't open this screenshot" } else { "Couldn't play this clip" }, 15.0, crate::theme::W::Semibold).color(p.text));
                     ui.add_space(4.0);
                     ui.label(crate::theme::text(e.as_str(), 13.0, crate::theme::W::Regular).color(p.text3));
                 });
             }
             State::Ready(r) => r.ui(ui),
+            State::Picture(pic) => {
+                if pic.ui(ui, is_fullscreen(&ctx)) {
+                    set_fullscreen(&ctx, true);
+                }
+            }
         }
         if !ctx.egui_wants_keyboard_input() && !crate::ui_kit::overlay_open(&ctx) {
             let none = egui::Modifiers::NONE;
-            let (esc, prev, next, f, f2, delete, keys) = ctx.input_mut(|i| {
+            let picture = matches!(self.state, State::Picture(_));
+            let (esc, prev, next, f, f2, delete, keys, copy) = ctx.input_mut(|i| {
                 (
                     i.consume_key(none, Key::Escape),
-                    i.consume_key(none, Key::Q),
-                    i.consume_key(none, Key::E),
+                    // A picture has no time to jump through: the arrows step too.
+                    i.consume_key(none, Key::Q) || (picture && i.consume_key(none, Key::ArrowLeft)),
+                    i.consume_key(none, Key::E) || (picture && i.consume_key(none, Key::ArrowRight)),
                     i.consume_key(none, Key::F),
                     i.consume_key(none, Key::F2),
                     i.consume_key(none, Key::Delete) || i.consume_key(egui::Modifiers::COMMAND, Key::Backspace),
-                    i.consume_key(egui::Modifiers::SHIFT, Key::Slash) || i.consume_key(none, Key::Questionmark),
+                    !picture && (i.consume_key(egui::Modifiers::SHIFT, Key::Slash) || i.consume_key(none, Key::Questionmark)),
+                    picture && (i.consume_key(egui::Modifiers::COMMAND, Key::C) || i.events.iter().any(|e| matches!(e, egui::Event::Copy))),
                 )
             });
             if keys {
                 out = ViewerOutcome::Keys;
+            }
+            if copy {
+                out = ViewerOutcome::Share(crate::library::ShareChoice::CopyImage);
             }
             if f2 {
                 out = ViewerOutcome::Rename;
@@ -301,6 +332,11 @@ impl Viewer {
                 out = ViewerOutcome::DragOut;
             }
         }
+        if let State::Picture(pic) = &mut self.state
+            && std::mem::take(&mut pic.drag_out)
+        {
+            out = ViewerOutcome::DragOut;
+        }
         if matches!(out, ViewerOutcome::Close | ViewerOutcome::Edit) {
             set_fullscreen(&ctx, false);
         }
@@ -315,6 +351,8 @@ impl Viewer {
         let mut out = ViewerOutcome::Stay;
         let stem = self.clip.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let title = crate::clips::title_for_stem(&stem);
+        let image = crate::clips::is_image(&self.clip);
+        let (prev_tip, next_tip) = if image { ("Previous  (←)", "Next  (→)") } else { ("Previous clip  (Q)", "Next clip  (E)") };
         // While its edit saves, the clip's file is about to change.
         let ready = !matches!(self.state, State::Saving);
         let wait = "Wait for the edit to finish saving";
@@ -329,7 +367,7 @@ impl Viewer {
             crate::transport::Part::Centre => {
                 let p = crate::theme::pal(ui);
                 ui.spacing_mut().item_spacing.x = 2.0;
-                if Btn::icon(Kind::Ghost, icon::CARET_LEFT).small().enabled(nav.previous.is_some()).tip("Previous clip  (Q)").show(ui).clicked() {
+                if Btn::icon(Kind::Ghost, icon::CARET_LEFT).small().enabled(nav.previous.is_some()).tip(prev_tip).show(ui).clicked() {
                     out = nav.previous.clone().map_or(ViewerOutcome::Stay, ViewerOutcome::Open);
                 }
                 if let Some((i, n)) = nav.position.filter(|_| ui.ctx().content_rect().width() >= 560.0) {
@@ -338,7 +376,7 @@ impl Viewer {
                     let (r, _) = ui.allocate_exact_size(egui::vec2(120.0 - 2.0 * 26.0 - 4.0, 26.0), Sense::hover());
                     ui.painter().galley(r.center() - g.size() / 2.0, g, p.text3);
                 }
-                if Btn::icon(Kind::Ghost, icon::CARET_RIGHT).small().enabled(nav.next.is_some()).tip("Next clip  (E)").show(ui).clicked() {
+                if Btn::icon(Kind::Ghost, icon::CARET_RIGHT).small().enabled(nav.next.is_some()).tip(next_tip).show(ui).clicked() {
                     out = nav.next.clone().map_or(ViewerOutcome::Stay, ViewerOutcome::Open);
                 }
             }
@@ -363,32 +401,46 @@ impl Viewer {
                     if Item::new("Rename…").icon(icon::PENCIL_SIMPLE).keys(Some(vec!["F2".into()])).show(ui).clicked() {
                         out = ViewerOutcome::Rename;
                     }
-                    if Item::new("Add a marker here").icon(icon::BOOKMARK_SIMPLE).keys(Some(vec!["B".into()])).enabled(matches!(self.state, State::Ready(_))).tip("A pin on the timeline to come back to: [ and ] jump between them").show(ui).clicked() {
+                    if !image && Item::new("Add a marker here").icon(icon::BOOKMARK_SIMPLE).keys(Some(vec!["B".into()])).enabled(matches!(self.state, State::Ready(_))).tip("A pin on the timeline to come back to: [ and ] jump between them").show(ui).clicked() {
                         mark = true;
                     }
-                    if Item::new("Open in another player").icon(icon::ARROW_SQUARE_OUT).show(ui).clicked() {
+                    if Item::new(if image { "Open in another app" } else { "Open in another player" }).icon(icon::ARROW_SQUARE_OUT).show(ui).clicked() {
                         out = ViewerOutcome::OpenExternal;
                     }
                     crate::ui_kit::menu_sep(ui);
-                    if Item::new("Keyboard shortcuts").icon(icon::KEYBOARD).keys(Some(vec!["?".into()])).show(ui).clicked() {
-                        out = ViewerOutcome::Keys;
+                    if !image {
+                        if Item::new("Keyboard shortcuts").icon(icon::KEYBOARD).keys(Some(vec!["?".into()])).show(ui).clicked() {
+                            out = ViewerOutcome::Keys;
+                        }
+                        crate::ui_kit::menu_sep(ui);
                     }
-                    crate::ui_kit::menu_sep(ui);
                     let del_key = Some(vec![if cfg!(target_os = "macos") { icon::BACKSPACE.to_owned() } else { "Del".to_owned() }]);
                     if Item::new(nav.delete_label.clone()).icon(icon::TRASH).danger().enabled(ready).keys(del_key).show(ui).clicked() {
                         out = ViewerOutcome::Delete;
                     }
                 });
-                let share_tip = if crate::share::CAN_DRAG_OUT { "Copy it, send it or upload it, or drag the picture into any app" } else { "Copy it, send it or upload it" };
+                let share_tip = match (image, crate::share::CAN_DRAG_OUT) {
+                    (true, true) => "Copy it or send it, or drag the picture into any app",
+                    (true, false) => "Copy it or send it",
+                    (false, true) => "Copy it, send it or upload it, or drag the picture into any app",
+                    (false, false) => "Copy it, send it or upload it",
+                };
                 // Narrow: Share and Edit as their icons.
                 let narrow = ui.ctx().content_rect().width() < 700.0;
                 let share = if narrow { Btn::icon(Kind::Primary, icon::EXPORT).tip("Share") } else { Btn::primary("Share").with_icon(icon::EXPORT) };
                 let share = share.enabled(ready).tip(if ready { share_tip } else { wait }).show(ui);
-                if let Some(c) = crate::ui_kit::menu_popup(&share, false, 250.0, |ui| crate::library::share_menu(ui, share.rect.left_bottom(), nav.linked)).flatten() {
+                if let Some(c) = crate::ui_kit::menu_popup(&share, false, 250.0, |ui| crate::library::share_menu(ui, share.rect.left_bottom(), nav.linked, image)).flatten() {
                     out = ViewerOutcome::Share(c);
                 }
+                // Shared: says so beside Share, and opens its link.
+                if let Some((glyph, words, tip)) = &nav.link {
+                    let b = if narrow { Btn::icon(Kind::Ghost, glyph) } else { Btn::ghost(words.clone()).with_icon(glyph) };
+                    if b.tip(*tip).show(ui).clicked() {
+                        out = ViewerOutcome::Share(crate::library::ShareChoice::Link);
+                    }
+                }
                 let edit = if narrow { Btn::icon(Kind::Normal, icon::SCISSORS) } else { Btn::normal("Edit").with_icon(icon::SCISSORS) };
-                if edit.enabled(ready).tip(if ready { "Trim it, adjust its sound, or save it smaller" } else { wait }).show(ui).clicked() {
+                if !image && edit.enabled(ready).tip(if ready { "Trim it, adjust its sound, or save it smaller" } else { wait }).show(ui).clicked() {
                     out = ViewerOutcome::Edit;
                 }
             }

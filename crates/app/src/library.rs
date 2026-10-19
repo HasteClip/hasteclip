@@ -50,6 +50,38 @@ pub(crate) enum Filter {
     Loose,
     /// One of your collections, by id.
     Collection(String),
+    /// The clips shared with a link: what anyone with their links can watch.
+    Shared,
+}
+
+/// Whether the library shows clips, screenshots or both (once it has any
+/// screenshots: until then, there's nothing to choose).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ShowKind {
+    #[default]
+    All,
+    Clips,
+    Screenshots,
+}
+
+impl ShowKind {
+    pub(crate) const ALL: [ShowKind; 3] = [ShowKind::All, ShowKind::Clips, ShowKind::Screenshots];
+
+    pub(crate) fn matches(self, clip: &clips::Clip) -> bool {
+        match self {
+            ShowKind::All => true,
+            ShowKind::Clips => !clip.is_image(),
+            ShowKind::Screenshots => clip.is_image(),
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            ShowKind::All => "All",
+            ShowKind::Clips => "Clips",
+            ShowKind::Screenshots => "Screenshots",
+        }
+    }
 }
 
 impl Filter {
@@ -230,6 +262,8 @@ pub(crate) enum Action {
     MoveTo(Vec<PathBuf>, Option<String>),
     MoveSelectedTo(Option<String>),
     Filter(Filter),
+    /// Show clips, screenshots or both.
+    Kind(ShowKind),
     RenameFolder(String),
     RevealFolder(String),
     /// Ask for a name, then make a collection with these clips in it.
@@ -738,6 +772,8 @@ pub(crate) enum ShareChoice {
     /// Copy its link (it's shared already).
     CopyLink,
     Copy,
+    /// A screenshot's picture on the clipboard (not its file).
+    CopyImage,
     /// The system share sheet, at this window position.
     Sheet(Pos2),
     Reveal,
@@ -748,9 +784,9 @@ pub(crate) enum ShareChoice {
 
 /// The ways to get a clip out, shared by the library's Share button and
 /// right-click menu and the player's Share button. `linked`: the clip has a
-/// share link.
-pub(crate) fn share_menu(ui: &mut egui::Ui, anchor: Pos2, linked: bool) -> Option<ShareChoice> {
-    crate::library_view::share_items(ui, anchor, false, linked)
+/// share link. `image`: it's a screenshot.
+pub(crate) fn share_menu(ui: &mut egui::Ui, anchor: Pos2, linked: bool, image: bool) -> Option<ShareChoice> {
+    crate::library_view::share_items(ui, anchor, false, linked, image)
 }
 
 impl App {
@@ -761,8 +797,17 @@ impl App {
             ShareChoice::CopyLink => self.copy_link(&file),
             ShareChoice::Copy => match share::copy_file(&file) {
                 Ok(()) => self.toast(format!("Copied — paste it into any app ({})", crate::hotkey_label_cmd("V"))),
-                Err(e) => self.toast_error(format!("Couldn't copy the clip: {e}")),
+                Err(e) => self.toast_error(format!("Couldn't copy the {}: {e}", if clips::is_image(&file) { "file" } else { "clip" })),
             },
+            // Read and put on the clipboard in the background: a 4K PNG takes
+            // a moment.
+            ShareChoice::CopyImage => {
+                let (tx, ctx) = (self.copy_tx.clone(), self.ctx());
+                std::thread::spawn(move || {
+                    let _ = tx.send(crate::screenshot::copy_file(&file));
+                    ctx.request_repaint();
+                });
+            }
             ShareChoice::Sheet(at) => {
                 if let Err(e) = share::share_sheet(frame, &file, at) {
                     self.toast_error(format!("Couldn't open sharing: {e}"));
@@ -800,7 +845,7 @@ impl App {
         });
     }
 
-    /// Finished MP3s: say so.
+    /// Finished MP3s and pictures copied: say so.
     pub(crate) fn pump_mp3s(&mut self) {
         while let Ok(result) = self.mp3_rx.try_recv() {
             match result {
@@ -832,6 +877,12 @@ fn delete_when_free(clip: &clips::Clip, library: &[clips::Clip], permanently: bo
                 std::thread::sleep(Duration::from_millis(50));
             }
             r => return r,
+        }
+        while let Ok(result) = self.copy_rx.try_recv() {
+            match result {
+                Ok(()) => self.toast(format!("Copied — paste it into any app ({})", crate::hotkey_label_cmd("V"))),
+                Err(e) => self.toast_error(format!("Couldn't copy the picture: {e}")),
+            }
         }
     }
 }
@@ -1015,7 +1066,7 @@ mod scale_tests {
         let mut version = 0;
         let update = |shown: &mut crate::library_grid::Shown, f: &Filter, q: &str, v: u64| {
             shown.update(
-                crate::library_grid::Inputs { clips: &clips, library_version: v, collections: &cols, filter: f, query: q, sort: crate::settings::LibrarySort::Newest, lengths_version: 0, placeholders: 0, new_renders: Vec::new(), renders: &[] },
+                crate::library_grid::Inputs { clips: &clips, library_version: v, collections: &cols, filter: f, kind: ShowKind::All, links: &crate::links::Links::default(), query: q, sort: crate::settings::LibrarySort::Newest, lengths_version: 0, placeholders: 0, new_renders: Vec::new(), renders: &[] },
                 false,
                 |_| None,
             )

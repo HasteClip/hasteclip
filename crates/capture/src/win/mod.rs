@@ -163,6 +163,38 @@ impl Recorder for WinRecorder {
     fn set_mic(&mut self, id: &str, device: &str) -> bool {
         self.session.as_mut().and_then(|s| s.audio.as_mut()).is_some_and(|a| a.set_mic(id, device))
     }
+
+    fn screenshot(&mut self, video: &VideoSource) -> Result<crate::PendingShot> {
+        if let Some(sw) = self.session.as_ref().and_then(|s| s.switch.as_ref()) {
+            return shot_of(&sw.latest);
+        }
+        // Nothing running: a capture of its own, for one picture.
+        system::com_init();
+        let gpu = d3d::Gpu::new()?;
+        let (source, (w, h)) = PictureSource::plan(video)?;
+        let picture = source.open(&gpu, w, h, 60, None)?;
+        // A screen has its picture by now; games and apps take a moment to
+        // find the one that's showing.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while (!picture.latest.has_frame() || picture.latest.waiting()) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let shot = shot_of(&picture.latest);
+        picture.video.stop();
+        shot
+    }
+}
+
+/// A screenshot of what's up in `latest`, unless that's the away screen or
+/// black: none of the games and apps recorded is showing.
+fn shot_of(latest: &d3d::Latest) -> Result<crate::PendingShot> {
+    if !latest.has_frame() {
+        bail!("nothing has been captured yet. Try again in a moment");
+    }
+    if latest.waiting() {
+        bail!("none of the games and apps you record is showing");
+    }
+    latest.snapshot()
 }
 
 impl Drop for WinRecorder {
@@ -1607,5 +1639,64 @@ mod tests {
         assert!(first.abs_diff(137) <= 1, "{first}");
         assert!(second.abs_diff(225) <= 1, "{second}");
         assert!(blend.is_empty(2) && blend.is_empty(3), "both start empty again");
+    }
+
+    /// With nothing running, a screenshot of the main screen is taken by a
+    /// capture of its own: the screen's size, opaque, not all black.
+    /// `HASTECLIP_SHOT=<file.png>` keeps it to look at.
+    #[test]
+    #[ignore = "captures the screen: cargo test -p capture screenshot_of_the_screen -- --ignored"]
+    fn screenshot_of_the_screen() {
+        let screen = system::list_screens().into_iter().next().expect("a screen");
+        let video = VideoSource::Screen { id: screen.id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() } };
+        let mut rec = WinRecorder::new(Arc::new(LiveAudio::default()));
+        let t = Instant::now();
+        let img = rec.screenshot(&video).unwrap().finish().unwrap();
+        eprintln!("{}×{} in {} ms", img.width, img.height, t.elapsed().as_millis());
+        let (w, h) = system::display_pixels(Some(&screen.id)).expect("its size");
+        assert_eq!((img.width, img.height), (w, h));
+        assert_eq!(img.bgra.len(), (w * h * 4) as usize);
+        assert!(img.bgra.chunks_exact(4).all(|p| p[3] == 255));
+        assert!(img.bgra.chunks_exact(4).any(|p| p[0] > 16 || p[1] > 16 || p[2] > 16), "all black");
+        if let Some(out) = std::env::var_os("HASTECLIP_SHOT") {
+            let rgb: Vec<u8> = img.bgra.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
+            let header = format!("P6\n{w} {h}\n255\n");
+            std::fs::write(out, [header.as_bytes(), &rgb].concat()).unwrap();
+        }
+    }
+
+    /// While clipping at 720p in 1:1, a screenshot is still all of the screen
+    /// at its own size: the recording's shape and size aren't the picture's.
+    #[test]
+    #[ignore = "captures the screen: cargo test -p capture screenshot_while_clipping -- --ignored"]
+    fn screenshot_while_clipping() {
+        let screen = system::list_screens().into_iter().next().expect("a screen");
+        let video = VideoSource::Screen { id: screen.id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() } };
+        let settings = EncodeSettings {
+            output_dir: std::env::temp_dir().join("hc-shot-test"),
+            container_ext: "mp4".into(),
+            fps: 30,
+            blend_samples: 1,
+            blend_shape: crate::BlendShape::Even,
+            video_bitrate_kbps: 4000,
+            target_height: Some(720),
+            shape: Some(crate::Shape { w: 1, h: 1, framing: crate::Framing::Fill }),
+            use_hardware: true,
+            replay_seconds: 5,
+            video: video.clone(),
+            away_screen: None,
+            webcam: None,
+            sources: Vec::new(),
+        };
+        let mut rec = WinRecorder::new(Arc::new(LiveAudio::default()));
+        rec.start(Mode::ReplayBuffer, &settings).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let t = Instant::now();
+        let img = rec.screenshot(&video).unwrap().finish().unwrap();
+        eprintln!("{}×{} in {} ms", img.width, img.height, t.elapsed().as_millis());
+        rec.stop(None).unwrap();
+        let (w, h) = system::display_pixels(Some(&screen.id)).expect("its size");
+        assert_eq!((img.width, img.height), (w, h));
+        assert!(img.bgra.chunks_exact(4).any(|p| p[0] > 16 || p[1] > 16 || p[2] > 16), "all black");
     }
 }

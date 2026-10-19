@@ -475,6 +475,58 @@ impl Latest {
         self.note_frame();
         Ok(())
     }
+
+    /// The picture up now, as it was captured (its valid part, at its own
+    /// size): copied aside on the GPU at once, read back by the returned
+    /// [`crate::PendingShot`].
+    pub(crate) fn snapshot(&self) -> Result<crate::PendingShot> {
+        let (w, h) = self.content();
+        if w == 0 || h == 0 {
+            bail!("nothing has been captured yet");
+        }
+        let staging = self.gpu.texture(w, h, DXGI_FORMAT_B8G8R8A8_UNORM, 0, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ.0 as u32)?;
+        let region = D3D11_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 };
+        {
+            let _held = self.gpu.exclusive();
+            unsafe {
+                self.gpu.context.CopySubresourceRegion(&staging, 0, 0, 0, 0, &self.texture, 0, Some(&region));
+                self.gpu.context.Flush();
+            }
+        }
+        let (gpu, staging) = (self.gpu.clone(), Shared(staging));
+        Ok(crate::PendingShot::new(move || {
+            let staging = staging;
+            let (cols, rows) = (w as usize, h as usize);
+            let mut bgra = vec![0u8; cols * rows * 4];
+            let start = std::time::Instant::now();
+            unsafe {
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                // Not waiting inside Map: that would hold the context, and
+                // the capture and the recording with it, until the copy's done.
+                loop {
+                    match gpu.context.Map(&staging.0, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32, Some(&mut mapped)) {
+                        Ok(()) => break,
+                        Err(e) if e.code() == windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAS_STILL_DRAWING && start.elapsed() < std::time::Duration::from_secs(2) => {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        Err(e) => return Err(e).context("couldn't read the picture back from the graphics card"),
+                    }
+                }
+                let src = mapped.pData as *const u8;
+                let pitch = mapped.RowPitch as usize;
+                for row in 0..rows {
+                    let line = std::slice::from_raw_parts(src.add(row * pitch), cols * 4);
+                    bgra[row * cols * 4..(row + 1) * cols * 4].copy_from_slice(line);
+                }
+                gpu.context.Unmap(&staging.0, 0);
+            }
+            // Games leave anything in their pictures' alpha.
+            for px in bgra.chunks_exact_mut(4) {
+                px[3] = 255;
+            }
+            Ok(crate::StillImage { width: w, height: h, bgra })
+        }))
+    }
 }
 
 /// A running capture of a monitor or a window.

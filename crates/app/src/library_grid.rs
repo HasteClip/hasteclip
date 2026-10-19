@@ -21,7 +21,7 @@ use egui::{Pos2, Vec2, vec2};
 
 use crate::clips::Clip;
 use crate::collections::Collections;
-use crate::library::{Filter, View};
+use crate::library::{Filter, ShowKind, View};
 use crate::settings::LibrarySort;
 use crate::theme;
 
@@ -56,16 +56,25 @@ pub enum GridItem {
 pub struct Group {
     pub day: Option<chrono::NaiveDate>,
     pub items: Vec<GridItem>,
-    /// How many of them are clips (not ones being made).
+    /// How many of them are clips (not ones being made), and of those, how
+    /// many are screenshots.
     pub clips: usize,
+    pub shots: usize,
 }
 
 /// What the library shows, worked out once per change.
 #[derive(Default)]
 pub struct Shown {
     key: Option<ShownKey>,
-    /// The clips in the filter, before the search.
+    /// The clips in the filter, before the search, and of those how many are
+    /// screenshots.
     pub in_filter: usize,
+    pub shots_in_filter: usize,
+    /// Whether the library has any screenshots (then clips or screenshots
+    /// can be chosen).
+    pub any_shots: bool,
+    /// How many of the library's clips are shared with a link.
+    pub shared: usize,
     /// The clips shown, in order (indices into the library's list).
     pub clips: Vec<usize>,
     pub groups: Vec<Group>,
@@ -86,6 +95,8 @@ struct ShownKey {
     library: u64,
     collections: u64,
     filter: Filter,
+    kind: ShowKind,
+    links: u64,
     query: String,
     sort: LibrarySort,
     lengths: u64,
@@ -101,6 +112,8 @@ pub struct Inputs<'a> {
     pub library_version: u64,
     pub collections: &'a Collections,
     pub filter: &'a Filter,
+    pub kind: ShowKind,
+    pub links: &'a crate::links::Links,
     pub query: &'a str,
     pub sort: LibrarySort,
     pub lengths_version: u64,
@@ -121,6 +134,8 @@ impl Shown {
             library: inp.library_version,
             collections: inp.collections.version(),
             filter: inp.filter.clone(),
+            kind: inp.kind,
+            links: inp.links.changes,
             query: query.clone(),
             sort: inp.sort,
             lengths: if inp.sort == LibrarySort::Longest { inp.lengths_version } else { 0 },
@@ -133,9 +148,12 @@ impl Shown {
         }
         let clips = inp.clips;
         let sets = inp.collections.sets();
-        let in_filter = |c: &Clip| match inp.filter {
-            Filter::Collection(id) => sets.get(id).is_some_and(|s| s.contains(&c.path)),
-            f => f.matches(c, inp.collections),
+        let in_filter = |c: &Clip| {
+            inp.kind.matches(c)
+                && match inp.filter {
+                    Filter::Collection(id) => sets.get(id).is_some_and(|s| s.contains(&c.path)),
+                    f => f.matches(c, inp.collections, inp.links),
+                }
         };
         let matches = |c: &Clip| query.is_empty() || c.title().to_lowercase().contains(&query) || c.folder.as_ref().is_some_and(|f| f.to_lowercase().contains(&query));
         let filtered: Vec<usize> = (0..clips.len()).filter(|&i| in_filter(&clips[i])).collect();
@@ -154,6 +172,9 @@ impl Shown {
         self.groups = group(clips, &shown, inp.sort, &query, inp.placeholders, &inp.new_renders, today);
         self.days = self.groups.iter().filter_map(|g| g.day).collect();
         self.in_filter = filtered.len();
+        self.shots_in_filter = filtered.iter().filter(|&&i| clips[i].is_image()).count();
+        self.any_shots = clips.iter().any(Clip::is_image);
+        self.shared = clips.iter().filter(|c| inp.links.get(&c.path).is_some()).count();
         self.clips = shown;
         let (games, collections) = views(clips, inp.collections, &sets);
         self.games = games;
@@ -183,16 +204,18 @@ fn group(clips: &[Clip], shown: &[usize], sort: LibrarySort, query: &str, placeh
     let mut live: Vec<GridItem> = (0..placeholders).map(GridItem::Placeholder).chain(new_renders.iter().map(|&i| GridItem::NewRender(i))).collect();
     let by_day = sort.by_day();
     if !live.is_empty() && query.is_empty() && by_day && sort == LibrarySort::Newest {
-        groups.push(Group { day: Some(today), items: std::mem::take(&mut live), clips: 0 });
+        groups.push(Group { day: Some(today), items: std::mem::take(&mut live), clips: 0, shots: 0 });
     }
     for &i in shown {
         let day = by_day.then(|| clips[i].day());
+        let shot = usize::from(clips[i].is_image());
         match groups.last_mut() {
             Some(g) if g.day == day => {
                 g.items.push(GridItem::Clip(i));
                 g.clips += 1;
+                g.shots += shot;
             }
-            _ => groups.push(Group { day, items: vec![GridItem::Clip(i)], clips: 1 }),
+            _ => groups.push(Group { day, items: vec![GridItem::Clip(i)], clips: 1, shots: shot }),
         }
     }
     if !live.is_empty() {
@@ -205,9 +228,9 @@ fn group(clips: &[Clip], shown: &[usize], sort: LibrarySort, query: &str, placeh
                     live.append(&mut g.items);
                     g.items = live;
                 }
-                None => groups.push(Group { day: None, items: live, clips: 0 }),
+                None => groups.push(Group { day: None, items: live, clips: 0, shots: 0 }),
             },
-            _ => groups.push(Group { day: Some(today), items: live, clips: 0 }),
+            _ => groups.push(Group { day: Some(today), items: live, clips: 0, shots: 0 }),
         }
     }
     groups
@@ -572,7 +595,7 @@ mod tests {
     fn layout_of(clips: &[Clip], filter: &Filter, width: f32) -> (Shown, Layout) {
         let cols = Collections::default();
         let mut shown = Shown::default();
-        shown.update(Inputs { clips, library_version: 1, collections: &cols, filter, query: "", sort: LibrarySort::Newest, lengths_version: 0, placeholders: 0, new_renders: Vec::new(), renders: &[] }, false, |_| None);
+        shown.update(Inputs { clips, library_version: 1, collections: &cols, filter, kind: ShowKind::All, links: &crate::links::Links::default(), query: "", sort: LibrarySort::Newest, lengths_version: 0, placeholders: 0, new_renders: Vec::new(), renders: &[] }, false, |_| None);
         let l = Layout::new(&shown.groups, Metrics::for_width(width), |_| 1.0, |it| key_for(it, clips, &[]));
         (shown, l)
     }
@@ -736,7 +759,8 @@ mod tests {
         let clips: Vec<Clip> = (0..50).map(|i| clip(i, "osu!")).collect();
         let cols = Collections::default();
         let mut shown = Shown::default();
-        let inp = |q: &'static str| Inputs { clips: &clips, library_version: 1, collections: &cols, filter: &Filter::All, query: q, sort: LibrarySort::Newest, lengths_version: 0, placeholders: 0, new_renders: Vec::new(), renders: &[] };
+        let links = crate::links::Links::default();
+        let inp = |q: &'static str| Inputs { clips: &clips, library_version: 1, collections: &cols, filter: &Filter::All, kind: ShowKind::All, links: &links, query: q, sort: LibrarySort::Newest, lengths_version: 0, placeholders: 0, new_renders: Vec::new(), renders: &[] };
         assert!(shown.update(inp(""), false, |_| None));
         assert!(!shown.update(inp(""), false, |_| None));
         assert!(shown.update(inp("12"), false, |_| None));

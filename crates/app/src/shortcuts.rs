@@ -33,7 +33,8 @@ pub struct Registered {
     active: Vec<(HotKey, ShortcutAction)>,
     /// The same by id, for the shortcut event handler.
     ids: Arc<Mutex<Vec<(u32, ShortcutAction)>>>,
-    /// Presses from the handler, and whether it saved the clip itself.
+    /// Presses from the handler, and whether it saved the clip (or took the
+    /// screenshot) itself.
     presses: Receiver<(ShortcutAction, bool)>,
     /// What `active` was built from, to re-register only on change.
     from: Option<Shortcuts>,
@@ -43,7 +44,8 @@ pub struct Registered {
 
 impl Registered {
     /// `ctx` is woken when a shortcut is pressed (where the backend can). Save
-    /// clip saves through `quick` as the key is pressed, frames or not.
+    /// clip saves and Take a screenshot takes it through `quick` as the key is
+    /// pressed, frames or not.
     pub fn new(ctx: egui::Context, quick: crate::service::QuickSave) -> Result<Self, String> {
         let ids: Arc<Mutex<Vec<(u32, ShortcutAction)>>> = Default::default();
         let (tx, presses) = channel();
@@ -65,7 +67,11 @@ impl Registered {
             }
             let action = handler_ids.lock().ok().and_then(|ids| ids.iter().find(|(id, _)| *id == ev.id).map(|(_, a)| *a));
             if let Some(action) = action {
-                let saved = action == ShortcutAction::SaveClip && quick.save();
+                let saved = match action {
+                    ShortcutAction::SaveClip => quick.save(),
+                    ShortcutAction::Screenshot => quick.screenshot(),
+                    _ => false,
+                };
                 let _ = tx.send((action, saved));
                 wake.request_repaint();
             }
@@ -95,7 +101,7 @@ impl Registered {
         }
         self.errors.clear();
         let mut valid = Vec::new();
-        for action in ShortcutAction::ALL {
+        for action in ShortcutAction::ALL.into_iter().filter(|a| a.available()) {
             let text = wanted.get(action);
             if text.is_empty() {
                 continue;
@@ -128,8 +134,8 @@ impl Registered {
         self.from = Some(wanted.clone());
     }
 
-    /// Shortcuts pressed since the last call, and whether the clip was saved
-    /// already (Save clip, as it was pressed).
+    /// Shortcuts pressed since the last call, and whether it was done
+    /// already (Save clip, Take a screenshot: as it was pressed).
     pub fn pressed(&mut self) -> Vec<(ShortcutAction, bool)> {
         #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let mut out: Vec<(ShortcutAction, bool)> = self.presses.try_iter().collect();
@@ -353,10 +359,15 @@ mod tests {
 
     #[test]
     fn defaults_parse_and_display() {
+        // Only Save clip has a key to begin with.
         for a in ShortcutAction::ALL {
             let text = Shortcuts::default().get(a).to_owned();
-            assert!(HotKey::from_str(&text).is_ok(), "{text}");
-            assert!(keys(&text).is_some());
+            if a == ShortcutAction::SaveClip {
+                assert!(HotKey::from_str(&text).is_ok(), "{text}");
+                assert!(keys(&text).is_some());
+            } else {
+                assert_eq!(label(&text), "Off", "{a:?}");
+            }
         }
         let alt = if cfg!(target_os = "macos") { "Option" } else { "Alt" };
         assert_eq!(keys("alt+F10").unwrap(), vec![alt.to_owned(), "F10".to_owned()]);

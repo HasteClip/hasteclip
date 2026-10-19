@@ -64,6 +64,24 @@ impl Container {
     }
 }
 
+/// File format for screenshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScreenshotFormat {
+    /// Every pixel as it was. The default.
+    Png,
+    /// About a quarter of the size, for sharing.
+    Jpg,
+}
+
+impl ScreenshotFormat {
+    pub fn ext(self) -> &'static str {
+        match self {
+            ScreenshotFormat::Png => "png",
+            ScreenshotFormat::Jpg => "jpg",
+        }
+    }
+}
+
 /// Kept so saved settings still load; not offered in the UI, since the
 /// VideoToolbox encoder only does average-bitrate today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -687,9 +705,14 @@ pub struct RecordSettings {
     /// Games with anti-cheat game capture may be used on anyway.
     pub game_capture_allowed: Vec<AllowedGame>,
 
+    // --- Screenshots ---
+    pub screenshot_format: ScreenshotFormat,
+    /// A screenshot also goes on the clipboard, to paste right away.
+    pub copy_screenshots: bool,
+
     // --- Shortcuts ---
     pub shortcuts: Shortcuts,
-    /// The sound played when a clip is saved.
+    /// The sound played when a clip (or a screenshot) is saved.
     pub save_sound: SaveSound,
     /// The editor's preview height, as a share of the window (the timeline
     /// gets the rest), as last dragged.
@@ -749,6 +772,8 @@ impl Default for RecordSettings {
             limiter: true,
             game_capture: true,
             game_capture_allowed: Vec::new(),
+            screenshot_format: ScreenshotFormat::Png,
+            copy_screenshots: true,
             shortcuts: Shortcuts::default(),
             save_sound: SaveSound::default(),
             editor_preview_share: 0.5,
@@ -788,17 +813,22 @@ pub struct CustomSound {
 }
 
 /// The global shortcuts, as `global_hotkey` strings ("alt+F10"). Empty = off.
+/// Only Save clip has one to begin with; the rest are off until chosen:
+/// pressed by accident, Start or stop clipping turns clipping off without a
+/// word (the clip you wanted isn't there), recording fills the disk, and
+/// any key taken is one a game or another app may want.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Shortcuts {
     pub save_clip: String,
     pub toggle_buffer: String,
     pub toggle_record: String,
+    pub screenshot: String,
 }
 
 impl Default for Shortcuts {
     fn default() -> Self {
-        Self { save_clip: "alt+F10".into(), toggle_buffer: "alt+F8".into(), toggle_record: "alt+F9".into() }
+        Self { save_clip: "alt+F10".into(), toggle_buffer: String::new(), toggle_record: String::new(), screenshot: String::new() }
     }
 }
 
@@ -808,17 +838,24 @@ pub enum ShortcutAction {
     SaveClip,
     ToggleBuffer,
     ToggleRecord,
+    Screenshot,
 }
 
 impl ShortcutAction {
-    pub const ALL: [ShortcutAction; 3] = [ShortcutAction::SaveClip, ShortcutAction::ToggleBuffer, ShortcutAction::ToggleRecord];
+    pub const ALL: [ShortcutAction; 4] = [ShortcutAction::SaveClip, ShortcutAction::Screenshot, ShortcutAction::ToggleBuffer, ShortcutAction::ToggleRecord];
 
     pub fn label(self) -> &'static str {
         match self {
             ShortcutAction::SaveClip => "Save clip",
             ShortcutAction::ToggleBuffer => "Start or stop clipping",
             ShortcutAction::ToggleRecord => "Start or stop recording",
+            ShortcutAction::Screenshot => "Take a screenshot",
         }
+    }
+
+    /// Whether it does anything here: screenshots aren't on every platform yet.
+    pub fn available(self) -> bool {
+        self != ShortcutAction::Screenshot || capture::SCREENSHOTS
     }
 }
 
@@ -828,6 +865,7 @@ impl Shortcuts {
             ShortcutAction::SaveClip => &self.save_clip,
             ShortcutAction::ToggleBuffer => &self.toggle_buffer,
             ShortcutAction::ToggleRecord => &self.toggle_record,
+            ShortcutAction::Screenshot => &self.screenshot,
         }
     }
 
@@ -836,6 +874,7 @@ impl Shortcuts {
             ShortcutAction::SaveClip => self.save_clip = value,
             ShortcutAction::ToggleBuffer => self.toggle_buffer = value,
             ShortcutAction::ToggleRecord => self.toggle_record = value,
+            ShortcutAction::Screenshot => self.screenshot = value,
         }
     }
 }

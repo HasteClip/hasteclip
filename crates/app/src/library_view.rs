@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2, vec2};
 
-use crate::library::{Action, CardDrag, DropOn, Filter, View};
+use crate::library::{Action, CardDrag, DropOn, Filter, ShowKind, View};
 use crate::settings::LibrarySort;
 use crate::theme::{self, W, icon};
 use crate::ui_kit::{self, Btn, Item, Kind};
@@ -60,6 +60,8 @@ impl App {
                 library_version: self.library_version,
                 collections: &self.collections,
                 filter: &self.library_filter,
+                kind: self.library_kind,
+                links: &self.links,
                 query: &self.library_query,
                 sort: self.settings.library_sort,
                 lengths_version,
@@ -106,8 +108,16 @@ impl App {
 
         // The heading: what's shown, how many, the order, fold all; recorder.
         let title = self.filter_name(&self.library_filter);
-        let in_filter = self.shown.in_filter;
-        let count = if query.is_empty() { format!("{in_filter} clips") } else { format!("{shown_count} of {in_filter} clips") };
+        let (in_filter, shots) = (self.shown.in_filter, self.shown.shots_in_filter);
+        let count = if query.is_empty() {
+            count_words(in_filter - shots, shots)
+        } else if shots == 0 {
+            format!("{shown_count} of {in_filter} clips")
+        } else if shots == in_filter {
+            format!("{shown_count} of {in_filter} screenshots")
+        } else {
+            format!("{shown_count} of {in_filter}")
+        };
         let wide_page = wide;
         let (games_c, cols_c) = (games.clone(), collections.clone());
         let mut head_action = None;
@@ -135,9 +145,23 @@ impl App {
                 let sort = app.settings.library_sort;
                 let all_folded = days.iter().all(|d| app.folded.contains(d));
                 let fold_label = if all_folded { "Expand all" } else { "Collapse all" };
+                // Clips, screenshots or both: once there are screenshots.
+                let kinds = app.shown.any_shots;
+                let chosen = ShowKind::ALL.iter().position(|k| *k == app.library_kind).unwrap_or(0);
                 if tight {
-                    // Not enough room: the order and fold-all in a menu (the
-                    // recorder keeps its words longer).
+                    // Not enough room: clips or screenshots as their icons,
+                    // the order and fold-all in a menu (the recorder keeps
+                    // its words longer).
+                    if kinds {
+                        let opts = [
+                            ui_kit::Seg::from("All"),
+                            ui_kit::Seg { icon: Some(icon::FILM_STRIP), label: "", tip: Some("Clips") },
+                            ui_kit::Seg { icon: Some(icon::CAMERA), label: "", tip: Some("Screenshots") },
+                        ];
+                        if let Some(i) = ui_kit::segmented_opts(ui, "lib_kind_tight", &opts, chosen, None, true) {
+                            head_action = Some(Action::Kind(ShowKind::ALL[i]));
+                        }
+                    }
                     let r = Btn::icon(Kind::Ghost, icon::DOTS_THREE).small().id("lib_more").tip(format!("Order: {}", sort.label())).show(ui);
                     ui_kit::menu_popup(&r, true, 200.0, |ui| {
                         ui_kit::menu_head(ui, "Order");
@@ -154,6 +178,12 @@ impl App {
                         }
                     });
                 } else {
+                    if kinds {
+                        let opts: Vec<ui_kit::Seg> = ShowKind::ALL.iter().map(|k| ui_kit::Seg::from(k.label())).collect();
+                        if let Some(i) = ui_kit::segmented_opts(ui, "lib_kind", &opts, chosen, None, true) {
+                            head_action = Some(Action::Kind(ShowKind::ALL[i]));
+                        }
+                    }
                     let r = Btn::ghost(sort.label()).with_icon(icon::ARROWS_DOWN_UP).small().id("lib_sort").show(ui);
                     ui_kit::menu_popup(&r, true, 200.0, |ui| {
                         for s in LibrarySort::ALL {
@@ -243,9 +273,9 @@ impl App {
             let selecting_now = selecting;
             let n_groups = self.shown.groups.len();
             for gi in 0..n_groups {
-                let (day, n_clips, len) = {
+                let (day, n_clips, n_shots, len) = {
                     let g = &self.shown.groups[gi];
-                    (g.day, g.clips, g.items.len())
+                    (g.day, g.clips, g.shots, g.items.len())
                 };
                 let place = self.moves.layout().groups[gi];
                 let open = opens[gi];
@@ -263,7 +293,7 @@ impl App {
                         if p.shown < 1.0 {
                             hui.multiply_opacity(p.shown);
                         }
-                        if day_header(&mut hui, &clips::day_label(d), n_clips, folded).clicked() {
+                        if day_header(&mut hui, &clips::day_label(d), n_clips, n_shots, folded).clicked() {
                             self.folded.set(d, !folded);
                         }
                     }
@@ -367,7 +397,15 @@ impl App {
     /// What a filter is called.
     pub(crate) fn filter_name(&self, f: &Filter) -> String {
         match f {
+            // With screenshots, what's shown of everything says which.
+            Filter::All if self.shown.any_shots => match self.library_kind {
+                ShowKind::All => "All",
+                ShowKind::Clips => "All clips",
+                ShowKind::Screenshots => "All screenshots",
+            }
+            .to_owned(),
             Filter::All => "All clips".to_owned(),
+            Filter::Shared => "Shared".to_owned(),
             Filter::Loose => "Other".to_owned(),
             Filter::Folder(name) => name.clone(),
             Filter::Collection(id) => self.collections.get(id).map(|c| c.name.clone()).unwrap_or_default(),
@@ -402,7 +440,7 @@ impl App {
         cui.set_clip_rect(card.intersect(ui.clip_rect()));
         egui::ScrollArea::vertical().id_salt("library_panel_scroll").auto_shrink([false, false]).show(&mut cui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
-            let all = View { filter: Filter::All, label: "All clips".into(), count: self.clips.len() };
+            let all = View { filter: Filter::All, label: if self.shown.any_shots { "All" } else { "All clips" }.into(), count: self.clips.len() };
             if let Some(a) = self.filter_row(ui, &all) {
                 action = Some(a);
             }
@@ -633,7 +671,7 @@ impl App {
         let mut action = None;
         let r = Btn::ghost(title).trail(icon::CARET_DOWN).id("lib_title_menu").show(ui);
         ui_kit::menu_popup(&r, true, 240.0, |ui| {
-            let all = View { filter: Filter::All, label: "All clips".into(), count: self.clips.len() };
+            let all = View { filter: Filter::All, label: if self.shown.any_shots { "All" } else { "All clips" }.into(), count: self.clips.len() };
             let mut pick = |ui: &mut egui::Ui, v: &View| {
                 if Item::new(v.label.clone()).check(self.library_filter == v.filter).value(v.count.to_string()).show(ui).clicked() {
                     action = Some(Action::Filter(v.filter.clone()));
@@ -667,6 +705,22 @@ impl App {
                 ui.add_space(10.0);
                 if Btn::normal("Clear search").small().show(ui).clicked() {
                     self.library_query.clear();
+                }
+            } else if self.library_kind != ShowKind::All {
+                let name = self.filter_name(&self.library_filter);
+                let shots = self.library_kind == ShowKind::Screenshots;
+                ui.label(theme::text(format!("No {} in {name} yet", if shots { "screenshots" } else { "clips" }), 15.0, W::Semibold).color(p.text));
+                ui.add_space(4.0);
+                let key = self.shortcut_keys(crate::settings::ShortcutAction::Screenshot).map(|k| ui_kit::key_text(&k));
+                let hint = match key {
+                    Some(key) if shots => format!("Press {key} in a game to take one."),
+                    None if shots => "Choose a key for them in Settings, under Shortcuts.".to_owned(),
+                    _ => "Show All to see everything here.".to_owned(),
+                };
+                ui.label(theme::text(hint, 13.5, W::Regular).color(p.text3));
+                ui.add_space(10.0);
+                if Btn::normal("Show all").small().show(ui).clicked() {
+                    self.library_kind = ShowKind::All;
                 }
             } else {
                 let name = self.filter_name(&self.library_filter);
@@ -842,8 +896,9 @@ impl App {
                 painter.rect_filled(thumb_rect, ui_kit::RADIUS, p.raise2);
             }
         }
+        let image = clip.is_image();
         // Rested on: it plays, after a moment (while nothing's dragged or saved).
-        if hovered && render.is_none() && self.card_drag.is_none() {
+        if hovered && render.is_none() && self.card_drag.is_none() && !image {
             crate::hover_play::HoverPlay::hovering(&mut self.hover_play, &clip.path);
             self.hover_seen = true;
         }
@@ -871,7 +926,9 @@ impl App {
         }
         // Length: the edited length with a scissors on an edited clip.
         let edited = clip.original.is_some();
-        if let Some(d) = duration {
+        if image {
+            pill(&painter, thumb_rect.right_bottom() - vec2(7.0, 7.0), Align2::RIGHT_BOTTOM, icon::CAMERA);
+        } else if let Some(d) = duration {
             let text = if edited { format!("{} {}", icon::SCISSORS, thumbs::format_duration(d)) } else { thumbs::format_duration(d) };
             pill(&painter, thumb_rect.right_bottom() - vec2(7.0, 7.0), Align2::RIGHT_BOTTOM, &text);
         }
@@ -883,14 +940,22 @@ impl App {
 
         let mut action = None;
         let modifiers = ui.input(|i| i.modifiers);
-        // Shared with a link: a link mark, bottom left, that opens its
-        // dialog. Uploading for one: how far, and a bar along the bottom.
-        if render.is_none() {
-            let upload = self.link_upload(&clip.path);
-            let mark = match upload {
-                Some(f) => Some((format!("{} {}%", icon::CLOUD_ARROW_UP, ((f * 100.0) as u32).min(99)), "Uploading for a link")),
-                None if self.links.get(&clip.path).is_some() => Some((icon::LINK.to_owned(), "Shared with a link")),
-                None => None,
+        // Shared with a link: "Shared", bottom left, in words (a link mark
+        // alone was easy to miss), opening its dialog. Uploading for one, or
+        // a new version under it: how far, and a bar along the bottom.
+        if render.is_none() && !image {
+            use crate::links::LinkState;
+            let pct = |f: f32| ((f * 100.0) as u32).min(99);
+            let state = self.link_state(&clip.path);
+            let (mark, upload) = match state {
+                Some(LinkState::Uploading(f)) => (Some((format!("{} {}%", icon::CLOUD_ARROW_UP, pct(f)), "Uploading for a link")), Some(f)),
+                Some(LinkState::Updating(f)) => (Some((format!("{} {}%", icon::CLOUD_ARROW_UP, pct(f)), "Updating its link to this version")), Some(f)),
+                Some(LinkState::Behind) => (
+                    Some((format!("{} Shared", icon::ARROWS_CLOCKWISE), "Shared with a link, which still shows an older version of it: it's brought up to date once HasteClip's server can be reached")),
+                    None,
+                ),
+                Some(LinkState::Shared) => (Some((format!("{} Shared", icon::LINK), "Shared with a link: click for it, and who's watched it")), None),
+                None => (None, None),
             };
             if let Some(f) = upload {
                 let bar = Rect::from_min_max(Pos2::new(thumb_rect.left(), thumb_rect.bottom() - 3.0), thumb_rect.max);
@@ -924,13 +989,16 @@ impl App {
             let mut qui = ui.new_child(egui::UiBuilder::new().max_rect(edit_r.union(share_r)).layout(egui::Layout::left_to_right(egui::Align::Center)));
             qui.multiply_opacity(qa);
             qui.spacing_mut().item_spacing.x = 6.0;
-            if overlay_icon(&mut qui, icon::SCISSORS, false, "Edit").clicked() {
+            // A screenshot isn't edited: Share alone, in the corner.
+            if image {
+                qui.add_space(30.0);
+            } else if overlay_icon(&mut qui, icon::SCISSORS, false, "Edit").clicked() {
                 action = Some(Action::Edit(clip.path.clone()));
             }
             let sr = overlay_icon(&mut qui, icon::EXPORT, true, "Share");
             let sr = egui::Response { id: share_id, ..sr };
             let linked = self.links.get(&clip.path).is_some();
-            if let Some(c) = ui_kit::menu_popup(&sr, false, 250.0, |ui| share_items(ui, sr.rect.left_bottom(), false, linked)).flatten() {
+            if let Some(c) = ui_kit::menu_popup(&sr, false, 250.0, |ui| share_items(ui, sr.rect.left_bottom(), false, linked, image)).flatten() {
                 action = Some(Action::Share(clip.path.clone(), c));
             }
         }
@@ -1031,10 +1099,11 @@ impl App {
             }
             return action;
         }
-        if Item::new("Play").icon(icon::PLAY).show(ui).clicked() {
+        let image = clip.is_image();
+        if Item::new(if image { "View" } else { "Play" }).icon(if image { icon::IMAGE } else { icon::PLAY }).show(ui).clicked() {
             action = Some(Action::Open(clip.path.clone()));
         }
-        if Item::new("Edit").icon(icon::SCISSORS).show(ui).clicked() {
+        if !image && Item::new("Edit").icon(icon::SCISSORS).show(ui).clicked() {
             action = Some(Action::Edit(clip.path.clone()));
         }
         if Item::new("Rename…").icon(icon::PENCIL_SIMPLE).keys(Some(vec!["F2".into()])).show(ui).clicked() {
@@ -1044,7 +1113,7 @@ impl App {
         let at = ui.ctx().pointer_latest_pos().unwrap_or_default();
         let linked = self.links.get(&clip.path).is_some();
         ui_kit::submenu(ui, Item::new("Share").icon(icon::EXPORT), |ui| {
-            if let Some(c) = share_items(ui, at, true, linked) {
+            if let Some(c) = share_items(ui, at, true, linked, image) {
                 action = Some(Action::Share(clip.path.clone(), c));
             }
         });
@@ -1066,7 +1135,7 @@ impl App {
             });
         }
         ui_kit::menu_sep(ui);
-        if Item::new("Open in another player").icon(icon::ARROW_SQUARE_OUT).show(ui).clicked() {
+        if Item::new(if image { "Open in another app" } else { "Open in another player" }).icon(icon::ARROW_SQUARE_OUT).show(ui).clicked() {
             action = Some(Action::OpenExternal(clip.path.clone()));
         }
         let selected = self.selection.paths.contains(&clip.path);
@@ -1188,7 +1257,8 @@ impl App {
                                     }
                                 });
                             }
-                            if Btn::ghost("Export").with_icon(icon::PACKAGE).small().tip("To a file with their originals, markers and collections, to import into HasteClip on another computer").show(ui).clicked() {
+                            let any_shot = selected.iter().any(|p| clips::is_image(p));
+                            if !any_shot && Btn::ghost("Export").with_icon(icon::PACKAGE).small().tip("To a file with their originals, markers and collections, to import into HasteClip on another computer").show(ui).clicked() {
                                 action = Some(Action::Export(selected.clone()));
                             }
                             let label = if self.settings.delete_permanently { format!("Delete {n}") } else { format!("Move {n} to {}", crate::store::bin_name()) };
@@ -1239,6 +1309,10 @@ impl App {
             }
             Action::Filter(f) => {
                 self.library_filter = f;
+                self.selection.clear();
+            }
+            Action::Kind(k) => {
+                self.library_kind = k;
                 self.selection.clear();
             }
             Action::RenameFolder(name) => self.rename_folder(&name),
@@ -1319,12 +1393,23 @@ pub fn search_field(ui: &mut egui::Ui, id: &str, text: &mut String, hint: &str) 
     out_resp
 }
 
+/// "12 clips", "1 screenshot", "12 clips, 3 screenshots".
+fn count_words(clips: usize, shots: usize) -> String {
+    let one = |n: usize, what: &str| if n == 1 { format!("1 {what}") } else { format!("{n} {what}s") };
+    match (clips, shots) {
+        (c, 0) => one(c, "clip"),
+        (0, s) => one(s, "screenshot"),
+        (c, s) => format!("{}, {}", one(c, "clip"), one(s, "screenshot")),
+    }
+}
+
 /// A day's heading: click to fold its clips away or open them again.
-fn day_header(ui: &mut egui::Ui, label: &str, clips: usize, folded: bool) -> egui::Response {
+/// `clips`: how many cards, `shots` of them screenshots.
+fn day_header(ui: &mut egui::Ui, label: &str, clips: usize, shots: usize, folded: bool) -> egui::Response {
     let p = theme::pal(ui);
     let id = ui.id().with(("day", label));
     let lg = ui.painter().layout_no_wrap(label.to_owned(), theme::font(14.5, W::Semibold), p.text);
-    let count = if clips == 1 { "1 clip".to_owned() } else { format!("{clips} clips") };
+    let count = count_words(clips - shots, shots);
     let cg = ui.painter().layout_no_wrap(count, theme::font(13.0, W::Regular), p.text3);
     let w = 18.0 + lg.size().x + 8.0 + cg.size().x;
     let (rect, resp) = ui.allocate_exact_size(vec2(w, DAY_H), Sense::click());
@@ -1428,10 +1513,31 @@ fn vrule(ui: &mut egui::Ui) {
 }
 
 /// The ways to get a clip out. `full`: the right-click menu's longer list.
-/// `linked`: the clip has a share link already.
-pub(crate) fn share_items(ui: &mut egui::Ui, anchor: Pos2, full: bool, linked: bool) -> Option<crate::library::ShareChoice> {
+/// `linked`: the clip has a share link already. `image`: it's a screenshot
+/// (its picture, its file, or where it is).
+pub(crate) fn share_items(ui: &mut egui::Ui, anchor: Pos2, full: bool, linked: bool, image: bool) -> Option<crate::library::ShareChoice> {
     use crate::library::ShareChoice;
     let mut choice = None;
+    if image {
+        if Item::new("Copy image").icon(icon::COPY).keys(Some(crate::shortcuts::command("C"))).tip(format!("Then paste it into Discord, a chat or an image editor ({})", crate::hotkey_label_cmd("V"))).show(ui).clicked() {
+            choice = Some(ShareChoice::CopyImage);
+        }
+        if Item::new("Copy file").icon(icon::FILE).tip("The file itself, to paste into a folder").show(ui).clicked() {
+            choice = Some(ShareChoice::Copy);
+        }
+        if share::HAS_SHARE_SHEET && Item::new(share::SHARE_SHEET_LABEL).icon(icon::PAPER_PLANE_TILT).show(ui).clicked() {
+            choice = Some(ShareChoice::Sheet(anchor));
+        }
+        ui_kit::menu_sep(ui);
+        if Item::new(crate::reveal_label()).icon(icon::FOLDER_OPEN).show(ui).clicked() {
+            choice = Some(ShareChoice::Reveal);
+        }
+        if !full && share::CAN_DRAG_OUT {
+            ui_kit::menu_sep(ui);
+            ui_kit::menu_head(ui, "Or drag the screenshot into any app");
+        }
+        return choice;
+    }
     if linked {
         if Item::new("Copy link").icon(icon::LINK).tip("Its link plays it in any browser and right in Discord").show(ui).clicked() {
             choice = Some(ShareChoice::CopyLink);

@@ -3,7 +3,8 @@
 //! A frame is grabbed with ffmpeg on a few background workers, cached as a JPEG
 //! (and the clip's duration beside it) under the OS cache dir, keyed by path +
 //! mtime + size so a replaced file gets a fresh thumbnail. A cached clip starts
-//! no process at all. Each picture is uploaded to the GPU once and reused.
+//! no process at all. A screenshot is simply made smaller. Each picture is
+//! uploaded to the GPU once and reused.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -195,6 +196,15 @@ fn cache_dir() -> PathBuf {
 
 fn generate(key: u64, video: &Path) -> (Option<egui::ColorImage>, Option<Duration>) {
     let jpg = jpeg_path(key);
+    if crate::clips::is_image(video) {
+        if !jpg.exists() {
+            let _ = std::fs::create_dir_all(cache_dir());
+            if let Err(e) = shrink_picture(video, &jpg) {
+                eprintln!("couldn't make a thumbnail of {}: {e}", video.display());
+            }
+        }
+        return (load(&jpg), None);
+    }
     let dur_file = cache_dir().join(format!("{key:016x}.dur"));
     let cached = std::fs::read_to_string(&dur_file).ok().and_then(|s| s.trim().parse::<f64>().ok());
     let duration = match cached {
@@ -251,6 +261,15 @@ fn shrink(img: &egui::ColorImage, w: usize) -> (usize, usize, Vec<u8>) {
         }
     }
     (w, h, out)
+}
+
+/// A screenshot's thumbnail: [`WIDTH`] wide, as a JPEG at `to`.
+fn shrink_picture(from: &Path, to: &Path) -> Result<(), String> {
+    let img = image::open(from).map_err(|e| e.to_string())?.to_rgb8();
+    let h = ((img.height() as u64 * WIDTH as u64 / img.width().max(1) as u64) as u32).max(1);
+    let small = image::imageops::resize(&img, WIDTH, h, image::imageops::FilterType::Triangle);
+    let file = std::fs::File::create(to).map_err(|e| e.to_string())?;
+    image::codecs::jpeg::JpegEncoder::new_with_quality(std::io::BufWriter::new(file), 85).encode_image(&small).map_err(|e| e.to_string())
 }
 
 fn load(jpg: &Path) -> Option<egui::ColorImage> {

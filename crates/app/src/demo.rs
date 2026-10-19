@@ -882,7 +882,7 @@ pub(crate) fn capture_thread(rx: mpsc::Receiver<crate::service::Cmd>, tx: mpsc::
                     let _ = ack.send(());
                 }
                 Cmd::Quit => break,
-                Cmd::UpdateVideo(_) | Cmd::ReplaySeconds(_) | Cmd::SetMic(..) => {}
+                Cmd::UpdateVideo(_) | Cmd::ReplaySeconds(_) | Cmd::SetMic(..) | Cmd::Screenshot(..) => {}
             }
         }
     })

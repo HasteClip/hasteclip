@@ -18,7 +18,7 @@ pub(crate) const REPLAY_CHOICES: [u32; 8] = [15, 30, 60, 120, 300, 600, 1200, 18
 /// The settings column's width.
 const COLUMN: f32 = 680.0;
 /// The groups, in order, for the section list.
-const SECTIONS: [&str; 8] = ["Clipping", "Video", "Clips", "Sharing", "Saved sound", "Shortcuts", "Voice", "App"];
+const SECTIONS: [&str; 9] = ["Clipping", "Video", "Clips", "Screenshots", "Sharing", "Saved sound", "Shortcuts", "Voice", "App"];
 
 /// A group's rows, filtered by the search: each row says its words, and the
 /// group shows only matching rows.
@@ -132,9 +132,10 @@ impl App {
             "Clipping" => f.shows(&["clip length", "replay buffer duration", "start clipping when hasteclip opens", "auto start"]),
             "Video" => f.shows(&["resolution", "height", "size", "frame rate", "fps", "quality", "bitrate", "mbps", "frame blending", "motion blur", "encoder", "hardware", "software", "file format", "mp4", "mov", "game capture", "anti-cheat", "obs"]),
             "Clips" => f.shows(&["clips folder", "location", "directory", "folder per game", "name clips after what happened", "game events", "osu", "names", "delete", "trash", "permanently"]),
+            "Screenshots" => capture::SCREENSHOTS && f.shows(&["screenshots", "take a screenshot", "shortcut", "hotkey", "format", "png", "jpg", "jpeg", "copy", "clipboard", "paste"]),
             "Sharing" => f.shows(&["discord", "activity", "rich presence"]),
             "Saved sound" => f.shows(&["play a sound when a clip is saved", "sound", "volume", "record the sound", "in clip", "add your own"]),
-            "Shortcuts" => f.shows(&["shortcuts", "hotkey", "keyboard", "save clip", "start or stop clipping", "start or stop recording"]),
+            "Shortcuts" => f.shows(&["shortcuts", "hotkey", "keyboard", "save clip", "take a screenshot", "start or stop clipping", "start or stop recording"]),
             "Voice" => f.shows(&["save by voice", "hasteclip that", "speech", "command", "voice samples", "review"]),
             "App" => f.shows(&["appearance", "theme", "dark", "light", "open at login", "autostart", "startup", "closing the window", "tray", "menu bar", "update", "version", "license", "licence", "about", "source code", "copyright", "open source", "reset"]),
             _ => false,
@@ -150,6 +151,7 @@ impl App {
             "Clipping" => self.clipping_group(ui, f),
             "Video" => self.video_group(ui, f),
             "Clips" => self.clips_group(ui, f),
+            "Screenshots" => self.screenshots_group(ui, f),
             "Sharing" => self.sharing_group(ui, f),
             "Saved sound" => self.sound_group(ui, f),
             "Shortcuts" => self.shortcuts_group(ui, f),
@@ -361,6 +363,42 @@ impl App {
         });
     }
 
+    fn screenshots_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
+        use crate::settings::ScreenshotFormat;
+        ui_kit::list(ui, "screenshots", |l| {
+            // The key is set under Shortcuts, with the others; it's off
+            // until chosen, so it's shown here too, a click from choosing it.
+            if f.shows(&["screenshots", "shortcut", "hotkey", "keyboard"]) {
+                let action = ShortcutAction::Screenshot;
+                let keys = self.shortcut_keys(action);
+                let note = if keys.is_none() { "Off. Choose a key to take screenshots" } else { "Set under Shortcuts" };
+                l.row(Row::new("Shortcut").note(note), |ui| {
+                    if Btn::normal(if keys.is_none() { "Choose a key" } else { "Change" }).small().show(ui).clicked() {
+                        self.recording_shortcut = Some((action, None));
+                        self.settings_jump = Some("Shortcuts");
+                    }
+                    if let Some(k) = &keys {
+                        ui_kit::keycaps(ui, k, false);
+                    }
+                });
+            }
+            if f.shows(&["screenshots", "format", "png", "jpg", "jpeg"]) {
+                let jpg = self.settings.screenshot_format == ScreenshotFormat::Jpg;
+                let note = if jpg { "About a quarter of the size, for sharing" } else { "Every pixel as it was" };
+                let tip = "Screenshots go in your clips folder, with the game's clips. PNG keeps every pixel as it was. JPG files are about a quarter of the size, and keep every pixel's colour so text stays sharp.";
+                l.row(Row::new("Format").tip("Format", tip).note(note), |ui| {
+                    let opts = [Seg::from("PNG"), Seg::from("JPG")];
+                    if let Some(i) = ui_kit::segmented_opts(ui, "screenshot_format", &opts, usize::from(jpg), None, true) {
+                        self.settings.screenshot_format = if i == 1 { ScreenshotFormat::Jpg } else { ScreenshotFormat::Png };
+                    }
+                });
+            }
+            if f.shows(&["screenshots", "copy", "clipboard", "paste"]) {
+                l.row(Row::new("Also copy it").tip("Also copy it", "A screenshot also goes on the clipboard as you take it, to paste right away.").note("Paste it straight into Discord or a chat"), |ui| ui_kit::switch(ui, &mut self.settings.copy_screenshots));
+            }
+        });
+    }
+
     fn sharing_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
         ui_kit::list(ui, "sharing", |l| {
             if f.shows(&["discord", "activity", "rich presence"]) {
@@ -460,13 +498,16 @@ impl App {
         }
         let desktop = self.hotkeys.as_ref().is_ok_and(|h| h.via_desktop());
         ui_kit::list(ui, "shortcuts", |l| {
-            for action in ShortcutAction::ALL {
+            for action in ShortcutAction::ALL.into_iter().filter(|a| a.available()) {
                 if !f.shows(&[action.label(), "shortcut", "hotkey", "keyboard"]) {
                     continue;
                 }
+                let off = self.settings.shortcuts.get(action).is_empty();
                 let note = match action {
                     ShortcutAction::SaveClip if desktop => "Works everywhere. Your desktop looks after it, and may ask you to confirm.",
                     ShortcutAction::SaveClip => "Works everywhere, even in a game",
+                    ShortcutAction::Screenshot if off => "Off. Choose a key to take screenshots",
+                    ShortcutAction::Screenshot => "Works everywhere, even in a game",
                     _ => "",
                 };
                 let problem = self.shortcut_problem(action);
@@ -890,13 +931,14 @@ impl App {
                 self.recording_shortcut = None;
             }
         } else {
-            let more = Btn::icon(Kind::Ghost, icon::DOTS_THREE).small().tip("Turn off, or back to the default").show(ui);
+            // Off by default: turning it off is going back.
+            let more = Btn::icon(Kind::Ghost, icon::DOTS_THREE).small().tip(if default.is_empty() { "Turn off" } else { "Turn off, or back to the default" }).show(ui);
             ui_kit::menu_popup(&more, false, 240.0, |ui| {
                 if Item::new("Turn off").icon(icon::PROHIBIT).enabled(!current.is_empty()).show(ui).clicked() {
                     self.settings.shortcuts.set(action, String::new());
                 }
                 let def = shortcuts::keys(&default).map(|k| ui_kit::key_text(&k)).unwrap_or_default();
-                if Item::new("Back to the default").icon(icon::ARROW_COUNTER_CLOCKWISE).enabled(current != default).value(def).show(ui).clicked() {
+                if !default.is_empty() && Item::new("Back to the default").icon(icon::ARROW_COUNTER_CLOCKWISE).enabled(current != default).value(def).show(ui).clicked() {
                     self.settings.shortcuts.set(action, default.clone());
                 }
             });

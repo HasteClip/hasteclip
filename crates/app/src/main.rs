@@ -35,10 +35,12 @@ mod linux_desktop;
 mod meter;
 mod moments;
 mod nav;
+mod picture;
 mod player;
 #[cfg(target_os = "linux")]
 mod portal_shortcuts;
 mod proxy;
+mod screenshot;
 mod service;
 mod settings;
 mod settings_ui;
@@ -457,6 +459,9 @@ struct App {
     /// Clips' sound being saved as MP3s, when done.
     mp3_tx: std::sync::mpsc::Sender<Result<PathBuf, String>>,
     mp3_rx: std::sync::mpsc::Receiver<Result<PathBuf, String>>,
+    /// Screenshots being put on the clipboard (Copy image), when done.
+    pub(crate) copy_tx: std::sync::mpsc::Sender<Result<(), String>>,
+    pub(crate) copy_rx: std::sync::mpsc::Receiver<Result<(), String>>,
     /// An export or import of clips running (see `transfer.rs`).
     transfer: Option<transfer::Transfer>,
     /// The library's shared clips, the uploads and unshares running, the
@@ -523,6 +528,8 @@ struct App {
     library_stamp: Vec<Option<SystemTime>>,
     /// Which of the library's folders (games) the library shows.
     pub(crate) library_filter: library::Filter,
+    /// And whether clips, screenshots or both.
+    pub(crate) library_kind: library::ShowKind,
     /// Your own groups of clips, in the library's `.hasteclip`.
     pub(crate) collections: collections::Collections,
     pub(crate) collection_dialog: Option<library::CollectionDialog>,
@@ -584,6 +591,7 @@ impl App {
         });
         let (render_tx, render_rx) = std::sync::mpsc::channel();
         let (mp3_tx, mp3_rx) = std::sync::mpsc::channel();
+        let (copy_tx, copy_rx) = std::sync::mpsc::channel();
         live_audio.set_limiter(settings.limiter);
         for s in &settings.audio_sources {
             let channel = live_audio.channel(&s.id);
@@ -664,6 +672,8 @@ impl App {
             render_rx,
             mp3_tx,
             mp3_rx,
+            copy_tx,
+            copy_rx,
             transfer: None,
             links,
             link_jobs: Vec::new(),
@@ -692,6 +702,7 @@ impl App {
             last_poll: None,
             library_stamp: Vec::new(),
             library_filter: library::Filter::All,
+            library_kind: library::ShowKind::All,
             collections,
             collection_dialog: None,
             card_drag: None,
@@ -827,7 +838,11 @@ impl App {
         }
         self.collections.reconnect(&self.clips);
         self.selection.retain(&self.clips);
-        self.library_filter.retain(&self.clips, &self.collections);
+        self.library_filter.retain(&self.clips, &self.collections, &self.links);
+        // The last screenshot gone: the choice of clips or screenshots goes too.
+        if !self.clips.iter().any(clips::Clip::is_image) {
+            self.library_kind = library::ShowKind::All;
+        }
     }
 
     fn toast(&mut self, text: impl Into<String>) {
@@ -1163,6 +1178,18 @@ impl eframe::App for App {
                 eprintln!("dev: to {:?}", self.page);
             }
         }
+        // `HASTECLIP_DEV_SCREENSHOT=<secs>`: take a screenshot every so many
+        // seconds, as its shortcut does (to check them without a key press).
+        if let Some(every) = std::env::var("HASTECLIP_DEV_SCREENSHOT").ok().and_then(|s| s.parse::<f64>().ok()) {
+            static STEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let step = (launched.elapsed().as_secs_f64() / every) as u64;
+            if STEP.swap(step, std::sync::atomic::Ordering::Relaxed) != step && step > 0 {
+                eprintln!("dev: taking a screenshot");
+                if !self.quick_save.screenshot() {
+                    self.take_screenshot();
+                }
+            }
+        }
         // `HASTECLIP_DEV_SWITCH=<secs>` (with the above): switch between the
         // whole screen and games and apps every so many seconds while
         // clipping, and save a clip a second before quitting (to check
@@ -1221,6 +1248,9 @@ impl App {
                 // Saved already, the moment the key went down.
                 settings::ShortcutAction::SaveClip if saved => self.clip_saving(),
                 settings::ShortcutAction::SaveClip => self.save_clip(),
+                // Taken already, the moment the key went down.
+                settings::ShortcutAction::Screenshot if saved => {}
+                settings::ShortcutAction::Screenshot => self.take_screenshot(),
             }
         }
 
@@ -1249,6 +1279,8 @@ impl App {
             sound: self.settings.save_sound.clone(),
         });
         self.quick_save.arm(armed);
+        let shot = (capture::SCREENSHOTS && self.recording_shortcut.is_none() && self.demo.is_none()).then(|| self.shot_armed());
+        self.quick_save.arm_screenshot(shot);
         self.updater.set_auto(self.settings.auto_update);
         self.pump_renders();
         self.pump_mp3s();
@@ -1587,9 +1619,10 @@ impl App {
             return;
         };
         // Neighbours among the clips shown in the library (a game's, a
-        // collection's), newest first, to step through; all clips when this one
-        // isn't among them (taken out of the collection meanwhile).
-        let shown: Vec<&clips::Clip> = self.clips.iter().filter(|c| self.library_filter.matches(c, &self.collections)).collect();
+        // collection's; clips, screenshots or both), newest first, to step
+        // through; all clips when this one isn't among them (taken out of the
+        // collection meanwhile).
+        let shown: Vec<&clips::Clip> = self.clips.iter().filter(|c| self.library_filter.matches(c, &self.collections, &self.links) && self.library_kind.matches(c)).collect();
         let list: Vec<&clips::Clip> = if shown.iter().any(|c| c.path == v.clip()) { shown } else { self.clips.iter().collect() };
         let at = list.iter().position(|c| c.path == v.clip());
         let mut collections: Vec<(String, String, bool)> =
@@ -1952,6 +1985,7 @@ impl App {
             demo::Action::Shortcut(settings::ShortcutAction::ToggleBuffer) => self.toggle_buffer(),
             demo::Action::Shortcut(settings::ShortcutAction::ToggleRecord) => self.toggle_record(),
             demo::Action::Shortcut(settings::ShortcutAction::SaveClip) => self.save_clip(),
+            demo::Action::Shortcut(settings::ShortcutAction::Screenshot) => self.take_screenshot(),
         }
     }
 
@@ -1987,6 +2021,32 @@ impl App {
         sound::play_saved(&self.settings.save_sound);
         self.voice.saved_by_hand();
         self.clip_saving();
+    }
+
+    /// How a screenshot is taken now: of what's recorded, into the library,
+    /// as Settings says.
+    fn shot_armed(&self) -> service::ShotArmed {
+        service::ShotArmed {
+            video: self.video_source(),
+            library: self.settings.output_dir.clone(),
+            folder_per_game: self.settings.folder_per_game,
+            game_folders: self.settings.game_folders.clone(),
+            options: screenshot::Options { format: self.settings.screenshot_format, copy: self.settings.copy_screenshots },
+            sound: self.settings.save_sound.clone(),
+        }
+    }
+
+    /// Take a screenshot (when the shortcut's own event couldn't): into the
+    /// folder of the game in focus.
+    fn take_screenshot(&mut self) {
+        if !capture::SCREENSHOTS {
+            return;
+        }
+        let a = self.shot_armed();
+        let game = self.games.focused().map(|(_, g)| g.name);
+        let dir = games::folder_for(&a.library, a.folder_per_game, &a.game_folders, game.as_deref());
+        self.service.screenshot(dir, a.video, a.options);
+        sound::play_saved(&a.sound);
     }
 
     /// A clip is being saved: a card for it in the library (the page you're
@@ -2091,7 +2151,18 @@ impl App {
                     let title = self.clips.iter().find(|c| c.path == path).map(|c| c.title()).unwrap_or_else(|| file_stem(&path));
                     self.toast_action(egui_phosphor::regular::CHECK_CIRCLE, format!("Saved {title}"), "Play", shell::ToastAction::Show(path.clone()));
                     // Showing another game's clips: show this one too.
-                    self.library_filter.reveal(&self.clips, &self.collections, &path);
+                    self.library_filter.reveal(&self.clips, &self.collections, &self.links, &path);
+                }
+                Evt::Shot(path, copied) => {
+                    self.folded.set(chrono::Local::now().date_naive(), false);
+                    self.last_saved = Some((path.clone(), Instant::now()));
+                    self.refresh_clips();
+                    let copied = if copied { " and copied" } else { "" };
+                    self.toast_action(egui_phosphor::regular::CAMERA, format!("Screenshot saved{copied}"), "View", shell::ToastAction::Show(path.clone()));
+                    self.library_filter.reveal(&self.clips, &self.collections, &self.links, &path);
+                    if self.library_kind == library::ShowKind::Clips {
+                        self.library_kind = library::ShowKind::All;
+                    }
                 }
                 Evt::Error(e) => {
                     // A start failure is followed by Evt::State(None); a save failure

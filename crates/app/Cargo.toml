@@ -15,7 +15,9 @@ log = "0.4"
 bytemuck = "1"
 capture = { path = "../capture" }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
-clipboard-rs = { version = "0.3", default-features = false }
+# Images on the clipboard (screenshots) are PNG and a bitmap: the bitmap needs
+# image's "bmp".
+clipboard-rs = { version = "0.3", default-features = false, features = ["image"] }
 cpal = "0.18"
 ctrlc = { version = "3.5.2", features = ["termination"] }
 dirs = "6.0.0"
@@ -23,7 +25,10 @@ eframe = "0.36.1"
 epaint_default_fonts = "0.36"
 egui = "0.36.1"
 global-hotkey = "0.8.0"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png", "webp"] }
+# Screenshots as JPG with every pixel's colour (image's own halves it, which
+# blurs coloured text).
+jpeg-encoder = "0.6"
 media = { path = "../media" }
 raw-window-handle = "0.6"
 rfd = "0.17.2"

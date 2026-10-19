@@ -1,5 +1,5 @@
-//! The clip library on disk: find finished clips and hand them off to the OS file
-//! manager or default player.
+//! The clip library on disk: find finished clips (and screenshots) and hand
+//! them off to the OS file manager or default player.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -7,6 +7,13 @@ use std::time::SystemTime;
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime};
 
 const VIDEO_EXTS: &[&str] = &["mp4", "mkv", "mov", "webm", "avi"];
+/// Pictures: screenshots, ours or put in the library some other way.
+const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp"];
+
+/// Whether the file at `path` is a picture (a screenshot), not a video.
+pub fn is_image(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| IMAGE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+}
 
 #[derive(Debug, Clone)]
 pub struct Clip {
@@ -27,6 +34,11 @@ pub struct Clip {
 }
 
 impl Clip {
+    /// A screenshot, not a video.
+    pub fn is_image(&self) -> bool {
+        is_image(&self.path)
+    }
+
     /// When the clip was captured: parsed from our `clip_YYYY-MM-DD_HH-MM-SS` names
     /// (stable even if the file is copied), else the file's modified time.
     pub fn captured_at(&self) -> NaiveDateTime {
@@ -34,11 +46,12 @@ impl Clip {
             .unwrap_or_else(|| DateTime::<Local>::from(self.modified).naive_local())
     }
 
-    /// Timestamp from our own names: `clip_…`/`recording_…` + `YYYY-MM-DD_HH-MM-SS`,
-    /// optionally followed by a suffix (e.g. ` (edit)` on an edited copy).
+    /// Timestamp from our own names: `clip_…`/`recording_…`/`screenshot_…` +
+    /// `YYYY-MM-DD_HH-MM-SS`, optionally followed by a suffix (e.g. ` (edit)`
+    /// on an edited copy).
     fn own_timestamp(&self) -> Option<NaiveDateTime> {
         let stem = self.path.file_stem()?.to_string_lossy().into_owned();
-        let ts = stem.strip_prefix("clip_").or_else(|| stem.strip_prefix("recording_"))?;
+        let ts = stem.strip_prefix("clip_").or_else(|| stem.strip_prefix("recording_")).or_else(|| stem.strip_prefix("screenshot_"))?;
         NaiveDateTime::parse_from_str(ts.get(..19)?, "%Y-%m-%d_%H-%M-%S").ok()
     }
 
@@ -131,14 +144,16 @@ fn scan_dir(lib: &Path, dir: &Path, folder: Option<&str>, any_edits: bool) -> Ve
                 .and_then(|e| e.to_str())
                 .map(|e| VIDEO_EXTS.contains(&e.to_ascii_lowercase().as_str()))
                 .unwrap_or(false);
-            if !ext_ok {
+            let image = is_image(&path);
+            if !ext_ok && !image {
                 return None;
             }
             let meta = entry.metadata().ok()?;
             if !meta.is_file() {
                 return None;
             }
-            let id = if any_edits { crate::store::read_id(&path) } else { None };
+            // Only videos are edited.
+            let id = if any_edits && !image { crate::store::read_id(&path) } else { None };
             let original = id.as_deref().and_then(|id| crate::store::find_original(lib, id));
             Some(Clip {
                 name: path.file_name()?.to_string_lossy().into_owned(),
@@ -279,14 +294,17 @@ pub fn day_label(day: NaiveDate) -> String {
 }
 
 /// Friendly title for a file stem: "clip_2026-10-01_14-51-01" → "14:51:01",
-/// "recording_…" → "Recording 14:51:01", and with what happened in the game
-/// ("clip_… - 3 kills on Mirage") → "3 kills on Mirage · 14:51:01"; anything
-/// else (a renamed clip) as is.
+/// "recording_…" → "Recording 14:51:01", "screenshot_…" → "Screenshot
+/// 14:51:01", and with what happened in the game ("clip_… - 3 kills on
+/// Mirage") → "3 kills on Mirage · 14:51:01"; anything else (a renamed clip)
+/// as is.
 pub fn title_for_stem(stem: &str) -> String {
     let (kind, rest) = if let Some(r) = stem.strip_prefix("clip_") {
         ("", r)
     } else if let Some(r) = stem.strip_prefix("recording_") {
         ("Recording ", r)
+    } else if let Some(r) = stem.strip_prefix("screenshot_") {
+        ("Screenshot ", r)
     } else {
         return stem.to_owned();
     };
@@ -395,6 +413,7 @@ mod tests {
     fn titles_and_names() {
         assert_eq!(title_for_stem("clip_2026-10-01_14-51-01"), "14:51:01");
         assert_eq!(title_for_stem("recording_2026-10-01_14-51-01"), "Recording 14:51:01");
+        assert_eq!(title_for_stem("screenshot_2026-10-01_14-51-01 (2)"), "Screenshot 14:51:01 (2)");
         assert_eq!(title_for_stem("clip_2026-10-01_14-51-01 (edit)"), "14:51:01 (edit)");
         assert_eq!(title_for_stem("Ace clutch"), "Ace clutch");
         assert_eq!(title_for_stem("clip_2026-10-01_14-51-01 - 3 kills on Mirage"), "3 kills on Mirage · 14:51:01");
@@ -423,11 +442,18 @@ mod tests {
         std::fs::write(lib.join("clip_2026-10-01_14-51-01.mp4"), b"x").unwrap();
         std::fs::write(lib.join("osu!").join("clip_2026-10-02_14-51-01.mp4"), b"x").unwrap();
         std::fs::write(lib.join("osu!").join(".clip_2026-10-02_14-52-01.mp4"), b"x").unwrap();
+        std::fs::write(lib.join("osu!").join("screenshot_2026-10-02_14-53-01.png"), b"x").unwrap();
+        std::fs::write(lib.join("osu!").join(".screenshot_2026-10-02_14-54-01.png"), b"x").unwrap();
+        std::fs::write(lib.join("notes.txt"), b"x").unwrap();
         std::fs::write(lib.join(".hasteclip").join("abcdef12").join("original.mp4"), b"x").unwrap();
         let found: Vec<(String, Option<String>)> = scan(&lib).into_iter().map(|c| (c.name, c.folder)).collect();
         assert_eq!(
             found,
-            [("clip_2026-10-02_14-51-01.mp4".to_owned(), Some("osu!".to_owned())), ("clip_2026-10-01_14-51-01.mp4".to_owned(), None)]
+            [
+                ("screenshot_2026-10-02_14-53-01.png".to_owned(), Some("osu!".to_owned())),
+                ("clip_2026-10-02_14-51-01.mp4".to_owned(), Some("osu!".to_owned())),
+                ("clip_2026-10-01_14-51-01.mp4".to_owned(), None)
+            ]
         );
         assert_eq!(free_path(&lib, "clip_2026-10-01_14-51-01.mp4"), lib.join("clip_2026-10-01_14-51-01 (2).mp4"));
         assert_eq!(free_path(&lib, "new.mp4"), lib.join("new.mp4"));

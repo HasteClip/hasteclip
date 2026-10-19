@@ -102,6 +102,42 @@ pub fn copy_file(file: &Path) -> Result<(), String> {
     }
 }
 
+/// Put a picture on the clipboard, `width`×`height` RGBA: ready to paste
+/// into Discord, a chat or an image editor.
+pub fn copy_image(width: u32, height: u32, rgba: Vec<u8>) -> Result<(), String> {
+    use clipboard_rs::Clipboard;
+    use clipboard_rs::common::RustImage;
+    let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_raw(width, height, rgba).ok_or("the picture's size isn't right")?);
+    // As for files: on Linux one context serves what's copied.
+    #[cfg(target_os = "linux")]
+    {
+        static CTX: std::sync::Mutex<Option<clipboard_rs::ClipboardContext>> = std::sync::Mutex::new(None);
+        let mut ctx = CTX.lock().unwrap();
+        if ctx.is_none() {
+            *ctx = Some(clipboard_rs::ClipboardContext::new().map_err(|e| e.to_string())?);
+        }
+        return ctx.as_ref().unwrap().set_image(clipboard_rs::RustImageData::from_dynamic_image(img)).map_err(|e| e.to_string());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let ctx = clipboard_rs::ClipboardContext::new().map_err(|e| e.to_string())?;
+        // Another app can have the clipboard open for a moment (one that
+        // keeps a history of what's copied reads each copy): try again for
+        // a while, not just the few microseconds clipboard-rs does.
+        let mut tries = 0;
+        loop {
+            match ctx.set_image(clipboard_rs::RustImageData::from_dynamic_image(img.clone())) {
+                Ok(()) => return Ok(()),
+                Err(_) if tries < 20 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    }
+}
+
 /// Whether this platform has a system share sheet.
 pub const HAS_SHARE_SHEET: bool = cfg!(any(target_os = "macos", target_os = "windows"));
 

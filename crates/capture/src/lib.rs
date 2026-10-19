@@ -671,6 +671,26 @@ impl PendingClip {
     }
 }
 
+/// Whether [`Recorder::screenshot`] can take one here (Windows, so far).
+pub const SCREENSHOTS: bool = cfg!(target_os = "windows");
+
+/// A screenshot being taken: its picture is the one up when it was asked
+/// for, copied aside on the graphics card; [`PendingShot::finish`] reads it
+/// back (a few ms), so call it off the capture thread.
+pub struct PendingShot(Box<dyn FnOnce() -> anyhow::Result<StillImage> + Send>);
+
+impl PendingShot {
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) fn new(finish: impl FnOnce() -> anyhow::Result<StillImage> + Send + 'static) -> Self {
+        Self(Box::new(finish))
+    }
+
+    /// The picture, opaque.
+    pub fn finish(self) -> anyhow::Result<StillImage> {
+        (self.0)()
+    }
+}
+
 /// A capture backend. Implemented by `SckRecorder` (macOS), `WinRecorder`
 /// (Windows) and `LinuxRecorder` (Linux).
 pub trait Recorder {
@@ -706,6 +726,14 @@ pub trait Recorder {
     /// (its track stays). Returns whether it was applied.
     fn set_mic(&mut self, _id: &str, _device: &str) -> bool {
         false
+    }
+
+    /// A screenshot of `video` now, as it's captured: every pixel of the
+    /// screen or the game's window, whatever shape and size recordings are
+    /// made in, without the webcam. From the running capture, or one of its
+    /// own when nothing runs. See [`SCREENSHOTS`].
+    fn screenshot(&mut self, _video: &VideoSource) -> anyhow::Result<PendingShot> {
+        anyhow::bail!("screenshots aren't available on this platform yet")
     }
 }
 

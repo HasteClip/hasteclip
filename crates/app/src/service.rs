@@ -19,6 +19,9 @@ pub(crate) enum Cmd {
     /// Save the replay buffer as a clip in this folder, its name ending in what
     /// happened in the game, if known.
     SaveClip(PathBuf, Details),
+    /// Take a screenshot of what's recorded (with a capture of its own if
+    /// nothing runs), into this folder.
+    Screenshot(PathBuf, capture::VideoSource, crate::screenshot::Options),
     /// Change what the running capture records, if it can without a restart.
     UpdateVideo(capture::VideoSource),
     /// How far back the running replay buffer reaches.
@@ -41,6 +44,8 @@ pub enum Evt {
     /// The UI syncs its own state to this so the two can never drift apart.
     State(Option<Mode>),
     Saved(PathBuf),
+    /// A screenshot is saved here, and was copied (or not).
+    Shot(PathBuf, bool),
     Error(String),
     /// Something to tell that isn't a failed start or save.
     Notice(String),
@@ -69,6 +74,19 @@ pub struct QuickSave {
     games: crate::games::Tracker,
     /// While the replay buffer runs: how to save.
     armed: Arc<Mutex<Option<Armed>>>,
+    /// Where screenshots can be taken: how.
+    shot: Arc<Mutex<Option<ShotArmed>>>,
+}
+
+/// How a screenshot is taken: of what, into which library, as what.
+#[derive(Clone, PartialEq)]
+pub struct ShotArmed {
+    pub video: capture::VideoSource,
+    pub library: PathBuf,
+    pub folder_per_game: bool,
+    pub game_folders: std::collections::BTreeMap<String, String>,
+    pub options: crate::screenshot::Options,
+    pub sound: crate::settings::SaveSound,
 }
 
 /// How a clip is saved: in which library, sorted by game or not, and the
@@ -89,6 +107,28 @@ impl QuickSave {
         {
             *armed = to;
         }
+    }
+
+    /// Kept up to date by the app, every frame.
+    pub fn arm_screenshot(&self, to: Option<ShotArmed>) {
+        if let Ok(mut armed) = self.shot.lock()
+            && *armed != to
+        {
+            *armed = to;
+        }
+    }
+
+    /// Take a screenshot now, into the folder of the game in focus. Whether
+    /// it was asked for.
+    pub fn screenshot(&self) -> bool {
+        let Some(a) = self.shot.lock().ok().and_then(|a| a.clone()) else { return false };
+        let game = self.games.focused().map(|(_, g)| g.name);
+        let dir = crate::games::folder_for(&a.library, a.folder_per_game, &a.game_folders, game.as_deref());
+        if self.tx.send(Cmd::Screenshot(dir, a.video, a.options)).is_err() {
+            return false;
+        }
+        crate::sound::play_saved(&a.sound);
+        true
     }
 
     /// Save a clip now, if the replay buffer runs. Whether it was asked for.
@@ -152,6 +192,26 @@ impl CaptureService {
                             send(&evt_tx, Evt::Error(describe(&e)));
                         }
                     },
+                    // The picture's taken now; it's saved on a thread of its own.
+                    Cmd::Screenshot(dir, video, options) => {
+                        let taken = chrono::Local::now().naive_local();
+                        match recorder.screenshot(&video) {
+                            Ok(pending) => {
+                                let evt_tx = evt_tx.clone();
+                                thread::spawn(move || match pending.finish().map_err(|e| e.to_string()).and_then(|img| crate::screenshot::save(&img, &dir, taken, options)) {
+                                    Ok((path, copied)) => send(&evt_tx, Evt::Shot(path, copied)),
+                                    Err(e) => {
+                                        eprintln!("taking a screenshot failed: {e}");
+                                        send(&evt_tx, Evt::Notice(format!("Couldn't take the screenshot: {e}")));
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                eprintln!("taking a screenshot failed: {e:#}");
+                                send(&evt_tx, Evt::Notice(format!("Couldn't take the screenshot: {}", describe(&e))));
+                            }
+                        }
+                    }
                     Cmd::UpdateVideo(video) => {
                         if !recorder.update_video(&video) {
                             send(&evt_tx, Evt::Notice("Couldn't switch what's recorded while capturing. Stop and start again to record it.".into()));
@@ -189,11 +249,14 @@ impl CaptureService {
     /// A way to save a clip from another thread (a shortcut's).
     pub fn quick_save(&self, games: crate::games::Tracker) -> QuickSave {
         let tx = self.cmd_tx.clone().expect("the capture thread runs while the service lives");
-        QuickSave { tx, games, armed: Default::default() }
+        QuickSave { tx, games, armed: Default::default(), shot: Default::default() }
     }
 
     pub fn save_clip(&self, dir: PathBuf, details: Details) {
         self.send(Cmd::SaveClip(dir, details));
+    }
+    pub fn screenshot(&self, dir: PathBuf, video: capture::VideoSource, options: crate::screenshot::Options) {
+        self.send(Cmd::Screenshot(dir, video, options));
     }
     pub fn stop(&self, dir: Option<PathBuf>, details: Details) {
         self.send(Cmd::Stop(dir, details));
