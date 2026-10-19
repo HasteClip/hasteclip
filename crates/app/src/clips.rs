@@ -31,6 +31,9 @@ pub struct Clip {
     pub original: Option<PathBuf>,
     /// The library's folder it's in (its game's), if it isn't loose in the library.
     pub folder: Option<String>,
+    /// What's kept beside it, in bytes: an edited clip's untouched original
+    /// and its edit (`.hasteclip/<id>/`). 0 for a clip never edited.
+    pub kept_bytes: u64,
 }
 
 impl Clip {
@@ -75,19 +78,24 @@ impl Clip {
 
     /// Human-readable size, e.g. "1.4 GB".
     pub fn human_size(&self) -> String {
-        let b = self.size_bytes as f64;
-        const KB: f64 = 1024.0;
-        const MB: f64 = KB * 1024.0;
-        const GB: f64 = MB * 1024.0;
-        if b >= GB {
-            format!("{:.1} GB", b / GB)
-        } else if b >= MB {
-            format!("{:.0} MB", b / MB)
-        } else if b >= KB {
-            format!("{:.0} KB", b / KB)
-        } else {
-            format!("{b} B")
-        }
+        human_bytes(self.size_bytes)
+    }
+}
+
+/// A size as a clip's is shown: "1.4 GB", "312 MB", "48 KB".
+pub fn human_bytes(bytes: u64) -> String {
+    let b = bytes as f64;
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.0} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.0} KB", b / KB)
+    } else {
+        format!("{b} B")
     }
 }
 
@@ -155,6 +163,7 @@ fn scan_dir(lib: &Path, dir: &Path, folder: Option<&str>, any_edits: bool) -> Ve
             // Only videos are edited.
             let id = if any_edits && !image { crate::store::read_id(&path) } else { None };
             let original = id.as_deref().and_then(|id| crate::store::find_original(lib, id));
+            let kept_bytes = id.as_deref().map_or(0, |id| dir_bytes(&crate::store::assets_dir(lib, id)));
             Some(Clip {
                 name: path.file_name()?.to_string_lossy().into_owned(),
                 modified: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
@@ -163,10 +172,17 @@ fn scan_dir(lib: &Path, dir: &Path, folder: Option<&str>, any_edits: bool) -> Ve
                 id,
                 original,
                 folder: folder.map(str::to_owned),
+                kept_bytes,
                 path,
             })
         })
         .collect()
+}
+
+/// The bytes in the files directly in `dir` (0 if there's no such folder).
+fn dir_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    entries.flatten().filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum()
 }
 
 /// The folder for clips with no game.

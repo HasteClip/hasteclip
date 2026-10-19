@@ -348,7 +348,7 @@ mod tests {
         std::fs::write(&path, vec![7u8; bytes]).unwrap();
         let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_760_000_000);
         std::fs::File::options().write(true).open(&path).unwrap().set_modified(modified).unwrap();
-        Clip { path, name: name.into(), modified, created: None, size_bytes: bytes as u64, id: None, original: None, folder: folder.map(str::to_owned) }
+        Clip { path, name: name.into(), modified, created: None, size_bytes: bytes as u64, id: None, original: None, folder: folder.map(str::to_owned), kept_bytes: 0 }
     }
 
     fn temp(name: &str) -> PathBuf {
@@ -426,7 +426,7 @@ mod tests {
                 continue;
             }
             let folder = p.parent().filter(|d| *d != lib).and_then(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned());
-            clips.push(Clip { id, path: p, name: String::new(), modified: m.modified().unwrap(), created: None, size_bytes: m.len(), original: None, folder });
+            clips.push(Clip { id, path: p, name: String::new(), modified: m.modified().unwrap(), created: None, size_bytes: m.len(), original: None, folder, kept_bytes: 0 });
         }
         assert!(!clips.is_empty(), "no clips found");
         let out = temp("real").join("all.hasteclip");

@@ -1525,6 +1525,19 @@ pub fn focus_since(ctx: &egui::Context, born: f64) -> f32 {
 /// as visible as a plain fade; the rings close in and fade out. Nothing
 /// changes size (scaled text is soft until it lands, then visibly snaps), and
 /// it's drawn the same way when it's sharp, so nothing changes at the end.
+/// A floating area centred on a point (a toast, the selection bar) is placed
+/// by how big it was the frame before. When that changed (another toast, a
+/// button more), the frame is laid out again before it's shown, so it's
+/// never off centre for a frame. `size`: how big it is now.
+pub fn keep_centred(ctx: &egui::Context, id: egui::Id, size: Vec2) {
+    let key = id.with("drawn_size");
+    let was: Option<Vec2> = ctx.data(|d| d.get_temp(key));
+    ctx.data_mut(|d| d.insert_temp(key, size));
+    if was.is_some_and(|w| (w - size).length() > 0.5) {
+        ctx.request_discard("a centred area changed size");
+    }
+}
+
 pub fn focus_in<R>(ui: &mut egui::Ui, x: f32, frame: egui::Frame, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let ctx = ui.ctx().clone();
     let x = x.clamp(0.0, 1.0);

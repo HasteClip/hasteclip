@@ -383,6 +383,12 @@ impl App {
                 action = Some(a);
             }
         }
+        // Where toasts go on this page (next frame): over the clips, above
+        // the selection bar while it's up.
+        let ctx = ui.ctx().clone();
+        let bar = ctx.memory(|m| m.area_rect(egui::Id::new("selection_bar"))).filter(|_| selecting);
+        let bottom = bar.map_or(22.0, |b| ctx.content_rect().bottom() - b.top() + 10.0);
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new("toasts_over_clips"), (page.center().x, bottom)));
         if let Some(a) = self.finish_drag(ui.ctx()) {
             action = Some(a);
         }
@@ -1033,8 +1039,14 @@ impl App {
         let lead = Rect::from_min_size(Pos2::new(mx, meta_y), Vec2::splat(15.0));
         self.filter_lead(ui, &clip.folder.clone().map_or(Filter::Loose, Filter::Folder), lead, p.text3);
         mx += 21.0;
-        let size = clip.human_size();
-        let size_g = painter.layout_no_wrap(size.clone(), theme::font(12.5, W::Regular), p.text3);
+        // Its size, and in brackets, quieter, all it takes on the disk when
+        // more is kept beside it (an edited clip's original): "2 MB (7 MB)".
+        let mut size = egui::text::LayoutJob::default();
+        size.append(&clip.human_size(), 0.0, egui::TextFormat::simple(theme::font(12.5, W::Regular), p.text3));
+        if clip.kept_bytes > 0 {
+            size.append(&format!(" ({})", clips::human_bytes(clip.size_bytes + clip.kept_bytes)), 0.0, egui::TextFormat::simple(theme::font(12.5, W::Regular), theme::fade(p.text3, 0.65)));
+        }
+        let size_g = painter.layout_job(size);
         let game_w = (rect.right() - mx - size_g.size().x - 18.0).max(20.0);
         let game_g = painter.layout_job(ui_kit::single_line_job(&game, theme::font(12.5, W::Regular), p.text3, game_w));
         let gy = meta_y + 7.5 - game_g.size().y / 2.0;
@@ -1046,12 +1058,15 @@ impl App {
         let size_rect = Rect::from_min_size(Pos2::new(mx, gy), size_g.size());
         painter.galley(size_rect.min, size_g, p.text3);
         let when = clip.captured_at().format("Saved %-d %B at %H:%M").to_string();
-        let size_tip = match (edited, &clip.original) {
-            (true, Some(orig)) => {
-                let orig_size = std::fs::metadata(orig).map(|m| m.len()).unwrap_or(0);
-                format!("{when}\nEdited: the original recording is {} more", crate::export_ui::human_bytes(orig_size))
-            }
-            _ => when,
+        let size_tip = if clip.kept_bytes > 0 {
+            format!(
+                "{when}\n{} in all: {} for the clip, and {} for its original recording, kept so the edit can be changed or undone. In the editor, ⋯ → Free up space trims or deletes it.",
+                clips::human_bytes(clip.size_bytes + clip.kept_bytes),
+                clip.human_size(),
+                clips::human_bytes(clip.kept_bytes),
+            )
+        } else {
+            when
         };
         ui.interact(size_rect, resp.id.with("size"), Sense::hover()).on_hover_text(size_tip);
 
@@ -1103,6 +1118,11 @@ impl App {
                         action = Some(Action::MoveSelectedTo(f));
                     }
                 });
+            }
+            if !paths.iter().any(|p| clips::is_image(p))
+                && Item::new(format!("Export {n} clips…")).icon(icon::PACKAGE).tip("To a file with their originals, markers and collections, to import into HasteClip on another computer").show(ui).clicked()
+            {
+                action = Some(Action::Export(paths.clone()));
             }
             ui_kit::menu_sep(ui);
             if Item::new("Deselect all").icon(icon::X_CIRCLE).show(ui).clicked() {
@@ -1197,8 +1217,8 @@ impl App {
         action
     }
 
-    /// ⌘A selects every clip, ⌫ / Delete trashes the selection, Esc clears it
-    /// (or the search).
+    /// ⌘A selects every clip, ⌫ / Delete trashes the selection, F2 renames
+    /// the one selected, Esc clears it (or the search).
     fn selection_keys(&mut self, ui: &egui::Ui) -> Option<Action> {
         if ui_kit::overlay_open(ui.ctx()) || ui.ctx().egui_wants_keyboard_input() {
             return None;
@@ -1213,6 +1233,8 @@ impl App {
                 Some(Action::TrashSelected)
             } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
                 Some(Action::Deselect)
+            } else if self.selection.paths.len() == 1 && i.consume_key(egui::Modifiers::NONE, egui::Key::F2) {
+                self.selection.paths.iter().next().cloned().map(Action::Rename)
             } else {
                 None
             }
@@ -1228,7 +1250,7 @@ impl App {
         let born = theme::born(ui.ctx(), egui::Id::new("selection_bar"));
         let t = theme::since(ui.ctx(), born, theme::NORMAL);
         let selected: Vec<PathBuf> = self.clips.iter().filter(|c| self.selection.paths.contains(&c.path)).map(|c| c.path.clone()).collect();
-        egui::Area::new(egui::Id::new("selection_bar"))
+        let bar = egui::Area::new(egui::Id::new("selection_bar"))
             .order(egui::Order::Foreground)
             .pivot(Align2::CENTER_BOTTOM)
             .fixed_pos(Pos2::new(page.center().x, page.bottom() - 22.0 + 12.0 * (1.0 - t)))
@@ -1253,6 +1275,12 @@ impl App {
                                 action = Some(Action::SelectAll);
                             }
                             vrule(ui);
+                            // One clip: rename it.
+                            if let [one] = selected.as_slice()
+                                && Btn::ghost("Rename").with_icon(icon::PENCIL_SIMPLE).small().tip("Rename  (F2)").show(ui).clicked()
+                            {
+                                action = Some(Action::Rename(one.clone()));
+                            }
                             let r = Btn::ghost("Add to collection").with_icon(icon::FOLDER_PLUS).small().show(ui);
                             ui_kit::menu_popup(&r, true, 220.0, |ui| {
                                 if let Some(a) = collection_items(ui, &self.collections, &selected) {
@@ -1272,10 +1300,6 @@ impl App {
                                     }
                                 });
                             }
-                            let any_shot = selected.iter().any(|p| clips::is_image(p));
-                            if !any_shot && Btn::ghost("Export").with_icon(icon::PACKAGE).small().tip("To a file with their originals, markers and collections, to import into HasteClip on another computer").show(ui).clicked() {
-                                action = Some(Action::Export(selected.clone()));
-                            }
                             let label = if self.settings.delete_permanently { format!("Delete {n}") } else { format!("Move {n} to {}", crate::store::bin_name()) };
                             if Btn::new(Kind::DangerText, label).with_icon(icon::TRASH).small().show(ui).clicked() {
                                 action = Some(Action::TrashSelected);
@@ -1283,6 +1307,8 @@ impl App {
                         });
                     });
             });
+        // A button more or less (Rename for one clip): centred from its first frame.
+        ui_kit::keep_centred(ui.ctx(), egui::Id::new("selection_bar"), bar.response.rect.size());
         action
     }
 

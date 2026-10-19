@@ -589,6 +589,7 @@ mod tests {
             id: None,
             original: None,
             folder: Some(folder.into()),
+            kept_bytes: 0,
         }
     }
 

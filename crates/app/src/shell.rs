@@ -578,6 +578,8 @@ impl App {
                 });
             });
         ctx.data_mut(|d| d.insert_temp(egui::Id::new("toast_hovered"), area.response.contains_pointer()));
+        // Another toast, another width: centred from its first frame.
+        ui_kit::keep_centred(ctx, egui::Id::new("toast"), area.response.rect.size());
         if close {
             self.toast = None;
         }

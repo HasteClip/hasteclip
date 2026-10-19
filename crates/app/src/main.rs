@@ -1022,6 +1022,14 @@ impl eframe::App for App {
             Page::Edit => 300.0,
             _ => 22.0,
         };
+        // Clips: over the clips, not the panel beside them (as the
+        // selection bar is), and above the selection bar while it's up.
+        if self.page == Page::Clips
+            && let Some((centre, bottom)) = ctx.data(|d| d.get_temp::<(f32, f32)>(egui::Id::new("toasts_over_clips")))
+        {
+            self.toast_x_offset = centre - ctx.content_rect().center().x;
+            self.toast_bottom = bottom;
+        }
         self.toasts(&ctx, frame);
 
         // The viewer in fullscreen: the picture from edge to edge.

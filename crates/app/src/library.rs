@@ -933,6 +933,7 @@ mod tests {
             id: None,
             original: None,
             folder: None,
+            kept_bytes: 0,
         }
     }
 
@@ -1068,6 +1069,7 @@ mod scale_tests {
                     id: None,
                     original: None,
                     folder: Some(folder),
+                    kept_bytes: 0,
                 }
             })
             .collect();

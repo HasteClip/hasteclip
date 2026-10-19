@@ -429,7 +429,7 @@ mod tests {
         let clip = |name: &str, id: &str| {
             let path = dir.join(name);
             std::fs::write(&path, b"x").unwrap();
-            Clip { path, name: name.into(), modified: std::time::SystemTime::UNIX_EPOCH, created: None, size_bytes: 1, id: Some(id.into()), original: None, folder: None }
+            Clip { path, name: name.into(), modified: std::time::SystemTime::UNIX_EPOCH, created: None, size_bytes: 1, id: Some(id.into()), original: None, folder: None, kept_bytes: 0 }
         };
         let (a, b, c) = (clip("a.mp4", "1111"), clip("b.mp4", "1111"), clip("c.mp4", "2222"));
         for id in ["1111", "2222"] {
@@ -454,7 +454,7 @@ mod tests {
         let made = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_790_000_000);
         std::fs::File::options().write(true).open(&original).unwrap().set_modified(made).unwrap();
         let modified = std::fs::metadata(&clip_path).unwrap().modified().unwrap();
-        let clip = Clip { path: clip_path.clone(), name: "a.mp4".into(), modified, created: None, size_bytes: 4, id: None, original: Some(original), folder: None };
+        let clip = Clip { path: clip_path.clone(), name: "a.mp4".into(), modified, created: None, size_bytes: 4, id: None, original: Some(original), folder: None, kept_bytes: 0 };
         assert_eq!(restore_edit_dates(std::slice::from_ref(&clip)), 1);
         assert_eq!(std::fs::metadata(&clip_path).unwrap().modified().unwrap(), made);
         // Already right: left alone.
