@@ -73,6 +73,8 @@ pub struct Nav {
     pub delete_label: String,
     /// The clip's edit being saved, 0..=1.
     pub saving: Option<f32>,
+    /// The clip has a share link.
+    pub linked: bool,
 }
 
 struct Loaded {
@@ -382,7 +384,7 @@ impl Viewer {
                 let narrow = ui.ctx().content_rect().width() < 700.0;
                 let share = if narrow { Btn::icon(Kind::Primary, icon::EXPORT).tip("Share") } else { Btn::primary("Share").with_icon(icon::EXPORT) };
                 let share = share.enabled(ready).tip(if ready { share_tip } else { wait }).show(ui);
-                if let Some(c) = crate::ui_kit::menu_popup(&share, false, 250.0, |ui| crate::library::share_menu(ui, share.rect.left_bottom())).flatten() {
+                if let Some(c) = crate::ui_kit::menu_popup(&share, false, 250.0, |ui| crate::library::share_menu(ui, share.rect.left_bottom(), nav.linked)).flatten() {
                     out = ViewerOutcome::Share(c);
                 }
                 let edit = if narrow { Btn::icon(Kind::Normal, icon::SCISSORS) } else { Btn::normal("Edit").with_icon(icon::SCISSORS) };

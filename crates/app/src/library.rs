@@ -283,20 +283,7 @@ impl App {
         let modal = ui_kit::dialog(ctx, "confirm_delete", 380.0, |ui| {
             ui_kit::dialog_title(ui, &title);
             if let Some(c) = &one {
-                ui.horizontal(|ui| {
-                    let (r, _) = ui.allocate_exact_size(egui::vec2(80.0, 45.0), Sense::hover());
-                    match &tex {
-                        Some(t) => {
-                            let uv = crate::filmstrip::crop_uv(t.size_vec2(), r.size());
-                            egui::Image::from_texture((t.id(), r.size())).uv(uv).corner_radius(4).paint_at(ui, r);
-                        }
-                        None => {
-                            ui.painter().rect_filled(r, 4, theme::pal(ui).raise2);
-                        }
-                    }
-                    ui.add_space(4.0);
-                    ui.add(egui::Label::new(theme::text(c.title(), 13.5, theme::W::Medium).color(theme::pal(ui).text)).truncate());
-                });
+                clip_row(ui, c, tex.as_ref(), None);
                 ui.add_space(8.0);
             }
             ui_kit::dialog_text(ui, &if permanently { format!("You can't get {what} back.") } else { format!("You can get {what} back from the {bin}.") });
@@ -594,6 +581,7 @@ impl App {
     pub(crate) fn follow_rename(&mut self, ctx: &egui::Context, from: &Path, to: &Path) {
         self.collections.follow(from, to);
         crate::moments::follow(from, to);
+        self.follow_links(from, to);
         if let Some((p, _)) = &mut self.last_saved
             && p == from
         {
@@ -718,8 +706,37 @@ impl App {
     }
 }
 
+/// A clip in a dialog: its picture and name, and `under` the name when given.
+pub(crate) fn clip_row(ui: &mut egui::Ui, clip: &clips::Clip, tex: Option<&egui::TextureHandle>, under: Option<&str>) {
+    let p = theme::pal(ui);
+    ui.horizontal(|ui| {
+        let (r, _) = ui.allocate_exact_size(egui::vec2(80.0, 45.0), Sense::hover());
+        match tex {
+            Some(t) => {
+                let uv = crate::filmstrip::crop_uv(t.size_vec2(), r.size());
+                egui::Image::from_texture((t.id(), r.size())).uv(uv).corner_radius(4).paint_at(ui, r);
+            }
+            None => {
+                ui.painter().rect_filled(r, 4, p.raise2);
+            }
+        }
+        ui.add_space(4.0);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.add(egui::Label::new(theme::text(clip.title(), 13.5, theme::W::Medium).color(p.text)).truncate());
+            if let Some(under) = under {
+                ui.add(egui::Label::new(theme::text(under, 12.5, theme::W::Regular).color(p.text3)).truncate());
+            }
+        });
+    });
+}
+
 /// A way to get a clip out, picked from [`share_menu`].
 pub(crate) enum ShareChoice {
+    /// The Share with a link dialog: upload it for a link, or its link.
+    Link,
+    /// Copy its link (it's shared already).
+    CopyLink,
     Copy,
     /// The system share sheet, at this window position.
     Sheet(Pos2),
@@ -730,15 +747,18 @@ pub(crate) enum ShareChoice {
 }
 
 /// The ways to get a clip out, shared by the library's Share button and
-/// right-click menu and the player's Share button.
-pub(crate) fn share_menu(ui: &mut egui::Ui, anchor: Pos2) -> Option<ShareChoice> {
-    crate::library_view::share_items(ui, anchor, false)
+/// right-click menu and the player's Share button. `linked`: the clip has a
+/// share link.
+pub(crate) fn share_menu(ui: &mut egui::Ui, anchor: Pos2, linked: bool) -> Option<ShareChoice> {
+    crate::library_view::share_items(ui, anchor, false, linked)
 }
 
 impl App {
     /// Do what was picked in [`share_menu`] for `file`.
     pub(crate) fn share(&mut self, frame: &eframe::Frame, file: PathBuf, choice: ShareChoice) {
         match choice {
+            ShareChoice::Link => self.open_link_dialog(file),
+            ShareChoice::CopyLink => self.copy_link(&file),
             ShareChoice::Copy => match share::copy_file(&file) {
                 Ok(()) => self.toast(format!("Copied — paste it into any app ({})", crate::hotkey_label_cmd("V"))),
                 Err(e) => self.toast_error(format!("Couldn't copy the clip: {e}")),

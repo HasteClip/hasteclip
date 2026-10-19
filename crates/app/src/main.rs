@@ -27,6 +27,7 @@ mod osu_plays;
 mod library;
 mod library_view;
 mod library_grid;
+mod links;
 mod glass;
 mod hover_play;
 #[cfg(target_os = "linux")]
@@ -458,6 +459,13 @@ struct App {
     mp3_rx: std::sync::mpsc::Receiver<Result<PathBuf, String>>,
     /// An export or import of clips running (see `transfer.rs`).
     transfer: Option<transfer::Transfer>,
+    /// The library's shared clips, the uploads and unshares running, the
+    /// server being asked about links, and the Share with a link dialog
+    /// (see `links.rs`).
+    links: links::Links,
+    link_jobs: Vec<links::Job>,
+    link_checks: Vec<links::Check>,
+    pub(crate) link_dialog: Option<links::Dialog>,
     next_render_id: u64,
     /// Open "Rename clip" dialog.
     pub(crate) rename: Option<library::Rename>,
@@ -562,6 +570,7 @@ impl App {
         }
         let mut collections = collections::Collections::load(&settings.output_dir);
         let folded = library::FoldedDays::load(&settings.output_dir);
+        let links = links::Links::load(&settings.output_dir);
         collections.reconnect(&clips);
         // Assets of clips deleted in Finder go to the Bin.
         store::sweep_orphans(&settings.output_dir, &clips);
@@ -656,6 +665,10 @@ impl App {
             mp3_tx,
             mp3_rx,
             transfer: None,
+            links,
+            link_jobs: Vec::new(),
+            link_checks: Vec::new(),
+            link_dialog: None,
             next_render_id: 0,
             rename: None,
             selection: library::Selection::default(),
@@ -757,6 +770,10 @@ impl App {
         if let Some(clip) = std::env::var_os("HASTECLIP_DEMO_RENAME").map(PathBuf::from) {
             app.rename_clip(clip);
         }
+        // `HASTECLIP_DEMO_LINK=<clip>` opens its Share with a link dialog.
+        if let Some(clip) = std::env::var_os("HASTECLIP_DEMO_LINK").map(PathBuf::from) {
+            app.open_link_dialog(clip);
+        }
         // `HASTECLIP_DEMO_PREBUILD=<clip>` builds its scrub frames in the
         // background at launch, as after saving it.
         if let Some(clip) = std::env::var_os("HASTECLIP_DEMO_PREBUILD").map(PathBuf::from) {
@@ -801,6 +818,9 @@ impl App {
         self.library_version += 1;
         if self.collections.library() != self.settings.output_dir {
             self.collections = collections::Collections::load(&self.settings.output_dir);
+        }
+        if self.links.library() != self.settings.output_dir {
+            self.links = links::Links::load(&self.settings.output_dir);
         }
         if self.folded.library() != self.settings.output_dir {
             self.folded = library::FoldedDays::load(&self.settings.output_dir);
@@ -1020,6 +1040,7 @@ impl eframe::App for App {
         let overlay = self.rename.is_some()
             || self.collection_dialog.is_some()
             || self.confirm_delete.is_some()
+            || self.link_dialog.is_some()
             || self.confirm_reset
             || self.close_dialog
             || self.show_keys.is_some()
@@ -1067,6 +1088,7 @@ impl eframe::App for App {
         self.rename_dialog(&ctx);
         self.collection_dialog(&ctx);
         self.delete_dialog(&ctx);
+        self.link_dialog(&ctx);
         self.close_dialog(&ctx);
         self.keys_dialog(&ctx);
         ui_kit::pointer_cursor(&ctx);
@@ -1232,6 +1254,7 @@ impl App {
         self.pump_mp3s();
         self.import_dropped(ctx);
         self.pump_transfer();
+        self.pump_links();
         // Every frame, not just while the Sources page draws: leaving the page must
         // stop the meters' capture, or macOS keeps showing its recording indicator.
         self.ensure_level_monitor();
@@ -1574,6 +1597,7 @@ impl App {
             collections,
             delete_label,
             saving,
+            linked: self.links.get(v.clip()).is_some(),
         };
         let outcome = v.ui(ui, &nav);
         if let Some((volume, muted)) = viewer::volume(ui.ctx()) {

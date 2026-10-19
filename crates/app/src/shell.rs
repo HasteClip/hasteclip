@@ -187,6 +187,8 @@ pub enum ToastAction {
     Show(std::path::PathBuf),
     /// Put clips just moved to the Bin back.
     Undelete(crate::library::Binned),
+    /// Copy the clip's share link.
+    CopyLink(std::path::PathBuf),
 }
 
 #[derive(Clone)]
@@ -587,6 +589,7 @@ impl App {
                     self.open_viewer(clip);
                 }
                 ToastAction::Undelete(binned) => self.undelete(binned),
+                ToastAction::CopyLink(clip) => self.copy_link(&clip),
             }
         }
     }

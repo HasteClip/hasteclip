@@ -883,6 +883,27 @@ impl App {
 
         let mut action = None;
         let modifiers = ui.input(|i| i.modifiers);
+        // Shared with a link: a link mark, bottom left, that opens its
+        // dialog. Uploading for one: how far, and a bar along the bottom.
+        if render.is_none() {
+            let upload = self.link_upload(&clip.path);
+            let mark = match upload {
+                Some(f) => Some((format!("{} {}%", icon::CLOUD_ARROW_UP, ((f * 100.0) as u32).min(99)), "Uploading for a link")),
+                None if self.links.get(&clip.path).is_some() => Some((icon::LINK.to_owned(), "Shared with a link")),
+                None => None,
+            };
+            if let Some(f) = upload {
+                let bar = Rect::from_min_max(Pos2::new(thumb_rect.left(), thumb_rect.bottom() - 3.0), thumb_rect.max);
+                painter.rect_filled(bar, 0, Color32::from_white_alpha(46));
+                painter.rect_filled(Rect::from_min_max(bar.min, Pos2::new(bar.left() + bar.width() * f, bar.bottom())), 0, Color32::WHITE);
+            }
+            if let Some((text, tip)) = mark {
+                let r = pill(&painter, thumb_rect.left_bottom() + vec2(7.0, -7.0), Align2::LEFT_BOTTOM, &text);
+                if ui.interact(r, resp.id.with("link"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip).clicked() {
+                    action = Some(Action::Share(clip.path.clone(), crate::library::ShareChoice::Link));
+                }
+            }
+        }
         // Selection circle: always while selecting, on hover otherwise.
         let show_check = theme::toggle(&ctx, resp.id.with("chk"), (hovered || selecting) && render.is_none(), theme::FAST);
         if show_check > 0.0 {
@@ -908,7 +929,8 @@ impl App {
             }
             let sr = overlay_icon(&mut qui, icon::EXPORT, true, "Share");
             let sr = egui::Response { id: share_id, ..sr };
-            if let Some(c) = ui_kit::menu_popup(&sr, false, 250.0, |ui| share_items(ui, sr.rect.left_bottom(), false)).flatten() {
+            let linked = self.links.get(&clip.path).is_some();
+            if let Some(c) = ui_kit::menu_popup(&sr, false, 250.0, |ui| share_items(ui, sr.rect.left_bottom(), false, linked)).flatten() {
                 action = Some(Action::Share(clip.path.clone(), c));
             }
         }
@@ -1020,8 +1042,9 @@ impl App {
         }
         ui_kit::menu_sep(ui);
         let at = ui.ctx().pointer_latest_pos().unwrap_or_default();
+        let linked = self.links.get(&clip.path).is_some();
         ui_kit::submenu(ui, Item::new("Share").icon(icon::EXPORT), |ui| {
-            if let Some(c) = share_items(ui, at, true) {
+            if let Some(c) = share_items(ui, at, true, linked) {
                 action = Some(Action::Share(clip.path.clone(), c));
             }
         });
@@ -1348,11 +1371,12 @@ fn new_collection_row(ui: &mut egui::Ui, dragging: bool) -> egui::Response {
 }
 
 /// A small dark label on a picture (a clip's length, an upload).
-fn pill(p: &egui::Painter, pos: Pos2, anchor: Align2, text: &str) {
+fn pill(p: &egui::Painter, pos: Pos2, anchor: Align2, text: &str) -> Rect {
     let g = p.layout_no_wrap(text.to_owned(), theme::font(11.5, W::Semibold), Color32::WHITE);
     let r = anchor.anchor_size(pos, g.size() + vec2(12.0, 4.0));
     p.rect_filled(r, 4, Color32::from_black_alpha(158));
     p.galley(r.min + vec2(6.0, 2.0), g, Color32::WHITE);
+    r
 }
 
 /// "Saving 42%" over a picture, with a bar along its bottom.
@@ -1404,9 +1428,21 @@ fn vrule(ui: &mut egui::Ui) {
 }
 
 /// The ways to get a clip out. `full`: the right-click menu's longer list.
-pub(crate) fn share_items(ui: &mut egui::Ui, anchor: Pos2, full: bool) -> Option<crate::library::ShareChoice> {
+/// `linked`: the clip has a share link already.
+pub(crate) fn share_items(ui: &mut egui::Ui, anchor: Pos2, full: bool, linked: bool) -> Option<crate::library::ShareChoice> {
     use crate::library::ShareChoice;
     let mut choice = None;
+    if linked {
+        if Item::new("Copy link").icon(icon::LINK).tip("Its link plays it in any browser and right in Discord").show(ui).clicked() {
+            choice = Some(ShareChoice::CopyLink);
+        }
+        if Item::new("Shared link…").icon(icon::GLOBE).tip("Its link, how many have watched it, and Stop sharing").show(ui).clicked() {
+            choice = Some(ShareChoice::Link);
+        }
+    } else if Item::new("Share with a link…").icon(icon::LINK).tip("Uploads it to HasteClip for a link that plays it in any browser and right in Discord").show(ui).clicked() {
+        choice = Some(ShareChoice::Link);
+    }
+    ui_kit::menu_sep(ui);
     if Item::new("Copy clip").icon(icon::COPY).keys(Some(crate::shortcuts::command("C"))).tip(format!("Then paste it into Discord, a chat or a folder ({})", crate::hotkey_label_cmd("V"))).show(ui).clicked() {
         choice = Some(ShareChoice::Copy);
     }
