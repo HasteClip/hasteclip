@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -260,13 +260,24 @@ pub struct Progress {
     pub sent: AtomicU64,
     pub total: AtomicU64,
     pub cancel: AtomicBool,
+    /// A smaller copy is made first (the clip is too big to play in
+    /// Discord), and how far it's come (0..=1, `f32` bits).
+    making: AtomicBool,
+    made: AtomicU32,
 }
 
 impl Progress {
-    /// 0..=1.
+    /// 0..=1: the upload, or with a smaller copy made first, half that and
+    /// half the upload.
     pub fn fraction(&self) -> f32 {
         let (sent, total) = (self.sent.load(Ordering::Relaxed), self.total.load(Ordering::Relaxed));
-        if total == 0 { 0.0 } else { (sent as f64 / total as f64).min(1.0) as f32 }
+        let up = if total == 0 { 0.0 } else { (sent as f64 / total as f64).min(1.0) as f32 };
+        if self.making.load(Ordering::Relaxed) { 0.5 * f32::from_bits(self.made.load(Ordering::Relaxed)) + 0.5 * up } else { up }
+    }
+
+    /// How far the smaller copy has come, while it's being made.
+    fn making(&self) -> Option<f32> {
+        (self.making.load(Ordering::Relaxed) && self.total.load(Ordering::Relaxed) == 0).then(|| f32::from_bits(self.made.load(Ordering::Relaxed)))
     }
 
     fn cancelled(&self) -> Result<(), String> {
@@ -304,12 +315,19 @@ pub fn rename(link: &Link, named: &Named) -> Result<(), String> {
         .map(drop)
 }
 
+/// The biggest video Discord plays right in a chat; past it, a link shows
+/// and nothing plays (reported at 100 MB, not documented). A little under.
+const EMBED_MAX_MB: u32 = 95;
+
 /// Upload `clip` as a new shared clip, or as the new version of shared clip
-/// `replacing`.
+/// `replacing`. One too big to play in Discord goes up as a smaller copy,
+/// made to fit as Save smaller makes one: the biggest picture that fits,
+/// and the mix.
 fn upload(clip: &Path, named: &Named, progress: &Progress, replacing: Option<&str>) -> Result<Shared, String> {
     let work = Scratch::new()?;
     let video = work.0.join("video.mp4");
-    web_copy(clip, &video)?;
+    let source = playable_size(clip, &work.0, progress)?;
+    web_copy(&source, &video)?;
     progress.cancelled()?;
     let info = media::probe(&video).map_err(|e| e.to_string())?;
     let thumb = work.0.join("thumb.jpg");
@@ -445,6 +463,38 @@ fn web_copy(clip: &Path, out: &Path) -> Result<(), String> {
     }
     let why = String::from_utf8_lossy(&done.stderr);
     Err(why.lines().last().unwrap_or("ffmpeg failed").to_owned())
+}
+
+/// `clip`, or a copy of it made in `work` that's small enough to play in
+/// Discord ([`EMBED_MAX_MB`]), as Save smaller makes one: the biggest
+/// picture that fits, and the mix.
+fn playable_size(clip: &Path, work: &Path, progress: &Progress) -> Result<PathBuf, String> {
+    let fits = u64::from(EMBED_MAX_MB) << 20;
+    if std::fs::metadata(clip).map_err(|e| e.to_string())?.len() <= fits {
+        return Ok(clip.to_path_buf());
+    }
+    progress.making.store(true, Ordering::Relaxed);
+    let small = work.join("small.mp4");
+    let info = media::probe(clip).map_err(|e| e.to_string())?;
+    let mut edit = media::Edit::new(&info);
+    edit.output.mix_only = true;
+    let mut aim = EMBED_MAX_MB;
+    for _ in 0..2 {
+        edit.output.max_mb = Some(aim);
+        progress.made.store(0, Ordering::Relaxed);
+        media::render_with_progress(clip, &info, &edit, &small, None, |f| progress.made.store(f.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed))
+            .map_err(|e| format!("couldn't make a copy small enough to play in Discord: {e}"))?;
+        progress.cancelled()?;
+        let size = std::fs::metadata(&small).map_err(|e| e.to_string())?.len();
+        if size <= fits {
+            break;
+        }
+        // The encoder went over (a picture too busy for the bitrate, like
+        // noise): once more, aimed as far under as it went over. Still over
+        // after that, it goes as it is: the link plays, if not in a chat.
+        aim = (f64::from(aim) * fits as f64 / size as f64 * 0.95) as u32;
+    }
+    Ok(small)
 }
 
 /// The picture a link's preview shows: a frame a second in (or from the
@@ -676,6 +726,27 @@ fn confirm_gone<T>(link: &Link, result: Result<T, String>) -> Result<T, String> 
     }
 }
 
+/// What a clip's page (and its link in a chat) is called: the clip's own
+/// name; or, for one still named after when it was saved ("23:28:15", which
+/// says nothing to whoever opens it), what happened in it ("3 kills on
+/// Mirage"), else its game ("osu! clip", "osu! recording").
+fn page_title(clip: &crate::clips::Clip) -> String {
+    let stem = clip.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let (kind, rest) = match stem.strip_prefix("clip_") {
+        Some(rest) => ("clip", Some(rest)),
+        None => ("recording", stem.strip_prefix("recording_")),
+    };
+    let saved = rest.filter(|r| r.get(..19).is_some_and(|ts| chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d_%H-%M-%S").is_ok()));
+    let Some(rest) = saved else { return clip.title() };
+    match rest[19..].trim().strip_prefix("- ") {
+        Some(happened) if !happened.trim().is_empty() => happened.trim().to_owned(),
+        _ => match clip.folder.as_deref().filter(|f| *f != crate::clips::DESKTOP) {
+            Some(game) => format!("{game} {kind}"),
+            None => format!("{}{}", kind[..1].to_uppercase(), &kind[1..]),
+        },
+    }
+}
+
 /// How long ago `at` ([`now`]'s seconds) was.
 fn now_secs_since(at: u64) -> Duration {
     Duration::from_secs(now().saturating_sub(at))
@@ -845,7 +916,7 @@ impl App {
     /// What a clip's page should call it: its name and game, as now.
     fn named(&self, clip: &Path) -> Named {
         let found = self.clips.iter().find(|c| c.path == clip);
-        Named { title: found.map(|c| c.title()).unwrap_or_default(), game: found.and_then(|c| c.folder.clone()) }
+        Named { title: found.map(page_title).unwrap_or_default(), game: found.and_then(|c| c.folder.clone()) }
     }
 
     /// Upload the clip for a link.
@@ -1064,7 +1135,7 @@ impl App {
         };
         let tex = self.thumbs.get(ctx, &found).and_then(|t| t.texture.clone());
         let job = self.link_jobs.iter().find(|j| j.clip == clip);
-        let sent = |j: &Job| (j.progress.sent.load(Ordering::Relaxed), j.progress.total.load(Ordering::Relaxed));
+        let sent = |j: &Job| (j.progress.sent.load(Ordering::Relaxed), j.progress.total.load(Ordering::Relaxed), j.progress.making(), j.progress.fraction());
         let uploading = job.filter(|j| j.doing == Doing::Sharing).map(sent);
         let updating = job.filter(|j| j.doing == Doing::Updating).map(sent);
         let stopping = job.is_some_and(|j| j.doing == Doing::Stopping);
@@ -1099,13 +1170,14 @@ impl App {
                 ui_kit::dialog_text(ui, &format!("{watched}Anyone with the link can watch it, in a browser or right in Discord. A link nobody watches for 90 days stops working."));
                 // It follows the clip: a new version on its way, or waiting
                 // to be.
-                if let Some((sent, total)) = updating {
+                if let Some((_, _, making, f)) = updating {
                     ui.add_space(10.0);
-                    progress_bar(ui, sent as f32 / total.max(1) as f32);
+                    progress_bar(ui, f);
                     ui.add_space(8.0);
-                    let how = match (sent * 100).checked_div(total) {
-                        None => "Getting the new version ready…".to_owned(),
-                        Some(pct) => format!("Updating the link to this version… {}%", pct.min(99)),
+                    let how = match making {
+                        Some(made) => format!("Making a copy that plays in Discord… {}%", ((made * 100.0) as u32).min(99)),
+                        None if f == 0.0 => "Getting the new version ready…".to_owned(),
+                        None => format!("Updating the link to this version… {}%", ((f * 100.0) as u32).min(99)),
                     };
                     ui.label(theme::text(how, 13.5, W::Medium).color(p.text));
                     ui.add_space(4.0);
@@ -1114,13 +1186,14 @@ impl App {
                     ui.add_space(8.0);
                     ui_kit::dialog_text(ui, "The link still shows it as it was before. It's brought up to date by itself as soon as HasteClip's server can be reached.");
                 }
-            } else if let Some((sent, total)) = uploading {
-                progress_bar(ui, sent as f32 / total.max(1) as f32);
+            } else if let Some((sent, total, making, f)) = uploading {
+                progress_bar(ui, f);
                 ui.add_space(8.0);
                 // No total yet: the copy to upload is still being made.
-                let how = match (sent * 100).checked_div(total) {
-                    None => "Getting it ready…".to_owned(),
-                    Some(pct) => format!("Uploading… {}% · {} of {}", pct.min(99), crate::export_ui::human_bytes(sent), crate::export_ui::human_bytes(total)),
+                let how = match (making, (sent * 100).checked_div(total)) {
+                    (Some(made), _) => format!("Making a copy that plays in Discord… {}%", ((made * 100.0) as u32).min(99)),
+                    (None, None) => "Getting it ready…".to_owned(),
+                    (None, Some(pct)) => format!("Uploading… {}% · {} of {}", pct.min(99), crate::export_ui::human_bytes(sent), crate::export_ui::human_bytes(total)),
                 };
                 ui.label(theme::text(how, 13.5, W::Medium).color(p.text));
                 ui.add_space(4.0);
@@ -1296,6 +1369,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A page is called what says something to whoever opens the link.
+    #[test]
+    fn pages_are_called_what_happened_or_the_game() {
+        let clip = |rel: &str| crate::clips::Clip {
+            path: PathBuf::from("/lib").join(rel),
+            name: String::new(),
+            modified: SystemTime::UNIX_EPOCH,
+            created: None,
+            size_bytes: 0,
+            id: None,
+            original: None,
+            folder: rel.split_once('/').map(|(f, _)| f.to_owned()),
+            kept_bytes: 0,
+        };
+        assert_eq!(page_title(&clip("osu!/clip_2026-10-19_23-28-15.mp4")), "osu! clip");
+        assert_eq!(page_title(&clip("Counter-Strike 2/clip_2026-10-19_23-28-15 - 3 kills on Mirage.mp4")), "3 kills on Mirage");
+        assert_eq!(page_title(&clip("Desktop/clip_2026-10-19_23-28-15.mp4")), "Clip");
+        assert_eq!(page_title(&clip("clip_2026-10-19_23-28-15 (edit).mp4")), "Clip");
+        assert_eq!(page_title(&clip("osu!/Ace clutch.mp4")), "Ace clutch");
+        assert_eq!(page_title(&clip("osu!/recording_2026-10-19_23-28-15.mp4")), "osu! recording");
+        assert_eq!(page_title(&clip("recording_2026-10-19_23-28-15.mp4")), "Recording");
+    }
+
+    /// A clip too big to play in Discord goes as a copy that fits, still an
+    /// H.264 MP4 a browser plays; a small one as it is.
+    #[test]
+    #[ignore = "encodes ~100 MB of video: cargo test -p hasteclip copies_fit_discord -- --ignored"]
+    fn copies_fit_discord() {
+        let dir = std::env::temp_dir().join(format!("hc-fit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("Big.mp4");
+        // Noise at a high bitrate: past the limit in a few seconds.
+        let made = media::ffmpeg()
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "nullsrc=s=1920x1080:r=60,geq=random(1)*255:128:128", "-f", "lavfi", "-i", "sine=f=440"])
+            .args(["-t", "5", "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "200M", "-maxrate", "200M", "-bufsize", "200M", "-c:a", "aac", "-pix_fmt", "yuv420p"])
+            .arg(&clip)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let big = std::fs::metadata(&clip).unwrap().len();
+        assert!(big > u64::from(EMBED_MAX_MB) << 20, "the test clip is {big} bytes");
+        let progress = Progress::default();
+        let small = playable_size(&clip, &dir, &progress).unwrap();
+        let size = std::fs::metadata(&small).unwrap().len();
+        assert!(size <= u64::from(EMBED_MAX_MB) << 20, "{size} bytes");
+        let probe = media::probe(&small).unwrap();
+        assert!(probe.width > 0 && probe.duration > 4.5, "{probe:?}");
+        assert!(progress.made.load(Ordering::Relaxed) > 0);
+        let out = dir.join("web.mp4");
+        web_copy(&small, &out).unwrap();
+        // A small one stays as it is.
+        assert_eq!(playable_size(&out, &dir, &Progress::default()).unwrap(), out);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn retries_wait_longer_each_time() {
         assert_eq!(backoff(0), Duration::from_secs(30));
@@ -1371,6 +1499,14 @@ mod tests {
         let page = ureq::get(&link.url).call().unwrap().body_mut().read_to_string().unwrap();
         assert!(page.contains("og:video") && page.contains("End to end") && page.contains("Test Game"));
         assert!(page.contains(".mp4?v=1"), "files linked by version");
+        assert!(page.contains(r#"property="twitter:card" content="player""#), "a player in chats");
+        // A chat app looks before it plays: answered, not refused.
+        let head = ureq::head(format!("{}.mp4?v=1", link.url)).config().max_redirects(0).build().call().unwrap();
+        assert_eq!(head.status(), 200);
+        let length = head.headers().get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
+        let res = ureq::get(format!("{}.mp4?v=1", link.url)).header("Range", "bytes=0-0").call().unwrap();
+        let total = res.headers().get("content-range").and_then(|v| v.to_str().ok()).and_then(|v| v.rsplit('/').next()?.parse::<u64>().ok());
+        assert!(length.is_some() && length == total, "{length:?} bytes, the file is {total:?}");
 
         // Renamed, and moved to another game.
         let renamed = Named { title: "Renamed".into(), game: None };
