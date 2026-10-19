@@ -444,6 +444,13 @@ impl App {
             if let Some(a) = self.filter_row(ui, &all) {
                 action = Some(a);
             }
+            // What anyone with a link can watch, together.
+            if self.shown.shared > 0 {
+                let shared = View { filter: Filter::Shared, label: "Shared".into(), count: self.shown.shared };
+                if let Some(a) = self.filter_row(ui, &shared) {
+                    action = Some(a);
+                }
+            }
             if !games.is_empty() {
                 group_label(ui, "Games");
                 for v in games {
@@ -531,6 +538,11 @@ impl App {
         };
         match filter {
             Filter::All => bare(egui_phosphor::fill::SQUARES_FOUR, 18.0),
+            // The chain as on a shared clip's card (filled, it's cut out of a
+            // square, and reads as a tile).
+            Filter::Shared => {
+                p.text(rect.center(), Align2::CENTER_CENTER, icon::LINK, FontId::proportional(18.0), color);
+            }
             Filter::Loose => bare(egui_phosphor::fill::FOLDER_SIMPLE, 17.0),
             Filter::Folder(name) => match self.folder_icon(ui.ctx(), name) {
                 Some(tex) => {
@@ -569,7 +581,7 @@ impl App {
             return false;
         }
         let label = match filter {
-            Filter::All => return false,
+            Filter::All | Filter::Shared => return false,
             Filter::Collection(id) if drag.files.iter().all(|p| self.collections.contains(id, p)) => return false,
             Filter::Collection(id) => format!("Add to {}", self.collections.get(id).map(|c| c.name.clone()).unwrap_or_default()),
             Filter::Folder(_) | Filter::Loose => {
@@ -678,6 +690,9 @@ impl App {
                 }
             };
             pick(ui, &all);
+            if self.shown.shared > 0 {
+                pick(ui, &View { filter: Filter::Shared, label: "Shared".into(), count: self.shown.shared });
+            }
             if !games.is_empty() {
                 ui_kit::menu_sep(ui);
                 ui_kit::menu_head(ui, "Games");
@@ -1296,7 +1311,7 @@ impl App {
                 DropOn::View(Filter::Folder(f)) => self.move_clips(ctx, &files, Some(f)),
                 DropOn::View(Filter::Loose) => self.move_clips(ctx, &files, None),
                 DropOn::View(Filter::Collection(id)) => self.put_in_collection(&files, &id, true),
-                DropOn::View(Filter::All) => {}
+                DropOn::View(Filter::All | Filter::Shared) => {}
                 DropOn::NewCollection => self.new_collection_with(files),
             },
             Action::Edit(p) => self.open_editor(p),
@@ -1644,7 +1659,7 @@ fn view_menu(ui: &mut egui::Ui, filter: &Filter) -> Option<Action> {
                 action = Some(Action::DeleteCollection(id.clone()));
             }
         }
-        Filter::All | Filter::Loose => {}
+        Filter::All | Filter::Shared | Filter::Loose => {}
     }
     action
 }

@@ -78,6 +78,8 @@ pub struct Nav {
     pub saving: Option<f32>,
     /// The clip has a share link.
     pub linked: bool,
+    /// How its link is, for the header: icon, words and what they mean.
+    pub link: Option<(&'static str, String, &'static str)>,
 }
 
 struct Loaded {

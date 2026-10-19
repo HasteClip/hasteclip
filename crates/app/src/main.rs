@@ -1614,6 +1614,16 @@ impl App {
     fn viewer_page(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         let delete_label = self.delete_label(None);
         let saving = self.viewer.as_ref().and_then(|v| self.renders.iter().find(|j| !j.as_new && j.source == v.clip())).map(|j| j.progress());
+        let link = self.viewer.as_ref().and_then(|v| self.link_state(v.clip())).map(|s| {
+            use egui_phosphor::regular as icon;
+            let pct = |f: f32| ((f * 100.0) as u32).min(99);
+            match s {
+                links::LinkState::Uploading(f) => (icon::CLOUD_ARROW_UP, format!("Uploading {}%", pct(f)), "Uploading for a link"),
+                links::LinkState::Updating(f) => (icon::CLOUD_ARROW_UP, format!("Updating {}%", pct(f)), "Updating its link to this version"),
+                links::LinkState::Behind => (icon::ARROWS_CLOCKWISE, "Shared".to_owned(), "Shared with a link, which still shows an older version of it: it's brought up to date once HasteClip's server can be reached"),
+                links::LinkState::Shared => (icon::LINK, "Shared".to_owned(), "Shared with a link: its link, and who's watched it"),
+            }
+        });
         let Some(v) = &mut self.viewer else {
             self.page = Page::Clips;
             return;
@@ -1636,6 +1646,7 @@ impl App {
             delete_label,
             saving,
             linked: self.links.get(v.clip()).is_some(),
+            link,
         };
         let outcome = v.ui(ui, &nav);
         if let Some((volume, muted)) = viewer::volume(ui.ctx()) {

@@ -85,22 +85,23 @@ impl ShowKind {
 }
 
 impl Filter {
-    pub(crate) fn matches(&self, clip: &clips::Clip, cols: &Collections) -> bool {
+    pub(crate) fn matches(&self, clip: &clips::Clip, cols: &Collections, links: &crate::links::Links) -> bool {
         match self {
             Filter::All => true,
             Filter::Folder(name) => clip.folder.as_ref() == Some(name),
             Filter::Loose => clip.folder.is_none(),
             Filter::Collection(id) => cols.contains(id, &clip.path),
+            Filter::Shared => links.get(&clip.path).is_some(),
         }
     }
 
     /// Back to all clips once there's nothing left to show: the last clip of a
-    /// game moved or deleted, or the collection deleted. (An emptied collection
-    /// stays: you may be about to fill it.)
-    pub fn retain(&mut self, clips: &[clips::Clip], cols: &Collections) {
+    /// game moved or deleted, the last link stopped, or the collection
+    /// deleted. (An emptied collection stays: you may be about to fill it.)
+    pub fn retain(&mut self, clips: &[clips::Clip], cols: &Collections, links: &crate::links::Links) {
         let gone = match self {
             Filter::Collection(id) => cols.get(id).is_none(),
-            _ => !clips.iter().any(|c| self.matches(c, cols)),
+            _ => !clips.iter().any(|c| self.matches(c, cols, links)),
         };
         if gone {
             *self = Filter::All;
@@ -108,8 +109,8 @@ impl Filter {
     }
 
     /// Make sure the clip at `path` is shown: all clips, if it isn't here.
-    pub fn reveal(&mut self, clips: &[clips::Clip], cols: &Collections, path: &Path) {
-        if clips.iter().any(|c| c.path == path && !self.matches(c, cols)) {
+    pub fn reveal(&mut self, clips: &[clips::Clip], cols: &Collections, links: &crate::links::Links, path: &Path) {
+        if clips.iter().any(|c| c.path == path && !self.matches(c, cols, links)) {
             *self = Filter::All;
         }
     }
@@ -306,6 +307,7 @@ impl App {
             _ => None,
         };
         let what = if paths.len() == 1 { "it" } else { "them" };
+        let shared = paths.iter().filter(|p| self.links.get(p).is_some()).count();
         let title = match (permanently, paths.len()) {
             (true, 1) => "Delete for good?".to_owned(),
             (true, n) => format!("Delete {n} clips for good?"),
@@ -321,6 +323,13 @@ impl App {
                 ui.add_space(8.0);
             }
             ui_kit::dialog_text(ui, &if permanently { format!("You can't get {what} back.") } else { format!("You can get {what} back from the {bin}.") });
+            // Other people may be using its link.
+            match (shared, paths.len()) {
+                (0, _) => {}
+                (_, 1) => ui_kit::dialog_text(ui, "It's shared with a link: the link stops working too."),
+                (1, _) => ui_kit::dialog_text(ui, "One of them is shared with a link: that link stops working too."),
+                (n, _) => ui_kit::dialog_text(ui, &format!("{n} of them are shared with a link: those links stop working too.")),
+            }
             ui_kit::dialog_buttons(ui, |ui| {
                 let label = if permanently { "Delete".to_owned() } else { format!("Move to {bin}") };
                 yes = ui.add(ui_kit::danger_button(label)).clicked();
@@ -344,7 +353,7 @@ impl App {
         // Where the player goes if its clip goes: the next clip in what's
         // shown, else the one before.
         let after = self.viewer.as_ref().map(|v| v.clip().to_path_buf()).filter(|c| paths.contains(c)).map(|current| {
-            let shown: Vec<&clips::Clip> = self.clips.iter().filter(|c| self.library_filter.matches(c, &self.collections)).collect();
+            let shown: Vec<&clips::Clip> = self.clips.iter().filter(|c| self.library_filter.matches(c, &self.collections, &self.links)).collect();
             let at = shown.iter().position(|c| c.path == current);
             let left = |c: &&&clips::Clip| !paths.contains(&c.path);
             at.and_then(|i| shown[i + 1..].iter().find(left).or_else(|| shown[..i].iter().rev().find(left))).map(|c| c.path.clone())
@@ -389,19 +398,29 @@ impl App {
         }
         self.collections.forget(&moved);
         crate::moments::forget(&moved);
+        // Their links stop once Undo has had its moment.
+        let shared = moved.iter().filter(|p| self.links.get(p).is_some()).count();
+        for p in &moved {
+            self.links.deleted(p);
+        }
         let bin = store::bin_name();
         let what = match moved.as_slice() {
             [one] => crate::clips::title_for_stem(&one.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()),
             _ => format!("{} clips", moved.len()),
+        };
+        let links = match (shared, moved.len()) {
+            (0, _) => "",
+            (_, 1) => ". Its link stops working",
+            _ => ". Their links stop working",
         };
         if let Some(e) = error {
             self.toast_error(format!("Couldn't delete: {e}"));
         } else if busy > 0 {
             self.toast_error("Clips that are still saving an edit were kept.");
         } else if !moved.is_empty() && permanently {
-            self.toast_icon(egui_phosphor::regular::TRASH, format!("Deleted {what}"));
+            self.toast_icon(egui_phosphor::regular::TRASH, format!("Deleted {what}{links}"));
         } else if !moved.is_empty() {
-            self.toast_action(egui_phosphor::regular::TRASH, format!("Moved {what} to the {bin}"), "Undo", crate::shell::ToastAction::Undelete(binned));
+            self.toast_action(egui_phosphor::regular::TRASH, format!("Moved {what} to the {bin}{links}"), "Undo", crate::shell::ToastAction::Undelete(binned));
         }
         self.selection.clear();
         self.refresh_clips();
@@ -426,6 +445,8 @@ impl App {
                     for id in collections {
                         self.collections.add(&id, std::slice::from_ref(&path));
                     }
+                    // Its link too, if it hasn't stopped yet.
+                    self.links.undeleted(&path);
                 }
                 self.refresh_clips();
             }
@@ -526,7 +547,7 @@ impl App {
                 CollectionDialogKind::Delete(id) => {
                     let id = id.clone();
                     self.collections.delete(&id);
-                    self.library_filter.retain(&self.clips, &self.collections);
+                    self.library_filter.retain(&self.clips, &self.collections, &self.links);
                     close = true;
                 }
                 CollectionDialogKind::Rename(id) => match crate::collections::check_name(&self.collections, &d.name, Some(id)) {
@@ -853,6 +874,12 @@ impl App {
                 Err(e) => self.toast_error(format!("Couldn't save the MP3: {e}")),
             }
         }
+        while let Ok(result) = self.copy_rx.try_recv() {
+            match result {
+                Ok(()) => self.toast(format!("Copied — paste it into any app ({})", crate::hotkey_label_cmd("V"))),
+                Err(e) => self.toast_error(format!("Couldn't copy the picture: {e}")),
+            }
+        }
     }
 
     /// Hand a drag of `files` to the OS, so they can be dropped into any app.
@@ -877,12 +904,6 @@ fn delete_when_free(clip: &clips::Clip, library: &[clips::Clip], permanently: bo
                 std::thread::sleep(Duration::from_millis(50));
             }
             r => return r,
-        }
-        while let Ok(result) = self.copy_rx.try_recv() {
-            match result {
-                Ok(()) => self.toast(format!("Copied — paste it into any app ({})", crate::hotkey_label_cmd("V"))),
-                Err(e) => self.toast_error(format!("Couldn't copy the picture: {e}")),
-            }
         }
     }
 }
