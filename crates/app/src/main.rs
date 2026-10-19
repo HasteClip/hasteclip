@@ -544,8 +544,8 @@ struct App {
     clipped_game: Option<(String, discord::Game, Instant)>,
     /// What's in focus while capturing, for the folder clips go in.
     games: games::Tracker,
-    /// When the current capture started, as Discord's "elapsed" timer counts.
-    presence_since: Option<SystemTime>,
+    /// The game Discord shows, and since when, as its "elapsed" timer counts.
+    presence_since: Option<(String, SystemTime)>,
 }
 
 impl App {
@@ -1476,15 +1476,20 @@ impl App {
         games::folder_for(&self.settings.output_dir, self.settings.folder_per_game, &self.settings.game_folders, game.as_deref())
     }
 
-    /// Discord shows what's being clipped while capture runs (when turned on).
+    /// Discord shows the game being clipped while capture runs (when turned
+    /// on), and nothing without a game (see `discord.rs`).
     fn update_presence(&mut self) {
-        if !self.settings.discord_presence || self.rec_state == RecState::Idle {
+        let game = self.clipped_game.as_ref().map(|(_, g, _)| g.clone()).filter(|_| self.settings.discord_presence && self.rec_state != RecState::Idle);
+        let Some(game) = game else {
             self.presence_since = None;
             self.presence.set(None);
             return;
+        };
+        // Timed from when this game showed up: another game starts again.
+        if self.presence_since.as_ref().is_none_or(|(name, _)| *name != game.name) {
+            self.presence_since = Some((game.name.clone(), SystemTime::now()));
         }
-        let game = self.clipped_game.as_ref().map(|(_, g, _)| g.clone());
-        let since = *self.presence_since.get_or_insert_with(SystemTime::now);
+        let since = self.presence_since.as_ref().map_or_else(SystemTime::now, |(_, at)| *at);
         self.presence.set(Some(discord::Status { recording: self.rec_state == RecState::Recording, game, since }));
     }
 

@@ -1,5 +1,9 @@
-//! "Clipping osu!" on your Discord profile, while HasteClip records (opt-in,
-//! Settings → Discord).
+//! "Clipping osu! with HasteClip" on your Discord profile while HasteClip
+//! clips or records a game (on unless turned off in Settings → Sharing), with
+//! a Get HasteClip button that others see (Discord doesn't show you your own
+//! activity's buttons). Nothing without a game: clipping runs all day in the
+//! tray, and "Clipping" alone on a profile for hours says nothing (and is what
+//! would make someone turn it off).
 //!
 //! Discord Rich Presence: the Discord app on this computer takes an activity
 //! from us over its local pipe. The activity belongs to the "HasteClip"
@@ -13,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
 use std::time::{Duration, SystemTime};
 
-use discord_rich_presence::activity::{Activity, Assets, Timestamps};
+use discord_rich_presence::activity::{Activity, Assets, Button, Timestamps};
 use discord_rich_presence::{DiscordIpc, DiscordIpcClient};
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +25,8 @@ use serde::{Deserialize, Serialize};
 const CLIENT_ID: &str = "1556434870572679198";
 /// Its art asset with the HasteClip logo (`assets/discord-logo.png`).
 const LOGO: &str = "logo";
+/// The activity's button: HasteClip's site, which shows what it is first.
+const GET: (&str, &str) = ("Get HasteClip", "https://hasteclip.com");
 /// While wanted but not connected (Discord not running yet), try again this often.
 const RETRY_EVERY: Duration = Duration::from_secs(15);
 /// Fetch Discord's games list again after this long (it's ~13 MB).
@@ -31,8 +37,8 @@ const GAMES_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub struct Status {
     /// Recording, not just the replay buffer.
     pub recording: bool,
-    pub game: Option<Game>,
-    /// Since when, for Discord's "elapsed" timer.
+    pub game: Game,
+    /// Since when, for Discord's "elapsed" timer: when the game showed up.
     pub since: SystemTime,
 }
 
@@ -119,24 +125,17 @@ fn activity(status: &Status) -> Activity<'_> {
     let doing = if status.recording { "Recording" } else { "Clipping" };
     // As Medal does it: the activity is named after the game ("osu! with
     // HasteClip") instead of the app, so it reads like the game itself.
-    let (name, details) = match &status.game {
-        Some(g) => (Some(format!("{} with HasteClip", g.name)), format!("{doing} {} with HasteClip", g.name)),
-        None if status.recording => (None, "Recording".to_owned()),
-        None => (None, "Replay buffer on".to_owned()),
-    };
-    let assets = match status.game.as_ref().and_then(|g| Some((g, g.icon.as_deref()?))) {
+    let g = &status.game;
+    let (name, details) = (format!("{} with HasteClip", g.name), format!("{doing} {} with HasteClip", g.name));
+    let assets = match g.icon.as_deref() {
         // The game's picture, with HasteClip as the badge in its corner.
-        Some((g, icon)) => Assets::new().large_image(icon).large_text(g.name.as_str()).small_image(LOGO).small_text("HasteClip"),
+        Some(icon) => Assets::new().large_image(icon).large_text(g.name.as_str()).small_image(LOGO).small_text("HasteClip"),
         None => Assets::new().large_image(LOGO).large_text("HasteClip"),
     };
     // In seconds: Discord takes milliseconds as seconds (whatever the crate
     // says), and a start that far ahead shows a timer stuck at 0:00.
     let since = status.since.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-    let activity = Activity::new().details(details).assets(assets).timestamps(Timestamps::new().start(since));
-    match name {
-        Some(name) => activity.name(name),
-        None => activity,
-    }
+    Activity::new().name(name).details(details).assets(assets).timestamps(Timestamps::new().start(since)).buttons(vec![Button::new(GET.0, GET.1)])
 }
 
 /// A game Discord knows, by the app's id (`capture::foreground_exe`): an

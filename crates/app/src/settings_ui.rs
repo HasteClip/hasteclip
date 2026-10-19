@@ -364,12 +364,15 @@ impl App {
     fn sharing_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
         ui_kit::list(ui, "sharing", |l| {
             if f.shows(&["discord", "activity", "rich presence"]) {
-                let note = if self.settings.discord_presence && self.rec_state != RecState::Idle {
-                    if self.presence.connected() { "Showing on Discord" } else { "Discord isn't running" }
-                } else {
-                    ""
+                let clipping_a_game = self.rec_state != RecState::Idle && self.clipped_game.is_some();
+                let note = match (self.settings.discord_presence, clipping_a_game) {
+                    (false, _) => "",
+                    (true, false) => "Shows while you clip a game",
+                    (true, true) if self.presence.connected() => "Showing on Discord",
+                    (true, true) => "Discord isn't running",
                 };
-                l.row(Row::new("Discord activity").tip("Discord activity", "Your Discord profile shows “Clipping osu!” while HasteClip captures. Needs Discord running.").note(note), |ui| ui_kit::switch(ui, &mut self.settings.discord_presence));
+                let tip = "While HasteClip clips a game, your Discord profile shows “Clipping osu! with HasteClip”, with a button for others to get HasteClip. Needs Discord running.";
+                l.row(Row::new("Discord activity").tip("Discord activity", tip).note(note), |ui| ui_kit::switch(ui, &mut self.settings.discord_presence));
             }
         });
     }

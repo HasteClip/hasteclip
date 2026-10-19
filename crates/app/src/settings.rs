@@ -727,7 +727,9 @@ impl Default for RecordSettings {
             replay_seconds: 60,
             auto_start_buffer: true,
             auto_update: true,
-            discord_presence: false,
+            // On to begin with: friends see what you clip, and where to get
+            // HasteClip. Settings saved before keep theirs (off).
+            discord_presence: true,
             voice_clip: true,
             voice_samples: false,
             encoder: Encoder::Auto,
