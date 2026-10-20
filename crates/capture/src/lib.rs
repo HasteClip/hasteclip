@@ -263,10 +263,10 @@ pub fn display_refresh(source: &VideoSource) -> Option<u32> {
 /// overlays (a webcam) will go on top of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VideoSource {
-    /// A whole display, by backend id (see [`list_screens`]). A game that
-    /// needs the game capture hook, fullscreen and in focus on it, is recorded
-    /// through the hook while it is.
-    Screen { id: String, hook: GameHook },
+    /// A whole display, by backend id (see [`list_screens`]), captured the
+    /// way `method` says (Windows). A game that needs the game capture hook,
+    /// fullscreen and in focus on it, is recorded through the hook while it is.
+    Screen { id: String, hook: GameHook, method: ScreenCapture },
     /// Games and apps, by executable name (see [`list_windowed_apps`]): records
     /// whichever of them was last in focus, for as long as it's showing, even
     /// while you click into something else. When it stops showing (minimized,
@@ -295,6 +295,61 @@ pub struct GameHook {
 impl Default for GameHook {
     fn default() -> Self {
         Self { auto: true, allowed: Vec::new() }
+    }
+}
+
+/// How a whole display is captured on Windows. Windows Graphics Capture draws
+/// a yellow border around the display on Windows 10 (Windows 11 lets us turn
+/// it off); Desktop Duplication draws none, but can only capture a display on
+/// the graphics card HasteClip uses. Games and apps are always recorded with
+/// Windows Graphics Capture (or the game capture hook): Desktop Duplication
+/// only captures whole displays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScreenCapture {
+    /// Desktop Duplication on Windows 10, where it can capture the display;
+    /// Windows Graphics Capture otherwise.
+    #[default]
+    Auto,
+    Duplication,
+    Wgc,
+}
+
+/// Which way a display is being captured, and whether that's what was asked
+/// for, to say so beside the setting: "Desktop Duplication", or "Windows
+/// Graphics Capture" when it couldn't. Windows only; `None` while nothing
+/// captures a display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenCaptureInUse {
+    pub duplication: bool,
+    /// Desktop Duplication was chosen, or picked by Automatic, but couldn't
+    /// start or stopped: Windows Graphics Capture is used until it can (it's
+    /// tried again now and then).
+    pub fell_back: bool,
+}
+
+/// How the display being captured now is captured (see [`ScreenCaptureInUse`]).
+pub fn screen_capture_in_use() -> Option<ScreenCaptureInUse> {
+    #[cfg(target_os = "windows")]
+    {
+        win::screen_capture_in_use()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
+/// What Automatic picks on this computer, for the setting's note: true when
+/// it's Desktop Duplication (Windows 10). Whether a display is on another
+/// graphics card is only known when it starts.
+pub fn screen_capture_auto_duplicates() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        win::screen_capture_auto_duplicates()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
     }
 }
 

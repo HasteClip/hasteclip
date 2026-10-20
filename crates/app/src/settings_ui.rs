@@ -130,7 +130,7 @@ impl App {
         // Measure first: a group with no matching rows doesn't show at all.
         let matches = match name {
             "Clipping" => f.shows(&["clip length", "replay buffer duration", "start clipping when hasteclip opens", "auto start"]),
-            "Video" => f.shows(&["resolution", "height", "size", "frame rate", "fps", "quality", "bitrate", "mbps", "frame blending", "motion blur", "encoder", "hardware", "software", "file format", "mp4", "mov", "game capture", "anti-cheat", "obs"]),
+            "Video" => f.shows(&["resolution", "height", "size", "frame rate", "fps", "quality", "bitrate", "mbps", "frame blending", "motion blur", "encoder", "hardware", "software", "file format", "mp4", "mov", "game capture", "anti-cheat", "obs"]) || SCREEN_CAPTURE && f.shows(SCREEN_CAPTURE_WORDS),
             "Clips" => f.shows(&["clips folder", "location", "directory", "folder per game", "name clips after what happened", "game events", "osu", "names", "delete", "trash", "permanently"]),
             "Screenshots" => capture::SCREENSHOTS && f.shows(&["screenshots", "take a screenshot", "shortcut", "hotkey", "format", "png", "jpg", "jpeg", "copy", "clipboard", "paste"]),
             "Sharing" => f.shows(&["discord", "activity", "rich presence"]),
@@ -301,6 +301,21 @@ impl App {
                     let (_, c) = l.row(Row::new("Also on these games with anti-cheat").tip("Games with anti-cheat", "Game capture leaves games with anti-cheat alone unless you add them here. Anti-cheat can close the game, or flag your account, when game capture is loaded into it.").kid().locked(lock.clone()), |ui| self.anticheat_list(ui));
                     locked_click |= c;
                 });
+            }
+            if SCREEN_CAPTURE && f.shows(SCREEN_CAPTURE_WORDS) {
+                let apps = matches!(self.settings.capture, settings::CaptureTarget::Apps { .. });
+                let (note, warn) = screen_capture_note(self.settings.screen_capture, apps, capture::screen_capture_in_use(), capture::screen_capture_auto_duplicates());
+                let (_, c) = l.row(Row::new("Screen capture").tip("Screen capture", SCREEN_CAPTURE_TIP).note(note).warn(warn).locked(lock.clone()), |ui| {
+                    let r = ui_kit::select(ui, self.settings.screen_capture.label(), 150.0);
+                    ui_kit::menu_popup(&r, false, 260.0, |ui| {
+                        for m in settings::ScreenCapture::ALL {
+                            if Item::new(m.label()).check(self.settings.screen_capture == m).show(ui).clicked() {
+                                self.settings.screen_capture = m;
+                            }
+                        }
+                    });
+                });
+                locked_click |= c;
             }
         });
         if locked_click && !said {
@@ -1292,6 +1307,38 @@ fn framing_field(ui: &mut egui::Ui, now: settings::Framing) -> Option<settings::
 }
 
 /// What recording in `shape` does to a `w`×`h` screen, in words.
+/// The screen capture setting shows: Windows, where there's a choice.
+const SCREEN_CAPTURE: bool = cfg!(target_os = "windows");
+const SCREEN_CAPTURE_WORDS: &[&str] = &["screen capture", "desktop duplication", "dxgi", "windows graphics capture", "yellow border", "capture method"];
+const SCREEN_CAPTURE_TIP: &str = "How your screen is recorded. Automatic uses Desktop Duplication on Windows 10, so there's no yellow border, and Windows Graphics Capture on Windows 11, which hides the border itself. Desktop Duplication can't record a display connected to another graphics card (common on laptops); then Windows Graphics Capture is used. Only for recording the screen: games and apps are always recorded with Windows Graphics Capture.";
+
+/// The screen capture setting's note, and whether it's a warning: how the
+/// screen is being recorded (`in_use`, while it is), else what the choice
+/// means here (`auto_duplicates`: Windows 10, where Automatic picks Desktop
+/// Duplication). Recording games and apps (`apps`), the setting doesn't apply.
+fn screen_capture_note(choice: settings::ScreenCapture, apps: bool, in_use: Option<capture::ScreenCaptureInUse>, auto_duplicates: bool) -> (String, bool) {
+    use settings::ScreenCapture::*;
+    if let Some(u) = in_use {
+        return match (u.duplication, u.fell_back) {
+            (true, _) => ("Recording with Desktop Duplication: no yellow border".into(), false),
+            (false, true) => ("Desktop Duplication can't record this display right now, so Windows Graphics Capture is used until it can".into(), true),
+            (false, false) if auto_duplicates => ("Recording with Windows Graphics Capture: Windows 10 shows a yellow border".into(), false),
+            (false, false) => ("Recording with Windows Graphics Capture".into(), false),
+        };
+    }
+    if apps {
+        return ("For recording the screen. Games and apps always use Windows Graphics Capture".into(), false);
+    }
+    let note = match choice {
+        Auto if auto_duplicates => "Uses Desktop Duplication here: no yellow border",
+        Auto => "Uses Windows Graphics Capture here",
+        Duplication => "No yellow border. Can't record a display on another graphics card",
+        Wgc if auto_duplicates => "Windows 10 shows a yellow border around your screen with it",
+        Wgc => "What HasteClip has always used",
+    };
+    (note.into(), false)
+}
+
 fn shape_note(shape: capture::Shape, (w, h): (u32, u32)) -> String {
     let (sw, sh) = shape.of(w, h);
     let screen = w as f64 / h.max(1) as f64;
@@ -1397,5 +1444,26 @@ mod ratio_tests {
         assert_eq!(kept_ratio([21, 9]), [21, 9]);
         assert_eq!(kept_ratio([99, 1]), [4, 1]);
         assert_eq!(kept_ratio([1, 99]), [1, 4]);
+    }
+}
+
+#[cfg(test)]
+mod screen_capture_tests {
+    use super::*;
+    use settings::ScreenCapture::*;
+
+    /// While the screen is recorded, the note says how, and warns when
+    /// Desktop Duplication couldn't be used; else what the choice does here.
+    #[test]
+    fn note_says_what_is_used() {
+        let using = |duplication, fell_back| Some(capture::ScreenCaptureInUse { duplication, fell_back });
+        assert_eq!(screen_capture_note(Auto, false, using(true, false), true).0, "Recording with Desktop Duplication: no yellow border");
+        let (note, warn) = screen_capture_note(Duplication, false, using(false, true), true);
+        assert!(warn && note.starts_with("Desktop Duplication can't"), "{note}");
+        assert!(screen_capture_note(Wgc, false, using(false, false), true).0.contains("yellow border"));
+        assert_eq!(screen_capture_note(Auto, false, None, true).0, "Uses Desktop Duplication here: no yellow border");
+        assert_eq!(screen_capture_note(Auto, false, None, false).0, "Uses Windows Graphics Capture here");
+        assert!(screen_capture_note(Duplication, true, None, true).0.contains("Games and apps"));
+        assert!(!screen_capture_note(Duplication, false, None, false).1);
     }
 }

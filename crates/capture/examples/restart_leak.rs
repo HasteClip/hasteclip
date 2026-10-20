@@ -20,7 +20,7 @@ fn main() -> anyhow::Result<()> {
         shape: None,
         use_hardware: true,
         replay_seconds: 30,
-        video: capture::VideoSource::Screen { id: String::new(), hook: capture::GameHook { auto: false, allowed: Vec::new() } },
+        video: capture::VideoSource::Screen { id: String::new(), hook: capture::GameHook { auto: false, allowed: Vec::new() }, method: Default::default() },
         away_screen: None,
         webcam: None,
         sources: Vec::new(),

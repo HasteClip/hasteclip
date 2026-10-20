@@ -404,6 +404,40 @@ impl From<BlendShape> for capture::BlendShape {
     }
 }
 
+/// How a whole display is captured on Windows (see `capture::ScreenCapture`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenCapture {
+    /// Desktop Duplication on Windows 10 (no yellow border), Windows Graphics
+    /// Capture on Windows 11.
+    #[default]
+    Auto,
+    Duplication,
+    Wgc,
+}
+
+impl ScreenCapture {
+    pub const ALL: [ScreenCapture; 3] = [ScreenCapture::Auto, ScreenCapture::Duplication, ScreenCapture::Wgc];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ScreenCapture::Auto => "Automatic",
+            ScreenCapture::Duplication => "Desktop Duplication",
+            ScreenCapture::Wgc => "Windows Graphics Capture",
+        }
+    }
+}
+
+impl From<ScreenCapture> for capture::ScreenCapture {
+    fn from(m: ScreenCapture) -> Self {
+        match m {
+            ScreenCapture::Auto => capture::ScreenCapture::Auto,
+            ScreenCapture::Duplication => capture::ScreenCapture::Duplication,
+            ScreenCapture::Wgc => capture::ScreenCapture::Wgc,
+        }
+    }
+}
+
 /// How the screen goes into a recording of another shape (see
 /// `capture::Framing`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -704,6 +738,8 @@ pub struct RecordSettings {
     pub game_capture: bool,
     /// Games with anti-cheat game capture may be used on anyway.
     pub game_capture_allowed: Vec<AllowedGame>,
+    /// How a whole display is captured (Windows).
+    pub screen_capture: ScreenCapture,
 
     // --- Screenshots ---
     pub screenshot_format: ScreenshotFormat,
@@ -772,6 +808,7 @@ impl Default for RecordSettings {
             limiter: true,
             game_capture: true,
             game_capture_allowed: Vec::new(),
+            screen_capture: ScreenCapture::Auto,
             screenshot_format: ScreenshotFormat::Png,
             copy_screenshots: true,
             shortcuts: Shortcuts::default(),
@@ -1005,6 +1042,22 @@ impl RecordSettings {
             }
             let _ = std::fs::write(path, json);
         }
+    }
+}
+
+#[cfg(test)]
+mod screen_capture_tests {
+    use super::*;
+
+    /// Settings saved before the choice was there load as Automatic; a choice
+    /// is saved by name.
+    #[test]
+    fn screen_capture_defaults_to_automatic_and_is_saved() {
+        let s: RecordSettings = serde_json::from_str(r#"{"fps": 60}"#).unwrap();
+        assert_eq!(s.screen_capture, ScreenCapture::Auto);
+        let s: RecordSettings = serde_json::from_str(r#"{"screen_capture": "duplication"}"#).unwrap();
+        assert_eq!(capture::ScreenCapture::from(s.screen_capture), capture::ScreenCapture::Duplication);
+        assert!(s.to_json().contains(r#""screen_capture": "duplication""#));
     }
 }
 
