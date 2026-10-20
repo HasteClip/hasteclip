@@ -26,6 +26,7 @@
 - [Download](#download)
 - [Getting started](#getting-started)
 - [Features](#features)
+- [Compared with other recorders](#compared-with-other-recorders)
 - [Platform support](#platform-support)
 - [Building from source](#building-from-source)
 - [License](#license)
@@ -88,7 +89,7 @@ Clips are saved in a `hasteclip` folder in your Videos folder (Movies on macOS),
 - **Replay buffer.** It keeps the last 5 seconds to 1 hour in memory. Save it with a shortcut, or by voice: “HasteClip that” is recognised on your computer and never sent anywhere.
 - **Clips named after the play.** “3 kills on Mirage”, “Pentakill as Jinx”, “412pp FC”: clips of Counter-Strike 2, Dota 2, League of Legends and osu! are named after what happened. Other games' clips are named by the time.
 - **Recording.** Record straight to disk for as long as you like. A crash or power loss still leaves a playable file.
-- **Native, hardware encoding.** H.264 on your graphics card's video engine, at native resolution or scaled down, up to 240 fps and beyond. HasteClip is written in Rust and draws on the GPU, with no browser running behind your game.
+- **Native, hardware encoding.** H.264 on your graphics card's video engine, at native resolution or scaled down, up to 540 fps at 1080p. HasteClip is written in Rust and draws on the GPU, with no browser running behind your game.
 - **Any shape.** Record the whole screen or a game's window, in its own aspect ratio or another, like 16:9 from an ultrawide screen.
 - **Sound as sources, not tracks.** Add your microphone, desktop sound, or single apps like the game, Discord or music. For each one, choose whether it's in the clip's sound, has its own track for editing later, or both. Each source has a live meter and a fader. There's noise reduction and mono for microphones, and a limiter on the mix.
 - **Webcam.** Show your camera in a corner, placed and cropped by dragging it on the preview.
@@ -117,6 +118,38 @@ Clips are saved in a `hasteclip` folder in your Videos folder (Movies on macOS),
 - **Share with a link.** Upload a clip for a link that plays in any browser and right in a Discord chat. No account is needed.
 - **Or share the file.** Copy a clip and paste it anywhere, or drag one (or ten) out of the library into Discord, a chat or a folder. You can also use your system's share sheet.
 - **Export and import.** Move clips to another computer with their edits, markers and collections in one `.hasteclip` file.
+
+## Compared with other recorders
+
+|  | HasteClip | Medal | NVIDIA ShadowPlay | Steam Game Recording | OBS Studio |
+|---|:-:|:-:|:-:|:-:|:-:|
+| **Price** | Free | Free, or $9.99/mo | Free | Free | Free |
+| **Runs on** | macOS, Windows, Linux | Windows | Windows | macOS, Windows, Linux | macOS, Windows, Linux |
+| **Graphics card** | Any | Any | NVIDIA only | Any | Any |
+| **Account** | Not needed | Asks you to sign in | Not needed | Steam account | Not needed |
+| **Ads** | None | Yes, Premium removes them | ? | ? | None |
+| **Open source** | ✅ | — | — | — | ✅ |
+| **How far back it saves** | Up to 1 hour | Up to 10 min | Up to 20 min | Unlimited | Up to 6 hours |
+| **Save a clip by voice** | ✅ | ✅ | With G-Assist | — | — |
+| **Clips named after what happened** | ✅ | ✅ | ? | — | — |
+| **Saves clips by itself** | — | ✅ 16 games | ✅ Highlights | Marks moments only | — |
+| **Highest frame rate** | 540 fps | 144 fps | 240 fps | 60 fps | 120 fps |
+| **Frame blending (smooth motion)** | ✅ | — | — | — | — |
+| **Each sound on its own track** | ✅ | ✅ | Mic only | — | ✅ |
+| **Smaller files (HEVC or AV1)** | — | ✅ | ✅ | HEVC | ✅ |
+| **HDR video** | — | — | ✅ | — | ✅ |
+| **Share with a link** | ✅ Free, no account | Needs an account, links last 14 days | — | Links last 2 days | — |
+| **Drag clips into Discord** | ✅ | Open the folder first | ? | Export first | — |
+| **Shrink to a size, like 10 MB** | ✅ | — | — | ✅ | — |
+| **Trim** | ✅ | ✅ | ? | ✅ | — |
+
+✅ yes · — no · ? we couldn't confirm it either way. Last checked 20 October 2026, mostly from each product's own pages; where those don't say, from its official forums or feedback board. Notes:
+
+- **NVIDIA ShadowPlay:** NVIDIA doesn't publish how far back it saves; 20 minutes is what users report. Its trimming is unclear: NVIDIA's support article implies an edit button, but users say the NVIDIA App dropped trimming.
+- **Frame rates:** HasteClip's 540 fps was measured at 1080p on an RTX 4060 Ti. OBS goes higher with custom settings.
+- **HasteClip** records in H.264 so clips play everywhere, and records HDR screens in SDR.
+
+The [full comparison](https://hasteclip.com/compare) adds AMD Adrenalin and Xbox Game Bar, and has more rows, notes and sources. Product names are their owners' trademarks; HasteClip isn't affiliated with any of them. If something here is out of date, please [open an issue](https://github.com/hasteclip/hasteclip/issues).
 
 ## Platform support
 
