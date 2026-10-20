@@ -1321,7 +1321,7 @@ fn screen_capture_note(choice: settings::ScreenCapture, apps: bool, in_use: Opti
     if let Some(u) = in_use {
         return match (u.duplication, u.fell_back) {
             (true, _) => ("Recording with Desktop Duplication: no yellow border".into(), false),
-            (false, true) => ("Desktop Duplication couldn't record this display, so Windows Graphics Capture is used".into(), true),
+            (false, true) => ("Desktop Duplication can't record this display right now, so Windows Graphics Capture is used until it can".into(), true),
             (false, false) if auto_duplicates => ("Recording with Windows Graphics Capture: Windows 10 shows a yellow border".into(), false),
             (false, false) => ("Recording with Windows Graphics Capture".into(), false),
         };
@@ -1459,7 +1459,7 @@ mod screen_capture_tests {
         let using = |duplication, fell_back| Some(capture::ScreenCaptureInUse { duplication, fell_back });
         assert_eq!(screen_capture_note(Auto, false, using(true, false), true).0, "Recording with Desktop Duplication: no yellow border");
         let (note, warn) = screen_capture_note(Duplication, false, using(false, true), true);
-        assert!(warn && note.starts_with("Desktop Duplication couldn't"), "{note}");
+        assert!(warn && note.starts_with("Desktop Duplication can't"), "{note}");
         assert!(screen_capture_note(Wgc, false, using(false, false), true).0.contains("yellow border"));
         assert_eq!(screen_capture_note(Auto, false, None, true).0, "Uses Desktop Duplication here: no yellow border");
         assert_eq!(screen_capture_note(Auto, false, None, false).0, "Uses Windows Graphics Capture here");

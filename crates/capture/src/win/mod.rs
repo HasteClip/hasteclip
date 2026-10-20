@@ -683,11 +683,19 @@ fn unseen_but_drawing(gpu: &mut Option<gpu::GpuUse>, window: windows::Win32::Fou
 enum DisplayCapture {
     Wgc(d3d::Capture),
     Dupl(dupl::DuplCapture),
+    /// Windows' capture standing in for Desktop Duplication that couldn't
+    /// start or stopped, until it can (see [`Video::follow_screen`]).
+    StandIn(d3d::Capture),
 }
+
+/// How long Windows' capture stands in for Desktop Duplication before it's
+/// tried again: at first, then twice as long each time it still can't, up to
+/// the second.
+const RETRY_DUPLICATION: (Duration, Duration) = (Duration::from_secs(5), Duration::from_secs(300));
 
 impl DisplayCapture {
     /// Capture the display the way `choice` says (see [`dupl::choose`]).
-    /// Desktop Duplication that can't start falls back to Windows' capture.
+    /// Desktop Duplication that can't start has Windows' capture stand in.
     fn start(
         gpu: &d3d::Gpu,
         item: &windows::Graphics::Capture::GraphicsCaptureItem,
@@ -698,21 +706,33 @@ impl DisplayCapture {
         by: u64,
     ) -> Result<Self> {
         let (method, why) = dupl::choose(choice, gpu, monitor);
-        if method == dupl::Method::Duplication {
-            match dupl::DuplCapture::start(gpu, monitor, latest, fps) {
-                Ok(c) => {
-                    eprintln!("recording the display with Desktop Duplication ({why})");
-                    set_in_use(by, crate::ScreenCaptureInUse { duplication: true, fell_back: false });
-                    return Ok(DisplayCapture::Dupl(c));
-                }
-                Err(e) => eprintln!("can't record the display with Desktop Duplication ({e:#}); using Windows' capture"),
-            }
-        } else {
+        if method == dupl::Method::Wgc {
             eprintln!("recording the display with Windows' capture ({why})");
+            return Self::wgc(gpu, item, latest, fps, by, false);
         }
+        match Self::duplicate(gpu, monitor, latest, fps, by) {
+            Ok(c) => {
+                eprintln!("recording the display with Desktop Duplication ({why})");
+                Ok(c)
+            }
+            Err(e) => {
+                eprintln!("can't record the display with Desktop Duplication ({e:#}); using Windows' capture until it can");
+                Self::wgc(gpu, item, latest, fps, by, true)
+            }
+        }
+    }
+
+    fn duplicate(gpu: &d3d::Gpu, monitor: windows::Win32::Graphics::Gdi::HMONITOR, latest: &Arc<d3d::Latest>, fps: u32, by: u64) -> Result<Self> {
+        let c = dupl::DuplCapture::start(gpu, monitor, latest, fps)?;
+        set_in_use(by, crate::ScreenCaptureInUse { duplication: true, fell_back: false });
+        Ok(DisplayCapture::Dupl(c))
+    }
+
+    /// Windows' capture, standing in for Desktop Duplication or not.
+    fn wgc(gpu: &d3d::Gpu, item: &windows::Graphics::Capture::GraphicsCaptureItem, latest: &Arc<d3d::Latest>, fps: u32, by: u64, stand_in: bool) -> Result<Self> {
         let c = d3d::Capture::start(gpu, item, latest, None, fps)?;
-        set_in_use(by, crate::ScreenCaptureInUse { duplication: false, fell_back: method == dupl::Method::Duplication });
-        Ok(DisplayCapture::Wgc(c))
+        set_in_use(by, crate::ScreenCaptureInUse { duplication: false, fell_back: stand_in });
+        Ok(if stand_in { DisplayCapture::StandIn(c) } else { DisplayCapture::Wgc(c) })
     }
 }
 
@@ -934,7 +954,10 @@ impl Video {
     /// [`DisplayCapture`]), except while a game that needs the game capture
     /// hook (see [`hook::plan`]) is fullscreen and in focus on it. The
     /// display's capture is stopped meanwhile: while Windows' runs, some games
-    /// lose their cursor.
+    /// lose their cursor. Desktop Duplication that couldn't start or stopped
+    /// is tried again now and then (see [`RETRY_DUPLICATION`]), never given
+    /// up for good: what stopped it (a hitch as a game went fullscreen,
+    /// another app duplicating the display) may pass.
     #[allow(clippy::too_many_arguments)]
     fn follow_screen(
         gpu: d3d::Gpu,
@@ -944,7 +967,7 @@ impl Video {
         first: DisplayCapture,
         fps: u32,
         settings: crate::GameHook,
-        mut method: crate::ScreenCapture,
+        method: crate::ScreenCapture,
         by: u64,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
@@ -956,8 +979,9 @@ impl Video {
             let (item, monitor) = (item.0, monitor.0);
             system::com_init();
             let mut display = Some(first.0);
-            // Desktop Duplication stopped for good earlier: said beside the setting.
-            let mut fell_back = false;
+            // While Windows' capture stands in for Desktop Duplication: when
+            // to try it again, and how long to wait after that if it can't.
+            let mut retry = (Instant::now() + RETRY_DUPLICATION.0, RETRY_DUPLICATION.0);
             let mut hooked: Option<(windows::Win32::Foundation::HWND, String, hook::HookCapture)> = None;
             // How to capture each game window, worked out once.
             let mut plans: std::collections::HashMap<usize, hook::Plan> = Default::default();
@@ -1007,31 +1031,48 @@ impl Video {
                     None if hooked.is_some() => hooked = None,
                     _ => {}
                 }
-                // Desktop Duplication stopped for good (it couldn't start
-                // again after the display changed): Windows' capture from now on.
+                // Desktop Duplication stopped (it couldn't start again after
+                // the display changed): Windows' capture stands in.
                 if let Some(DisplayCapture::Dupl(c)) = &display
                     && let Some(why) = c.ended()
                 {
-                    eprintln!("desktop duplication stopped ({why}); recording the display with Windows' capture");
-                    display = None;
-                    method = crate::ScreenCapture::Wgc;
-                    fell_back = true;
+                    eprintln!("desktop duplication stopped ({why}); recording the display with Windows' capture until it can start again");
+                    display = DisplayCapture::wgc(&gpu, &item, &latest, fps, by, true).map_err(|e| eprintln!("can't record the display: {e:#}")).ok();
+                    retry.0 = Instant::now() + retry.1;
                 }
                 if hooked.is_none() && display.is_none() {
                     match DisplayCapture::start(&gpu, &item, monitor, &latest, fps, method, by) {
                         Ok(c) => {
-                            if fell_back {
-                                set_in_use(by, crate::ScreenCaptureInUse { duplication: false, fell_back: true });
+                            if matches!(c, DisplayCapture::StandIn(_)) {
+                                retry.0 = Instant::now() + retry.1;
                             }
                             display = Some(c);
                         }
                         Err(e) => eprintln!("can't record the display: {e:#}"),
                     }
                 }
+                // Desktop Duplication tried again, Windows' capture standing in
+                // until it starts (they draw the same picture meanwhile).
+                if let Some(DisplayCapture::StandIn(_)) = &display
+                    && Instant::now() >= retry.0
+                {
+                    match DisplayCapture::duplicate(&gpu, monitor, &latest, fps, by) {
+                        Ok(c) => {
+                            eprintln!("recording the display with Desktop Duplication again");
+                            display = Some(c);
+                            retry.1 = RETRY_DUPLICATION.0;
+                        }
+                        Err(e) => {
+                            eprintln!("desktop duplication still can't start ({e:#})");
+                            retry.1 = (retry.1 * 2).min(RETRY_DUPLICATION.1);
+                        }
+                    }
+                    retry.0 = Instant::now() + retry.1;
+                }
                 // Windows' capture sends nothing new while a fullscreen game
                 // is in focus: it can't see it (exclusive fullscreen).
                 // (Desktop Duplication sees it: it's what the display shows.)
-                if let (Some(DisplayCapture::Wgc(capture)), Some((h, exe)), Some(hook::Plan::Watch)) = (&display, &game, plan)
+                if let (Some(DisplayCapture::Wgc(capture) | DisplayCapture::StandIn(capture)), Some((h, exe)), Some(hook::Plan::Watch)) = (&display, &game, plan)
                     && let Some(percent) = unseen_but_drawing(&mut gpu_use, *h, capture.since_last_frame())
                     && frozen.insert(exe.to_lowercase())
                 {

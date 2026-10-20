@@ -322,7 +322,8 @@ pub enum ScreenCapture {
 pub struct ScreenCaptureInUse {
     pub duplication: bool,
     /// Desktop Duplication was chosen, or picked by Automatic, but couldn't
-    /// start: Windows Graphics Capture is used instead.
+    /// start or stopped: Windows Graphics Capture is used until it can (it's
+    /// tried again now and then).
     pub fell_back: bool,
 }
 

@@ -135,7 +135,7 @@ impl Duplication {
                 // Still duplicated by our capture before this one, closing.
                 Err(e) if e.code() == E_INVALIDARG && started.elapsed() < START_TIMEOUT => thread::sleep(Duration::from_millis(20)),
                 Err(e) if e.code() == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE => bail!("too many apps are capturing the screen this way at once (Windows allows four)"),
-                Err(e) if e.code() == E_ACCESSDENIED => bail!("Windows won't let it see the screen right now (a UAC prompt or the lock screen?)"),
+                Err(e) if e.code() == E_ACCESSDENIED => return Err(e).context("Windows won't let it see the screen right now (a UAC prompt or the lock screen?)"),
                 Err(e) if e.code() == DXGI_ERROR_UNSUPPORTED => bail!("Windows can't duplicate this display here ({})", e.message()),
                 Err(e) => return Err(e).context("couldn't start Desktop Duplication"),
             }
@@ -216,8 +216,9 @@ fn asks_per_second(fps: u32) -> f64 {
 }
 
 /// After the display's picture or mode changes under it (a game going
-/// exclusive fullscreen, the resolution, a UAC prompt), how long to keep
-/// trying to start again before giving up.
+/// exclusive fullscreen, the resolution), how long to keep trying to start
+/// again before giving up (see [`reopen`]): Windows' capture stands in then,
+/// until Desktop Duplication can start (see `Video::follow_screen`).
 const RESTART_FOR: Duration = Duration::from_secs(10);
 
 fn run(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, fps: u32, stop: &AtomicBool, ready: &std::sync::mpsc::Sender<Result<(), String>>) -> Result<()> {
@@ -263,6 +264,9 @@ fn run(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, fps: u32, stop: &Atom
     let quiet = 2.0 / fps.max(1) as f64;
     // When this duplication started (again), for its first picture's timeout.
     let mut started = Instant::now();
+    // When the duplication stopped working (it was lost, or one started again
+    // sent no picture), until one sends a picture again (see `reopen`).
+    let mut lost: Option<Instant> = None;
     // `HASTECLIP_DUPL_LOG=1`: asks, new pictures, cursor-only updates, since `counted.0`.
     let mut counted = (Instant::now(), 0u32, 0u32, 0u32);
     let log = std::env::var_os("HASTECLIP_DUPL_LOG").is_some();
@@ -272,6 +276,8 @@ fn run(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, fps: u32, stop: &Atom
         counted.1 += 1;
         // When a new picture came up, if there's one.
         let mut got = None;
+        // Why to start a new duplication, if it's to be.
+        let mut again = None;
         // Not waiting for one: a waiting ask holds our device's lock, so the
         // pacer and encoder would wait too (measured: up to the whole wait).
         match unsafe { d.dupl.AcquireNextFrame(0, &mut info, &mut resource) } {
@@ -300,31 +306,36 @@ fn run(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, fps: u32, stop: &Atom
             }
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
                 if first && started.elapsed() > FIRST_FRAME_TIMEOUT {
-                    bail!("Desktop Duplication sent no picture");
+                    // The first duplication can't see the display. One started
+                    // again may have come in a hitch (a game going fullscreen,
+                    // the screen coming back): another is started.
+                    if lost.is_none() {
+                        bail!("Desktop Duplication sent no picture");
+                    }
+                    again = Some("no picture".to_string());
                 }
             }
             // The display's picture changed kind (a mode change, a desktop
             // switch, a game going exclusive fullscreen): start again.
-            Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST || e.code() == DXGI_ERROR_INVALID_CALL => {
-                eprintln!("desktop duplication: lost ({}); starting again", e.message());
-                let lost = Instant::now();
-                d = loop {
-                    if stop.load(Ordering::Relaxed) {
-                        return Ok(());
-                    }
-                    match Duplication::open(gpu, monitor) {
-                        Ok(d) => break d,
-                        Err(e) if lost.elapsed() > RESTART_FOR => return Err(e.context("couldn't start Desktop Duplication again")),
-                        Err(_) => thread::sleep(Duration::from_millis(100)),
-                    }
-                };
-                // Its first picture, whether or not anything changed.
-                first = true;
-                held = None;
-                started = Instant::now();
-                continue;
-            }
+            Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST || e.code() == DXGI_ERROR_INVALID_CALL => again = Some(e.message()),
             Err(e) => return Err(e).context("Desktop Duplication failed"),
+        }
+        if let Some(why) = again {
+            eprintln!("desktop duplication: lost ({why}); starting again");
+            // Not at once when the one before never worked: Windows may be
+            // taking each away as it starts.
+            if lost.is_some() {
+                thread::sleep(Duration::from_millis(100));
+            }
+            match reopen(gpu, monitor, stop, lost.get_or_insert_with(Instant::now))? {
+                Some(new) => d = new,
+                None => return Ok(()),
+            }
+            // Its first picture, whether or not anything changed.
+            first = true;
+            held = None;
+            started = Instant::now();
+            continue;
         }
         // The picture goes up when it's new, or when the cursor moved over
         // it: looked at every time, as Windows only says when its own
@@ -355,6 +366,7 @@ fn run(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, fps: u32, stop: &Atom
             }
             if first {
                 first = false;
+                lost = None;
                 let _ = ready.send(Ok(()));
             }
         }
@@ -377,6 +389,31 @@ fn run(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, fps: u32, stop: &Atom
         }
     }
     Ok(())
+}
+
+/// Start duplicating the display again after it stopped working at `lost`:
+/// none if told to stop meanwhile. Gives up after [`RESTART_FOR`], not
+/// counting while Windows lets no one see the screen (the lock screen, a UAC
+/// prompt, Ctrl+Alt+Del): nothing can capture those (the recording keeps the
+/// last picture), and the screen comes back when they go, however long that is.
+fn reopen(gpu: &Gpu, monitor: HMONITOR, stop: &AtomicBool, lost: &mut Instant) -> Result<Option<Duplication>> {
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        match Duplication::open(gpu, monitor) {
+            Ok(d) => return Ok(Some(d)),
+            Err(e) if denied(&e) => *lost = Instant::now(),
+            Err(e) if lost.elapsed() > RESTART_FOR => return Err(e.context("couldn't start Desktop Duplication again")),
+            Err(_) => {}
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Windows lets no one see the screen now (see [`reopen`]).
+fn denied(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<windows::core::Error>().is_some_and(|w| w.code() == E_ACCESSDENIED)
 }
 
 /// Copy a frame of Windows' into a texture of our own (`held`, reused while
@@ -497,6 +534,41 @@ mod tests {
         assert_eq!(asks_per_second(60), 240.0);
         assert_eq!(asks_per_second(600), 2400.0);
         assert_eq!(asks_per_second(0), 4.0);
+    }
+
+    /// The lock screen's refusal is told apart from other failures, through
+    /// what `Duplication::open` adds to it.
+    #[test]
+    fn tells_the_lock_screen_apart() {
+        let failed = |code| Err::<(), _>(windows::core::Error::from(code)).context("Windows won't let it see the screen right now").unwrap_err();
+        assert!(denied(&failed(E_ACCESSDENIED)));
+        assert!(!denied(&failed(E_INVALIDARG)));
+        assert!(!denied(&anyhow::anyhow!("Desktop Duplication sent no picture")));
+    }
+
+    /// Desktop Duplication that can't start (another of ours duplicates the
+    /// display) has Windows' capture stand in, and takes over once it can.
+    #[test]
+    #[ignore = "captures the screen: cargo test -p capture stands_in_until_duplication_can -- --ignored"]
+    fn stands_in_until_duplication_can() {
+        unsafe { windows::Win32::UI::HiDpi::SetThreadDpiAwarenessContext(windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        let screen = super::super::system::list_screens().into_iter().next().expect("a screen");
+        let gpu = Gpu::new().unwrap();
+        let held = Duplication::open(&gpu, super::super::system::find_monitor(&screen.id)).unwrap();
+        let video = crate::VideoSource::Screen { id: screen.id, hook: crate::GameHook { auto: false, allowed: Vec::new() }, method: crate::ScreenCapture::Duplication };
+        let preview = crate::preview::VideoPreview::start(&video, Some(360), None, 30, None, None);
+        let becomes = |want: crate::ScreenCaptureInUse, within: Duration| {
+            let t = Instant::now();
+            while crate::screen_capture_in_use() != Some(want) {
+                assert!(t.elapsed() < within, "still {:?} after {within:?}", crate::screen_capture_in_use());
+                thread::sleep(Duration::from_millis(50));
+            }
+            eprintln!("{want:?} after {:.1?}", t.elapsed());
+        };
+        becomes(crate::ScreenCaptureInUse { duplication: false, fell_back: true }, Duration::from_secs(10));
+        drop(held);
+        becomes(crate::ScreenCaptureInUse { duplication: true, fell_back: false }, Duration::from_secs(15));
+        drop(preview);
     }
 
     #[test]
