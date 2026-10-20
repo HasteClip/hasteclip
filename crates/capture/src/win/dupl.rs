@@ -239,6 +239,17 @@ fn run(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, fps: u32, stop: &Atom
         d.hdr.map_or(String::new(), |s| format!(", HDR (SDR white at {:.0} nits)", 80.0 / s))
     );
     let every = Duration::from_secs_f64(1.0 / asks_per_second(fps));
+    // A still screen is asked only often enough that a new picture is noticed
+    // in time for its frame (see `BLEND_LATE`): it's timed by when it came
+    // up, however late it's noticed. Asking at the full rate finds nothing
+    // nearly every time, and each ask costs about 45 µs of a core, waking
+    // included (measured: 5% of one at 540 fps, 1% at 60). Still is nothing
+    // new (no picture, the cursor still) for a look, and for twice as long
+    // as between those asks: a game showing pictures faster than that, two
+    // could come between asks and one be lost.
+    let still_every = every.max(Duration::from_secs_f64(super::BLEND_LATE / 2.0));
+    let still_after = Duration::from_secs_f64(1.0 / fps.max(1) as f64).max(2 * still_every);
+    let mut changed = Instant::now();
     let mut next = Instant::now();
     let mut first = true;
     // The picture held (since its last frame was released), so the cursor
@@ -261,6 +272,8 @@ fn run(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, fps: u32, stop: &Atom
         counted.1 += 1;
         // When a new picture came up, if there's one.
         let mut got = None;
+        // Not waiting for one: a waiting ask holds our device's lock, so the
+        // pacer and encoder would wait too (measured: up to the whole wait).
         match unsafe { d.dupl.AcquireNextFrame(0, &mut info, &mut resource) } {
             Ok(()) => {
                 let at = super::system::host_now();
@@ -321,6 +334,7 @@ fn run(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, fps: u32, stop: &Atom
         let moved = last_cursor != Some((pos.x, pos.y));
         if let Some((texture, view)) = held.as_ref().filter(|_| got.is_some() || moved) {
             last_cursor = Some((pos.x, pos.y));
+            changed = Instant::now();
             let at = got.unwrap_or_else(super::system::host_now);
             draw(gpu, &quad, &target, latest, texture, view, &d);
             cursor.draw_on_screen(gpu, &quad, latest, &target, d.origin, d.size);
@@ -354,7 +368,7 @@ fn run(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, fps: u32, stop: &Atom
             );
             counted = (Instant::now(), 0, 0, 0);
         }
-        next += every;
+        next += if changed.elapsed() < still_after { every } else { still_every };
         let now = Instant::now();
         if next > now {
             thread::sleep(next - now);

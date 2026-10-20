@@ -522,7 +522,7 @@ impl PictureSource {
             }
             PictureSource::Screen(item, monitor, hook, method) => {
                 let by = NEXT_FOLLOWER.fetch_add(1, Ordering::Relaxed);
-                let capture = DisplayCapture::start(gpu, &item, monitor, &latest, fps, method, by)?;
+                let capture = DisplayCapture::start(gpu, &item, monitor, latest, fps, method, by)?;
                 // Wait for the first frame so a capture that can't see the screen
                 // fails here, visibly, instead of producing an empty file.
                 let deadline = Instant::now() + Duration::from_secs(3);
@@ -1243,7 +1243,8 @@ impl FrameBlend {
 
 /// How long after a frame's time it's made: the game capture knows a picture
 /// is new a few milliseconds after it came up (it compares it with the last),
-/// and it must still get into its frame. A guess.
+/// and it must still get into its frame; Desktop Duplication asks for new
+/// pictures every half of it while the screen is still. A guess.
 const BLEND_LATE: f64 = 0.012;
 /// How much of the way the looks move toward halfway between the game's
 /// pictures, on each picture. A guess: slow enough that the noise in
