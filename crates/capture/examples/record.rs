@@ -3,7 +3,7 @@
 //! Args are sources: `mic:<device>`, `desktop`, `desktop-excl` (desktop minus app
 //! sources), `app:<bundle id or exe>`. Append `@mix`, `@track` to limit where it
 //! goes (default both). Env: REPLAY=1, SECS=n, EXT=mov, HEIGHT=n (0 = native),
-//! FPS=n, BLEND=n (looks per frame), SOFT=1 (blended softly), SHAPE=16:9[:fill|fit|stretch] (fill unless said), SOFTWARE=1, LIST=1 (list the inputs), SWITCH_MIC=<device> (the first source, a mic, switches to it halfway), SCREEN=<id>, WEBCAM=<id|1>, WEBCAM_FORMAT=WxH, APP=<exe>[,<exe>…] (record those apps' windows,
+//! FPS=n, BLEND=n (looks per frame), SOFT=1 (blended softly), SHAPE=16:9[:fill|fit|stretch] (fill unless said), SOFTWARE=1, LIST=1 (list the inputs), SWITCH_MIC=<device> (the first source, a mic, switches to it halfway), SCREEN=<id>, METHOD=dupl|wgc (how the screen is captured, Windows), WEBCAM=<id|1>, WEBCAM_FORMAT=WxH, APP=<exe>[,<exe>…] (record those apps' windows,
 //! following focus), HOOK=0 (never the game capture hook), ALLOW=<exe>[,…]
 //! (games with anti-cheat it may be used on), HASTECLIP_FORCE_HOOK=<exe>[,…] (always, for testing).
 use capture::sources::{AudioSource, SourceKind};
@@ -77,7 +77,16 @@ default: {:?}", d.inputs.iter().map(|i| &i.name).collect::<Vec<_>>(), d.default_
                     away_when_unfocused: env("AWAY").is_some(),
                     hook,
                 },
-                None => capture::VideoSource::Screen { id: env("SCREEN").unwrap_or_default(), hook },
+                // METHOD=dupl|wgc: how the display is captured (Automatic unless said).
+                None => capture::VideoSource::Screen {
+                    id: env("SCREEN").unwrap_or_default(),
+                    hook,
+                    method: match env("METHOD").as_deref() {
+                        Some("dupl") => capture::ScreenCapture::Duplication,
+                        Some("wgc") => capture::ScreenCapture::Wgc,
+                        _ => capture::ScreenCapture::Auto,
+                    },
+                },
             }
         },
         away_screen: None,

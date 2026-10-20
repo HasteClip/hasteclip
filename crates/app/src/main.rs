@@ -933,6 +933,7 @@ impl App {
             _ => capture::VideoSource::Screen {
                 id: self.screens.get(self.settings.display_index).map(|d| d.id.clone()).unwrap_or_else(|| "0".to_owned()),
                 hook: self.game_hook(),
+                method: self.settings.screen_capture.into(),
             },
         }
     }

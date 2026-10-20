@@ -2,7 +2,8 @@
 //! WASAPI, all in-process — no external tools.
 //!
 //! - **Video**: WGC delivers the monitor, or one app's window, as BGRA textures
-//!   on the GPU (`d3d`). A pacer thread converts the newest one to NV12 at the
+//!   on the GPU (`d3d`); a monitor can be captured with Desktop Duplication
+//!   instead (`dupl`), which draws no yellow border on Windows 10. A pacer thread converts the newest one to NV12 at the
 //!   output size with the GPU's video processor and hands it to a Media
 //!   Foundation H.264 encoder (`h264`) at exactly `fps`, so the output is
 //!   constant frame rate even when the screen is static and WGC sends nothing.
@@ -24,6 +25,7 @@ mod camera;
 mod changes;
 mod cursor;
 mod d3d;
+mod dupl;
 pub mod decode;
 pub(crate) mod direct;
 pub mod gpu;
@@ -424,8 +426,9 @@ impl Session {
 
 /// Where a session's picture comes from: a display, or an app's window.
 enum PictureSource {
-    /// A display (and which), and when to switch to the game capture hook.
-    Screen(windows::Graphics::Capture::GraphicsCaptureItem, windows::Win32::Graphics::Gdi::HMONITOR, crate::GameHook),
+    /// A display (and which), when to switch to the game capture hook, and
+    /// how to capture it.
+    Screen(windows::Graphics::Capture::GraphicsCaptureItem, windows::Win32::Graphics::Gdi::HMONITOR, crate::GameHook, crate::ScreenCapture),
     /// The apps to follow, changeable while capturing.
     Apps(AppList),
 }
@@ -474,11 +477,11 @@ impl PictureSource {
     /// display's — so it can't change mid-file, whatever the windows do.
     fn plan(source: &VideoSource) -> Result<(Self, (u32, u32))> {
         Ok(match source {
-            VideoSource::Screen { id, hook } => {
+            VideoSource::Screen { id, hook, method } => {
                 let monitor = system::find_monitor(id);
                 let item = d3d::monitor_item(monitor)?;
                 let size = item.Size()?;
-                (PictureSource::Screen(item, monitor, hook.clone()), (size.Width.max(2) as u32, size.Height.max(2) as u32))
+                (PictureSource::Screen(item, monitor, hook.clone(), *method), (size.Width.max(2) as u32, size.Height.max(2) as u32))
             }
             VideoSource::Apps { .. } => {
                 let (_, w, h) = system::primary_monitor();
@@ -517,8 +520,9 @@ impl PictureSource {
                 }
                 Video::follow_apps(gpu.clone(), latest.clone(), list, fps, away)
             }
-            PictureSource::Screen(item, monitor, hook) => {
-                let capture = d3d::Capture::start(gpu, &item, &latest, None, fps)?;
+            PictureSource::Screen(item, monitor, hook, method) => {
+                let by = NEXT_FOLLOWER.fetch_add(1, Ordering::Relaxed);
+                let capture = DisplayCapture::start(gpu, &item, monitor, &latest, fps, method, by)?;
                 // Wait for the first frame so a capture that can't see the screen
                 // fails here, visibly, instead of producing an empty file.
                 let deadline = Instant::now() + Duration::from_secs(3);
@@ -528,7 +532,7 @@ impl PictureSource {
                     }
                     thread::sleep(Duration::from_millis(10));
                 }
-                Video::follow_screen(gpu.clone(), latest.clone(), item, monitor, capture, fps, hook)
+                Video::follow_screen(gpu.clone(), latest.clone(), item, monitor, capture, fps, hook, method, by)
             }
         })
     }
@@ -673,6 +677,69 @@ const DRAWING: f64 = 0.3;
 fn unseen_but_drawing(gpu: &mut Option<gpu::GpuUse>, window: windows::Win32::Foundation::HWND, since_last_frame: Duration) -> Option<f64> {
     let percent = gpu.as_mut()?.percent(system::window_pid(window));
     (since_last_frame > FROZEN && percent > DRAWING).then_some(percent)
+}
+
+/// A display's capture: Windows' own, or Desktop Duplication (see `dupl`).
+enum DisplayCapture {
+    Wgc(d3d::Capture),
+    Dupl(dupl::DuplCapture),
+}
+
+impl DisplayCapture {
+    /// Capture the display the way `choice` says (see [`dupl::choose`]).
+    /// Desktop Duplication that can't start falls back to Windows' capture.
+    fn start(
+        gpu: &d3d::Gpu,
+        item: &windows::Graphics::Capture::GraphicsCaptureItem,
+        monitor: windows::Win32::Graphics::Gdi::HMONITOR,
+        latest: &Arc<d3d::Latest>,
+        fps: u32,
+        choice: crate::ScreenCapture,
+        by: u64,
+    ) -> Result<Self> {
+        let (method, why) = dupl::choose(choice, gpu, monitor);
+        if method == dupl::Method::Duplication {
+            match dupl::DuplCapture::start(gpu, monitor, latest, fps) {
+                Ok(c) => {
+                    eprintln!("recording the display with Desktop Duplication ({why})");
+                    set_in_use(by, crate::ScreenCaptureInUse { duplication: true, fell_back: false });
+                    return Ok(DisplayCapture::Dupl(c));
+                }
+                Err(e) => eprintln!("can't record the display with Desktop Duplication ({e:#}); using Windows' capture"),
+            }
+        } else {
+            eprintln!("recording the display with Windows' capture ({why})");
+        }
+        let c = d3d::Capture::start(gpu, item, latest, None, fps)?;
+        set_in_use(by, crate::ScreenCaptureInUse { duplication: false, fell_back: method == dupl::Method::Duplication });
+        Ok(DisplayCapture::Wgc(c))
+    }
+}
+
+/// How the display is being captured (see [`crate::screen_capture_in_use`]),
+/// and by which [`Video::follow_screen`] (its number): a preview's closing
+/// as a recording's starts mustn't take the recording's away.
+static IN_USE: std::sync::Mutex<Option<(u64, crate::ScreenCaptureInUse)>> = std::sync::Mutex::new(None);
+static NEXT_FOLLOWER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn set_in_use(by: u64, now: crate::ScreenCaptureInUse) {
+    *IN_USE.lock().unwrap() = Some((by, now));
+}
+
+/// `by` stopped: it no longer says how the display is captured, if it did.
+fn clear_in_use(by: u64) {
+    let mut in_use = IN_USE.lock().unwrap();
+    if in_use.is_some_and(|(b, _)| b == by) {
+        *in_use = None;
+    }
+}
+
+pub(crate) fn screen_capture_in_use() -> Option<crate::ScreenCaptureInUse> {
+    IN_USE.lock().unwrap().map(|(_, u)| u)
+}
+
+pub(crate) fn screen_capture_auto_duplicates() -> bool {
+    dupl::border_always_shown()
 }
 
 /// Keeps the picture coming: one capture of a display, or the windows of a set
@@ -863,18 +930,22 @@ impl Video {
         Video::App { stop, thread }
     }
 
-    /// Record a display: Windows' capture of it, except while a game that
-    /// needs the game capture hook (see [`hook::plan`]) is fullscreen and in
-    /// focus on it. Windows' capture of the display is stopped meanwhile: while
-    /// it runs, some games lose their cursor.
+    /// Record a display: Windows' capture of it (or Desktop Duplication, see
+    /// [`DisplayCapture`]), except while a game that needs the game capture
+    /// hook (see [`hook::plan`]) is fullscreen and in focus on it. The
+    /// display's capture is stopped meanwhile: while Windows' runs, some games
+    /// lose their cursor.
+    #[allow(clippy::too_many_arguments)]
     fn follow_screen(
         gpu: d3d::Gpu,
         latest: Arc<d3d::Latest>,
         item: windows::Graphics::Capture::GraphicsCaptureItem,
         monitor: windows::Win32::Graphics::Gdi::HMONITOR,
-        first: d3d::Capture,
+        first: DisplayCapture,
         fps: u32,
         settings: crate::GameHook,
+        mut method: crate::ScreenCapture,
+        by: u64,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
@@ -885,6 +956,8 @@ impl Video {
             let (item, monitor) = (item.0, monitor.0);
             system::com_init();
             let mut display = Some(first.0);
+            // Desktop Duplication stopped for good earlier: said beside the setting.
+            let mut fell_back = false;
             let mut hooked: Option<(windows::Win32::Foundation::HWND, String, hook::HookCapture)> = None;
             // How to capture each game window, worked out once.
             let mut plans: std::collections::HashMap<usize, hook::Plan> = Default::default();
@@ -934,15 +1007,31 @@ impl Video {
                     None if hooked.is_some() => hooked = None,
                     _ => {}
                 }
+                // Desktop Duplication stopped for good (it couldn't start
+                // again after the display changed): Windows' capture from now on.
+                if let Some(DisplayCapture::Dupl(c)) = &display
+                    && let Some(why) = c.ended()
+                {
+                    eprintln!("desktop duplication stopped ({why}); recording the display with Windows' capture");
+                    display = None;
+                    method = crate::ScreenCapture::Wgc;
+                    fell_back = true;
+                }
                 if hooked.is_none() && display.is_none() {
-                    match d3d::Capture::start(&gpu, &item, &latest, None, fps) {
-                        Ok(c) => display = Some(c),
+                    match DisplayCapture::start(&gpu, &item, monitor, &latest, fps, method, by) {
+                        Ok(c) => {
+                            if fell_back {
+                                set_in_use(by, crate::ScreenCaptureInUse { duplication: false, fell_back: true });
+                            }
+                            display = Some(c);
+                        }
                         Err(e) => eprintln!("can't record the display: {e:#}"),
                     }
                 }
                 // Windows' capture sends nothing new while a fullscreen game
                 // is in focus: it can't see it (exclusive fullscreen).
-                if let (Some(capture), Some((h, exe)), Some(hook::Plan::Watch)) = (&display, &game, plan)
+                // (Desktop Duplication sees it: it's what the display shows.)
+                if let (Some(DisplayCapture::Wgc(capture)), Some((h, exe)), Some(hook::Plan::Watch)) = (&display, &game, plan)
                     && let Some(percent) = unseen_but_drawing(&mut gpu_use, *h, capture.since_last_frame())
                     && frozen.insert(exe.to_lowercase())
                 {
@@ -953,6 +1042,7 @@ impl Video {
                     thread::sleep(Duration::from_millis(20));
                 }
             }
+            clear_in_use(by);
         });
         Video::Screen { stop, thread }
     }
@@ -1648,7 +1738,7 @@ mod tests {
     #[ignore = "captures the screen: cargo test -p capture screenshot_of_the_screen -- --ignored"]
     fn screenshot_of_the_screen() {
         let screen = system::list_screens().into_iter().next().expect("a screen");
-        let video = VideoSource::Screen { id: screen.id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() } };
+        let video = VideoSource::Screen { id: screen.id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() }, method: Default::default() };
         let mut rec = WinRecorder::new(Arc::new(LiveAudio::default()));
         let t = Instant::now();
         let img = rec.screenshot(&video).unwrap().finish().unwrap();
@@ -1671,7 +1761,7 @@ mod tests {
     #[ignore = "captures the screen: cargo test -p capture screenshot_while_clipping -- --ignored"]
     fn screenshot_while_clipping() {
         let screen = system::list_screens().into_iter().next().expect("a screen");
-        let video = VideoSource::Screen { id: screen.id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() } };
+        let video = VideoSource::Screen { id: screen.id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() }, method: Default::default() };
         let settings = EncodeSettings {
             output_dir: std::env::temp_dir().join("hc-shot-test"),
             container_ext: "mp4".into(),

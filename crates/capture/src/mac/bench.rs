@@ -36,7 +36,7 @@ fn settings(fps: u32, kbps: u32) -> EncodeSettings {
         shape: None,
         use_hardware: true,
         replay_seconds: 60,
-        video: VideoSource::Screen { id: String::new(), hook: Default::default() },
+        video: VideoSource::Screen { id: String::new(), hook: Default::default(), method: Default::default() },
         away_screen: None,
         webcam: None,
         sources: Vec::new(),
@@ -247,7 +247,7 @@ fn spawn_sampler(stop: Arc<AtomicBool>) -> thread::JoinHandle<(Vec<f64>, Vec<f64
 /// Record the main display (and the webcam, as `mode` says) for `secs` into
 /// files in `dir`, and report what it cost.
 pub fn live(mode: LiveMode, secs: f64, camera: &str, dir: &Path, kbps: u32, cam_kbps: u32, target_height: Option<u32>) -> Result<()> {
-    let source = VideoSource::Screen { id: String::new(), hook: Default::default() };
+    let source = VideoSource::Screen { id: String::new(), hook: Default::default(), method: Default::default() };
     let (content, display, (w, h)) = super::video::plan(&source, target_height, None)?;
     let fps = 60;
     let s = settings(fps, kbps);

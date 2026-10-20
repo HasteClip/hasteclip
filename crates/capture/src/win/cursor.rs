@@ -1,7 +1,8 @@
 //! The mouse cursor, drawn over a game's picture from the capture hook (which,
 //! unlike Windows Graphics Capture, copies the game's frames without it):
 //! Windows' current cursor image, where the cursor is in the game's window,
-//! while the game is in focus and shows a cursor.
+//! while the game is in focus and shows a cursor. And over a display's
+//! picture from Desktop Duplication, which hands the cursor over separately.
 
 use anyhow::{Context, Result};
 use windows::Win32::Foundation::{HWND, POINT, RECT};
@@ -46,16 +47,21 @@ impl CursorLayer {
         }
     }
 
+    /// Draw the cursor over a display's picture in `latest` (through
+    /// `target`; `size` of it, from the top-left corner, showing the display
+    /// whose top-left corner is at `origin` on the desktop), wherever it is on
+    /// it, if Windows shows one. Physical pixels: the calling thread is per-monitor DPI aware.
+    pub(crate) fn draw_on_screen(&mut self, gpu: &Gpu, quad: &Quad, latest: &Latest, target: &ID3D11RenderTargetView, origin: (i32, i32), size: (u32, u32)) {
+        if let Err(e) = self.try_place(gpu, quad, latest, target, POINT { x: origin.0, y: origin.1 }, (1.0, 1.0), size) {
+            eprintln!("cursor: {e:#}");
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn try_draw(&mut self, gpu: &Gpu, quad: &Quad, latest: &Latest, target: &ID3D11RenderTargetView, window: HWND, pid: u32, size: (u32, u32)) -> Result<()> {
         let mut focused = 0u32;
         unsafe { GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut focused)) };
         if focused != pid {
-            return Ok(());
-        }
-        let mut info = CURSORINFO { cbSize: std::mem::size_of::<CURSORINFO>() as u32, ..Default::default() };
-        unsafe { GetCursorInfo(&mut info) }?;
-        if info.flags.0 & CURSOR_SHOWING.0 == 0 || info.hCursor.is_invalid() {
             return Ok(());
         }
         // Where the client area is and how big, in physical pixels (this
@@ -68,7 +74,19 @@ impl CursorLayer {
             let _ = ClientToScreen(window, &mut origin);
         }
         let (cw, ch) = ((client.right - client.left).max(1) as f32, (client.bottom - client.top).max(1) as f32);
-        let (sx, sy) = (size.0 as f32 / cw, size.1 as f32 / ch);
+        self.try_place(gpu, quad, latest, target, origin, (size.0 as f32 / cw, size.1 as f32 / ch), size)
+    }
+
+    /// Draw the cursor, if Windows shows one, where it is against `origin`
+    /// (desktop pixels at the picture's top-left corner), `scale`d from the
+    /// desktop's pixels to the picture's, on the picture (`size` of `latest`).
+    #[allow(clippy::too_many_arguments)]
+    fn try_place(&mut self, gpu: &Gpu, quad: &Quad, latest: &Latest, target: &ID3D11RenderTargetView, origin: POINT, (sx, sy): (f32, f32), size: (u32, u32)) -> Result<()> {
+        let mut info = CURSORINFO { cbSize: std::mem::size_of::<CURSORINFO>() as u32, ..Default::default() };
+        unsafe { GetCursorInfo(&mut info) }?;
+        if info.flags.0 & CURSOR_SHOWING.0 == 0 || info.hCursor.is_invalid() {
+            return Ok(());
+        }
         let handle = info.hCursor.0 as isize;
         if self.image.as_ref().is_none_or(|(h, _)| *h != handle) {
             self.image = cursor_image(info.hCursor.0).map(|img| upload(gpu, img)).transpose()?.map(|i| (handle, i));
@@ -85,6 +103,7 @@ impl CursorLayer {
             uv: [0.0, 0.0, 1.0, 1.0],
             // Only on the picture.
             clip: RECT { left: 0, top: 0, right: size.0 as i32, bottom: size.1 as i32 },
+            turns: 0,
         };
         quad.draw(gpu, target, (latest.width, latest.height), &image.view, &at, false);
         Ok(())

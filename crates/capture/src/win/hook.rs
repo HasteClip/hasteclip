@@ -621,6 +621,7 @@ impl Source {
                     dest: [0.0, 0.0, w as f32, h as f32],
                     uv: if self.flip { [0.0, 1.0, 1.0, 0.0] } else { [0.0, 0.0, 1.0, 1.0] },
                     clip: RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 },
+                    turns: 0,
                 };
                 quad.draw(gpu, target, (latest.width, latest.height), &view, &at, true);
             }

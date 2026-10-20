@@ -911,7 +911,7 @@ fn is_keyframe(sample: &CMSampleBuffer) -> bool {
 pub(crate) fn probe_encoder(width: usize, height: usize) -> String {
     let s = EncodeSettings {
         output_dir: std::env::temp_dir(), container_ext: "mp4".into(), fps: 60, blend_samples: 1, blend_shape: Default::default(), video_bitrate_kbps: 20000, target_height: None, shape: None,
-        use_hardware: true, replay_seconds: 5, video: crate::VideoSource::Screen { id: String::new(), hook: Default::default() },
+        use_hardware: true, replay_seconds: 5, video: crate::VideoSource::Screen { id: String::new(), hook: Default::default(), method: Default::default() },
         away_screen: None, webcam: None, sources: Vec::new(),
     };
     match probe_video_format(width, height, &s) {
