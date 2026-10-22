@@ -69,7 +69,8 @@ pub(crate) fn monitors() -> Vec<Monitor> {
         .into_iter()
         .filter_map(|o| {
             let name = o.name.clone()?;
-            let (w, h) = o.size?;
+            // KWin streams a turned monitor turned: as tall as it's shown.
+            let (w, h) = o.size.map(|(w, h)| if o.sideways { (h, w) } else { (w, h) })?;
             let label = match &o.description {
                 Some(d) if !d.trim().is_empty() && d.trim() != name => format!("{name} ({})", d.trim()),
                 _ => name.clone(),
@@ -85,10 +86,14 @@ struct Output {
     wl: wl_output::WlOutput,
     name: Option<String>,
     description: Option<String>,
+    /// The current mode's size, in the panel's own pixels (unturned).
     size: Option<(i32, i32)>,
     position: (i32, i32),
     /// The current mode's refresh rate, in mHz.
     refresh: Option<i32>,
+    /// Turned a quarter (a portrait monitor): shown, and streamed, with its
+    /// sides swapped.
+    sideways: bool,
 }
 
 #[derive(Default)]
@@ -134,7 +139,7 @@ impl Session {
         for g in globals.contents().clone_list() {
             if g.interface == wl_output::WlOutput::interface().name {
                 let wl = globals.registry().bind::<wl_output::WlOutput, _, _>(g.name, g.version.min(4), &qh, ());
-                state.outputs.push(Output { wl, name: None, description: None, size: None, position: (0, 0), refresh: None });
+                state.outputs.push(Output { wl, name: None, description: None, size: None, position: (0, 0), refresh: None, sideways: false });
             }
         }
         queue.roundtrip(&mut state).context("the Wayland compositor didn't answer")?;
@@ -252,7 +257,9 @@ impl Dispatch<wl_output::WlOutput, ()> for State {
         match event {
             wl_output::Event::Name { name } => o.name = Some(name),
             wl_output::Event::Description { description } => o.description = Some(description),
-            wl_output::Event::Geometry { x, y, make, model, .. } => {
+            wl_output::Event::Geometry { x, y, make, model, transform, .. } => {
+                use wl_output::Transform as T;
+                o.sideways = matches!(transform, WEnum::Value(T::_90 | T::_270 | T::Flipped90 | T::Flipped270));
                 o.position = (x, y);
                 if o.description.is_none() {
                     o.description = Some(format!("{make} {model}").trim().to_owned());
