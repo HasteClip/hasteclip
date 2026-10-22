@@ -28,6 +28,7 @@
 //! Recording games and apps by their windows isn't offered: Wayland doesn't
 //! let an app see which window is in front, or capture one without asking.
 
+mod apps;
 pub mod audio;
 mod camera;
 pub mod ffmpeg;
@@ -129,6 +130,16 @@ pub fn list_screens() -> Vec<Device> {
         }
     }
     vec![Device { id: SCREEN_ID.into(), name: "Screen (picked when recording first starts)".into() }]
+}
+
+/// Whether games and apps can be recorded (KDE Plasma, so far).
+pub(crate) fn app_capture() -> bool {
+    apps::available()
+}
+
+/// Running programs with a window, for `VideoSource::Apps`.
+pub(crate) fn list_windowed_apps() -> Vec<Device> {
+    if apps::available() { apps::list() } else { Vec::new() }
 }
 
 /// Forget which screen was picked, so the next capture (the preview, when
@@ -264,26 +275,42 @@ impl Recorder for LinuxRecorder {
     }
 
     fn screenshot(&mut self, video: &VideoSource) -> Result<crate::PendingShot> {
-        if let Some(screen) = self.session.as_ref().and_then(|s| s.screen.as_ref()) {
-            return shot_of(&screen.latest);
+        if let Some(feed) = self.session.as_ref().and_then(|s| s.feed.as_ref()) {
+            return shot_of(feed);
         }
-        // Nothing running: a capture of its own, for one picture.
-        let screen = open_screen(video)?;
+        // Nothing running: a capture of its own, for one picture. A screen
+        // has its picture by now; games and apps take a moment to find the
+        // one that's showing.
+        let feed = Feed::open(video, None)?;
         let deadline = Instant::now() + Duration::from_secs(2);
-        while !screen.latest.has_frame() && Instant::now() < deadline {
-            screen.latest.want();
+        while (feed.get().is_none() || feed.waiting()) && Instant::now() < deadline {
+            feed.want();
             thread::sleep(Duration::from_millis(10));
         }
-        let shot = shot_of(&screen.latest);
-        screen::release(screen);
+        let shot = shot_of(&feed);
+        feed.release();
         shot
+    }
+
+    fn update_video(&mut self, video: &VideoSource) -> bool {
+        match (self.session.as_ref().and_then(|s| s.feed.as_ref()), video) {
+            (Some(Feed::Apps(a)), VideoSource::Apps { ids, away_when_unfocused, .. }) => {
+                a.set(ids, *away_when_unfocused);
+                true
+            }
+            _ => false,
+        }
     }
 }
 
-/// A screenshot of the newest picture in `latest`: all of the screen at its
-/// own size, without the webcam. Made opaque B, G, R, A rows when finished.
-fn shot_of(latest: &screen::Latest) -> Result<crate::PendingShot> {
-    let (frame, _) = latest.get().context("nothing has been captured yet. Try again in a moment")?;
+/// A screenshot of the newest picture: all of the screen, or the game's
+/// window, at its own size, without the webcam. Made opaque B, G, R, A rows
+/// when finished.
+fn shot_of(feed: &Feed) -> Result<crate::PendingShot> {
+    if feed.waiting() {
+        bail!("none of the games and apps you record is showing");
+    }
+    let (frame, _) = feed.get().context("nothing has been captured yet. Try again in a moment")?;
     Ok(crate::PendingShot::new(move || {
         let row = frame.width as usize * 4;
         let mut bgra = Vec::with_capacity(row * frame.height as usize);
@@ -321,18 +348,84 @@ enum Target {
 /// are exact, so this only delays writing — it never shifts audio against video.
 const MIX_LATENCY: f64 = 0.3;
 
-/// The screen, for a video source: games and apps can't be recorded here.
-fn open_screen(source: &VideoSource) -> Result<Arc<screen::Screen>> {
-    match source {
-        VideoSource::Screen { id, .. } => screen::acquire(id),
-        VideoSource::Apps { .. } => bail!("recording games and apps isn't available on Linux — record the screen instead"),
+/// Where the pictures come from: a screen, or games and apps.
+#[derive(Clone)]
+enum Feed {
+    Screen(Arc<screen::Screen>),
+    Apps(Arc<apps::Apps>),
+}
+
+impl Feed {
+    /// Start `source`'s pictures. Games and apps show the away screen (else
+    /// black) until one of them is found.
+    fn open(source: &VideoSource, away_screen: Option<&crate::StillImage>) -> Result<Self> {
+        match source {
+            VideoSource::Screen { id, .. } => Ok(Self::Screen(screen::acquire(id)?)),
+            VideoSource::Apps { ids, away_when_unfocused, .. } if apps::available() => {
+                Ok(Self::Apps(apps::Apps::start(ids, *away_when_unfocused, away_screen)))
+            }
+            VideoSource::Apps { .. } => bail!("recording games and apps is only available on KDE Plasma so far — record the screen instead"),
+        }
+    }
+
+    /// The size pictures are fitted into before scaling: the screen's, or
+    /// for games and apps the main display's.
+    fn size(&self) -> (u32, u32) {
+        match self {
+            Self::Screen(s) => s.latest.get().map_or((1920, 1080), |(f, _)| (f.width, f.height)),
+            Self::Apps(_) => display_pixels(None).unwrap_or((1920, 1080)),
+        }
+    }
+
+    /// Ask a source that reads the screen on request (X11) for the next picture.
+    fn want(&self) {
+        if let Self::Screen(s) = self {
+            s.latest.want();
+        }
+    }
+
+    /// The newest picture and a number that changes with it.
+    fn get(&self) -> Option<(Arc<screen::Frame>, u64)> {
+        match self {
+            Self::Screen(s) => s.latest.get(),
+            Self::Apps(a) => a.get(),
+        }
+    }
+
+    /// Why the pictures stopped, if they did (games and apps don't stop).
+    fn ended(&self) -> Option<String> {
+        match self {
+            Self::Screen(s) => s.latest.ended(),
+            Self::Apps(_) => None,
+        }
+    }
+
+    /// Whether none of the games and apps recorded is showing.
+    fn waiting(&self) -> bool {
+        matches!(self, Self::Apps(a) if a.waiting())
+    }
+
+    /// The game or app whose window is recorded, while it shows.
+    fn app(&self) -> Option<String> {
+        match self {
+            Self::Apps(a) => a.app(),
+            Self::Screen(_) => None,
+        }
+    }
+
+    /// Let go. A screen keeps running a little longer, in case it's taken up
+    /// again right away (`screen::release`).
+    fn release(self) {
+        if let Self::Screen(s) = self {
+            screen::release(s);
+        }
     }
 }
 
 /// Everything a running capture owns. Torn down in `finish` in an order that
 /// lets every encoder flush into the writer before it closes the file.
 struct Session {
-    screen: Option<Arc<screen::Screen>>,
+    feed: Option<Feed>,
     pacer: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
     audio: Option<AudioCapture>,
     mixer: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
@@ -344,8 +437,8 @@ struct Session {
 
 impl Session {
     fn start(s: &EncodeSettings, target: Target, live: &Arc<LiveAudio>, mov: bool) -> Result<Self> {
-        let screen = open_screen(&s.video)?;
-        let (canvas_w, canvas_h) = screen.latest.get().map_or((1920, 1080), |(f, _)| (f.width, f.height));
+        let feed = Feed::open(&s.video, s.away_screen.as_deref())?;
+        let (canvas_w, canvas_h) = feed.size();
         let (width, height) = crate::recorded_size(canvas_w, canvas_h, s.target_height, s.shape);
         let framing = s.shape.map_or(crate::Framing::Fit, |shape| shape.framing);
         let clock = Arc::new(Clock::default());
@@ -362,7 +455,7 @@ impl Session {
         let writer_tx = writer.tx.clone();
 
         let mut session = Self {
-            screen: Some(screen.clone()),
+            feed: Some(feed.clone()),
             pacer: None,
             audio: None,
             mixer: None,
@@ -390,7 +483,7 @@ impl Session {
             session.mixer = Some((stop, mixer));
 
             let encoder = ffmpeg::H264::start(width, height, s, session.writer_tx.clone())?;
-            let picture = Picture::new(screen.latest.clone(), width, height, framing, s.webcam.as_ref());
+            let picture = Picture::new(feed.clone(), width, height, framing, s.webcam.as_ref());
             session.pacer = Some(spawn_pacer(s.fps, picture, encoder, clock));
             Ok(())
         })();
@@ -408,8 +501,8 @@ impl Session {
             stop.store(true, Ordering::Relaxed);
             let _ = handle.join();
         }
-        if let Some(screen) = self.screen.take() {
-            screen::release(screen);
+        if let Some(feed) = self.feed.take() {
+            feed.release();
         }
         if let Some(audio) = self.audio.take() {
             audio.stop();
@@ -431,7 +524,7 @@ impl Session {
 /// Makes the frame: the screen put into the output size (`framing`), the
 /// webcam on top. Redraws only when one of them changed.
 struct Picture {
-    latest: Arc<screen::Latest>,
+    feed: Feed,
     canvas: Canvas,
     framing: crate::Framing,
     camera: Option<(camera::CameraLayer, SharedPlacement)>,
@@ -445,18 +538,18 @@ struct Picture {
 }
 
 impl Picture {
-    fn new(latest: Arc<screen::Latest>, width: u32, height: u32, framing: crate::Framing, webcam: Option<&crate::webcam::Webcam>) -> Self {
+    fn new(feed: Feed, width: u32, height: u32, framing: crate::Framing, webcam: Option<&crate::webcam::Webcam>) -> Self {
         let camera = webcam.map(|w| (camera::CameraLayer::new(w), w.placement.clone()));
         let mut canvas = Canvas::new(width, height);
         canvas.clear();
-        Self { latest, canvas, framing, camera, shows: None, nv12: Vec::new(), version: 0 }
+        Self { feed, canvas, framing, camera, shows: None, nv12: Vec::new(), version: 0 }
     }
 
     /// Bring the canvas up to date. Returns whether there's a picture yet.
     fn update(&mut self, nv12: bool) -> bool {
         // A source that reads the screen on request (X11) reads the next one now.
-        self.latest.want();
-        let Some((frame, seq)) = self.latest.get() else { return false };
+        self.feed.want();
+        let Some((frame, seq)) = self.feed.get() else { return false };
         let (cam, place) = match &mut self.camera {
             Some((layer, place)) => {
                 let place = *place.lock().unwrap();
@@ -519,8 +612,8 @@ fn submit_preview(picture: &Picture, sent: &mut Previewed) {
         recorded: (canvas.width, canvas.height),
         rgba,
         seq: 0,
-        waiting: false,
-        app: None,
+        waiting: picture.feed.waiting(),
+        app: picture.feed.app(),
     };
     sent.spare = Some(crate::preview::publish_frame(sent.generation, frame));
 }
@@ -564,7 +657,7 @@ fn spawn_pacer(fps: u32, mut picture: Picture, encoder: ffmpeg::H264, clock: Arc
                     burst += 1;
                 }
                 if !ended {
-                    if let Some(why) = picture.latest.ended() {
+                    if let Some(why) = picture.feed.ended() {
                         // Sharing was stopped from the desktop: the file keeps the last picture.
                         eprintln!("{why}");
                         ended = true;
@@ -600,24 +693,24 @@ impl PreviewCapture {
         let (stop2, error2) = (stop.clone(), error.clone());
         let generation = crate::preview::new_producer();
         thread::spawn(move || {
-            let screen = match open_screen(&source) {
-                Ok(s) => s,
+            let feed = match Feed::open(&source, None) {
+                Ok(f) => f,
                 Err(e) => {
                     *error2.lock().unwrap() = Some(format!("{e:#}"));
                     return;
                 }
             };
-            let (w, h) = screen.latest.get().map_or((1920, 1080), |(f, _)| (f.width, f.height));
+            let (w, h) = feed.size();
             let (width, height) = crate::recorded_size(w, h, target_height, shape);
             let framing = shape.map_or(crate::Framing::Fit, |shape| shape.framing);
-            let mut picture = Picture::new(screen.latest.clone(), width, height, framing, webcam.as_ref());
+            let mut picture = Picture::new(feed.clone(), width, height, framing, webcam.as_ref());
             let mut sent = Previewed::new(generation);
             // Paced like the recording would be.
             let every = 1.0 / fps.max(1) as f64;
             let t0 = host_now();
             let mut n = 0u64;
             while !stop2.load(Ordering::Relaxed) {
-                if let Some(why) = picture.latest.ended() {
+                if let Some(why) = picture.feed.ended() {
                     *error2.lock().unwrap() = Some(why);
                     break;
                 }
@@ -633,7 +726,7 @@ impl PreviewCapture {
                 }
             }
             drop(picture);
-            screen::release(screen);
+            feed.release();
         });
         Self { stop, error }
     }
@@ -653,6 +746,37 @@ impl Drop for PreviewCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Recording games and apps follows the picked program's window once
+    /// it's in focus, at the window's own size, and says which it is.
+    #[test]
+    #[ignore = "opens a window and captures it: cargo test -p capture records_an_apps_window -- --ignored"]
+    fn records_an_apps_window() {
+        let listed = list_windowed_apps();
+        eprintln!("apps: {:?}", listed.iter().map(|d| format!("{} = {}", d.id, d.name)).collect::<Vec<_>>());
+        // Konsole: one program that isn't otherwise running, so closing it leaves none.
+        let mut term = std::process::Command::new("konsole").args(["--separate", "-e", "sh", "-c", "while true; do date +%T.%N; sleep 0.02; done"]).spawn().expect("konsole");
+        thread::sleep(Duration::from_millis(1500));
+        let video = VideoSource::Apps { ids: vec!["konsole".into()], away_when_unfocused: true, hook: crate::GameHook { auto: false, allowed: Vec::new() } };
+        let feed = Feed::open(&video, None).unwrap();
+        let t = Instant::now();
+        while feed.app().is_none() && t.elapsed() < Duration::from_secs(3) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let app = feed.app();
+        let (frame, seq) = feed.get().unwrap();
+        thread::sleep(Duration::from_millis(500));
+        let (_, seq2) = feed.get().unwrap();
+        let lit = frame.data.chunks_exact(4).filter(|p| p[0] > 16 || p[1] > 16 || p[2] > 16).count();
+        eprintln!("app {app:?} after {} ms: {}x{}, {lit} lit pixels, pictures {seq:#x} → {seq2:#x}", t.elapsed().as_millis(), frame.width, frame.height);
+        let _ = term.kill();
+        thread::sleep(Duration::from_millis(500));
+        eprintln!("after closing: app {:?}, waiting {}", feed.app(), feed.waiting());
+        assert_eq!(app.as_deref(), Some("konsole"));
+        assert!(lit > 0, "all black");
+        assert!(seq2 > seq, "no new pictures");
+        assert!(feed.waiting());
+    }
 
     /// A screenshot is all of the screen at its own size, opaque.
     #[test]

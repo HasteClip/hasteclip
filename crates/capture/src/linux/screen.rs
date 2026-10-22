@@ -191,6 +191,26 @@ pub(crate) fn acquire(id: &str) -> Result<Arc<Screen>> {
     Ok(screen)
 }
 
+/// A stream of one window on KDE Plasma (by its uuid in KWin's window list),
+/// at its own size; not shared. Blocks until its first picture (for up to 2
+/// seconds: a window that isn't drawing yet still opens).
+pub(crate) fn open_kwin_window(uuid: &str) -> Result<Screen> {
+    let latest = Arc::new(Latest::default());
+    let ended = Arc::downgrade(&latest);
+    let cast = kwin::Cast::open_window(uuid, move |why| {
+        if let Some(l) = ended.upgrade() {
+            l.end(why);
+        }
+    })?;
+    let node = cast.node;
+    let screen = Screen::start_pipewire(uuid, None, node, latest, move || drop(cast))?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !screen.latest.has_frame() && screen.latest.ended().is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(screen)
+}
+
 /// Don't hand out the running cast anymore: the next [`acquire`] starts a new
 /// one (it ends once its holders let go).
 pub(crate) fn forget() {

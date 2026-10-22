@@ -362,7 +362,7 @@ impl App {
         // Linux, where the desktop picks it when capture starts.
         let stop_first = self.stop_first();
         let display_locked = !idle && cfg!(target_os = "linux");
-        if capture::APP_CAPTURE {
+        if capture::app_capture() {
             let opts = [
                 crate::ui_kit::Seg { icon: Some(egui_phosphor::regular::MONITOR), label: "Whole screen", tip: Some("Everything on one display") },
                 crate::ui_kit::Seg { icon: Some(egui_phosphor::regular::APP_WINDOW), label: "Games and apps", tip: Some("Only the games and apps you pick, following whichever you're using") },
@@ -386,7 +386,7 @@ impl App {
         crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
 
         match self.settings.capture.clone() {
-            CaptureTarget::Apps { apps, away_screen } if capture::APP_CAPTURE => self.app_list(ui, apps, away_screen, frame.as_deref()),
+            CaptureTarget::Apps { apps, away_screen } if capture::app_capture() => self.app_list(ui, apps, away_screen, frame.as_deref()),
             // Linux on Wayland: the desktop's own dialog picks the screen (once; it's remembered).
             _ if cfg!(target_os = "linux") && !capture::screens_listed() => {
                 group(ui, "screen", |ui| {

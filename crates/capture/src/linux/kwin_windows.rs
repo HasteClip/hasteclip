@@ -1,6 +1,8 @@
-//! KWin's window list (`org_kde_plasma_window_management`): which window is
-//! active and its process, native Wayland windows included. Followed by a
-//! background thread from the first time it's asked, so asking is instant.
+//! KWin's window list (`org_kde_plasma_window_management`): every window's
+//! process, title and state (which is active, which minimized), native
+//! Wayland windows included, and the id KWin's screencast streams a window
+//! by. Followed by a background thread from the first time it's asked, so
+//! asking is instant.
 //!
 //! Restricted like KWin's screencast: our `.desktop` file asks for it (see
 //! `super::kwin`). Plasma 6.8 and later give it to any app.
@@ -17,29 +19,55 @@ use wayland_protocols_plasma::plasma_window_management::client::{
     org_kde_plasma_window as window, org_kde_plasma_window_management as management,
 };
 
-/// `org_kde_plasma_window_management.state.active`.
+/// `org_kde_plasma_window_management.state`'s flags.
 const ACTIVE: u32 = 0x1;
+const MINIMIZED: u32 = 0x2;
+const SKIP_TASKBAR: u32 = 0x1000;
 
-/// What's known: each window's process and whether it's active.
+/// A window, as KWin describes it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Window {
+    /// What KWin's screencast streams it by.
+    pub uuid: String,
+    pub pid: Option<u32>,
+    pub title: String,
+    /// Its Wayland app id (or X11 class): often its `.desktop` file's name.
+    pub app_id: String,
+    pub active: bool,
+    pub minimized: bool,
+    /// Not in the taskbar: a panel, a popup, a tooltip.
+    pub skip_taskbar: bool,
+}
+
+/// What's known: each window, by its object.
 #[derive(Default)]
 struct Known {
-    windows: HashMap<ObjectId, (Option<u32>, bool)>,
+    windows: HashMap<ObjectId, Window>,
 }
 
 static KNOWN: Mutex<Option<Known>> = Mutex::new(None);
 
-/// The active window's process, if KWin lets us follow its windows.
-pub(crate) fn active_pid() -> Option<u32> {
+/// Whether KWin lets us follow its windows (started the first time it's asked).
+pub(crate) fn following() -> bool {
     static STARTED: OnceLock<bool> = OnceLock::new();
-    let following = *STARTED.get_or_init(|| {
+    *STARTED.get_or_init(|| {
         let kde = std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|d| d.split(':').any(|d| d.eq_ignore_ascii_case("KDE")));
         kde && start()
-    });
-    if !following {
+    })
+}
+
+/// Every window, if KWin lets us follow them.
+pub(crate) fn windows() -> Option<Vec<Window>> {
+    if !following() {
         return None;
     }
     let known = KNOWN.lock().unwrap();
-    known.as_ref()?.windows.values().find(|(_, active)| *active).and_then(|(pid, _)| *pid)
+    Some(known.as_ref()?.windows.values().cloned().collect())
+}
+
+/// The active window's process, if KWin lets us follow its windows.
+pub(crate) fn active_pid() -> Option<u32> {
+    windows()?.into_iter().find(|w| w.active).and_then(|w| w.pid)
 }
 
 /// Connect, and follow the windows on a thread. False if KWin won't say.
@@ -50,7 +78,8 @@ fn start() -> bool {
     let Ok(_manager) = globals.bind::<management::OrgKdePlasmaWindowManagement, _, _>(&qh, 12..=16, ()) else { return false };
     *KNOWN.lock().unwrap() = Some(Known::default());
     let mut state = State;
-    if queue.roundtrip(&mut state).is_err() {
+    // The first answer lists the windows; the second, what each one is.
+    if queue.roundtrip(&mut state).is_err() || queue.roundtrip(&mut state).is_err() {
         return false;
     }
     thread::Builder::new()
@@ -79,9 +108,9 @@ impl Dispatch<management::OrgKdePlasmaWindowManagement, ()> for State {
         qh: &QueueHandle<Self>,
     ) {
         if let management::Event::WindowWithUuid { uuid, .. } = event {
-            let w = manager.get_window_by_uuid(uuid, qh, ());
+            let w = manager.get_window_by_uuid(uuid.clone(), qh, ());
             if let Some(k) = KNOWN.lock().unwrap().as_mut() {
-                k.windows.insert(w.id(), (None, false));
+                k.windows.insert(w.id(), Window { uuid, ..Default::default() });
             }
         }
     }
@@ -96,8 +125,15 @@ impl Dispatch<window::OrgKdePlasmaWindow, ()> for State {
         let mut known = KNOWN.lock().unwrap();
         let Some(k) = known.as_mut() else { return };
         match event {
-            window::Event::PidChanged { pid } => k.windows.entry(w.id()).or_default().0 = Some(pid),
-            window::Event::StateChanged { flags } => k.windows.entry(w.id()).or_default().1 = flags & ACTIVE != 0,
+            window::Event::PidChanged { pid } => k.windows.entry(w.id()).or_default().pid = Some(pid),
+            window::Event::TitleChanged { title } => k.windows.entry(w.id()).or_default().title = title,
+            window::Event::AppIdChanged { app_id } => k.windows.entry(w.id()).or_default().app_id = app_id,
+            window::Event::StateChanged { flags } => {
+                let win = k.windows.entry(w.id()).or_default();
+                win.active = flags & ACTIVE != 0;
+                win.minimized = flags & MINIMIZED != 0;
+                win.skip_taskbar = flags & SKIP_TASKBAR != 0;
+            }
             window::Event::Unmapped => {
                 k.windows.remove(&w.id());
                 w.destroy();

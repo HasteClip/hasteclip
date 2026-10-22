@@ -178,6 +178,22 @@ impl Cast {
         let output = output.wl.clone();
         let qh = session.queue.handle();
         let stream = session.screencast.stream_output(&output, POINTER_EMBEDDED, &qh, ());
+        Self::stream(session, stream, ended)
+    }
+
+    /// Ask KWin to stream one window (by its uuid in KWin's window list,
+    /// `super::kwin_windows`), at its own size. `ended` is called if KWin
+    /// stops the stream (the window closed).
+    pub(crate) fn open_window(uuid: &str, ended: impl FnOnce(String) + Send + 'static) -> Result<Self> {
+        let session = Session::connect()?;
+        let qh = session.queue.handle();
+        let stream = session.screencast.stream_window(uuid.to_owned(), POINTER_EMBEDDED, &qh, ());
+        Self::stream(session, stream, ended)
+    }
+
+    /// Wait for KWin to make `stream`'s PipeWire node, then keep the
+    /// connection open on a thread for as long as this is held.
+    fn stream(mut session: Session, stream: stream::ZkdeScreencastStreamUnstableV1, ended: impl FnOnce(String) + Send + 'static) -> Result<Self> {
         let deadline = Instant::now() + Duration::from_secs(5);
         let node = loop {
             if let Some(node) = session.state.node {

@@ -422,8 +422,20 @@ pub struct StillImage {
     pub bgra: Vec<u8>,
 }
 
-/// Whether this platform can record games and apps ([`VideoSource::Apps`]).
-pub const APP_CAPTURE: bool = cfg!(any(target_os = "windows", target_os = "macos"));
+/// Whether games and apps can be recorded here ([`VideoSource::Apps`]):
+/// on Windows and macOS, and on Linux on KDE Plasma's Wayland session so far.
+/// Asked once; quick after that.
+pub fn app_capture() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *AVAILABLE.get_or_init(linux::app_capture)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        cfg!(any(target_os = "windows", target_os = "macos"))
+    }
+}
 
 /// Running apps with a window, for [`VideoSource::Apps`], sorted by name.
 pub fn list_windowed_apps() -> Vec<Device> {
@@ -435,7 +447,11 @@ pub fn list_windowed_apps() -> Vec<Device> {
     {
         mac::windows::list_windowed_apps()
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::list_windowed_apps()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         Vec::new()
     }

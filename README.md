@@ -160,7 +160,7 @@ HasteClip is in beta (versions 0.x). It works day to day, but not every feature 
 | Replay buffer, recording, editor, library | ✅ | ✅ | ✅ |
 | Share links, copy, export and import | ✅ | ✅ | ✅ |
 | Voice saving, named clips, per-app sound, webcam | ✅ | ✅ | ✅ |
-| Record a single game or app window | ✅ | ✅ | — (whole screen) |
+| Record a single game or app window | ✅ | ✅ | ✅ (KDE Plasma) |
 | Drag clips out, system share sheet | ✅ | ✅ | — (use Copy clip) |
 | Frame blending | ✅ | ✅ | — |
 | Automatic updates | — | ✅ | ✅ |
