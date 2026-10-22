@@ -921,6 +921,57 @@ impl App {
     }
 }
 
+/// Exposure times that don't band under lights flickering at twice the mains
+/// frequency `mains` (Hz): whole flickers, in V4L2's units of 100 µs (10 ms
+/// at 50 Hz, 8.33 ms at 60 Hz), within `min..=max`.
+fn flicker_free(mains: f64, min: i64, max: i64) -> Vec<i64> {
+    let period = 10_000.0 / (2.0 * mains);
+    (1..).map(|k| (k as f64 * period).round() as i64).take_while(|v| *v <= max).filter(|v| *v >= min).collect()
+}
+
+/// The next exposure time up (`up`) or down from `value`: among `steps` if
+/// given, else by `step`.
+fn exposure_step(value: i64, up: bool, steps: Option<&[i64]>, step: i64, min: i64, max: i64) -> i64 {
+    match steps {
+        Some(steps) if up => steps.iter().copied().find(|v| *v > value).unwrap_or(value),
+        Some(steps) => steps.iter().rev().copied().find(|v| *v < value).unwrap_or(value),
+        None => (value + if up { step } else { -step }).clamp(min, max),
+    }
+}
+
+/// The exposure time: − and + to step it, the slider, its time in ms. With
+/// `steps`, they move between flicker-free times only.
+fn exposure_widget(ui: &mut egui::Ui, c: &CameraControl, steps: Option<&[i64]>, set: &mut Vec<(u32, i64)>) {
+    use crate::theme::{self, W};
+    let ControlKind::Int { min, max, step } = c.kind else { return control_widget(ui, c, set) };
+    let pal = theme::pal(ui);
+    // Right to left: the time, +, the slider, −.
+    ui.add_sized([56.0, 20.0], egui::Label::new(theme::text(&format!("{:.1} ms", c.value as f64 / 10.0), 12.5, W::Regular).color(pal.text3)));
+    let next = |up: bool| Some(exposure_step(c.value, up, steps, step, min, max)).filter(|v| *v != c.value);
+    if crate::ui_kit::Btn::icon(crate::ui_kit::Kind::Ghost, egui_phosphor::regular::PLUS).small().tip("Longer").show(ui).clicked()
+        && let Some(v) = next(true)
+    {
+        set.push((c.id, v));
+    }
+    let span = (max - min).max(1) as f32;
+    let mut v = (c.value - min) as f32 / span;
+    if crate::transport::slider(ui, &mut v, 110.0).changed() {
+        let raw = min + (v * span).round() as i64;
+        let to = match steps {
+            Some(steps) => steps.iter().copied().min_by_key(|s| (s - raw).abs()).unwrap_or(raw),
+            None => raw,
+        };
+        if to != c.value {
+            set.push((c.id, to));
+        }
+    }
+    if crate::ui_kit::Btn::icon(crate::ui_kit::Kind::Ghost, egui_phosphor::regular::MINUS).small().tip("Shorter").show(ui).clicked()
+        && let Some(v) = next(false)
+    {
+        set.push((c.id, v));
+    }
+}
+
 /// The Camera page's still side: the picture, which camera it is and in what
 /// size, and resetting its settings.
 fn picture_side(ui: &mut egui::Ui, panel: &mut CameraPanel, name: &str, max_h: f32, reset: &mut bool) {
@@ -980,6 +1031,14 @@ fn controls_view(ui: &mut egui::Ui, panel: &CameraPanel, set: &mut Vec<(u32, i64
     if panel.controls.is_empty() {
         ui.label(theme::text("This camera has no settings to change, or they couldn't be read.", 13.0, W::Regular).color(pal.text3));
     }
+    // The mains frequency, from the flicker setting, for flicker-free exposure times.
+    let mains = panel.controls.iter().find(|c| c.id == v4l2::POWER_LINE).and_then(|c| match c.value {
+        1 => Some(50.0),
+        2 => Some(60.0),
+        _ => None,
+    });
+    let snap_id = egui::Id::new("camera_flicker_free");
+    let mut snap = ui.data(|d| d.get_temp::<bool>(snap_id)).unwrap_or(true);
     for (n, (heading, rows)) in panel_groups(&panel.controls).into_iter().enumerate() {
         crate::ui_kit::section_head(ui, heading, n == 0, |_| {});
         crate::ui_kit::list(ui, ("camera", heading), |l| {
@@ -999,7 +1058,21 @@ fn controls_view(ui: &mut egui::Ui, panel: &CameraPanel, set: &mut Vec<(u32, i64
                         // The setting it takes over, while it's off.
                         if let Some((label, m)) = manual {
                             l.well(("camera_manual", auto.id), !on, |l| {
-                                l.row(crate::ui_kit::Row::new(label).kid(), |ui| control_widget(ui, m, set));
+                                if m.id == v4l2::EXPOSURE {
+                                    let steps = match (mains, m.kind.clone()) {
+                                        (Some(hz), ControlKind::Int { min, max, .. }) if snap => Some(flicker_free(hz, min, max)),
+                                        _ => None,
+                                    };
+                                    l.row(crate::ui_kit::Row::new(label).kid(), |ui| exposure_widget(ui, m, steps.as_deref(), set));
+                                    if let Some(hz) = mains {
+                                        let note = format!("Whole flickers of {hz:.0} Hz lights (every {:.2} ms), so no bands roll through the picture", 1000.0 / (2.0 * hz));
+                                        l.row(crate::ui_kit::Row::new("Flicker-free steps").kid().note(note), |ui| {
+                                            crate::ui_kit::switch(ui, &mut snap);
+                                        });
+                                    }
+                                } else {
+                                    l.row(crate::ui_kit::Row::new(label).kid(), |ui| control_widget(ui, m, set));
+                                }
                             });
                         }
                     }
@@ -1007,11 +1080,24 @@ fn controls_view(ui: &mut egui::Ui, panel: &CameraPanel, set: &mut Vec<(u32, i64
             }
         });
     }
+    ui.data_mut(|d| d.insert_temp(snap_id, snap));
 }
 
 #[cfg(test)]
 mod panel_tests {
     use super::*;
+
+    /// At 50 Hz, every 10 ms; at 60 Hz, every 8.33 ms (in 100 µs units),
+    /// stepped through by − and +.
+    #[test]
+    fn flicker_free_exposure_times() {
+        assert_eq!(flicker_free(50.0, 3, 450), [100, 200, 300, 400]);
+        assert_eq!(flicker_free(60.0, 3, 340), [83, 167, 250, 333]);
+        let steps = flicker_free(60.0, 3, 2047);
+        assert_eq!(exposure_step(250, true, Some(&steps), 1, 3, 2047), 333);
+        assert_eq!(exposure_step(260, false, Some(&steps), 1, 3, 2047), 250);
+        assert_eq!(exposure_step(250, true, None, 1, 3, 2047), 251);
+    }
 
     fn ctl(id: u32, name: &str, kind: ControlKind, value: i64) -> CameraControl {
         CameraControl { id, name: name.into(), kind, value, default: value, inactive: false }
