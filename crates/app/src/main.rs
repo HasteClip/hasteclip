@@ -932,6 +932,17 @@ impl App {
         Some(capture::webcam::Webcam { device: w.id.clone(), format: w.format.map(Into::into), placement: self.webcam_placement.clone() })
     }
 
+    /// Where the chosen display is in `screens`: found by its id, by its
+    /// place for settings from before ids were kept, else the main display
+    /// (listed first).
+    pub(crate) fn display_at(&self) -> usize {
+        match &self.settings.display_id {
+            Some(id) => self.screens.iter().position(|d| &d.id == id).unwrap_or(0),
+            None if self.settings.display_index < self.screens.len() => self.settings.display_index,
+            None => 0,
+        }
+    }
+
     pub(crate) fn video_source(&self) -> capture::VideoSource {
         match &self.settings.capture {
             settings::CaptureTarget::Apps { apps, away_screen } if capture::APP_CAPTURE => capture::VideoSource::Apps {
@@ -940,7 +951,7 @@ impl App {
                 hook: self.game_hook(),
             },
             _ => capture::VideoSource::Screen {
-                id: self.screens.get(self.settings.display_index).map(|d| d.id.clone()).unwrap_or_else(|| "0".to_owned()),
+                id: self.screens.get(self.display_at()).map(|d| d.id.clone()).unwrap_or_else(|| "0".to_owned()),
                 hook: self.game_hook(),
                 method: self.settings.screen_capture.into(),
             },

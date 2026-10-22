@@ -409,7 +409,8 @@ impl App {
                         ui.label(crate::theme::text("Display", 13.5, crate::theme::W::Medium).color(pal.text));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let names: Vec<String> = self.screens.iter().map(|d| d.name.clone()).collect();
-                            let current = names.get(self.settings.display_index).cloned().unwrap_or_else(|| "Main display".to_owned());
+                            let at = self.display_at();
+                            let current = names.get(at).cloned().unwrap_or_else(|| "Main display".to_owned());
                             let r = crate::ui_kit::select(ui, &current, 180.0).on_hover_text(if display_locked { stop_first } else { "" });
                             if display_locked && r.clicked() {
                                 egui::Popup::close_id(ui.ctx(), r.id.with("menu"));
@@ -417,7 +418,8 @@ impl App {
                             } else if !display_locked {
                                 crate::ui_kit::menu_popup(&r, false, 240.0, |ui| {
                                     for (i, name) in names.iter().enumerate() {
-                                        if crate::ui_kit::Item::new(name.clone()).check(self.settings.display_index == i).show(ui).clicked() {
+                                        if crate::ui_kit::Item::new(name.clone()).check(at == i).show(ui).clicked() {
+                                            self.settings.display_id = Some(self.screens[i].id.clone());
                                             self.settings.display_index = i;
                                         }
                                     }

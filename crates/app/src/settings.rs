@@ -161,7 +161,7 @@ impl OutputResolution {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CaptureTarget {
-    /// The display chosen by `display_index`.
+    /// The display chosen by `display_id`.
     #[default]
     Screen,
     /// Games and apps: whichever is in focus is recorded (see
@@ -669,7 +669,12 @@ pub struct RecordSettings {
     pub idle_apps: Option<CaptureTarget>,
     /// A webcam over the picture, if any.
     pub webcam: Option<WebcamCfg>,
-    /// Index into the runtime-detected display list.
+    /// The chosen display's id (`capture::Device::id`), so the choice stays
+    /// with that display when others are plugged in or listed in another
+    /// order. The main display when it isn't connected.
+    pub display_id: Option<String>,
+    /// Where the chosen display was in the list: what settings from before
+    /// `display_id` have, and still written for them.
     pub display_index: usize,
     pub fps: u32,
     /// Live frame blending: look at the screen this many times a second and
@@ -774,6 +779,7 @@ impl Default for RecordSettings {
             capture: CaptureTarget::Screen,
             idle_apps: None,
             webcam: None,
+            display_id: None,
             display_index: 0,
             fps: 60,
             blend_fps: 0,
