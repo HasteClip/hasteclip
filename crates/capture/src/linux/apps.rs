@@ -23,7 +23,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use super::screen::{self, Frame, Order, Screen};
-use super::{focus, kwin, kwin_windows, x11_windows};
+use super::{ext_windows, focus, kwin, kwin_windows, wlr_windows, x11_windows};
 use crate::{Device, StillImage};
 
 /// A window, as the desktop describes it.
@@ -45,6 +45,9 @@ pub(crate) struct Window {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Source {
     Kde,
+    /// Sway and its kin: the ext window list and capture, with the wlroots
+    /// list for which window is active.
+    Wlr,
     X11,
 }
 
@@ -58,6 +61,8 @@ fn source() -> Option<Source> {
             Some(Source::X11)
         } else if kwin::available() && kwin_windows::following() {
             Some(Source::Kde)
+        } else if ext_windows::available() && wlr_windows::windows().is_some() {
+            Some(Source::Wlr)
         } else if x11_windows::available() {
             Some(Source::X11)
         } else {
@@ -74,6 +79,7 @@ impl Source {
                 .into_iter()
                 .map(|w| Window { id: w.uuid, pid: w.pid, title: w.title, app_id: w.app_id, active: w.active, minimized: w.minimized, skip_taskbar: w.skip_taskbar })
                 .collect(),
+            Self::Wlr => wlr_listed(),
             Self::X11 => x11_windows::windows(),
         }
     }
@@ -81,9 +87,41 @@ impl Source {
     fn open(self, id: &str) -> anyhow::Result<Screen> {
         match self {
             Self::Kde => screen::open_kwin_window(id),
+            Self::Wlr => screen::open_ext_window(id),
             Self::X11 => screen::open_x11_window(id),
         }
     }
+}
+
+/// The ext list's windows, with which is active or minimized from the
+/// wlroots list (matched by app id and title), and their processes found by
+/// app id (remembered a few seconds: that reads every process's file).
+fn wlr_listed() -> Vec<Window> {
+    static PIDS: Mutex<Option<(Instant, HashMap<String, Option<u32>>)>> = Mutex::new(None);
+    let states = wlr_windows::windows().unwrap_or_default();
+    let mut pids = PIDS.lock().unwrap();
+    let (at, cache) = pids.get_or_insert_with(|| (Instant::now(), HashMap::new()));
+    if at.elapsed() > Duration::from_secs(5) {
+        cache.clear();
+        *at = Instant::now();
+    }
+    ext_windows::windows()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|w| {
+            let state = states.iter().find(|s| s.app_id == w.app_id && s.title == w.title);
+            let pid = *cache.entry(w.app_id.clone()).or_insert_with(|| focus::pid_of_app_id(&w.app_id));
+            Window {
+                id: w.id,
+                pid,
+                title: w.title,
+                app_id: w.app_id,
+                active: state.is_some_and(|s| s.active),
+                minimized: state.is_some_and(|s| s.minimized),
+                skip_taskbar: false,
+            }
+        })
+        .collect()
 }
 
 /// Whether games and apps can be recorded here: KDE Plasma's Wayland

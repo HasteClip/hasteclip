@@ -847,6 +847,7 @@ dependencies = [
  "rubato",
  "serde_json",
  "wayland-client",
+ "wayland-protocols",
  "wayland-protocols-plasma",
  "wayland-protocols-wlr",
  "wgpu",

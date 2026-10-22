@@ -34,6 +34,7 @@ mod apps;
 pub mod audio;
 mod blend;
 mod camera;
+mod ext_windows;
 pub mod ffmpeg;
 mod image;
 pub mod focus;
@@ -1019,6 +1020,36 @@ mod tests {
         thread::sleep(Duration::from_millis(500));
         eprintln!("after closing: app {:?}, waiting {}", feed.app(), feed.waiting());
         assert_eq!(app.as_deref(), Some("vkcube"));
+        assert!(lit > 0, "all black");
+        assert!(seq2 > seq, "no new pictures");
+    }
+
+    /// A window on Sway and its kin is followed and captured with the ext
+    /// protocols: run inside one (a nested Sway with `foot` open will do).
+    #[test]
+    #[ignore = "needs Sway: WAYLAND_DISPLAY=<sway's> XDG_CURRENT_DESKTOP=sway cargo test -p capture records_a_wlr_window -- --ignored"]
+    fn records_a_wlr_window() {
+        let listed = list_windowed_apps();
+        eprintln!("apps: {:?}", listed.iter().map(|d| format!("{} = {}", d.id, d.name)).collect::<Vec<_>>());
+        let video = VideoSource::Apps { ids: vec!["foot".into()], away_when_unfocused: true, hook: crate::GameHook { auto: false, allowed: Vec::new() } };
+        let feed = Feed::open(&video, None).unwrap();
+        let t = Instant::now();
+        while feed.app().is_none() && t.elapsed() < Duration::from_secs(3) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let app = feed.app();
+        thread::sleep(Duration::from_millis(300));
+        let (frame, seq) = feed.get().unwrap();
+        thread::sleep(Duration::from_millis(500));
+        let (_, seq2) = feed.get().unwrap();
+        let lit = frame.data.chunks_exact(4).filter(|p| p[0] > 16 || p[1] > 16 || p[2] > 16).count();
+        eprintln!("app {app:?}: {}x{}, {lit} lit pixels, pictures {seq:#x} → {seq2:#x}", frame.width, frame.height);
+        if let Some(out) = std::env::var_os("HASTECLIP_SHOT") {
+            let (w, h) = (frame.width, frame.height);
+            let rgb: Vec<u8> = frame.data.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
+            std::fs::write(out, [format!("P6\n{w} {h}\n255\n").as_bytes(), &rgb].concat()).unwrap();
+        }
+        assert_eq!(app.as_deref(), Some("foot"));
         assert!(lit > 0, "all black");
         assert!(seq2 > seq, "no new pictures");
     }

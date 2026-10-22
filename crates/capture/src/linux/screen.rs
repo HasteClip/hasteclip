@@ -303,6 +303,17 @@ pub(crate) fn open_x11_window(id: &str) -> Result<Screen> {
     Ok(screen)
 }
 
+/// A window on Sway and its kin (`ext:<identifier>`, see
+/// `super::ext_windows`), captured at its own size; not shared.
+pub(crate) fn open_ext_window(id: &str) -> Result<Screen> {
+    let screen = Screen::start_direct(id, super::ext_windows::Grab::open, super::ext_windows::run)?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !screen.latest.has_frame() && screen.latest.ended().is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(screen)
+}
+
 /// Don't hand out the running cast anymore: the next [`acquire`] starts a new
 /// one (it ends once its holders let go).
 pub(crate) fn forget() {

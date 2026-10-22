@@ -167,7 +167,7 @@ HasteClip is in beta (versions 0.x). It works day to day, but not every feature 
 | Screenshots | — | ✅ | ✅ |
 | Game capture for fullscreen games | — | ✅ | — |
 
-**Games and apps on Linux:** every window on KDE Plasma and on X11 desktops. On other Wayland desktops, the windows of X11 apps, which includes games run through Proton or Wine; a native Wayland app's window can't be followed there yet, so record the whole screen for those.
+**Games and apps on Linux:** every window on KDE Plasma, on X11 desktops, and on Sway and other desktops with the ext window capture protocols (Sway 1.11 and later). On GNOME, the windows of X11 apps, which includes games run through Proton or Wine; GNOME doesn't let apps follow its native Wayland windows, so record the whole screen for those.
 
 **Encoders:** VideoToolbox on macOS. NVENC, AMF or Quick Sync through Media Foundation on Windows. NVENC or VA-API through ffmpeg on Linux, with x264 when there's no GPU encoder.
 
