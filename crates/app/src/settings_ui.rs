@@ -393,7 +393,8 @@ impl App {
             if f.shows(&["screenshots", "shortcut", "hotkey", "keyboard"]) {
                 let action = ShortcutAction::Screenshot;
                 let keys = self.shortcut_keys(action);
-                let note = if keys.is_none() { "Off. Choose a key to take screenshots" } else { "Set under Shortcuts" };
+                // Off says itself (its button reads Choose a key).
+                let note = if keys.is_none() { "" } else { "Set under Shortcuts" };
                 l.row(Row::new("Shortcut").note(note), |ui| {
                     if Btn::normal(if keys.is_none() { "Choose a key" } else { "Change" }).small().show(ui).clicked() {
                         self.recording_shortcut = Some((action, None));
@@ -528,7 +529,8 @@ impl App {
                 let note = match action {
                     ShortcutAction::SaveClip if desktop => "Works everywhere. Your desktop looks after it, and may ask you to confirm.",
                     ShortcutAction::SaveClip => "Works everywhere, even in a game",
-                    ShortcutAction::Screenshot if off => "Off. Choose a key to take screenshots",
+                    // Off says itself: its keys read Off.
+                    ShortcutAction::Screenshot if off => "",
                     ShortcutAction::Screenshot => "Works everywhere, even in a game",
                     _ => "",
                 };
