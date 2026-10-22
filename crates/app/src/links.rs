@@ -264,6 +264,21 @@ pub struct Progress {
     /// Discord), and how far it's come (0..=1, `f32` bits).
     making: AtomicBool,
     made: AtomicU32,
+    /// The copy is made (or wasn't needed): the clip is being got ready to
+    /// go up, until `total` is set.
+    readying: AtomicBool,
+    /// When the first bytes were confirmed and how many were by then, and
+    /// the speed since, for how long is left.
+    speed: Mutex<Speed>,
+}
+
+/// The upload's speed, from what the storage has confirmed.
+#[derive(Default)]
+struct Speed {
+    since: Option<(std::time::Instant, u64)>,
+    /// Bytes a second, smoothed over the last few seconds.
+    rate: f64,
+    at: Option<(std::time::Instant, u64)>,
 }
 
 impl Progress {
@@ -277,7 +292,29 @@ impl Progress {
 
     /// How far the smaller copy has come, while it's being made.
     fn making(&self) -> Option<f32> {
-        (self.making.load(Ordering::Relaxed) && self.total.load(Ordering::Relaxed) == 0).then(|| f32::from_bits(self.made.load(Ordering::Relaxed)))
+        (self.making.load(Ordering::Relaxed) && !self.readying.load(Ordering::Relaxed) && self.total.load(Ordering::Relaxed) == 0).then(|| f32::from_bits(self.made.load(Ordering::Relaxed)))
+    }
+
+    /// How long is left at the speed it's going, once it's going.
+    fn left(&self) -> Option<Duration> {
+        let (sent, total) = (self.sent.load(Ordering::Relaxed), self.total.load(Ordering::Relaxed));
+        let now = std::time::Instant::now();
+        let mut s = self.speed.lock().unwrap();
+        let since = *s.since.get_or_insert((now, sent));
+        if let Some((t, n)) = s.at {
+            let dt = now.duration_since(t).as_secs_f64();
+            if dt >= 0.5 {
+                // Over about the last 5 seconds, so a burst doesn't swing it.
+                let rate = sent.saturating_sub(n) as f64 / dt;
+                let k = (dt / 5.0).min(1.0);
+                s.rate = if s.rate == 0.0 { rate } else { s.rate + (rate - s.rate) * k };
+                s.at = Some((now, sent));
+            }
+        } else {
+            s.at = Some((now, sent));
+        }
+        // A couple of seconds in before it's worth saying.
+        (now.duration_since(since.0) >= Duration::from_secs(2) && s.rate > 0.0 && total > sent).then(|| Duration::from_secs_f64((total - sent) as f64 / s.rate))
     }
 
     fn cancelled(&self) -> Result<(), String> {
@@ -327,6 +364,7 @@ fn upload(clip: &Path, named: &Named, progress: &Progress, replacing: Option<&st
     let work = Scratch::new()?;
     let video = work.0.join("video.mp4");
     let source = playable_size(clip, &work.0, progress)?;
+    progress.readying.store(true, Ordering::Relaxed);
     web_copy(&source, &video)?;
     progress.cancelled()?;
     let info = media::probe(&video).map_err(|e| e.to_string())?;
@@ -355,13 +393,13 @@ fn upload(clip: &Path, named: &Named, progress: &Progress, replacing: Option<&st
     progress.total.store(size + thumb_bytes.as_ref().map_or(0, |b| b.len() as u64), Ordering::Relaxed);
 
     let uploaded = (|| {
-        let etags = put_parts(&server, &video, size, &upload, progress)?;
+        let etags = put_parts(&video, size, &upload, progress)?;
         progress.cancelled()?;
         if let (Some(link), Some(bytes)) = (&upload.thumb, &thumb_bytes) {
-            // The preview picture is nice to have, not worth failing over.
-            if server.put(link, bytes, Some("image/jpeg")).is_ok() {
-                progress.sent.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-            }
+            // The preview picture is nice to have, not worth failing over
+            // (what it counted is taken back if it doesn't go).
+            let lane = crate::upload_watch::Lane::new();
+            let _ = put(&lane, link, bytes, Some("image/jpeg"), progress);
         }
         let complete = match replacing {
             None => format!("{}/v1/clips/{}/complete", api(), upload.id),
@@ -469,7 +507,12 @@ fn web_copy(clip: &Path, out: &Path) -> Result<(), String> {
 /// Discord ([`EMBED_MAX_MB`]), as Save smaller makes one: the biggest
 /// picture that fits, and the mix.
 fn playable_size(clip: &Path, work: &Path, progress: &Progress) -> Result<PathBuf, String> {
-    let fits = u64::from(EMBED_MAX_MB) << 20;
+    fit_under(clip, work, EMBED_MAX_MB, progress)
+}
+
+/// `clip`, or a copy of it made in `work` that's at most `mb` MB.
+fn fit_under(clip: &Path, work: &Path, mb: u32, progress: &Progress) -> Result<PathBuf, String> {
+    let fits = u64::from(mb) << 20;
     if std::fs::metadata(clip).map_err(|e| e.to_string())?.len() <= fits {
         return Ok(clip.to_path_buf());
     }
@@ -478,24 +521,31 @@ fn playable_size(clip: &Path, work: &Path, progress: &Progress) -> Result<PathBu
     let info = media::probe(clip).map_err(|e| e.to_string())?;
     let mut edit = media::Edit::new(&info);
     edit.output.mix_only = true;
-    let mut aim = EMBED_MAX_MB;
-    for _ in 0..2 {
-        edit.output.max_mb = Some(aim);
+    edit.output.max_mb = Some(mb);
+    loop {
         progress.made.store(0, Ordering::Relaxed);
         media::render_with_progress(clip, &info, &edit, &small, None, |f| progress.made.store(f.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed))
             .map_err(|e| format!("couldn't make a copy small enough to play in Discord: {e}"))?;
         progress.cancelled()?;
         let size = std::fs::metadata(&small).map_err(|e| e.to_string())?.len();
         if size <= fits {
-            break;
+            return Ok(small);
         }
-        // The encoder went over (a picture too busy for the bitrate, like
-        // noise): once more, aimed as far under as it went over. Still over
-        // after that, it goes as it is: the link plays, if not in a chat.
-        aim = (f64::from(aim) * fits as f64 / size as f64 * 0.95) as u32;
+        // The encoder went over: a picture too busy for the bitrate. macOS's
+        // won't go under what it spends on a frame of that size however low
+        // it's asked to (1080p noise asked for 5 Mbit/s came out at 39; at
+        // 720p, 3.5), so asking again for less does nothing: a smaller
+        // picture, until it fits. At the smallest, it goes as it is: the
+        // link plays, if not in a chat.
+        let (_, h) = edit.output.size(&info);
+        let Some(next) = SMALLER.into_iter().find(|&s| s < h) else { return Ok(small) };
+        edit.output.height = Some(next);
     }
-    Ok(small)
 }
+
+/// The picture heights a copy for Discord steps down through when it comes
+/// out too big.
+const SMALLER: [u32; 5] = [1080, 720, 540, 480, 360];
 
 /// The picture a link's preview shows: a frame a second in (or from the
 /// middle of a shorter clip), at most 1280 wide. `false` if there isn't one.
@@ -531,8 +581,74 @@ struct Shared {
 /// server, few enough to be gentle on a slow one.
 const PARALLEL: usize = 3;
 
+/// `PUT` bytes to a signed link (`content_type` when it was signed for
+/// one); the ETag. The bar counts what the storage confirms as it goes. A
+/// try that stalls (see `upload_watch`) or loses its connection is made
+/// again, with twice the patience each time (one that was only slow gets
+/// waited for), as long as each gets further than the last: a line that's
+/// gone for good doesn't keep it going. What a try counted is taken back
+/// when it doesn't go.
+fn put(lane: &crate::upload_watch::Lane, link: &str, bytes: &[u8], content_type: Option<&str>, progress: &Progress) -> Result<String, String> {
+    let len = bytes.len() as u64;
+    let (mut patience, mut best, mut other_errors) = (1u32, 0u64, 0);
+    loop {
+        progress.cancelled()?;
+        // Counted up to the part's size (headers and TLS make the
+        // confirmed bytes a little more).
+        let counted = AtomicU64::new(0);
+        let (res, stalled) = lane.watch(
+            patience,
+            |n| {
+                let now = n.min(len);
+                let before = counted.swap(now, Ordering::Relaxed);
+                progress.sent.fetch_add(now.saturating_sub(before), Ordering::Relaxed);
+            },
+            |agent| {
+                let mut req = agent.put(link);
+                if let Some(t) = content_type {
+                    req = req.header("Content-Type", t);
+                }
+                req.send(bytes)
+            },
+        );
+        let got = counted.load(Ordering::Relaxed);
+        let failed = |progress: &Progress| {
+            progress.sent.fetch_sub(got, Ordering::Relaxed);
+        };
+        match res {
+            Ok(r) if r.status().is_success() => {
+                // All of it, whatever was confirmed along the way.
+                progress.sent.fetch_add(len - got, Ordering::Relaxed);
+                let etag = r.headers().get("etag").and_then(|v| v.to_str().ok());
+                return etag.map(str::to_owned).ok_or_else(|| "the storage didn't confirm a part".into());
+            }
+            // Signed for exactly this; asking again won't change it.
+            Ok(r) if r.status() == 403 => {
+                failed(progress);
+                return Err(format!("the storage refused the upload ({})", r.status()));
+            }
+            Ok(r) => {
+                failed(progress);
+                other_errors += 1;
+                if other_errors > 1 {
+                    return Err(format!("the storage answered {}", r.status()));
+                }
+            }
+            Err(e) => {
+                failed(progress);
+                // Gone again without getting further: the line is down.
+                if got <= best && patience > 1 {
+                    return Err(if stalled { "the upload stopped getting through. Check your connection and try again".into() } else { offline(e) });
+                }
+                best = best.max(got);
+                patience *= 2;
+            }
+        }
+    }
+}
+
 /// Upload the video's parts, a few at a time; their ETags, in order.
-fn put_parts(server: &Server, video: &Path, size: u64, upload: &Upload, progress: &Progress) -> Result<Vec<String>, String> {
+fn put_parts(video: &Path, size: u64, upload: &Upload, progress: &Progress) -> Result<Vec<String>, String> {
     let n = upload.parts.len();
     let next = AtomicUsize::new(0);
     let etags: Mutex<Vec<Option<String>>> = Mutex::new(vec![None; n]);
@@ -544,6 +660,8 @@ fn put_parts(server: &Server, video: &Path, size: u64, upload: &Upload, progress
                     Ok(f) => f,
                     Err(e) => return *failed.lock().unwrap() = Some(e.to_string()),
                 };
+                // Its own connections, so what they confirm is its part's.
+                let lane = crate::upload_watch::Lane::new();
                 let mut buf = Vec::new();
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
@@ -559,11 +677,8 @@ fn put_parts(server: &Server, video: &Path, size: u64, upload: &Upload, progress
                     if let Err(e) = file.seek(SeekFrom::Start(start)).and_then(|_| file.read_exact(&mut buf)) {
                         return *failed.lock().unwrap() = Some(e.to_string());
                     }
-                    match server.put(&upload.parts[i], &buf, None) {
-                        Ok(etag) => {
-                            etags.lock().unwrap()[i] = Some(etag);
-                            progress.sent.fetch_add(len, Ordering::Relaxed);
-                        }
+                    match put(&lane, &upload.parts[i], &buf, None, progress) {
+                        Ok(etag) => etags.lock().unwrap()[i] = Some(etag),
                         Err(e) => return *failed.lock().unwrap() = Some(e),
                     }
                 }
@@ -579,14 +694,11 @@ fn put_parts(server: &Server, video: &Path, size: u64, upload: &Upload, progress
 struct Server {
     /// For the API: quick answers.
     agent: ureq::Agent,
-    /// For uploading parts: 8 MB on a slow connection takes a while.
-    upload: ureq::Agent,
 }
 
 impl Server {
     fn new() -> Self {
-        let agent = |secs| ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(secs))).http_status_as_error(false).build().into();
-        Self { agent: agent(30), upload: agent(600) }
+        Self { agent: ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(30))).http_status_as_error(false).build().into() }
     }
 
     /// This app's token, signing up for one the first time.
@@ -650,32 +762,6 @@ impl Server {
             return Ok(res);
         }
         Err("the server didn't take this app's token".into())
-    }
-
-    /// `PUT` bytes to a signed link, trying again on a hiccup; the ETag.
-    /// `content_type` when the link was signed for one.
-    fn put(&self, link: &str, bytes: &[u8], content_type: Option<&str>) -> Result<String, String> {
-        let mut last = String::new();
-        for attempt in 0..4 {
-            if attempt > 0 {
-                std::thread::sleep(Duration::from_secs(1 << attempt));
-            }
-            let mut req = self.upload.put(link);
-            if let Some(t) = content_type {
-                req = req.header("Content-Type", t);
-            }
-            match req.send(bytes) {
-                Ok(r) if r.status().is_success() => {
-                    let etag = r.headers().get("etag").and_then(|v| v.to_str().ok());
-                    return etag.map(str::to_owned).ok_or_else(|| "the storage didn't confirm a part".into());
-                }
-                // Signed for exactly this; asking again won't change it.
-                Ok(r) if r.status() == 403 => return Err(format!("the storage refused the upload ({})", r.status())),
-                Ok(r) => last = format!("the storage answered {}", r.status()),
-                Err(e) => last = offline(e),
-            }
-        }
-        Err(last)
     }
 }
 
@@ -1135,7 +1221,7 @@ impl App {
         };
         let tex = self.thumbs.get(ctx, &found).and_then(|t| t.texture.clone());
         let job = self.link_jobs.iter().find(|j| j.clip == clip);
-        let sent = |j: &Job| (j.progress.sent.load(Ordering::Relaxed), j.progress.total.load(Ordering::Relaxed), j.progress.making(), j.progress.fraction());
+        let sent = |j: &Job| (j.progress.sent.load(Ordering::Relaxed), j.progress.total.load(Ordering::Relaxed), j.progress.making(), j.progress.fraction(), j.progress.left());
         let uploading = job.filter(|j| j.doing == Doing::Sharing).map(sent);
         let updating = job.filter(|j| j.doing == Doing::Updating).map(sent);
         let stopping = job.is_some_and(|j| j.doing == Doing::Stopping);
@@ -1170,14 +1256,14 @@ impl App {
                 ui_kit::dialog_text(ui, &format!("{watched}Anyone with the link can watch it, in a browser or right in Discord. A link nobody watches for 90 days stops working."));
                 // It follows the clip: a new version on its way, or waiting
                 // to be.
-                if let Some((_, _, making, f)) = updating {
+                if let Some((sent, total, making, f, left)) = updating {
                     ui.add_space(10.0);
                     progress_bar(ui, f);
                     ui.add_space(8.0);
-                    let how = match making {
-                        Some(made) => format!("Making a copy that plays in Discord… {}%", ((made * 100.0) as u32).min(99)),
-                        None if f == 0.0 => "Getting the new version ready…".to_owned(),
-                        None => format!("Updating the link to this version… {}%", ((f * 100.0) as u32).min(99)),
+                    let how = match (making, total) {
+                        (Some(made), _) => format!("Making a copy that plays in Discord… {}%", ((made * 100.0) as u32).min(99)),
+                        (None, 0) => "Getting the new version ready…".to_owned(),
+                        (None, _) => format!("Updating the link to this version… {}", going(sent, total, left)),
                     };
                     ui.label(theme::text(how, 13.5, W::Medium).color(p.text));
                     ui.add_space(4.0);
@@ -1186,14 +1272,15 @@ impl App {
                     ui.add_space(8.0);
                     ui_kit::dialog_text(ui, "The link still shows it as it was before. It's brought up to date by itself as soon as HasteClip's server can be reached.");
                 }
-            } else if let Some((sent, total, making, f)) = uploading {
+            } else if let Some((sent, total, making, f, left)) = uploading {
                 progress_bar(ui, f);
                 ui.add_space(8.0);
-                // No total yet: the copy to upload is still being made.
-                let how = match (making, (sent * 100).checked_div(total)) {
+                // No total yet: the copy to upload is still being made, or
+                // got ready to go up.
+                let how = match (making, total) {
                     (Some(made), _) => format!("Making a copy that plays in Discord… {}%", ((made * 100.0) as u32).min(99)),
-                    (None, None) => "Getting it ready…".to_owned(),
-                    (None, Some(pct)) => format!("Uploading… {}% · {} of {}", pct.min(99), crate::export_ui::human_bytes(sent), crate::export_ui::human_bytes(total)),
+                    (None, 0) => "Getting it ready to upload…".to_owned(),
+                    (None, _) => format!("Uploading… {}", going(sent, total, left)),
                 };
                 ui.label(theme::text(how, 13.5, W::Medium).color(p.text));
                 ui.add_space(4.0);
@@ -1297,6 +1384,32 @@ fn link_row(ui: &mut egui::Ui, url: &str, copied: bool) -> bool {
 }
 
 /// A bar filled `f` (0..=1) of the way.
+/// "12% · 15 MB of 123 MB · about 2 minutes left": how far an upload has
+/// come, and how long is left once that can be said.
+fn going(sent: u64, total: u64, left: Option<Duration>) -> String {
+    let pct = (sent * 100).checked_div(total).unwrap_or(0).min(99);
+    let mut s = format!("{pct}% · {} of {}", crate::export_ui::human_bytes(sent), crate::export_ui::human_bytes(total));
+    if let Some(left) = left {
+        s += &format!(" · {}", time_left(left));
+    }
+    s
+}
+
+/// "about 2 minutes left", rounded the way it's read.
+fn time_left(d: Duration) -> String {
+    let secs = d.as_secs();
+    match secs {
+        0..10 => "a few seconds left".to_owned(),
+        10..60 => format!("about {} seconds left", secs.div_ceil(10) * 10),
+        60..90 => "about a minute left".to_owned(),
+        90..3600 => format!("about {} minutes left", (secs + 30) / 60),
+        _ => {
+            let h = (secs + 1800) / 3600;
+            if h == 1 { "about an hour left".to_owned() } else { format!("about {h} hours left") }
+        }
+    }
+}
+
 fn progress_bar(ui: &mut egui::Ui, f: f32) {
     let p = theme::pal(ui);
     let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 6.0), egui::Sense::hover());
@@ -1307,6 +1420,138 @@ fn progress_bar(ui: &mut egui::Ui, f: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in for the storage's signed part link: takes each PUT's body
+    /// at `rate` bytes a second and answers with an ETag. `stall` stops the
+    /// first `stall` tries for good partway (connected, reading nothing);
+    /// `refuse` answers 403. Returns its link and how many tries it saw.
+    fn storage(rate: f64, stall: usize, refuse: bool) -> (String, Arc<AtomicUsize>) {
+        use std::io::Write as _;
+        let listener = crate::upload_watch::tests::small_buffer_listener();
+        let url = format!("http://{}/part?signed", listener.local_addr().unwrap());
+        let tries = Arc::new(AtomicUsize::new(0));
+        let seen = tries.clone();
+        std::thread::spawn(move || {
+            for c in listener.incoming() {
+                let Ok(mut c) = c else { return };
+                let n = seen.fetch_add(1, Ordering::Relaxed);
+                std::thread::spawn(move || {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") && c.read(&mut byte).unwrap_or(0) == 1 {
+                        head.push(byte[0]);
+                    }
+                    let text = String::from_utf8_lossy(&head).to_lowercase();
+                    let len: usize = text.lines().find_map(|l| l.strip_prefix("content-length:")).and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+                    if refuse {
+                        let _ = c.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        return;
+                    }
+                    let t0 = std::time::Instant::now();
+                    let (mut got, mut buf) = (0usize, [0u8; 4096]);
+                    while got < len {
+                        if n < stall && got >= len / 3 {
+                            std::thread::sleep(Duration::from_secs(60));
+                            return;
+                        }
+                        match c.read(&mut buf) {
+                            Ok(0) | Err(_) => return,
+                            Ok(k) => got += k,
+                        }
+                        let ahead = got as f64 / rate - t0.elapsed().as_secs_f64();
+                        if ahead > 0.0 {
+                            std::thread::sleep(Duration::from_secs_f64(ahead));
+                        }
+                    }
+                    let _ = c.write_all(format!("HTTP/1.1 200 OK\r\nETag: \"part{n}\"\r\nContent-Length: 0\r\n\r\n").as_bytes());
+                });
+            }
+        });
+        (url, tries)
+    }
+
+    #[test]
+    fn time_left_reads_as_said() {
+        let t = |s| time_left(Duration::from_secs(s));
+        assert_eq!(t(4), "a few seconds left");
+        assert_eq!(t(23), "about 30 seconds left");
+        assert_eq!(t(70), "about a minute left");
+        assert_eq!(t(150), "about 3 minutes left");
+        assert_eq!(t(3700), "about an hour left");
+        assert_eq!(t(9000), "about 3 hours left");
+        assert_eq!(going(15_000_000, 123_000_000, None), format!("12% · {} of {}", crate::export_ui::human_bytes(15_000_000), crate::export_ui::human_bytes(123_000_000)));
+    }
+
+    /// Over HTTPS to a real server: the lane's own connections carry TLS,
+    /// and the bar follows what the server confirmed.
+    #[test]
+    #[ignore = "uploads 3 MB to httpbin.org: cargo test -p hasteclip over_https -- --ignored --nocapture"]
+    fn a_part_goes_up_over_https() {
+        let progress = Progress::default();
+        progress.total.store(3_000_000, Ordering::Relaxed);
+        let part = vec![1u8; 3_000_000];
+        let watch = std::thread::scope(|s| {
+            let up = s.spawn(|| put(&crate::upload_watch::Lane::new(), "https://httpbin.org/put", &part, None, &progress));
+            let t0 = std::time::Instant::now();
+            while !up.is_finished() {
+                std::thread::sleep(Duration::from_millis(300));
+                eprintln!("{:>5} ms: {} of 3 MB, {:?}", t0.elapsed().as_millis(), progress.sent.load(Ordering::Relaxed) / 1000, progress.left());
+            }
+            up.join().unwrap()
+        });
+        // httpbin answers with no ETag: the bytes went, the part "wasn't confirmed".
+        assert_eq!(watch.unwrap_err(), "the storage didn't confirm a part");
+        assert_eq!(progress.sent.load(Ordering::Relaxed), 3_000_000);
+    }
+
+    /// A slow part goes up, the bar ending at exactly its size.
+    #[test]
+    fn a_slow_part_goes_up() {
+        let (url, tries) = storage(400_000.0, 0, false);
+        let progress = Progress::default();
+        let part = vec![1u8; 800_000];
+        let etag = put(&crate::upload_watch::Lane::new(), &url, &part, None, &progress).unwrap();
+        assert_eq!(etag, "\"part0\"");
+        assert_eq!(progress.sent.load(Ordering::Relaxed), part.len() as u64);
+        assert_eq!(tries.load(Ordering::Relaxed), 1);
+    }
+
+    /// A part that stalls is tried again, and goes up; what the stalled try
+    /// counted isn't counted twice.
+    #[test]
+    fn a_stalled_part_is_tried_again() {
+        let (url, tries) = storage(400_000.0, 1, false);
+        let progress = Progress::default();
+        let part = vec![1u8; 800_000];
+        let etag = put(&crate::upload_watch::Lane::new(), &url, &part, None, &progress).unwrap();
+        assert_eq!(etag, "\"part1\"");
+        assert_eq!(progress.sent.load(Ordering::Relaxed), part.len() as u64);
+        assert_eq!(tries.load(Ordering::Relaxed), 2);
+    }
+
+    /// A line that stays down: it gives up, says so, and takes back what it
+    /// had counted.
+    #[test]
+    fn a_dead_line_gives_up() {
+        let (url, _) = storage(400_000.0, usize::MAX, false);
+        let progress = Progress::default();
+        let t0 = std::time::Instant::now();
+        let err = put(&crate::upload_watch::Lane::new(), &url, &vec![1u8; 800_000], None, &progress).unwrap_err();
+        assert!(err.contains("stopped getting through"), "{err}");
+        assert_eq!(progress.sent.load(Ordering::Relaxed), 0);
+        assert!(t0.elapsed() < Duration::from_secs(30), "gave up after {:?}", t0.elapsed());
+    }
+
+    /// Refused: no second try.
+    #[test]
+    fn a_refused_part_stops_at_once() {
+        let (url, tries) = storage(400_000.0, 0, true);
+        let progress = Progress::default();
+        let err = put(&crate::upload_watch::Lane::new(), &url, &vec![1u8; 100_000], None, &progress).unwrap_err();
+        assert!(err.contains("refused"), "{err}");
+        assert_eq!(tries.load(Ordering::Relaxed), 1);
+        assert_eq!(progress.sent.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn links_follow_their_clip_and_are_saved() {
@@ -1390,6 +1635,33 @@ mod tests {
         assert_eq!(page_title(&clip("osu!/Ace clutch.mp4")), "Ace clutch");
         assert_eq!(page_title(&clip("osu!/recording_2026-10-19_23-28-15.mp4")), "osu! recording");
         assert_eq!(page_title(&clip("recording_2026-10-19_23-28-15.mp4")), "Recording");
+    }
+
+    /// Noise asked to fit a bitrate macOS's encoder won't go down to at the
+    /// picture it was planned at: the copy is made smaller until it fits,
+    /// instead of going out over.
+    #[test]
+    #[ignore = "encodes 10 s of 1080p60 noise a few times: cargo test -p hasteclip busy_copies_fit -- --ignored"]
+    #[cfg(target_os = "macos")]
+    fn busy_copies_fit() {
+        let dir = std::env::temp_dir().join(format!("hc-busy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("Noise.mp4");
+        let made = media::ffmpeg()
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "nullsrc=s=1920x1080:r=60,geq=random(1)*255:128:128", "-f", "lavfi", "-i", "sine=f=440"])
+            .args(["-t", "10", "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "60M", "-c:a", "aac", "-pix_fmt", "yuv420p"])
+            .arg(&clip)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        // 10 s in 12 MB: under 10 Mbit/s, which the plan puts at 1080p, and
+        // macOS's encoder makes 44 MB of there.
+        let small = fit_under(&clip, &dir, 12, &Progress::default()).unwrap();
+        let size = std::fs::metadata(&small).unwrap().len();
+        assert!(size <= 12 << 20, "{:.1} MB, over 12", size as f64 / 1e6);
+        // And it uses what it may: aiming lower made 1.9 MB of it.
+        assert!(size >= 6 << 20, "{:.1} MB of the 12 it could have", size as f64 / 1e6);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A clip too big to play in Discord goes as a copy that fits, still an

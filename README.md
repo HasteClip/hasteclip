@@ -37,7 +37,7 @@ Download yours from the [latest release](https://github.com/hasteclip/hasteclip/
 
 | System | File | Requirements | Updates |
 |---|---|---|---|
-| macOS | `HasteClip-mac-arm64.dmg` | macOS 13 or later, Apple Silicon | By hand, for now |
+| macOS | `HasteClip-mac-arm64.dmg` | macOS 13 or later, Apple Silicon | Automatic |
 | Windows | `HasteClip-win-Setup.exe` | Windows 10 (2004) or 11 | Automatic |
 | Linux | `HasteClip-linux-x64.tar.gz` | x86-64, Wayland or X11, PipeWire | Automatic |
 
@@ -48,9 +48,9 @@ Automatic updates download in the background and install when you quit, never mi
 
 Open the `.dmg` and drag HasteClip to Applications.
 
-The app isn't signed by Apple yet, so macOS blocks the first launch. Open it once, then go to *System Settings → Privacy & Security* and click *Open Anyway*. You can also run `xattr -dr com.apple.quarantine /Applications/HasteClip.app` instead.
+The app is signed with HasteClip's own certificate, not by Apple, so macOS blocks the first launch. Open it once, then go to *System Settings → Privacy & Security* and click *Open Anyway*. You can also run `xattr -dr com.apple.quarantine /Applications/HasteClip.app` instead. Updates don't ask again.
 
-On first launch, macOS asks for **Screen & System Audio Recording** permission, and for **Microphone** permission if you record your mic. Grant them, then restart HasteClip. After an update, macOS may ask for Screen Recording permission again.
+On first launch, HasteClip shows what it needs macOS to allow: **Screen & System Audio Recording**, and **Input Monitoring** so your shortcuts work in games that take over the whole screen. Allow them, then restart HasteClip. macOS keeps them through updates. You can see and change them later in *Settings → Permissions*.
 </details>
 
 <details>
@@ -163,7 +163,7 @@ HasteClip is in beta (versions 0.x). It works day to day, but not every feature 
 | Record a single game or app window | ✅ | ✅ | ✅ (see below) |
 | Drag clips out, system share sheet | ✅ | ✅ | Drag out on Wayland (no share sheet) |
 | Frame blending | ✅ | ✅ | ✅ |
-| Automatic updates | — | ✅ | ✅ |
+| Automatic updates | ✅ | ✅ | ✅ |
 | Screenshots | — | ✅ | ✅ |
 | Game capture for fullscreen games | — | ✅ | — |
 

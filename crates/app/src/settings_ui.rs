@@ -18,6 +18,9 @@ pub(crate) const REPLAY_CHOICES: [u32; 8] = [15, 30, 60, 120, 300, 600, 1200, 18
 /// The settings column's width.
 const COLUMN: f32 = 680.0;
 /// The groups, in order, for the section list.
+#[cfg(target_os = "macos")]
+const SECTIONS: [&str; 10] = ["Clipping", "Video", "Clips", "Screenshots", "Sharing", "Saved sound", "Shortcuts", "Permissions", "Voice", "App"];
+#[cfg(not(target_os = "macos"))]
 const SECTIONS: [&str; 9] = ["Clipping", "Video", "Clips", "Screenshots", "Sharing", "Saved sound", "Shortcuts", "Voice", "App"];
 
 /// A group's rows, filtered by the search: each row says its words, and the
@@ -135,7 +138,9 @@ impl App {
             "Screenshots" => capture::SCREENSHOTS && f.shows(&["screenshots", "take a screenshot", "shortcut", "hotkey", "format", "png", "jpg", "jpeg", "copy", "clipboard", "paste"]),
             "Sharing" => f.shows(&["discord", "activity", "rich presence"]),
             "Saved sound" => f.shows(&["play a sound when a clip is saved", "sound", "volume", "record the sound", "in clip", "add your own"]),
-            "Shortcuts" => f.shows(&["shortcuts", "hotkey", "keyboard", "save clip", "take a screenshot", "start or stop clipping", "start or stop recording"]),
+            "Shortcuts" => f.shows(&["shortcuts", "hotkey", "keyboard", "save clip", "take a screenshot", "start or stop clipping", "start or stop recording", "fullscreen games", "input monitoring", "permission"]),
+            #[cfg(target_os = "macos")]
+            "Permissions" => crate::setup::Need::ALL.iter().any(|n| f.shows(n.words()) || f.shows(&[n.label()])) || f.shows(&["permissions", "privacy", "allow"]),
             "Voice" => f.shows(&["save by voice", "hasteclip that", "speech", "command", "voice samples", "review"]),
             "App" => f.shows(&["appearance", "theme", "dark", "light", "open at login", "autostart", "startup", "closing the window", "tray", "menu bar", "update", "version", "license", "licence", "about", "source code", "copyright", "open source", "reset"]),
             _ => false,
@@ -155,6 +160,8 @@ impl App {
             "Sharing" => self.sharing_group(ui, f),
             "Saved sound" => self.sound_group(ui, f),
             "Shortcuts" => self.shortcuts_group(ui, f),
+            #[cfg(target_os = "macos")]
+            "Permissions" => self.permissions_group(ui, f),
             "Voice" => self.voice_group(ui, f),
             "App" => self.app_group(ui, f),
             _ => {}
@@ -529,7 +536,66 @@ impl App {
                 let note = problem.clone().unwrap_or_else(|| note.to_owned());
                 l.row(Row::new(action.label()).note(note).warn(problem.is_some()), |ui| self.shortcut_editor(ui, action));
             }
+            #[cfg(target_os = "macos")]
+            if f.shows(&["fullscreen games", "input monitoring", "shortcut", "hotkey", "keyboard", "permission"]) {
+                let allowed = crate::key_tap::allowed();
+                let note = if allowed {
+                    "They work even in games that take over the whole screen."
+                } else {
+                    "Some games take over the whole screen in fullscreen, and macOS doesn't let shortcuts through while they do. Allow Input Monitoring under Permissions so they keep working."
+                };
+                let mut open = false;
+                l.row(Row::new("In fullscreen games").note(note), |ui| {
+                    if allowed {
+                        ui.label(theme::text(format!("{}  Allowed", icon::CHECK), 13.0, W::Medium).color(p.text2));
+                    } else {
+                        open = Btn::normal("Permissions").small().show(ui).clicked();
+                    }
+                });
+                if open {
+                    self.settings_jump = Some("Permissions");
+                }
+            }
         });
+    }
+
+    /// macOS: what HasteClip needs macOS to allow, whether it's allowed,
+    /// and a way to allow what isn't. Nothing here nags: a permission left
+    /// off only shows as off when someone looks.
+    #[cfg(target_os = "macos")]
+    fn permissions_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
+        use crate::setup::Need;
+        let p = theme::pal(ui);
+        let mut ask = None;
+        let mut all = true;
+        ui_kit::list(ui, "permissions", |l| {
+            for need in Need::ALL {
+                let mut words = vec![need.label(), "permission", "privacy", "allow"];
+                words.extend_from_slice(need.words());
+                if !f.shows(&words) {
+                    continue;
+                }
+                let allowed = need.allowed();
+                all &= allowed;
+                l.row(Row::new(need.label()).note(need.why()), |ui| {
+                    if allowed {
+                        ui.label(theme::text(format!("{}  Allowed", icon::CHECK), 13.0, W::Medium).color(p.text2));
+                    } else if Btn::normal("Allow").small().show(ui).clicked() {
+                        ask = Some(need);
+                    }
+                });
+            }
+        });
+        if let Some(need) = ask {
+            need.ask();
+            if need == Need::Keys {
+                self.start_key_tap();
+            }
+        }
+        if !all {
+            // Back from System Settings, it shows as allowed.
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+        }
     }
 
     fn voice_group(&mut self, ui: &mut egui::Ui, f: &Filter) {

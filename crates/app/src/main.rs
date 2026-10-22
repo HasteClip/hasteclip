@@ -30,6 +30,8 @@ mod library_grid;
 mod links;
 mod glass;
 mod hover_play;
+#[cfg(target_os = "macos")]
+mod key_tap;
 #[cfg(target_os = "linux")]
 mod linux_desktop;
 mod meter;
@@ -44,6 +46,8 @@ mod screenshot;
 mod service;
 mod settings;
 mod settings_ui;
+#[cfg(target_os = "macos")]
+mod setup;
 mod share;
 mod transport;
 #[cfg(target_os = "linux")]
@@ -60,6 +64,9 @@ mod transfer;
 mod time_field;
 mod ui_kit;
 mod update;
+#[cfg(target_os = "macos")]
+mod update_mac;
+mod upload_watch;
 #[cfg(target_os = "linux")]
 mod update_linux;
 #[cfg(hw_decode)]
@@ -130,6 +137,10 @@ fn main() -> eframe::Result<()> {
     velopack::VelopackApp::build().run();
     #[cfg(target_os = "linux")]
     if update_linux::apply_pending_at_launch() {
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    if update_mac::apply_pending_at_launch() {
         return Ok(());
     }
     // One HasteClip at a time: another launch shows the running one and
@@ -533,6 +544,8 @@ struct App {
     quitting: bool,
     /// The first close: ask whether to keep running in the tray.
     close_dialog: bool,
+    /// macOS: the permissions screen is up (once, at the first launch).
+    setup_open: bool,
     /// What was shown last frame (page, library filter, Clip names open), to
     /// scroll a new view back to the top and bring its content in.
     last_view: Option<(Page, library::Filter, bool)>,
@@ -613,6 +626,12 @@ impl App {
             channel.set_denoise(s.noise_reduction.into());
             channel.set_mono(s.mono);
         }
+        // macOS: what it needs allowed is shown once, before clipping starts
+        // (and once more when a release needs it allowed again).
+        #[cfg(target_os = "macos")]
+        let setup_open = settings.setup_shown < setup::SETUP_ROUND && !demo::on();
+        #[cfg(not(target_os = "macos"))]
+        let setup_open = false;
         let updater = update::Updater::new(ctx.clone(), settings.auto_update);
         let (tray_tx, tray_rx) = std::sync::mpsc::channel();
         if let Some(listener) = instance {
@@ -726,6 +745,7 @@ impl App {
             tray,
             quitting: false,
             close_dialog: false,
+            setup_open,
             edit_return: None,
             nav: nav::History::default(),
             web_images: Default::default(),
@@ -828,8 +848,12 @@ impl App {
         if !recovered.is_empty() {
             app.toast("Recovered a recording that was cut off last time");
         }
-        // Never miss a moment: arm the buffer on launch (unless it can't work yet).
-        if app.settings.auto_start_buffer && !open_sources && !open_review && app.permission != capture::Permission::Denied {
+        // Input Monitoring allowed: shortcuts work while a game holds the screen too.
+        #[cfg(target_os = "macos")]
+        app.start_key_tap();
+        // Never miss a moment: arm the buffer on launch (unless it can't work
+        // yet, or the permissions screen is up: it starts when that closes).
+        if app.settings.auto_start_buffer && !open_sources && !open_review && !app.setup_open && app.permission != capture::Permission::Denied {
             app.start_replay_buffer();
         }
         if demo::on() && demo::clipping_from_start() {
@@ -1093,6 +1117,7 @@ impl eframe::App for App {
             || self.link_dialog.is_some()
             || self.confirm_reset
             || self.close_dialog
+            || self.setup_open
             || self.show_keys.is_some()
             || ctx.memory(|m| m.top_modal_layer().is_some())
             || ctx.any_popup_open();
@@ -1141,6 +1166,8 @@ impl eframe::App for App {
         self.link_dialog(&ctx);
         self.close_dialog(&ctx);
         self.keys_dialog(&ctx);
+        #[cfg(target_os = "macos")]
+        self.setup_dialog(&ctx);
         ui_kit::pointer_cursor(&ctx);
         ui_kit::lenient_clicks(&ctx);
         laps.lap("dialogs");
@@ -2252,7 +2279,7 @@ impl App {
 }
 
 /// Open the macOS Screen Recording privacy pane directly.
-fn open_screen_settings() {
+pub(crate) fn open_screen_settings() {
     #[cfg(target_os = "macos")]
     {
         let _ = std::process::Command::new("open")

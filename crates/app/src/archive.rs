@@ -236,17 +236,17 @@ fn extract<R: Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>, name: &str, to
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     // Written aside, then moved in: the library never sees half a clip.
-    let partial = to.with_file_name(format!(".{}.importing", to.file_name().unwrap_or_default().to_string_lossy()));
+    let partial = capture::output::in_progress(to);
     let result = (|| {
         let mut out = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&partial)?);
         copy(&mut entry, &mut out, progress)?;
         out.flush()?;
         std::fs::rename(&partial, to)
     })();
-    result.map_err(|e| {
+    if result.is_err() {
         let _ = std::fs::remove_file(&partial);
-        format!("Couldn't write {}: {e}", to.display())
-    })
+    }
+    result.map_err(|e| format!("Couldn't write {}: {e}", to.display()))
 }
 
 /// Copy, counting the bytes into `progress`.

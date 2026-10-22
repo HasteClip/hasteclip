@@ -59,20 +59,15 @@ fn reserve(dir: &Path, name: &str) -> PathBuf {
     path
 }
 
-/// Write `img` to `path`: to a hidden file first, renamed once it's whole, so
-/// the library never shows half of one.
+/// Write `img` to `path`: into a hidden folder first, moved out once it's
+/// whole, so the library never shows half of one.
 fn write(img: &capture::StillImage, path: &Path, format: ScreenshotFormat) -> Result<(), String> {
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let partial = path.with_file_name(format!(".{name}"));
-    let encoded = encode(img, &partial, format);
-    if let Err(e) = encoded {
+    let partial = capture::output::in_progress(path);
+    let written = encode(img, &partial, format).and_then(|()| std::fs::rename(&partial, path).map_err(|e| format!("couldn't save it: {e}")));
+    if written.is_err() {
         let _ = std::fs::remove_file(&partial);
-        return Err(e);
     }
-    std::fs::rename(&partial, path).map_err(|e| {
-        let _ = std::fs::remove_file(&partial);
-        format!("couldn't save it: {e}")
-    })
+    written
 }
 
 fn encode(img: &capture::StillImage, to: &Path, format: ScreenshotFormat) -> Result<(), String> {
@@ -141,9 +136,10 @@ mod tests {
         let j = image::open(&jpg).unwrap().to_rgb8();
         assert_eq!((j.width(), j.height()), (64, 36));
         assert!(j.get_pixel(5, 0).0[0] > 180);
-        // Nothing hidden is left behind.
-        let hidden = std::fs::read_dir(&dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with('.')).count();
+        // Nothing half-written is left behind.
+        let hidden = std::fs::read_dir(&dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with('.') && e.file_name() != capture::output::WRITING).count();
         assert_eq!(hidden, 0);
+        assert_eq!(std::fs::read_dir(dir.join(capture::output::WRITING)).unwrap().count(), 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
