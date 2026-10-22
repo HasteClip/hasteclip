@@ -807,6 +807,9 @@ impl App {
         let name = self.settings.webcam.as_ref().map(|w| w.name.clone()).unwrap_or_default();
         let current = self.settings.webcam.as_ref().and_then(|w| w.format).map(capture::webcam::Format::from);
         let mut pick: Option<Option<capture::webcam::Format>> = None;
+        // How it's turned and mirrored in the clips (the webcam's placement).
+        let orient = self.settings.webcam.as_ref().map_or_else(Orientation::default, |w| Orientation { flip_h: w.placement.flip_h, flip_v: w.placement.flip_v, turns: w.placement.turns });
+        let mut reorient: Option<Orientation> = None;
         // The frame rate the camera runs at: as picked, or Automatic's pick.
         let fps = current.or_else(|| self.camera_panel.as_ref().and_then(|p| capture::webcam::formats(&p.device).into_iter().max_by_key(|f| f.auto_rank()))).map(|f| f.fps());
         let Some(panel) = self.camera_panel.as_mut() else { return };
@@ -822,22 +825,24 @@ impl App {
                 ui.allocate_ui_with_layout(vec2(col, h), egui::Layout::top_down(egui::Align::Min), |ui| {
                     ui.set_width(col);
                     ui.add_space(4.0);
-                    picture_side(ui, panel, &name, fps, h * 0.7, &mut reset);
+                    picture_side(ui, panel, &name, fps, orient, h * 0.7, &mut reset);
                 });
                 ui.allocate_ui_with_layout(vec2(col, h), egui::Layout::top_down(egui::Align::Min), |ui| {
                     ui.set_width(col);
                     crate::ui_kit::scroll(ui, "camera_controls", |ui| {
                         format_view(ui, &panel.device, current, &mut pick);
+                        orientation_view(ui, orient, &mut reorient);
                         controls_view(ui, panel, fps, &mut set);
                         ui.add_space(28.0);
                     });
                 });
             });
         } else {
-            picture_side(ui, panel, &name, fps, h * 0.4, &mut reset);
+            picture_side(ui, panel, &name, fps, orient, h * 0.4, &mut reset);
             crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
             crate::ui_kit::scroll(ui, "camera_controls", |ui| {
                 format_view(ui, &panel.device, current, &mut pick);
+                orientation_view(ui, orient, &mut reorient);
                 controls_view(ui, panel, fps, &mut set);
                 ui.add_space(28.0);
             });
@@ -878,6 +883,24 @@ impl App {
                 w.format = p.map(Into::into);
             }
             self.webcam_view.ask_fit();
+        }
+        // Turned or mirrored: the placement, as the preview's right-click does
+        // it (a quarter turn swaps the box's sides).
+        if let (Some(o), Some(w)) = (reorient, self.settings.webcam.as_mut()) {
+            let aspect = w.placement.frame_aspect.unwrap_or(16.0 / 9.0);
+            let mut p: Placement = w.placement.into();
+            p.flip_h = o.flip_h;
+            p.flip_v = o.flip_v;
+            // Turned a quarter at a time, as seen (`Placement::turn`), from how
+            // it's seen now to how it's wanted.
+            let seen = Orientation { flip_h: p.flip_h, flip_v: p.flip_v, turns: p.turns }.seen_turns();
+            match (o.turns as i8 - seen as i8).rem_euclid(4) {
+                1 => p = p.turn(1, aspect),
+                2 => p = p.turn(1, aspect).turn(1, aspect),
+                3 => p = p.turn(-1, aspect),
+                _ => {}
+            }
+            w.placement = PlacementCfg::laid_out(p, aspect);
         }
         if back {
             self.camera_panel = None;
@@ -979,10 +1002,10 @@ fn curve_value(pos: f32, min: i64, max: i64) -> i64 {
 
 /// The Camera page's still side: the picture, which camera it is and in what
 /// size, and resetting its settings.
-fn picture_side(ui: &mut egui::Ui, panel: &mut CameraPanel, name: &str, fps: Option<f32>, max_h: f32, reset: &mut bool) {
+fn picture_side(ui: &mut egui::Ui, panel: &mut CameraPanel, name: &str, fps: Option<f32>, orient: Orientation, max_h: f32, reset: &mut bool) {
     use crate::theme::{self, W};
     let pal = theme::pal(ui);
-    picture_view(ui, panel, max_h);
+    picture_view(ui, panel, orient, max_h);
     crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
     let status = match (capture::webcam::status(), panel.fps) {
         (capture::webcam::Status::Live { width, height }, Some(fps)) => format!("{name} · {width}×{height} · {fps:.0} new pictures/s"),
@@ -1018,7 +1041,7 @@ fn slowdown(measured: Option<f32>, fps: Option<f32>) -> Option<String> {
 
 /// The camera's own picture, live, as wide as there's room for and at most
 /// `max_h` tall.
-fn picture_view(ui: &mut egui::Ui, panel: &mut CameraPanel, max_h: f32) {
+fn picture_view(ui: &mut egui::Ui, panel: &mut CameraPanel, orient: Orientation, max_h: f32) {
     let pal = crate::theme::pal(ui);
     let w = ui.available_width();
     if let Some(p) = capture::webcam::camera_picture((w * ui.ctx().pixels_per_point()) as u32, panel.seq) {
@@ -1042,19 +1065,81 @@ fn picture_view(ui: &mut egui::Ui, panel: &mut CameraPanel, max_h: f32) {
         _ => {}
     }
     ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
-    let aspect = panel.picture.as_ref().map_or(16.0 / 9.0, |t| t.size()[0] as f32 / t.size()[1].max(1) as f32);
+    // As it is in the clips: turned, then mirrored or flipped.
+    let raw = panel.picture.as_ref().map_or(16.0 / 9.0, |t| t.size()[0] as f32 / t.size()[1].max(1) as f32);
+    let sideways = orient.turns % 2 == 1;
+    let aspect = if sideways { 1.0 / raw } else { raw };
     let pw = w.min(max_h.max(120.0) * aspect);
     ui.vertical_centered(|ui| {
         let (rect, _) = ui.allocate_exact_size(vec2(pw, pw / aspect), egui::Sense::hover());
         match &panel.picture {
             Some(t) => {
-                egui::Image::from_texture((t.id(), rect.size())).corner_radius(crate::ui_kit::RADIUS).paint_at(ui, rect);
+                // Drawn unturned, then turned about its middle; the mirror and
+                // flip are the clip's (after turning), so sideways they swap axes.
+                let unturned = if sideways { egui::Rect::from_center_size(rect.center(), vec2(rect.height(), rect.width())) } else { rect };
+                let (fu, fv) = if sideways { (orient.flip_v, orient.flip_h) } else { (orient.flip_h, orient.flip_v) };
+                let uv = egui::Rect::from_min_max(egui::pos2(if fu { 1.0 } else { 0.0 }, if fv { 1.0 } else { 0.0 }), egui::pos2(if fu { 0.0 } else { 1.0 }, if fv { 0.0 } else { 1.0 }));
+                let mut image = egui::Image::from_texture((t.id(), unturned.size())).uv(uv);
+                image = if orient.turns % 4 == 0 { image.corner_radius(crate::ui_kit::RADIUS) } else { image.rotate(orient.turns as f32 * std::f32::consts::FRAC_PI_2, vec2(0.5, 0.5)) };
+                image.paint_at(ui, unturned);
             }
             None => {
                 ui.painter().rect_filled(rect, crate::ui_kit::RADIUS, pal.control);
                 ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "Waiting for the camera…", egui::FontId::proportional(13.0), pal.text3);
             }
         }
+    });
+}
+
+/// How the webcam is turned (quarter turns clockwise) and mirrored or
+/// flipped in the clips: its placement's.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct Orientation {
+    flip_h: bool,
+    flip_v: bool,
+    turns: u8,
+}
+
+impl Orientation {
+    /// Quarter turns clockwise as you see it: a mirrored picture's turns go
+    /// the other way under its mirror (`Placement::turn`).
+    fn seen_turns(self) -> u8 {
+        let t = self.turns % 4;
+        if self.flip_h != self.flip_v { (4 - t) % 4 } else { t }
+    }
+}
+
+/// The webcam's orientation in the clips, after its format: the same as the
+/// preview's right-click. What's wanted goes in `reorient`, its `turns` as
+/// seen (`Orientation::seen_turns`).
+fn orientation_view(ui: &mut egui::Ui, now: Orientation, reorient: &mut Option<Orientation>) {
+    use crate::ui_kit::{Item, Row};
+    crate::ui_kit::section_head(ui, "Orientation", false, |_| {});
+    crate::ui_kit::list(ui, "camera_orientation", |l| {
+        l.row(Row::new("Mirror").note("Left and right swapped, in your clips too"), |ui| {
+            let mut on = now.flip_h;
+            if crate::ui_kit::switch(ui, &mut on).changed() {
+                *reorient = Some(Orientation { flip_h: on, turns: now.seen_turns(), ..now });
+            }
+        });
+        l.row(Row::new("Upside down"), |ui| {
+            let mut on = now.flip_v;
+            if crate::ui_kit::switch(ui, &mut on).changed() {
+                *reorient = Some(Orientation { flip_v: on, turns: now.seen_turns(), ..now });
+            }
+        });
+        l.row(Row::new("Rotation"), |ui| {
+            let label = |t: u8| format!("{}°", t as u32 % 4 * 90);
+            let seen = now.seen_turns();
+            let r = crate::ui_kit::select(ui, &label(seen), 150.0);
+            crate::ui_kit::menu_popup(&r, false, 160.0, |ui| {
+                for t in 0..4u8 {
+                    if Item::new(label(t)).check(seen == t).show(ui).clicked() && seen != t {
+                        *reorient = Some(Orientation { turns: t, ..now });
+                    }
+                }
+            });
+        });
     });
 }
 
