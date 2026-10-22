@@ -292,6 +292,10 @@ impl Recorder for LinuxRecorder {
         shot
     }
 
+    fn set_mic(&mut self, id: &str, device: &str) -> bool {
+        self.session.as_mut().and_then(|s| s.audio.as_mut()).is_some_and(|a| a.set_mic(id, device))
+    }
+
     fn update_video(&mut self, video: &VideoSource) -> bool {
         match (self.session.as_ref().and_then(|s| s.feed.as_ref()), video) {
             (Some(Feed::Apps(a)), VideoSource::Apps { ids, away_when_unfocused, .. }) => {

@@ -928,9 +928,8 @@ fn source_card(
     use egui_phosphor::regular as icon;
     let pal = theme::pal(ui);
     let mut action = CardAction::None;
-    // A mic can switch device while capturing (its track stays); on Linux
-    // mics are set when capture starts.
-    let picker_locked = locked.filter(|_| cfg!(target_os = "linux") || !matches!(source.kind, SourceKind::Microphone { .. }));
+    // A mic can switch device while capturing (its track stays).
+    let picker_locked = locked.filter(|_| !matches!(source.kind, SourceKind::Microphone { .. }));
     let card_id = source.id.clone();
     group(ui, ("source", card_id), |ui| {
         ui.multiply_opacity(if source.enabled { 1.0 } else { 0.6 });

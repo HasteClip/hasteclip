@@ -170,7 +170,7 @@ impl Cast {
     /// Ask KWin to stream the monitor with this id (the main one if there's
     /// none such). `ended` is called if KWin stops the stream.
     pub(crate) fn open(id: &str, ended: impl FnOnce(String) + Send + 'static) -> Result<Self> {
-        let mut session = Session::connect()?;
+        let session = Session::connect()?;
         let want = id.strip_prefix("kde:");
         let mut outputs: Vec<&Output> = session.state.outputs.iter().filter(|o| o.size.is_some()).collect();
         outputs.sort_by_key(|o| session.state.rank(o));
