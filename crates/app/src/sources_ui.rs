@@ -493,7 +493,11 @@ impl App {
     /// The preview itself: as wide as the card, never taller than a third of
     /// the window so the rest stays in view.
     fn preview_picture(&mut self, ui: &mut egui::Ui, frame: Option<&capture::preview::PreviewFrame>) {
-        let aspect = frame.map_or(16.0 / 10.0, |f| f.width as f32 / f.height.max(1) as f32);
+        // The frame's shape; between captures (none has a frame for a moment,
+        // starting to clip) the shape of the picture still shown, so it isn't
+        // drawn stretched.
+        let shown = self.sources_view.preview.as_ref().map(|(t, _)| t.size()).map(|[w, h]| w as f32 / h.max(1) as f32);
+        let aspect = frame.map(|f| f.width as f32 / f.height.max(1) as f32).or(shown).unwrap_or(16.0 / 10.0);
         let max_h = (ui.ctx().content_rect().height() * 0.45).max(140.0);
         let w = ui.available_width().min(max_h * aspect);
         ui.vertical_centered(|ui| {

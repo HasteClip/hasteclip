@@ -994,21 +994,9 @@ fn rate_for(formats: &[capture::webcam::Format], size: (u32, u32), current: Opti
     same.or_else(|| at.max_by(|a, b| a.fps().total_cmp(&b.fps()))).copied()
 }
 
-/// A size, named when it's a common one: "1080p · 1920×1080".
+/// A size: "1920×1080".
 fn size_label(w: u32, h: u32) -> String {
-    let name = match (w, h) {
-        (3840, 2160) => Some("4K"),
-        (2560, 1440) => Some("1440p"),
-        (1920, 1080) => Some("1080p"),
-        (1280, 720) => Some("720p"),
-        (854, 480) | (640, 480) => Some("480p"),
-        (640, 360) => Some("360p"),
-        _ => None,
-    };
-    match name {
-        Some(n) => format!("{n} · {w}×{h}"),
-        None => format!("{w}×{h}"),
-    }
+    format!("{w}×{h}")
 }
 
 fn fps_label(fps: f32) -> String {
@@ -1031,7 +1019,7 @@ mod format_tests {
         // 30 fps is kept where the new size has it; else the fastest.
         assert_eq!(rate_for(&formats, (640, 480), Some(f(1920, 1080, 30))), Some(f(640, 480, 30)));
         assert_eq!(rate_for(&formats, (1280, 720), Some(f(1920, 1080, 30))), Some(f(1280, 720, 60)));
-        assert_eq!(size_label(1920, 1080), "1080p · 1920×1080");
+        assert_eq!(size_label(1920, 1080), "1920×1080");
         // As `Format::label`: within 0.05 of a whole number reads as it.
         assert_eq!(fps_label(29.97), "30 fps");
         assert_eq!(fps_label(7.5), "7.50 fps");
