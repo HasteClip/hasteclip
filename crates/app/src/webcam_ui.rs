@@ -822,7 +822,7 @@ impl App {
                 ui.allocate_ui_with_layout(vec2(col, h), egui::Layout::top_down(egui::Align::Min), |ui| {
                     ui.set_width(col);
                     ui.add_space(4.0);
-                    picture_side(ui, panel, &name, h * 0.7, &mut reset);
+                    picture_side(ui, panel, &name, fps, h * 0.7, &mut reset);
                 });
                 ui.allocate_ui_with_layout(vec2(col, h), egui::Layout::top_down(egui::Align::Min), |ui| {
                     ui.set_width(col);
@@ -834,7 +834,7 @@ impl App {
                 });
             });
         } else {
-            picture_side(ui, panel, &name, h * 0.4, &mut reset);
+            picture_side(ui, panel, &name, fps, h * 0.4, &mut reset);
             crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
             crate::ui_kit::scroll(ui, "camera_controls", |ui| {
                 format_view(ui, &panel.device, current, &mut pick);
@@ -1031,7 +1031,7 @@ fn zone_slider(ui: &mut egui::Ui, value: &mut f32, width: f32, zone: Option<(f32
 
 /// The Camera page's still side: the picture, which camera it is and in what
 /// size, and resetting its settings.
-fn picture_side(ui: &mut egui::Ui, panel: &mut CameraPanel, name: &str, max_h: f32, reset: &mut bool) {
+fn picture_side(ui: &mut egui::Ui, panel: &mut CameraPanel, name: &str, fps: Option<f32>, max_h: f32, reset: &mut bool) {
     use crate::theme::{self, W};
     let pal = theme::pal(ui);
     picture_view(ui, panel, max_h);
@@ -1049,7 +1049,32 @@ fn picture_side(ui: &mut egui::Ui, panel: &mut CameraPanel, name: &str, max_h: f
             }
         });
     });
+    // Slower than its format: say why, as far as can be told.
+    let manual_exposure = {
+        let auto = panel.controls.iter().find(|c| c.id == v4l2::AUTO_EXPOSURE);
+        let time = panel.controls.iter().find(|c| c.id == v4l2::EXPOSURE);
+        time.filter(|_| auto.is_none_or(|a| !auto_on(a))).map(|c| c.value)
+    };
+    if let Some(why) = slowdown(panel.fps, fps, manual_exposure) {
+        ui.add(egui::Label::new(theme::text(why, 12.5, W::Regular).color(pal.warn)).wrap());
+    }
     ui.add(egui::Label::new(theme::text("Changes apply right away, in every app, and are put back each time HasteClip opens this camera.", 12.0, W::Regular).color(pal.text3)).wrap());
+}
+
+/// Why the camera sends fewer new pictures (`measured` a second) than its
+/// format's `fps`, when clearly fewer: an exposure (`manual`, in 100 µs
+/// units) longer than a frame, else too little light reaching the camera,
+/// which slows itself down then whatever its settings (gain doesn't help).
+fn slowdown(measured: Option<f32>, fps: Option<f32>, manual: Option<i64>) -> Option<String> {
+    let (measured, fps) = (measured?, fps?);
+    if measured >= fps * 0.85 {
+        return None;
+    }
+    let sending = format!("Sending {measured:.0} of {fps:.0} pictures a second:");
+    Some(match manual {
+        Some(t) if t > exposure_guides(fps).1 => format!("{sending} the exposure is longer than a frame. Shorten it to get {fps:.0}."),
+        _ => format!("{sending} the camera slows down when too little light reaches it. Brighter light in front of you brings {fps:.0} back; gain doesn't."),
+    })
 }
 
 /// The camera's own picture, live, as wide as there's room for and at most
@@ -1215,6 +1240,17 @@ mod panel_tests {
         assert_eq!(curve_value(curve_pos(167, 3, 2047), 3, 2047), 167);
         assert_eq!(curve_value(0.0, 3, 2047), 3);
         assert_eq!(curve_value(1.0, 3, 2047), 2047);
+    }
+
+    /// Only clearly fewer than the format's rate is a slowdown; past a
+    /// frame's exposure it's that, else the light.
+    #[test]
+    fn says_why_the_camera_slows() {
+        assert_eq!(slowdown(Some(58.0), Some(60.0), None), None);
+        assert!(slowdown(Some(30.0), Some(60.0), Some(250)).unwrap().contains("longer than a frame"));
+        assert!(slowdown(Some(30.0), Some(60.0), Some(100)).unwrap().contains("too little light"));
+        assert!(slowdown(Some(30.0), Some(60.0), None).unwrap().contains("too little light"));
+        assert_eq!(slowdown(None, Some(60.0), None), None);
     }
 
     #[test]
