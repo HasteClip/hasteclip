@@ -444,11 +444,22 @@ struct Switchable {
     /// Every picture is kept as it arrives (`queue_arrivals`): the next
     /// source too.
     queuing: AtomicBool,
+    /// The part of a screen recorded, for as long as it runs (it sets the
+    /// recording's size).
+    crop: Option<crate::Crop>,
 }
 
 enum Source {
     Screen(Arc<screen::Screen>),
     Apps(Arc<apps::Apps>),
+}
+
+/// The part of a screen `video` records, if it's cropped.
+fn crop_of(video: &VideoSource) -> Option<crate::Crop> {
+    match video {
+        VideoSource::Screen { crop, .. } => *crop,
+        VideoSource::Apps { .. } => None,
+    }
 }
 
 impl Source {
@@ -474,14 +485,32 @@ impl Source {
 }
 
 impl Feed {
-    fn open(source: &VideoSource, away_screen: Option<&crate::StillImage>) -> Result<Self> {
-        let source = Source::open(source, away_screen)?;
+    fn open(video: &VideoSource, away_screen: Option<&crate::StillImage>) -> Result<Self> {
+        let source = Source::open(video, away_screen)?;
         Ok(Self(Arc::new(Switchable {
             source: std::sync::RwLock::new(source),
             base: Default::default(),
             last: Default::default(),
             queuing: AtomicBool::new(false),
+            crop: crop_of(video),
         })))
+    }
+
+    fn crop(&self) -> Option<crate::Crop> {
+        self.0.crop
+    }
+
+    /// The size it's recorded at: the crop's, else the screen's (or the
+    /// main display's) as `target_height` and `shape` make it.
+    fn recorded_size(&self, target_height: Option<u32>, shape: Option<crate::Shape>) -> (u32, u32) {
+        let (w, h) = self.size();
+        match self.crop() {
+            Some(c) => {
+                let [_, _, w, h] = c.rect(w, h);
+                (w, h)
+            }
+            None => crate::recorded_size(w, h, target_height, shape),
+        }
     }
 
     fn source(&self) -> std::sync::RwLockReadGuard<'_, Source> {
@@ -502,6 +531,9 @@ impl Feed {
         if let (Source::Apps(a), VideoSource::Apps { ids, away_when_unfocused, .. }) = (&*self.source(), video) {
             a.set(ids, *away_when_unfocused);
             return Ok(());
+        }
+        if crop_of(video) != self.crop() {
+            bail!("another crop makes the recording another size");
         }
         let new = Source::open(video, away_screen)?;
         let queuing = self.0.queuing.load(Ordering::Relaxed);
@@ -626,8 +658,7 @@ struct Session {
 impl Session {
     fn start(s: &EncodeSettings, target: Target, live: &Arc<LiveAudio>, mov: bool) -> Result<Self> {
         let feed = Feed::open(&s.video, s.away_screen.as_deref())?;
-        let (canvas_w, canvas_h) = feed.size();
-        let (width, height) = crate::recorded_size(canvas_w, canvas_h, s.target_height, s.shape);
+        let (width, height) = feed.recorded_size(s.target_height, s.shape);
         let framing = s.shape.map_or(crate::Framing::Fit, |shape| shape.framing);
         let clock = Arc::new(Clock::default());
 
@@ -744,7 +775,8 @@ struct Picture {
 impl Picture {
     fn new(feed: Feed, width: u32, height: u32, framing: crate::Framing, webcam: Option<&crate::webcam::Webcam>) -> Self {
         let camera = webcam.map(|w| (camera::CameraLayer::new(w), w.placement.clone()));
-        let gpu = screen::gpu_frames().map(|g| gpu_frame::GpuPicture::new(g, width, height, framing));
+        let crop = feed.crop();
+        let gpu = screen::gpu_frames().map(|g| gpu_frame::GpuPicture::new(g, width, height, framing, crop));
         let mut canvas = if gpu.is_some() { Canvas::new(0, 0) } else { Canvas::new(width, height) };
         canvas.clear();
         Self { feed, width, height, canvas, gpu, framing, camera, shows: None, camera_shown: None, nv12: Vec::new(), version: 0 }
@@ -785,7 +817,7 @@ impl Picture {
                     }
                 }
                 None => {
-                    self.canvas.fill_from(&frame, self.framing);
+                    self.canvas.fill_from(&frame, self.framing, self.feed.crop());
                     if let (Some(cam), Some(place)) = (&cam, &place) {
                         self.canvas.draw_camera(cam, place);
                     }
@@ -947,8 +979,7 @@ impl PreviewCapture {
                 }
             };
             *opened2.lock().unwrap() = Some(feed.clone());
-            let (w, h) = feed.size();
-            let (width, height) = crate::recorded_size(w, h, target_height, shape);
+            let (width, height) = feed.recorded_size(target_height, shape);
             let framing = shape.map_or(crate::Framing::Fit, |shape| shape.framing);
             let mut picture = Picture::new(feed.clone(), width, height, framing, webcam.as_ref());
             let mut sent = Previewed::new(generation);
@@ -1040,7 +1071,7 @@ mod tests {
     #[ignore = "records the screen: cargo test -p capture records_the_screen -- --ignored"]
     fn records_the_screen() {
         let screen = list_screens().into_iter().next().expect("a screen");
-        let video = VideoSource::Screen { id: screen.id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() }, method: Default::default() };
+        let video = VideoSource::Screen { id: screen.id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() }, method: Default::default(), crop: None };
         let dir = std::env::temp_dir().join("hc-record-test");
         let _ = std::fs::remove_dir_all(&dir);
         let settings = EncodeSettings {
@@ -1166,7 +1197,7 @@ mod tests {
     #[ignore = "captures the screen: cargo test -p capture screenshot_of_the_screen -- --ignored"]
     fn screenshot_of_the_screen() {
         let screen = list_screens().into_iter().next().expect("a screen");
-        let video = VideoSource::Screen { id: screen.id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() }, method: Default::default() };
+        let video = VideoSource::Screen { id: screen.id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() }, method: Default::default(), crop: None };
         let mut rec = LinuxRecorder::new(Arc::new(LiveAudio::default()));
         let t = Instant::now();
         let img = rec.screenshot(&video).unwrap().finish().unwrap();

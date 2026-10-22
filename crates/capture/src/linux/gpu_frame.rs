@@ -230,6 +230,8 @@ pub(crate) struct GpuPicture {
     pub width: u32,
     pub height: u32,
     framing: crate::Framing,
+    /// The part of the picture used, if not all of it.
+    crop: Option<crate::Crop>,
     scale: wgpu::ComputePipeline,
     nv12: wgpu::ComputePipeline,
     /// The frame, RGBA.
@@ -292,7 +294,7 @@ struct Layer {
 }
 
 impl GpuPicture {
-    pub(crate) fn new(gpu: Arc<Gpu>, width: u32, height: u32, framing: crate::Framing) -> Self {
+    pub(crate) fn new(gpu: Arc<Gpu>, width: u32, height: u32, framing: crate::Framing, crop: Option<crate::Crop>) -> Self {
         let device = &gpu.device;
         let pipeline = |source: &str, entry: &str| {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(entry), source: wgpu::ShaderSource::Wgsl(source.into()) });
@@ -340,7 +342,7 @@ impl GpuPicture {
         let size_bytes: Vec<u8> = [width, height, 0, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
         gpu.queue.write_buffer(&sizes, 0, &size_bytes);
         let layer = Layer { canvas: Canvas::new(width, height), texture: overlay, rows: None, on: false };
-        Self { gpu, width, height, framing, scale, nv12, frame, uniforms, nv12_buf, readback, layer, uploaded: None, nv12_bind, blend: None, preview: None }
+        Self { gpu, width, height, framing, crop, scale, nv12, frame, uniforms, nv12_buf, readback, layer, uploaded: None, nv12_bind, blend: None, preview: None }
     }
 
     /// Draw the webcam's layer: `cam` placed at `place`, or none.
@@ -387,7 +389,7 @@ impl GpuPicture {
             },
         };
         let (sw, sh) = (texture.width(), texture.height());
-        let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = crate::placement((sw, sh), (self.width, self.height), self.framing);
+        let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = crate::placement_cropped(self.crop, (sw, sh), (self.width, self.height), self.framing);
         let floats: Vec<u8> = [sx, sy, sw, sh, dx, dy, dw, dh].iter().flat_map(|v| (*v as f32).to_le_bytes()).chain([self.width, self.height, u32::from(self.layer.on), 0].iter().flat_map(|v| v.to_le_bytes())).collect();
         self.gpu.queue.write_buffer(&self.uniforms, 0, &floats);
         let device = &self.gpu.device;
@@ -516,7 +518,7 @@ impl GpuPicture {
 
     /// Add each open frame's waiting weight of the held picture to its sum.
     fn flush(&mut self) {
-        let (width, height, framing) = (self.width, self.height, self.framing);
+        let (width, height, framing, crop) = (self.width, self.height, self.framing, self.crop);
         let Some(b) = &mut self.blend else { return };
         let Some(held) = &b.held else {
             b.slots.iter_mut().for_each(|s| s.pending = 0.0);
@@ -525,7 +527,7 @@ impl GpuPicture {
         if b.slots.iter().all(|s| s.pending <= 0.0) {
             return;
         }
-        let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = crate::placement((held.width(), held.height()), (width, height), framing);
+        let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = crate::placement_cropped(crop, (held.width(), held.height()), (width, height), framing);
         let device = &self.gpu.device;
         let source_view = held.create_view(&Default::default());
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("looks") });
@@ -722,7 +724,7 @@ mod tests {
     fn blends_light() {
         let gpu = super::super::gpu::gpu().expect("a graphics card");
         let solid = |v: u8| Frame { width: 16, height: 16, stride: 64, order: Order::Bgr, data: [v, v, v, 255].repeat(256), texture: None };
-        let mut pic = GpuPicture::new(gpu, 16, 16, crate::Framing::Fit);
+        let mut pic = GpuPicture::new(gpu, 16, 16, crate::Framing::Fit, None);
         pic.start_blending(2);
         assert!(!pic.finish(0), "no look, no frame");
         pic.hold(&solid(0), 1);
@@ -751,7 +753,7 @@ mod tests {
         let gpu = super::super::gpu::gpu().expect("a graphics card");
         let (sw, sh) = (2560u32, 1440u32);
         let frame = Frame { width: sw, height: sh, stride: sw as usize * 4, order: Order::Bgr, data: vec![90; (sw * sh * 4) as usize], texture: None };
-        let mut pic = GpuPicture::new(gpu, 1920, 1080, crate::Framing::Fit);
+        let mut pic = GpuPicture::new(gpu, 1920, 1080, crate::Framing::Fit, None);
         let mut out = Vec::new();
         let mut nv12 = Vec::new();
         for i in 0..3 {
@@ -782,10 +784,10 @@ mod tests {
             let data: Vec<u8> = (0..sw * sh * 4).map(|i| ((i * 7919) % 251) as u8).collect();
             let frame = Frame { width: sw, height: sh, stride: sw as usize * 4, order: Order::Bgr, data, texture: None };
             let mut cpu = Canvas::new(dw, dh);
-            cpu.fill_from(&frame, framing);
+            cpu.fill_from(&frame, framing, None);
             let mut want = Vec::new();
             cpu.to_nv12(&mut want);
-            let mut pic = GpuPicture::new(gpu.clone(), dw, dh, framing);
+            let mut pic = GpuPicture::new(gpu.clone(), dw, dh, framing, None);
             assert!(pic.draw(&frame, 1));
             let mut got = Vec::new();
             pic.nv12(&mut got);

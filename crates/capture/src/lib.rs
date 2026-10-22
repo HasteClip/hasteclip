@@ -217,6 +217,13 @@ pub fn frame_size(source: &VideoSource, target_height: Option<u32>, shape: Optio
         let _ = id;
         None
     };
+    // Cropped: that part, at its own size.
+    if let VideoSource::Screen { crop: Some(c), .. } = source {
+        return native.map(|(w, h)| {
+            let [_, _, w, h] = c.rect(w, h);
+            (w, h)
+        });
+    }
     native.map(|(w, h)| recorded_size(w, h, target_height, shape))
 }
 
@@ -286,6 +293,37 @@ pub fn display_refresh(source: &VideoSource) -> Option<u32> {
     }
 }
 
+/// Part of a display, in its pixels: `w`×`h`, at `at` (its top-left corner)
+/// or in the middle. Kept inside the display, and even, for the encoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Crop {
+    pub w: u32,
+    pub h: u32,
+    pub at: Option<(u32, u32)>,
+}
+
+impl Crop {
+    /// Where it is on a `cw`×`ch` display: (left, top, width, height).
+    pub fn rect(&self, cw: u32, ch: u32) -> [u32; 4] {
+        let w = self.w.clamp(2, cw.max(2)) & !1;
+        let h = self.h.clamp(2, ch.max(2)) & !1;
+        let (x, y) = self.at.unwrap_or(((cw.saturating_sub(w)) / 2, (ch.saturating_sub(h)) / 2));
+        [x.min(cw.saturating_sub(w)), y.min(ch.saturating_sub(h)), w, h]
+    }
+}
+
+/// Whether a screen can be cropped ([`VideoSource::Screen`]'s `crop`) here.
+pub const SCREEN_CROP: bool = cfg!(target_os = "linux");
+
+/// [`placement`] of part of a picture: `crop` of it, if any.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn placement_cropped(crop: Option<Crop>, (cw, ch): (u32, u32), frame: (u32, u32), framing: Framing) -> ([u32; 4], [u32; 4]) {
+    let Some(c) = crop else { return placement((cw, ch), frame, framing) };
+    let [x, y, w, h] = c.rect(cw, ch);
+    let ([sx, sy, sw, sh], dest) = placement((w, h), frame, framing);
+    ([x + sx, y + sy, sw, sh], dest)
+}
+
 /// What a recording's video shows. This is the bottom layer of the picture;
 /// overlays (a webcam) will go on top of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,7 +331,9 @@ pub enum VideoSource {
     /// A whole display, by backend id (see [`list_screens`]), captured the
     /// way `method` says (Windows). A game that needs the game capture hook,
     /// fullscreen and in focus on it, is recorded through the hook while it is.
-    Screen { id: String, hook: GameHook, method: ScreenCapture },
+    /// `crop`: only that part of it, recorded at its own size (a game
+    /// running at a lower resolution than the display, black around it).
+    Screen { id: String, hook: GameHook, method: ScreenCapture, crop: Option<Crop> },
     /// Games and apps, by executable name (see [`list_windowed_apps`]): records
     /// whichever of them was last in focus, for as long as it's showing, even
     /// while you click into something else. When it stops showing (minimized,
@@ -850,7 +890,7 @@ pub trait Recorder {
 
 #[cfg(test)]
 mod size_tests {
-    use super::{Framing, Shape, output_size, placement, recorded_size};
+    use super::{Crop, Framing, Shape, output_size, placement, placement_cropped, recorded_size};
 
     #[test]
     fn output_size_keeps_aspect_and_even() {
@@ -885,6 +925,11 @@ mod size_tests {
 
     #[test]
     fn where_the_picture_goes() {
+        // Cropped: the middle 1600×900 of 2560×1440, then as usual.
+        let crop = Some(Crop { w: 1600, h: 900, at: None });
+        assert_eq!(placement_cropped(crop, (2560, 1440), (1600, 900), Framing::Fit), ([480, 270, 1600, 900], [0, 0, 1600, 900]));
+        // Placed past the edge: moved back in; odd sizes made even.
+        assert_eq!(Crop { w: 1601, h: 901, at: Some((2000, 1000)) }.rect(2560, 1440), [960, 540, 1600, 900]);
         // Fill: the middle 2560 of 3440, over all of the frame.
         assert_eq!(placement((3440, 1440), (2560, 1440), Framing::Fill), ([440, 0, 2560, 1440], [0, 0, 2560, 1440]));
         // Fit: all of it, bars above and below.

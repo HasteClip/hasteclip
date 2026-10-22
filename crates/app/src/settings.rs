@@ -593,6 +593,22 @@ impl Default for GameTitles {
     }
 }
 
+/// The part of the screen recorded: `w`×`h` pixels, at `at` (its top-left
+/// corner), else in the middle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenCrop {
+    pub w: u32,
+    pub h: u32,
+    #[serde(default)]
+    pub at: Option<[u32; 2]>,
+}
+
+impl From<ScreenCrop> for capture::Crop {
+    fn from(c: ScreenCrop) -> Self {
+        capture::Crop { w: c.w, h: c.h, at: c.at.map(|[x, y]| (x, y)) }
+    }
+}
+
 /// A part of an osu! clip's name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -693,6 +709,10 @@ pub struct RecordSettings {
     pub shape: Option<[u32; 2]>,
     /// How the screen goes into that shape.
     pub framing: Framing,
+    /// Only part of the screen, at its own size (a game at a lower
+    /// resolution than the display, black around it): set on Sources.
+    /// Shape and resolution don't apply while it's set.
+    pub screen_crop: Option<ScreenCrop>,
     pub video_bitrate_mbps: u32,
 
     pub replay_seconds: u32,
@@ -796,6 +816,7 @@ impl Default for RecordSettings {
             resolution: OutputResolution::Native,
             shape: None,
             framing: Framing::Fill,
+            screen_crop: None,
             video_bitrate_mbps: 40,
 
             replay_seconds: 60,

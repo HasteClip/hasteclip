@@ -27,8 +27,8 @@ impl Canvas {
     /// Fill with a picture, put in as `framing` says (see `crate::placement`):
     /// its middle filling the canvas, all of it with black bars, or all of
     /// it stretched.
-    pub(crate) fn fill_from(&mut self, src: &Frame, framing: crate::Framing) {
-        let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = crate::placement((src.width, src.height), (self.width, self.height), framing);
+    pub(crate) fn fill_from(&mut self, src: &Frame, framing: crate::Framing, crop: Option<crate::Crop>) {
+        let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = crate::placement_cropped(crop, (src.width, src.height), (self.width, self.height), framing);
         let data = &src.data[sy as usize * src.stride + sx as usize * 4..];
         let (size, to) = ((sw as usize, sh as usize), (dw as usize, dh as usize));
         let swap = src.order == Order::Rgb;
@@ -401,9 +401,9 @@ mod tests {
     fn flat_colours_survive_scaling() {
         for (sw, sh, dw, dh) in [(64, 36, 64, 36), (64, 36, 32, 18), (96, 54, 64, 36), (40, 30, 64, 48)] {
             let mut c = Canvas::new(dw, dh);
-            c.fill_from(&frame(sw, sh, [10, 120, 250, 0], Order::Bgr), crate::Framing::Fit);
+            c.fill_from(&frame(sw, sh, [10, 120, 250, 0], Order::Bgr), crate::Framing::Fit, None);
             assert!(c.bgra.chunks_exact(4).all(|p| p == [10, 120, 250, 255]), "{sw}x{sh} -> {dw}x{dh}");
-            c.fill_from(&frame(sw, sh, [250, 120, 10, 0], Order::Rgb), crate::Framing::Fit);
+            c.fill_from(&frame(sw, sh, [250, 120, 10, 0], Order::Rgb), crate::Framing::Fit, None);
             assert!(c.bgra.chunks_exact(4).all(|p| p == [10, 120, 250, 255]), "rgb {sw}x{sh} -> {dw}x{dh}");
         }
     }
@@ -418,7 +418,7 @@ mod tests {
             }
         }
         let mut c = Canvas::new(2, 1);
-        c.fill_from(&f, crate::Framing::Stretch);
+        c.fill_from(&f, crate::Framing::Stretch, None);
         assert!(c.bgra.chunks_exact(4).all(|p| (127..=128).contains(&p[0])), "{:?}", c.bgra);
     }
 
@@ -439,12 +439,12 @@ mod tests {
             c.bgra[at..at + 3].to_vec()
         };
         let mut c = Canvas::new(4, 4);
-        c.fill_from(&f, crate::Framing::Fill);
+        c.fill_from(&f, crate::Framing::Fill, None);
         assert!((0..4).all(|x| px(&c, x, 0) == [0, 255, 0]), "the green middle: {:?}", c.bgra);
-        c.fill_from(&f, crate::Framing::Stretch);
+        c.fill_from(&f, crate::Framing::Stretch, None);
         assert_eq!((px(&c, 0, 2), px(&c, 3, 2)), (vec![0, 0, 255], vec![255, 0, 0]));
         let mut c = Canvas::new(12, 12);
-        c.fill_from(&f, crate::Framing::Fit);
+        c.fill_from(&f, crate::Framing::Fit, None);
         assert_eq!((px(&c, 0, 0), px(&c, 0, 6), px(&c, 11, 6)), (vec![0, 0, 0], vec![0, 0, 255], vec![255, 0, 0]));
     }
 

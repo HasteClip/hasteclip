@@ -984,6 +984,7 @@ impl App {
                 id: self.screens.get(self.display_at()).map(|d| d.id.clone()).unwrap_or_else(|| "0".to_owned()),
                 hook: self.game_hook(),
                 method: self.settings.screen_capture.into(),
+                crop: self.settings.screen_crop.filter(|_| capture::SCREEN_CROP).map(Into::into),
             },
         }
     }
