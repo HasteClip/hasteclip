@@ -221,19 +221,27 @@ fn resample(src: &[u8], size: (usize, usize), stride: usize, swap: bool, out: &m
     let xs = Taps::new(sw, dw);
     let ys = Taps::new(sh, dh);
     bands(out, dw * 4, |y0, rows| {
-        // One horizontally scaled source row at a time, weighted into the
-        // output row: each source row is scaled once per output row it
-        // touches (once or twice when shrinking).
+        let n = rows.len() / (dw * 4);
+        if n == 0 {
+            return;
+        }
+        // Each source row this band covers, scaled across once (×256, which
+        // still fits 16 bits), then the output rows weighted from those.
+        let top = ys.first[y0];
+        let bottom = ys.first[y0 + n - 1] + ys.n;
+        let mut scaled = vec![0u16; (bottom - top) * dw * 3];
+        for (k, line) in scaled.chunks_exact_mut(dw * 3).enumerate() {
+            let at = (top + k) * stride;
+            scale_row(&src[at..at + sw * 4], &xs, line);
+        }
         let mut acc = vec![0u32; dw * 3];
-        let mut line = vec![0u32; dw * 3];
         for (i, row) in rows.chunks_exact_mut(dw * 4).enumerate() {
             acc.iter_mut().for_each(|a| *a = 0);
             let (first, weights) = ys.of(y0 + i);
-            for (k, &wy) in weights.iter().enumerate() {
-                let at = (first + k) * stride;
-                scale_row(&src[at..at + sw * 4], &xs, &mut line);
-                for (a, l) in acc.iter_mut().zip(&line) {
-                    *a += l * wy;
+            for (k, &wy) in weights.iter().enumerate().filter(|&(_, &w)| w > 0) {
+                let line = &scaled[(first + k - top) * dw * 3..][..dw * 3];
+                for (a, &l) in acc.iter_mut().zip(line) {
+                    *a += l as u32 * wy;
                 }
             }
             // Each pass's weights add up to 256: two passes, 65536.
@@ -259,20 +267,19 @@ fn copy_row(src: &[u8], out: &mut [u8], swap: bool) {
 
 /// Area-average resampling weights, from `src` samples to `dst`: for each
 /// output sample, the first source sample it covers and how much of each
-/// (out of 256).
+/// (out of 256). Every output sample has the same number of weights (`n`,
+/// the unused ones 0), so the loops over them are plain.
 struct Taps {
     first: Vec<usize>,
-    /// Concatenated weights; `span[i]` is where output `i`'s start.
+    /// `n` weights for each output sample.
     weights: Vec<u32>,
-    span: Vec<(usize, usize)>,
+    n: usize,
 }
 
 impl Taps {
     fn new(src: usize, dst: usize) -> Self {
         let scale = src as f64 / dst.max(1) as f64;
-        let mut first = Vec::with_capacity(dst);
-        let mut weights = Vec::new();
-        let mut span = Vec::with_capacity(dst);
+        let mut each = Vec::with_capacity(dst);
         for i in 0..dst {
             // The source interval this output sample covers (at least one
             // sample wide, so enlarging picks the nearest).
@@ -292,31 +299,65 @@ impl Taps {
             let sum: u32 = w.iter().sum();
             let biggest = (0..w.len()).max_by_key(|&k| w[k]).unwrap_or(0);
             w[biggest] = (w[biggest] + 256).saturating_sub(sum);
-            first.push(lo);
-            span.push((weights.len(), w.len()));
-            weights.extend(w);
+            each.push((lo, w));
         }
-        Self { first, weights, span }
+        let n = each.iter().map(|(_, w)| w.len()).max().unwrap_or(1).min(src.max(1));
+        let mut first = Vec::with_capacity(dst);
+        let mut weights = Vec::with_capacity(dst * n);
+        for (lo, w) in each {
+            // Padded to `n` with zeros, after it, or before it where that
+            // would run past the last source sample.
+            let start = lo.min(src - n);
+            first.push(start);
+            weights.extend(std::iter::repeat_n(0, lo - start));
+            weights.extend(&w);
+            weights.extend(std::iter::repeat_n(0, n - w.len() - (lo - start)));
+        }
+        Self { first, weights, n }
     }
 
     fn of(&self, i: usize) -> (usize, &[u32]) {
-        let (at, n) = self.span[i];
-        (self.first[i], &self.weights[at..at + n])
+        (self.first[i], &self.weights[i * self.n..(i + 1) * self.n])
     }
 }
 
 /// One source row scaled to the output width: 3 channels a pixel, ×256.
-fn scale_row(src: &[u8], xs: &Taps, out: &mut [u32]) {
-    for (i, o) in out.chunks_exact_mut(3).enumerate() {
-        let (first, weights) = xs.of(i);
+fn scale_row(src: &[u8], xs: &Taps, out: &mut [u16]) {
+    // The common tap counts get their own copy of the loop, unrolled.
+    match xs.n {
+        1 => scale_row_n::<1>(src, xs, out),
+        2 => scale_row_n::<2>(src, xs, out),
+        3 => scale_row_n::<3>(src, xs, out),
+        4 => scale_row_n::<4>(src, xs, out),
+        _ => scale_row_any(src, xs, out),
+    }
+}
+
+fn scale_row_n<const N: usize>(src: &[u8], xs: &Taps, out: &mut [u16]) {
+    for ((o, &first), weights) in out.chunks_exact_mut(3).zip(&xs.first).zip(xs.weights.chunks_exact(N)) {
+        let px = &src[first * 4..][..N * 4];
         let (mut c0, mut c1, mut c2) = (0u32, 0u32, 0u32);
-        for (k, &w) in weights.iter().enumerate() {
-            let p = &src[(first + k) * 4..];
+        for k in 0..N {
+            let w = weights[k];
+            c0 += px[k * 4] as u32 * w;
+            c1 += px[k * 4 + 1] as u32 * w;
+            c2 += px[k * 4 + 2] as u32 * w;
+        }
+        o.copy_from_slice(&[c0 as u16, c1 as u16, c2 as u16]);
+    }
+}
+
+fn scale_row_any(src: &[u8], xs: &Taps, out: &mut [u16]) {
+    let n = xs.n;
+    for ((o, &first), weights) in out.chunks_exact_mut(3).zip(&xs.first).zip(xs.weights.chunks_exact(n)) {
+        let px = &src[first * 4..(first + n) * 4];
+        let (mut c0, mut c1, mut c2) = (0u32, 0u32, 0u32);
+        for (p, &w) in px.chunks_exact(4).zip(weights) {
             c0 += p[0] as u32 * w;
             c1 += p[1] as u32 * w;
             c2 += p[2] as u32 * w;
         }
-        o.copy_from_slice(&[c0, c1, c2]);
+        o.copy_from_slice(&[c0 as u16, c1 as u16, c2 as u16]);
     }
 }
 
