@@ -175,6 +175,16 @@ pub(crate) fn app_capture() -> bool {
     apps::available()
 }
 
+/// A camera's settings (V4L2 controls).
+pub(crate) fn camera_controls(device: &str) -> Vec<crate::webcam::CameraControl> {
+    camera::controls(device)
+}
+
+/// Set a camera's setting.
+pub(crate) fn set_camera_control(device: &str, id: u32, value: i64) -> Result<()> {
+    camera::set_control(device, id, value)
+}
+
 /// A program's icon from the desktop's icon theme.
 pub(crate) fn app_icon(id: &str, size: u32) -> Option<Vec<u8>> {
     icons::app_icon(id, size)

@@ -286,6 +286,58 @@ pub(crate) fn set_formats(device: &str, formats: Vec<Format>) {
 /// `guvcview` set a camera's controls for every app).
 pub const HAS_SETTINGS: bool = cfg!(target_os = "windows");
 
+/// Whether the app shows a camera's controls itself ([`camera_controls`]):
+/// on Linux, where there's no settings window of the driver's to open.
+pub const HAS_CONTROLS: bool = cfg!(target_os = "linux");
+
+/// A setting a camera offers (Linux): its V4L2 control.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CameraControl {
+    pub id: u32,
+    pub name: String,
+    pub kind: ControlKind,
+    pub value: i64,
+    pub default: i64,
+    /// It does nothing now (exposure while it's automatic, say).
+    pub inactive: bool,
+}
+
+/// What a camera control takes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ControlKind {
+    Int { min: i64, max: i64, step: i64 },
+    Bool,
+    /// Its items, by value.
+    Menu(Vec<(i64, String)>),
+}
+
+/// The settings camera `device` offers, with their values now (Linux; none
+/// elsewhere). Reads the camera: call it off the UI thread, or seldom.
+pub fn camera_controls(device: &str) -> Vec<CameraControl> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::camera_controls(device)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = device;
+        Vec::new()
+    }
+}
+
+/// Set a camera setting; it applies at once, in every app (Linux).
+pub fn set_camera_control(device: &str, id: u32, value: i64) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::set_camera_control(device, id, value)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (device, id, value);
+        anyhow::bail!("camera settings are the driver's own here")
+    }
+}
+
 /// Open the camera's own settings window (exposure, focus, white balance…, as
 /// its driver offers them). Changes apply to the camera straight away, in
 /// every app. Returns at once; the window runs by itself.

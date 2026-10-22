@@ -138,6 +138,7 @@ impl App {
         if capture::webcam::AVAILABLE {
             crate::ui_kit::gap(ui, crate::ui_kit::SECTION_GAP);
             self.webcam_card(ui);
+            self.camera_controls_dialog(ui.ctx());
         }
     }
 

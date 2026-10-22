@@ -1,5 +1,6 @@
 //! The webcam on the Sources page: picking a camera and its format, its own
-//! settings window, and placing it on the live preview the way OBS does — drag
+//! settings (the driver's window on Windows, a dialog of its controls on
+//! Linux), and placing it on the live preview the way OBS does — drag
 //! to move, any handle to resize (always keeping its shape: it's never
 //! stretched), past the opposite side to flip it, Alt with a handle to crop,
 //! right-click to flip or turn it a quarter. Moves snap to the frame's edges and centre (Ctrl to place
@@ -410,14 +411,98 @@ impl App {
                             w.placement = PlacementCfg::laid_out(Placement::default_for(camera_aspect, frame_aspect), frame_aspect);
                         }
                     }
-                    if capture::webcam::HAS_SETTINGS
+                    if (capture::webcam::HAS_SETTINGS || capture::webcam::HAS_CONTROLS)
                         && Btn::ghost("Camera settings…").small().tip("The camera's own settings: exposure, focus, white balance. They apply right away, in every app.").show(ui).clicked()
                     {
-                        capture::webcam::open_settings(&cam.id, &cam.name);
+                        if capture::webcam::HAS_CONTROLS {
+                            self.camera_controls = Some((cam.id.clone(), capture::webcam::camera_controls(&cam.id)));
+                        } else {
+                            capture::webcam::open_settings(&cam.id, &cam.name);
+                        }
                     }
                 });
             });
         });
+    }
+
+    /// The camera settings dialog (Linux): each of the camera's controls, set
+    /// as it's changed. Read again after each change, as one can turn others
+    /// on or off (automatic exposure, the exposure time).
+    pub(crate) fn camera_controls_dialog(&mut self, ctx: &egui::Context) {
+        use crate::theme::{self, W};
+        use crate::ui_kit::Dismissed;
+        use capture::webcam::ControlKind;
+        let Some((device, controls)) = self.camera_controls.as_ref() else { return };
+        let device = device.clone();
+        let mut set: Vec<(u32, i64)> = Vec::new();
+        let mut done = false;
+        let modal = crate::ui_kit::dialog(ctx, "camera_controls", 460.0, |ui| {
+            crate::ui_kit::dialog_title(ui, "Camera settings");
+            let pal = theme::pal(ui);
+            if controls.is_empty() {
+                crate::ui_kit::dialog_text(ui, "This camera has no settings to change, or it couldn't be read.");
+            }
+            egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                for c in controls {
+                    ui.horizontal(|ui| {
+                        ui.set_min_height(30.0);
+                        ui.add_enabled_ui(!c.inactive, |ui| {
+                            ui.label(theme::text(&c.name, 13.0, W::Regular).color(pal.text2));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| match &c.kind {
+                                ControlKind::Bool => {
+                                    let mut on = c.value != 0;
+                                    if crate::ui_kit::switch(ui, &mut on).changed() {
+                                        set.push((c.id, i64::from(on)));
+                                    }
+                                }
+                                ControlKind::Int { min, max, step } => {
+                                    ui.label(theme::text(&c.value.to_string(), 12.5, W::Regular).color(pal.text3));
+                                    let span = (max - min).max(1) as f32;
+                                    let mut v = (c.value - min) as f32 / span;
+                                    if crate::transport::slider(ui, &mut v, 180.0).changed() {
+                                        let raw = *min as f32 + v * span;
+                                        let stepped = min + ((raw - *min as f32) / *step as f32).round() as i64 * step;
+                                        if stepped != c.value {
+                                            set.push((c.id, stepped.clamp(*min, *max)));
+                                        }
+                                    }
+                                }
+                                ControlKind::Menu(items) => {
+                                    let current = items.iter().find(|(v, _)| *v == c.value).map_or_else(|| c.value.to_string(), |(_, n)| n.clone());
+                                    let r = crate::ui_kit::select(ui, &current, 180.0);
+                                    crate::ui_kit::menu_popup(&r, false, 220.0, |ui| {
+                                        for (v, name) in items {
+                                            if crate::ui_kit::Item::new(name.clone()).check(*v == c.value).show(ui).clicked() {
+                                                set.push((c.id, *v));
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+                        });
+                    });
+                }
+            });
+            crate::ui_kit::dialog_buttons(ui, |ui| {
+                if ui.add(crate::ui_kit::button("Done", true)).clicked() {
+                    done = true;
+                }
+                if !controls.is_empty() && ui.add(crate::ui_kit::button("Reset all", false).ghost()).on_hover_text("Back to the camera's defaults").clicked() {
+                    set.extend(controls.iter().filter(|c| c.value != c.default).map(|c| (c.id, c.default)));
+                }
+            });
+        });
+        if !set.is_empty() {
+            for (id, value) in set {
+                if let Err(e) = capture::webcam::set_camera_control(&device, id, value) {
+                    eprintln!("camera setting: {e:#}");
+                }
+            }
+            self.camera_controls = Some((device.clone(), capture::webcam::camera_controls(&device)));
+        }
+        if done || modal.dismissed() {
+            self.camera_controls = None;
+        }
     }
 
     /// The webcam's box on the preview, its handles, and dragging them.
