@@ -924,18 +924,12 @@ fn exposure_guides(fps: f32) -> (i64, i64) {
 
 /// The exposure time: − and + (or the arrow keys) to step it finely, to
 /// where lights' flicker leaves no bands, found by eye; the slider; its time in ms.
-fn exposure_widget(ui: &mut egui::Ui, c: &CameraControl, fps: Option<f32>, set: &mut Vec<(u32, i64)>) {
+fn exposure_widget(ui: &mut egui::Ui, c: &CameraControl, set: &mut Vec<(u32, i64)>) {
     use crate::theme::{self, W};
     let ControlKind::Int { min, max, step } = c.kind else { return control_widget(ui, c, set) };
     let pal = theme::pal(ui);
-    // Longer than a frame, the camera can't keep its frame rate.
-    let whole = fps.map(|fps| exposure_guides(fps).1).filter(|w| (min..max).contains(w));
-    let dropping = whole.is_some_and(|w| c.value > w);
     // Right to left: the time, +, the slider, −.
-    let time = ui.add_sized([56.0, 20.0], egui::Label::new(theme::text(&format!("{:.1} ms", c.value as f64 / 10.0), 12.5, W::Regular).color(if dropping { pal.warn } else { pal.text3 })));
-    if let (true, Some(fps)) = (dropping, fps) {
-        time.on_hover_text(format!("Longer than a frame at {fps:.0} fps: the camera's frame rate drops"));
-    }
+    ui.add_sized([56.0, 20.0], egui::Label::new(theme::text(&format!("{:.1} ms", c.value as f64 / 10.0), 12.5, W::Regular).color(pal.text3)));
     let next = |up: bool| Some(exposure_step(c.value, up, step, min, max)).filter(|v| *v != c.value);
     if crate::ui_kit::Btn::icon(crate::ui_kit::Kind::Ghost, egui_phosphor::regular::PLUS).small().tip("Longer").show(ui).clicked()
         && let Some(v) = next(true)
@@ -946,8 +940,7 @@ fn exposure_widget(ui: &mut egui::Ui, c: &CameraControl, fps: Option<f32>, set: 
     // shortest (linear squeezed them into its first fifth; stops gave the
     // too-dark ones as much as the rest).
     let mut v = curve_pos(c.value, min, max);
-    let zone = whole.zip(fps).map(|(w, fps)| (curve_pos(w, min, max), format!("Longer than a frame at {fps:.0} fps ({:.1} ms): the camera's frame rate drops", w as f64 / 10.0)));
-    let slider = zone_slider(ui, &mut v, 130.0, zone);
+    let slider = crate::transport::slider(ui, &mut v, 130.0);
     if slider.changed() {
         let to = curve_value(v, min, max);
         if to != c.value {
@@ -984,51 +977,6 @@ fn curve_value(pos: f32, min: i64, max: i64) -> i64 {
     (min + (t * (max - min) as f64).round() as i64).clamp(min, max)
 }
 
-/// The slim slider (`transport::slider`'s look) with the track past `zone`
-/// (0 to 1, and what it means) coloured as a warning, the fill too.
-fn zone_slider(ui: &mut egui::Ui, value: &mut f32, width: f32, zone: Option<(f32, String)>) -> egui::Response {
-    use crate::theme;
-    let p = theme::pal(ui);
-    let (rect, mut resp) = ui.allocate_exact_size(vec2(width, 20.0), egui::Sense::click_and_drag());
-    if let Some(pos) = resp.interact_pointer_pos()
-        && (resp.dragged() || resp.clicked() || resp.drag_started())
-    {
-        let v = ((pos.x - rect.left() - 7.0) / (rect.width() - 14.0)).clamp(0.0, 1.0);
-        if v != *value {
-            *value = v;
-            resp.mark_changed();
-        }
-    }
-    let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered() || resp.dragged(), theme::FAST);
-    let track = egui::Rect::from_min_max(egui::pos2(rect.left() + 7.0, rect.center().y - 2.0), egui::pos2(rect.right() - 7.0, rect.center().y + 2.0));
-    ui.painter().rect_filled(track, 2, p.control_h);
-    let at = |v: f32| track.left() + track.width() * v.clamp(0.0, 1.0);
-    if let Some((from, tip)) = &zone {
-        let part = egui::Rect::from_min_max(egui::pos2(at(*from), track.top()), track.max);
-        ui.painter().rect_filled(part, 2, theme::fade(p.warn, 0.35));
-        if resp.hover_pos().is_some_and(|h| h.x >= part.left()) && !resp.dragged() {
-            resp = resp.on_hover_text(tip.as_str());
-        }
-    }
-    let x = at(*value);
-    let fill = theme::mix(p.text2, p.text, hv);
-    match &zone {
-        // Past the zone's start, the fill is the warning's colour.
-        Some((from, _)) if *value > *from => {
-            let edge = at(*from);
-            ui.painter().rect_filled(egui::Rect::from_min_max(track.min, egui::pos2(edge, track.bottom())), 2, fill);
-            ui.painter().rect_filled(egui::Rect::from_min_max(egui::pos2(edge, track.top()), egui::pos2(x, track.bottom())), 2, p.warn);
-        }
-        _ => {
-            ui.painter().rect_filled(egui::Rect::from_min_max(track.min, egui::pos2(x, track.bottom())), 2, fill);
-        }
-    }
-    let k = 7.0 + hv;
-    ui.painter().circle_filled(egui::pos2(x, rect.center().y + 1.0), k, Color32::from_black_alpha(60));
-    ui.painter().circle_filled(egui::pos2(x, rect.center().y), k, Color32::WHITE);
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
 /// The Camera page's still side: the picture, which camera it is and in what
 /// size, and resetting its settings.
 fn picture_side(ui: &mut egui::Ui, panel: &mut CameraPanel, name: &str, fps: Option<f32>, max_h: f32, reset: &mut bool) {
@@ -1049,31 +997,22 @@ fn picture_side(ui: &mut egui::Ui, panel: &mut CameraPanel, name: &str, fps: Opt
             }
         });
     });
-    // Slower than its format: say why, as far as can be told.
-    let manual_exposure = {
-        let auto = panel.controls.iter().find(|c| c.id == v4l2::AUTO_EXPOSURE);
-        let time = panel.controls.iter().find(|c| c.id == v4l2::EXPOSURE);
-        time.filter(|_| auto.is_none_or(|a| !auto_on(a))).map(|c| c.value)
-    };
-    if let Some(why) = slowdown(panel.fps, fps, manual_exposure) {
+    // Slower than its format: said, with what can cause it (the camera
+    // doesn't say which).
+    if let Some(why) = slowdown(panel.fps, fps) {
         ui.add(egui::Label::new(theme::text(why, 12.5, W::Regular).color(pal.warn)).wrap());
     }
     ui.add(egui::Label::new(theme::text("Changes apply right away, in every app, and are put back each time HasteClip opens this camera.", 12.0, W::Regular).color(pal.text3)).wrap());
 }
 
-/// Why the camera sends fewer new pictures (`measured` a second) than its
-/// format's `fps`, when clearly fewer: an exposure (`manual`, in 100 µs
-/// units) longer than a frame, else too little light reaching the camera,
-/// which slows itself down then whatever its settings (gain doesn't help).
-fn slowdown(measured: Option<f32>, fps: Option<f32>, manual: Option<i64>) -> Option<String> {
+/// When the camera sends clearly fewer new pictures (`measured` a second)
+/// than its format's `fps`: saying so, and what can cause it. Which one, the
+/// camera doesn't say, and its own limits aren't a frame's length (a C922 at
+/// 60 fps kept up at 17.2 ms and slowed at 16.8 in dimmer light).
+fn slowdown(measured: Option<f32>, fps: Option<f32>) -> Option<String> {
     let (measured, fps) = (measured?, fps?);
-    if measured >= fps * 0.85 {
-        return None;
-    }
-    let sending = format!("Sending {measured:.0} of {fps:.0} pictures a second:");
-    Some(match manual {
-        Some(t) if t > exposure_guides(fps).1 => format!("{sending} the exposure is longer than a frame. Shorten it to get {fps:.0}."),
-        _ => format!("{sending} the camera slows down when too little light reaches it. Brighter light in front of you brings {fps:.0} back; gain doesn't."),
+    (measured < fps * 0.85).then(|| {
+        format!("Sending {measured:.0} of {fps:.0} pictures a second. Cameras slow down when too little light reaches them (brighter light in front of you helps; gain doesn't), or when the exposure is longer than they can fit in a frame.")
     })
 }
 
@@ -1195,7 +1134,7 @@ fn controls_view(ui: &mut egui::Ui, panel: &CameraPanel, fps: Option<f32>, set: 
                                     let tip = fps.map(|fps| {
                                         let (half, whole) = exposure_guides(fps);
                                         format!(
-                                            "How long each picture takes in light. Film's rule of thumb is half a frame, a 180° shutter: {:.1} ms at {fps:.0} fps, for motion blur that looks natural. Longer than a whole frame ({:.1} ms) and the camera lowers its frame rate. Under lamps, step it with − and + (or the arrow keys) to where no bands roll through the picture.",
+                                            "How long each picture takes in light. Film's rule of thumb is half a frame, a 180° shutter: {:.1} ms at {fps:.0} fps, for motion blur that looks natural. About a whole frame ({:.1} ms) or longer, a camera can't keep its frame rate; where exactly is the camera's own, as is how much light it wants (watch the pictures a second under the picture). Under lamps, step it with − and + (or the arrow keys) to where no bands roll through the picture.",
                                             half as f64 / 10.0,
                                             whole as f64 / 10.0
                                         )
@@ -1205,7 +1144,7 @@ fn controls_view(ui: &mut egui::Ui, panel: &CameraPanel, fps: Option<f32>, set: 
                                         Some(t) => row.tip("Exposure time", t),
                                         None => row,
                                     };
-                                    l.row(row, |ui| exposure_widget(ui, m, fps, set));
+                                    l.row(row, |ui| exposure_widget(ui, m, set));
                                 } else {
                                     l.row(crate::ui_kit::Row::new(label).kid(), |ui| control_widget(ui, m, set));
                                 }
@@ -1242,15 +1181,14 @@ mod panel_tests {
         assert_eq!(curve_value(1.0, 3, 2047), 2047);
     }
 
-    /// Only clearly fewer than the format's rate is a slowdown; past a
-    /// frame's exposure it's that, else the light.
+    /// Only clearly fewer than the format's rate is a slowdown, said with
+    /// both causes (which one, the camera doesn't say).
     #[test]
-    fn says_why_the_camera_slows() {
-        assert_eq!(slowdown(Some(58.0), Some(60.0), None), None);
-        assert!(slowdown(Some(30.0), Some(60.0), Some(250)).unwrap().contains("longer than a frame"));
-        assert!(slowdown(Some(30.0), Some(60.0), Some(100)).unwrap().contains("too little light"));
-        assert!(slowdown(Some(30.0), Some(60.0), None).unwrap().contains("too little light"));
-        assert_eq!(slowdown(None, Some(60.0), None), None);
+    fn says_when_the_camera_slows() {
+        assert_eq!(slowdown(Some(58.0), Some(60.0)), None);
+        let said = slowdown(Some(30.0), Some(60.0)).unwrap();
+        assert!(said.starts_with("Sending 30 of 60") && said.contains("light") && said.contains("exposure"));
+        assert_eq!(slowdown(None, Some(60.0)), None);
     }
 
     #[test]
