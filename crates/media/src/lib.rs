@@ -721,9 +721,13 @@ impl Edit {
     }
 }
 
-fn hidden_sibling(source: &Path, suffix: &str) -> PathBuf {
-    let name = source.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    source.with_file_name(format!(".{name}{suffix}"))
+/// Where `dest` is written until it's whole: `.writing/<name>` next to it,
+/// as the recorder does (`capture::output::in_progress`, which says why the
+/// file itself never starts with a dot). Makes the folder.
+fn writing_path(dest: &Path) -> std::io::Result<PathBuf> {
+    let dir = dest.parent().unwrap_or(Path::new(".")).join(".writing");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir.join(dest.file_name().unwrap_or_default()))
 }
 
 /// Decode one audio stream to interleaved stereo f32 at [`PREVIEW_RATE`].
@@ -972,13 +976,15 @@ pub fn render_with_progress(
         let plan = plan(source, info, edit);
         let weights = Weights::new(&plan, edit.duration());
         render_video(source, info, edit, &plan, &work, &video, &|f| progress(f * weights.video))?;
-        // `.name.rendering.mp4`: hidden (dotfile) so the library never shows a
-        // half-written clip, and ending in the real extension so ffmpeg picks the
-        // container. (Not `with_extension`, which would replace `.mp4` and could
-        // eat into the name.)
-        let partial = hidden_sibling(dest, &format!(".rendering.{ext}"));
-        mux_audio(source, info, edit, id, &video, &partial, &|f| progress(weights.video + f * (1.0 - weights.video)))?;
-        std::fs::rename(&partial, dest)?;
+        // In a hidden folder so the library never shows a half-written clip,
+        // under its real name so ffmpeg picks the container from its extension.
+        let partial = writing_path(dest)?;
+        let muxed = mux_audio(source, info, edit, id, &video, &partial, &|f| progress(weights.video + f * (1.0 - weights.video)))
+            .and_then(|()| Ok(std::fs::rename(&partial, dest)?));
+        if muxed.is_err() {
+            let _ = std::fs::remove_file(&partial);
+        }
+        muxed?;
         progress(1.0);
         Ok(())
     })();

@@ -66,7 +66,7 @@ sha2 = "0.11"
 # Windows-only: drawing decoded frames straight from the GPU (gpu_frames.rs).
 [target.'cfg(windows)'.dependencies]
 velopack = "1.2.161"
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Direct3D12", "Win32_Graphics_Dwm", "Win32_System_Console", "Win32_System_Registry", "Win32_System_Threading"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Direct3D12", "Win32_Graphics_Dwm", "Win32_Networking_WinSock", "Win32_System_Console", "Win32_System_IO", "Win32_System_Registry", "Win32_System_Threading"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1.31"
@@ -81,6 +81,9 @@ objc2-io-surface = { version = "0.3.2", default-features = false, features = ["s
 objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLAllocation", "MTLDevice", "MTLPixelFormat", "MTLResource", "MTLTexture", "objc2-io-surface"] }
 objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSString", "NSURL", "NSGeometry", "NSFileManager", "NSError"] }
 objc2-app-kit = { version = "0.3.2", features = ["NSSharingService", "NSView", "NSResponder", "NSWindow", "NSToolbar", "NSButton", "NSControl"] }
+# Shortcuts while a game holds the screen: a listen-only key tap (key_tap.rs).
+objc2-core-foundation = { version = "0.3.2", features = ["CFMachPort", "CFRunLoop"] }
+objc2-core-graphics = { version = "0.3.2", features = ["CGEvent", "CGEventTypes"] }
 
 # Windows-only: the system Share UI, and opening files with their default app.
 [target.'cfg(target_os = "windows")'.dependencies]
