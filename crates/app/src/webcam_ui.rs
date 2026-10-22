@@ -941,12 +941,14 @@ fn exposure_widget(ui: &mut egui::Ui, c: &CameraControl, fps: Option<f32>, set: 
     {
         set.push((c.id, v));
     }
-    let span = (max - min).max(1) as f32;
-    let mut v = (c.value - min) as f32 / span;
-    let zone = whole.zip(fps).map(|(w, fps)| ((w - min) as f32 / span, format!("Longer than a frame at {fps:.0} fps ({:.1} ms): the camera's frame rate drops", w as f64 / 10.0)));
-    let slider = zone_slider(ui, &mut v, 110.0, zone);
+    // In stops, as cameras set shutter speed: each doubling of the time the
+    // same way along, so the short times everyone uses aren't squeezed into
+    // the slider's first fifth.
+    let mut v = log_pos(c.value, min, max);
+    let zone = whole.zip(fps).map(|(w, fps)| (log_pos(w, min, max), format!("Longer than a frame at {fps:.0} fps ({:.1} ms): the camera's frame rate drops", w as f64 / 10.0)));
+    let slider = zone_slider(ui, &mut v, 130.0, zone);
     if slider.changed() {
-        let to = min + (v * span).round() as i64;
+        let to = log_value(v, min, max);
         if to != c.value {
             set.push((c.id, to));
         }
@@ -964,8 +966,20 @@ fn exposure_widget(ui: &mut egui::Ui, c: &CameraControl, fps: Option<f32>, set: 
     }
 }
 
+/// Where `value` sits along a slider from `min` to `max` in stops (0 to 1).
+fn log_pos(value: i64, min: i64, max: i64) -> f32 {
+    let (lo, hi) = ((min.max(1)) as f64, max.max(min.max(1) + 1) as f64);
+    ((value.max(1) as f64 / lo).ln() / (hi / lo).ln()).clamp(0.0, 1.0) as f32
+}
+
+/// The value at `pos` (0 to 1) along a slider from `min` to `max` in stops.
+fn log_value(pos: f32, min: i64, max: i64) -> i64 {
+    let (lo, hi) = ((min.max(1)) as f64, max.max(min.max(1) + 1) as f64);
+    ((lo * (hi / lo).powf(pos as f64)).round() as i64).clamp(min, max)
+}
+
 /// The slim slider (`transport::slider`'s look) with the track past `zone`
-/// (0 to 1, and what it means) coloured as a warning.
+/// (0 to 1, and what it means) coloured as a warning, the fill too.
 fn zone_slider(ui: &mut egui::Ui, value: &mut f32, width: f32, zone: Option<(f32, String)>) -> egui::Response {
     use crate::theme;
     let p = theme::pal(ui);
@@ -985,13 +999,24 @@ fn zone_slider(ui: &mut egui::Ui, value: &mut f32, width: f32, zone: Option<(f32
     let at = |v: f32| track.left() + track.width() * v.clamp(0.0, 1.0);
     if let Some((from, tip)) = &zone {
         let part = egui::Rect::from_min_max(egui::pos2(at(*from), track.top()), track.max);
-        ui.painter().rect_filled(part, 2, theme::fade(p.warn, 0.55));
+        ui.painter().rect_filled(part, 2, theme::fade(p.warn, 0.35));
         if resp.hover_pos().is_some_and(|h| h.x >= part.left()) && !resp.dragged() {
             resp = resp.on_hover_text(tip.as_str());
         }
     }
     let x = at(*value);
-    ui.painter().rect_filled(egui::Rect::from_min_max(track.min, egui::pos2(x, track.bottom())), 2, theme::mix(p.text2, p.text, hv));
+    let fill = theme::mix(p.text2, p.text, hv);
+    match &zone {
+        // Past the zone's start, the fill is the warning's colour.
+        Some((from, _)) if *value > *from => {
+            let edge = at(*from);
+            ui.painter().rect_filled(egui::Rect::from_min_max(track.min, egui::pos2(edge, track.bottom())), 2, fill);
+            ui.painter().rect_filled(egui::Rect::from_min_max(egui::pos2(edge, track.top()), egui::pos2(x, track.bottom())), 2, p.warn);
+        }
+        _ => {
+            ui.painter().rect_filled(egui::Rect::from_min_max(track.min, egui::pos2(x, track.bottom())), 2, fill);
+        }
+    }
     let k = 7.0 + hv;
     ui.painter().circle_filled(egui::pos2(x, rect.center().y + 1.0), k, Color32::from_black_alpha(60));
     ui.painter().circle_filled(egui::pos2(x, rect.center().y), k, Color32::WHITE);
@@ -1170,6 +1195,17 @@ mod panel_tests {
     /// A Logitech C922's controls: named and grouped, automatic modes paired
     /// with the setting they take over, the rest under More.
     /// Half a frame and a whole one: at 30 fps 16.7 and 33.3 ms, at 60 fps 8.3 and 16.7 ms.
+    /// In stops: a C922's 0.3–204.7 ms puts 16.7 ms (a frame at 60 fps) past
+    /// the middle, not at 8%; and back again.
+    #[test]
+    fn exposure_slider_in_stops() {
+        let p = log_pos(167, 3, 2047);
+        assert!((0.55..0.7).contains(&p), "{p}");
+        assert_eq!(log_value(p, 3, 2047), 167);
+        assert_eq!(log_value(0.0, 3, 2047), 3);
+        assert_eq!(log_value(1.0, 3, 2047), 2047);
+    }
+
     #[test]
     fn exposure_guides_by_frame_rate() {
         assert_eq!(exposure_guides(30.0), (167, 333));
