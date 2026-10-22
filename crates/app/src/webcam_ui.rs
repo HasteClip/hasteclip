@@ -796,6 +796,8 @@ impl App {
         let name = self.settings.webcam.as_ref().map(|w| w.name.clone()).unwrap_or_default();
         let current = self.settings.webcam.as_ref().and_then(|w| w.format).map(capture::webcam::Format::from);
         let mut pick: Option<Option<capture::webcam::Format>> = None;
+        // The frame rate the camera runs at: as picked, or Automatic's pick.
+        let fps = current.or_else(|| self.camera_panel.as_ref().and_then(|p| capture::webcam::formats(&p.device).into_iter().max_by_key(|f| f.auto_rank()))).map(|f| f.fps());
         let Some(panel) = self.camera_panel.as_mut() else { return };
         let mut set: Vec<(u32, i64)> = Vec::new();
         let mut reset = false;
@@ -815,7 +817,7 @@ impl App {
                     ui.set_width(col);
                     crate::ui_kit::scroll(ui, "camera_controls", |ui| {
                         format_view(ui, &panel.device, current, &mut pick);
-                        controls_view(ui, panel, &mut set);
+                        controls_view(ui, panel, fps, &mut set);
                         ui.add_space(28.0);
                     });
                 });
@@ -825,7 +827,7 @@ impl App {
             crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
             crate::ui_kit::scroll(ui, "camera_controls", |ui| {
                 format_view(ui, &panel.device, current, &mut pick);
-                controls_view(ui, panel, &mut set);
+                controls_view(ui, panel, fps, &mut set);
                 ui.add_space(28.0);
             });
         }
@@ -877,9 +879,18 @@ fn exposure_step(value: i64, up: bool, step: i64, min: i64, max: i64) -> i64 {
     (value + if up { step } else { -step }).clamp(min, max)
 }
 
+/// Film's guides for an exposure time at `fps`, in V4L2's units of 100 µs:
+/// the 180° shutter (half a frame, for motion blur that looks natural), and
+/// the whole frame (longer, and the frame rate drops).
+fn exposure_guides(fps: f32) -> (i64, i64) {
+    let frame = 10_000.0 / fps as f64;
+    ((frame / 2.0).round() as i64, frame.round() as i64)
+}
+
 /// The exposure time: − and + to step it finely (to where lights' flicker
-/// leaves no bands, found by eye), the slider, its time in ms.
-fn exposure_widget(ui: &mut egui::Ui, c: &CameraControl, set: &mut Vec<(u32, i64)>) {
+/// leaves no bands, found by eye), the slider with the guides for `fps`
+/// marked on it, its time in ms.
+fn exposure_widget(ui: &mut egui::Ui, c: &CameraControl, fps: Option<f32>, set: &mut Vec<(u32, i64)>) {
     use crate::theme::{self, W};
     let ControlKind::Int { min, max, step } = c.kind else { return control_widget(ui, c, set) };
     let pal = theme::pal(ui);
@@ -893,10 +904,27 @@ fn exposure_widget(ui: &mut egui::Ui, c: &CameraControl, set: &mut Vec<(u32, i64
     }
     let span = (max - min).max(1) as f32;
     let mut v = (c.value - min) as f32 / span;
-    if crate::transport::slider(ui, &mut v, 110.0).changed() {
+    let slider = crate::transport::slider(ui, &mut v, 110.0);
+    if slider.changed() {
         let to = min + (v * span).round() as i64;
         if to != c.value {
             set.push((c.id, to));
+        }
+    }
+    // The guides, as ticks across the track (where the slider draws it).
+    if let Some(fps) = fps {
+        let (half, whole) = exposure_guides(fps);
+        let r = slider.rect;
+        let (left, right) = (r.left() + 7.0, r.right() - 7.0);
+        let marks = [(half, pal.text2, format!("180° shutter at {fps:.0} fps: {:.1} ms", half as f64 / 10.0)), (whole, pal.warn, format!("A whole frame at {fps:.0} fps: {:.1} ms. Longer lowers the frame rate", whole as f64 / 10.0))];
+        for (at, color, tip) in marks {
+            if !(min..=max).contains(&at) {
+                continue;
+            }
+            let x = left + (right - left) * (at - min) as f32 / span;
+            let tick = egui::Rect::from_center_size(egui::pos2(x, r.center().y), vec2(2.0, 12.0));
+            ui.painter().rect_filled(tick, 1.0, color);
+            ui.interact(tick.expand2(vec2(3.0, 0.0)), ui.id().with(("exposure_guide", at)), egui::Sense::hover()).on_hover_text(tip);
         }
     }
     if crate::ui_kit::Btn::icon(crate::ui_kit::Kind::Ghost, egui_phosphor::regular::MINUS).small().tip("Shorter").show(ui).clicked()
@@ -1003,7 +1031,7 @@ fn format_view(ui: &mut egui::Ui, device: &str, current: Option<capture::webcam:
 }
 
 /// The camera's settings in groups, each a card of rows. What's changed goes in `set`.
-fn controls_view(ui: &mut egui::Ui, panel: &CameraPanel, set: &mut Vec<(u32, i64)>) {
+fn controls_view(ui: &mut egui::Ui, panel: &CameraPanel, fps: Option<f32>, set: &mut Vec<(u32, i64)>) {
     use crate::theme::{self, W};
     let pal = theme::pal(ui);
     if panel.controls.is_empty() {
@@ -1029,7 +1057,11 @@ fn controls_view(ui: &mut egui::Ui, panel: &CameraPanel, set: &mut Vec<(u32, i64
                         if let Some((label, m)) = manual {
                             l.well(("camera_manual", auto.id), !on, |l| {
                                 if m.id == v4l2::EXPOSURE {
-                                    l.row(crate::ui_kit::Row::new(label).kid(), |ui| exposure_widget(ui, m, set));
+                                    let note = fps.map(|fps| {
+                                        let (half, whole) = exposure_guides(fps);
+                                        format!("180° shutter at {fps:.0} fps: {:.1} ms. Longer than {:.1} ms lowers the frame rate", half as f64 / 10.0, whole as f64 / 10.0)
+                                    });
+                                    l.row(crate::ui_kit::Row::new(label).kid().note(note.unwrap_or_default()), |ui| exposure_widget(ui, m, fps, set));
                                 } else {
                                     l.row(crate::ui_kit::Row::new(label).kid(), |ui| control_widget(ui, m, set));
                                 }
@@ -1052,6 +1084,13 @@ mod panel_tests {
 
     /// A Logitech C922's controls: named and grouped, automatic modes paired
     /// with the setting they take over, the rest under More.
+    /// Half a frame and a whole one: at 30 fps 16.7 and 33.3 ms, at 60 fps 8.3 and 16.7 ms.
+    #[test]
+    fn exposure_guides_by_frame_rate() {
+        assert_eq!(exposure_guides(30.0), (167, 333));
+        assert_eq!(exposure_guides(60.0), (83, 167));
+    }
+
     #[test]
     fn groups_a_webcams_controls() {
         use v4l2::*;
