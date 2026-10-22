@@ -1035,7 +1035,7 @@ impl App {
                 }
             });
         }
-        let keys = shortcuts::keys(&current).unwrap_or_else(|| vec!["Off".to_owned()]);
+        let keys = shortcuts::keys(&current).unwrap_or_default();
         let tip = if listening { "Press the new shortcut. Esc cancels." } else { "Click, then press the new shortcut" };
         let r = ui_kit::keycaps(ui, &keys, listening).on_hover_text(tip);
         if r.clicked() {

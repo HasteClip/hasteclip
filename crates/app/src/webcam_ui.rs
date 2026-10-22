@@ -415,27 +415,17 @@ impl App {
                     self.webcam_view.ask_fit();
                 }
             }
-            crate::ui_kit::divider(ui, 0.0);
-            ui.horizontal(|ui| {
-                ui.set_min_height(42.0);
-                ui.label(theme::text("Drag it on the preview to move it.", 12.5, W::Regular).color(pal.text3)).on_hover_text(
-                    "Drag a corner or edge to resize it, and past the opposite side to flip it. Hold Alt to crop, Ctrl to stop snapping. Right-click it to mirror, flip or turn it a quarter.",
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    if Btn::ghost("Reset").small().tip("Back to the bottom-right corner, uncropped").show(ui).clicked() {
-                        let camera_aspect = match status {
-                            Status::Live { width, height } => width as f32 / height.max(1) as f32,
-                            _ => 16.0 / 9.0,
-                        };
-                        if let Some(w) = self.settings.webcam.as_mut() {
-                            w.placement = PlacementCfg::laid_out(Placement::default_for(camera_aspect, frame_aspect), frame_aspect);
-                        }
-                    }
-                    let label = if capture::webcam::HAS_CONTROLS { "Adjust camera" } else { "Camera settings…" };
-                    if (capture::webcam::HAS_SETTINGS || capture::webcam::HAS_CONTROLS)
-                        && Btn::ghost(label).small().tip("The camera's own settings: exposure, focus, white balance. They apply right away, in every app, and are put back each time it's opened.").show(ui).clicked()
-                    {
+            // Its own settings: a page of them (Linux), else the driver's window.
+            if capture::webcam::HAS_SETTINGS || capture::webcam::HAS_CONTROLS {
+                crate::ui_kit::divider(ui, 0.0);
+                row(ui, "Camera settings", &mut |ui| {
+                    let tip = "The camera's own settings: exposure, focus, white balance. They apply right away, in every app.";
+                    let open = if capture::webcam::HAS_CONTROLS {
+                        Btn::normal("Adjust").trail(icon::CARET_RIGHT).small().tip(tip).show(ui).clicked()
+                    } else {
+                        Btn::normal("Open…").small().tip(tip).show(ui).clicked()
+                    };
+                    if open {
                         if capture::webcam::HAS_CONTROLS {
                             self.camera_panel = Some(CameraPanel::open(&cam.id));
                         } else {
@@ -443,6 +433,23 @@ impl App {
                         }
                     }
                 });
+            }
+            // Where it sits in the clips: set on the preview, reset here.
+            crate::ui_kit::divider(ui, 0.0);
+            row(ui, "Position", &mut |ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                if Btn::normal("Reset").small().tip("Back to the bottom-right corner, uncropped").show(ui).clicked() {
+                    let camera_aspect = match status {
+                        Status::Live { width, height } => width as f32 / height.max(1) as f32,
+                        _ => 16.0 / 9.0,
+                    };
+                    if let Some(w) = self.settings.webcam.as_mut() {
+                        w.placement = PlacementCfg::laid_out(Placement::default_for(camera_aspect, frame_aspect), frame_aspect);
+                    }
+                }
+                ui.label(theme::text("Drag it on the preview", 12.5, W::Regular).color(pal.text3)).on_hover_text(
+                    "Drag a corner or edge to resize it, and past the opposite side to flip it. Hold Alt to crop, Ctrl to stop snapping. Right-click it to mirror, flip or turn it a quarter.",
+                );
             });
         });
     }

@@ -729,7 +729,16 @@ pub fn key_hint(painter: &egui::Painter, left: Pos2, keys: &[String], size: f32,
 pub fn keycaps(ui: &mut egui::Ui, keys: &[String], listening: bool) -> Response {
     let p = theme::pal(ui);
     let font = theme::font(12.5, W::Semibold);
-    let caps: Vec<String> = if listening { vec!["Press keys…".into()] } else { keys.iter().map(|k| key_text(std::slice::from_ref(k))).collect() };
+    // No keys: "Off", as words, not on a key (it isn't one).
+    let off = !listening && keys.is_empty();
+    let plain = listening || off;
+    let caps: Vec<String> = if listening {
+        vec!["Press keys…".into()]
+    } else if off {
+        vec!["Off".into()]
+    } else {
+        keys.iter().map(|k| key_text(std::slice::from_ref(k))).collect()
+    };
     let galleys: Vec<_> = caps.iter().map(|k| ui.painter().layout_no_wrap(k.clone(), font.clone(), p.text)).collect();
     let cap_w = |g: &std::sync::Arc<egui::Galley>| (g.size().x + 10.0).max(22.0);
     let inner: f32 = galleys.iter().map(cap_w).sum::<f32>() + 4.0 * galleys.len().saturating_sub(1) as f32;
@@ -747,11 +756,11 @@ pub fn keycaps(ui: &mut egui::Ui, keys: &[String], listening: bool) -> Response 
     for g in galleys {
         let cw = cap_w(&g);
         let cap = Rect::from_min_size(Pos2::new(x, rect.center().y - 10.0), vec2(cw, 20.0));
-        if !listening {
+        if !plain {
             painter.rect_filled(cap.translate(vec2(0.0, 1.0)), 4, p.line2);
             painter.rect_filled(cap, 4, if p.dark { p.raise } else { Color32::WHITE });
         }
-        painter.galley(cap.center() - g.size() / 2.0, g, if listening { p.text2 } else { p.text });
+        painter.galley(cap.center() - g.size() / 2.0, g, if plain { p.text2 } else { p.text });
         x += cw + 4.0;
     }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -1295,11 +1304,13 @@ impl<'a> Row<'a> {
         // How wide the control was last frame: beside the label when both
         // fit, else under it (narrow windows), never over it.
         let key = ui.id().with(("row_control_w", self.label));
-        let control_w = ui.data(|d| d.get_temp::<f32>(key)).unwrap_or(0.0);
+        let known_w = ui.data(|d| d.get_temp::<f32>(key));
+        let control_w = known_w.unwrap_or(0.0);
         // The label's height as last drawn, to centre it on the control (its
         // line is as tall as a control can be, not just its text).
         let label_key = ui.id().with(("row_label_h", self.label));
-        let label_h = ui.data(|d| d.get_temp::<f32>(label_key)).unwrap_or(20.0);
+        let known_h = ui.data(|d| d.get_temp::<f32>(label_key));
+        let label_h = known_h.unwrap_or(20.0);
         let mut drawn_label_h = 0.0;
         let inner_w = width - pad_x * 2.0;
         let stacked = control_w > 0.0 && control_w + 16.0 + 140.0 > inner_w;
@@ -1384,13 +1395,21 @@ impl<'a> Row<'a> {
             })
             .inner
         };
+        // Laid out by last frame's sizes. The first time, the frame is drawn
+        // again with the real ones; after that a change (a control growing as
+        // it animates) is just used next frame: discarding every frame of an
+        // animation made egui warn, and a frame's lag doesn't show.
         if control_rect.is_positive() && (control_rect.width() - control_w).abs() > 0.5 {
             ui.data_mut(|d| d.insert_temp(key, control_rect.width()));
-            ui.ctx().request_discard("a settings row's control changed width");
+            if known_w.is_none() {
+                ui.ctx().request_discard("a settings row's control was measured");
+            }
         }
         if self.note.is_none() && drawn_label_h > 0.0 && (drawn_label_h - label_h).abs() > 0.5 {
             ui.data_mut(|d| d.insert_temp(label_key, drawn_label_h));
-            ui.ctx().request_discard("a settings row's label changed height");
+            if known_h.is_none() {
+                ui.ctx().request_discard("a settings row's label was measured");
+            }
         }
         (r, clicked_locked)
     }
