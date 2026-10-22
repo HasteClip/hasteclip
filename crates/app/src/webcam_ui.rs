@@ -370,31 +370,51 @@ impl App {
                 });
             });
             crate::ui_kit::divider(ui, 0.0);
-            row(ui, "Format", &mut |ui| {
-                let formats = capture::webcam::formats(&cam.id);
-                let current = cam.format.map(capture::webcam::Format::from);
-                let label = current.map_or_else(|| "Automatic".to_owned(), |f| f.label());
+            // The format in two short choices: the size, then the rates it comes at.
+            let formats = capture::webcam::formats(&cam.id);
+            let current = cam.format.map(capture::webcam::Format::from);
+            let mut pick: Option<Option<capture::webcam::Format>> = None;
+            row(ui, "Resolution", &mut |ui| {
+                let label = current.map_or_else(|| "Automatic".to_owned(), |f| size_label(f.width, f.height));
                 let r = crate::ui_kit::select(ui, &label, 180.0);
                 crate::ui_kit::menu_popup(&r, false, 240.0, |ui| {
-                    if Item::new("Automatic").check(current.is_none()).tip("The sharpest picture up to 1080p at 30 fps or more").show(ui).clicked() {
-                        if let Some(w) = self.settings.webcam.as_mut() {
-                            w.format = None;
+                    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                        if Item::new("Automatic").check(current.is_none()).tip("The sharpest picture up to 1080p at 30 fps or more").show(ui).clicked() {
+                            pick = Some(None);
                         }
-                        self.webcam_view.ask_fit();
-                    }
-                    if formats.is_empty() {
-                        crate::ui_kit::menu_head(ui, "The camera's formats show once it's open.");
-                    }
-                    for f in formats {
-                        if Item::new(f.label()).check(current == Some(f)).show(ui).clicked() && current != Some(f) {
-                            if let Some(w) = self.settings.webcam.as_mut() {
-                                w.format = Some(f.into());
+                        if formats.is_empty() {
+                            crate::ui_kit::menu_head(ui, "The camera's sizes show once it's open.");
+                        }
+                        for (w, h) in sizes(&formats) {
+                            let on = current.is_some_and(|f| (f.width, f.height) == (w, h));
+                            if Item::new(size_label(w, h)).check(on).show(ui).clicked() && !on {
+                                pick = Some(rate_for(&formats, (w, h), current));
                             }
-                            self.webcam_view.ask_fit();
                         }
-                    }
+                    });
                 });
             });
+            if let Some(f) = current {
+                crate::ui_kit::divider(ui, 0.0);
+                row(ui, "Frame rate", &mut |ui| {
+                    let r = crate::ui_kit::select(ui, &fps_label(f.fps()), 180.0);
+                    crate::ui_kit::menu_popup(&r, false, 200.0, |ui| {
+                        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                            for o in formats.iter().filter(|o| (o.width, o.height) == (f.width, f.height)) {
+                                if Item::new(fps_label(o.fps())).check(*o == f).show(ui).clicked() && *o != f {
+                                    pick = Some(Some(*o));
+                                }
+                            }
+                        });
+                    });
+                });
+            }
+            if let Some(p) = pick {
+                if let Some(w) = self.settings.webcam.as_mut() {
+                    w.format = p.map(Into::into);
+                }
+                self.webcam_view.ask_fit();
+            }
             crate::ui_kit::divider(ui, 0.0);
             ui.horizontal(|ui| {
                 ui.set_min_height(42.0);
@@ -412,7 +432,11 @@ impl App {
                             w.placement = PlacementCfg::laid_out(Placement::default_for(camera_aspect, frame_aspect), frame_aspect);
                         }
                     }
-                    let label = if capture::webcam::HAS_CONTROLS { "Adjust camera" } else { "Camera settings…" };
+                    let label = match (capture::webcam::HAS_CONTROLS, self.camera_panel.is_some()) {
+                        (true, true) => "Done adjusting",
+                        (true, false) => "Adjust camera",
+                        (false, _) => "Camera settings…",
+                    };
                     if (capture::webcam::HAS_SETTINGS || capture::webcam::HAS_CONTROLS)
                         && Btn::ghost(label).small().tip("The camera's own settings: exposure, focus, white balance. They apply right away, in every app, and are put back each time it's opened.").show(ui).clicked()
                     {
@@ -751,12 +775,21 @@ impl App {
         }
         let Some(panel) = self.camera_panel.as_mut() else { return };
         let pal = theme::pal(ui);
-        let mut back = false;
-        crate::sources_ui::column_head(ui, "Camera", |ui| {
-            if Btn::ghost("Back").with_icon(egui_phosphor::regular::CARET_LEFT).small().tip("Back to Sound").show(ui).clicked() {
+        // Back to Sound: the arrow, Done, or Esc.
+        let mut back = ui.input(|i| i.key_pressed(egui::Key::Escape)) && !ui.ctx().any_popup_open();
+        ui.horizontal(|ui| {
+            ui.set_min_height(30.0);
+            if Btn::icon(crate::ui_kit::Kind::Ghost, egui_phosphor::regular::CARET_LEFT).small().tip("Back to Sound  (Esc)").show(ui).clicked() {
                 back = true;
             }
+            ui.label(theme::text("Camera", 15.0, W::Semibold).color(pal.text));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if Btn::primary("Done").small().tip("Back to Sound  (Esc)").show(ui).clicked() {
+                    back = true;
+                }
+            });
         });
+        ui.add_space(4.0);
         // Its own picture, big and live.
         let w = ui.available_width();
         if let Some(p) = capture::webcam::camera_picture((w * ui.ctx().pixels_per_point()) as u32, panel.seq) {
@@ -938,5 +971,69 @@ mod panel_tests {
         assert!(auto_on(ae));
         assert_eq!(auto_value(ae, false), v4l2::EXPOSURE_MANUAL);
         assert_eq!(auto_value(ae, true), 3);
+    }
+}
+
+/// The sizes a camera offers, each once, biggest first.
+fn sizes(formats: &[capture::webcam::Format]) -> Vec<(u32, u32)> {
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for f in formats {
+        if !out.contains(&(f.width, f.height)) {
+            out.push((f.width, f.height));
+        }
+    }
+    out.sort_by_key(|(w, h)| std::cmp::Reverse((w * h, *w)));
+    out
+}
+
+/// The format to take at size `size`: the rate it had, if offered there,
+/// else the fastest.
+fn rate_for(formats: &[capture::webcam::Format], size: (u32, u32), current: Option<capture::webcam::Format>) -> Option<capture::webcam::Format> {
+    let at = formats.iter().filter(|f| (f.width, f.height) == size);
+    let same = current.and_then(|c| at.clone().find(|f| (f.fps() - c.fps()).abs() < 0.05));
+    same.or_else(|| at.max_by(|a, b| a.fps().total_cmp(&b.fps()))).copied()
+}
+
+/// A size, named when it's a common one: "1080p · 1920×1080".
+fn size_label(w: u32, h: u32) -> String {
+    let name = match (w, h) {
+        (3840, 2160) => Some("4K"),
+        (2560, 1440) => Some("1440p"),
+        (1920, 1080) => Some("1080p"),
+        (1280, 720) => Some("720p"),
+        (854, 480) | (640, 480) => Some("480p"),
+        (640, 360) => Some("360p"),
+        _ => None,
+    };
+    match name {
+        Some(n) => format!("{n} · {w}×{h}"),
+        None => format!("{w}×{h}"),
+    }
+}
+
+fn fps_label(fps: f32) -> String {
+    if (fps - fps.round()).abs() < 0.05 { format!("{} fps", fps.round()) } else { format!("{fps:.2} fps") }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+    use capture::webcam::Format;
+
+    fn f(width: u32, height: u32, fps: u32) -> Format {
+        Format { width, height, fps_num: fps, fps_den: 1 }
+    }
+
+    #[test]
+    fn sizes_once_biggest_first_and_rates_kept() {
+        let formats = [f(640, 480, 30), f(1920, 1080, 30), f(1920, 1080, 60), f(640, 480, 15), f(1280, 720, 60)];
+        assert_eq!(sizes(&formats), [(1920, 1080), (1280, 720), (640, 480)]);
+        // 30 fps is kept where the new size has it; else the fastest.
+        assert_eq!(rate_for(&formats, (640, 480), Some(f(1920, 1080, 30))), Some(f(640, 480, 30)));
+        assert_eq!(rate_for(&formats, (1280, 720), Some(f(1920, 1080, 30))), Some(f(1280, 720, 60)));
+        assert_eq!(size_label(1920, 1080), "1080p · 1920×1080");
+        // As `Format::label`: within 0.05 of a whole number reads as it.
+        assert_eq!(fps_label(29.97), "30 fps");
+        assert_eq!(fps_label(7.5), "7.50 fps");
     }
 }

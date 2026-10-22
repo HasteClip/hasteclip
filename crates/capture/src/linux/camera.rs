@@ -96,8 +96,20 @@ pub fn keep_open(want: Option<(String, Option<Format>)>) {
     };
     let feed = Arc::new(CameraFeed { device, format, frame: Mutex::new(None), seq: Default::default(), stop: AtomicBool::new(false) });
     *current = Some(feed.clone());
-    thread::spawn(move || run(feed));
+    // The camera before is let go of first (its ffmpeg ends after its next
+    // picture): opened while that still holds it, a camera is busy.
+    let mut running = RUNNING.lock().unwrap();
+    let before = running.take();
+    *running = Some(thread::spawn(move || {
+        if let Some(t) = before {
+            let _ = t.join();
+        }
+        run(feed)
+    }));
 }
+
+/// The thread of the camera opened last, to wait for before opening another.
+static RUNNING: Mutex<Option<thread::JoinHandle<()>>> = Mutex::new(None);
 
 /// Open the camera and keep it open until told to stop, reopening it when it
 /// goes away (unplugged, taken by another app) and comes back.
@@ -549,6 +561,40 @@ fn intervals(fd: &std::fs::File, pixel: u32, width: u32, height: u32) -> Vec<(u3
 mod tests {
     use super::*;
 
+
+    /// Switching a camera's format reopens it without it being busy (the
+    /// one before let go of first).
+    #[test]
+    #[ignore = "uses a camera nothing else has open: HASTECLIP_WEBCAM=<device> cargo test -p capture switches_format -- --ignored"]
+    fn switches_format() {
+        let device = std::env::var("HASTECLIP_WEBCAM").unwrap();
+        let formats = formats_of(&std::fs::canonicalize(&device).unwrap()).unwrap();
+        let (a, b) = (formats[0].0, formats[formats.len() / 2].0);
+        let live = |want: (u32, u32)| {
+            let t = std::time::Instant::now();
+            let mut seen = Vec::new();
+            loop {
+                let s = crate::webcam::status();
+                if seen.last() != Some(&s) {
+                    seen.push(s.clone());
+                }
+                if s == (crate::webcam::Status::Live { width: want.0, height: want.1 }) || t.elapsed() > Duration::from_secs(8) {
+                    return seen;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        keep_open(Some((device.clone(), Some(a))));
+        let first = live((a.width, a.height));
+        keep_open(Some((device.clone(), Some(b))));
+        let t = std::time::Instant::now();
+        let second = live((b.width, b.height));
+        eprintln!("{} then {} in {} ms: {first:?} → {second:?}", a.label(), b.label(), t.elapsed().as_millis());
+        keep_open(None);
+        thread::sleep(Duration::from_millis(300));
+        assert!(!second.iter().any(|s| matches!(s, crate::webcam::Status::Unavailable(_))), "busy on the way");
+        assert_eq!(second.last(), Some(&crate::webcam::Status::Live { width: b.width, height: b.height }));
+    }
 
     /// Settings remembered for a camera go back on when it's opened.
     #[test]
