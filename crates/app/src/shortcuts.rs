@@ -181,6 +181,28 @@ impl Registered {
         out
     }
 
+    /// Open the desktop's editor for its shortcuts, where it keeps theirs
+    /// (Wayland, through the portal). False where it can't.
+    pub fn configure_desktop(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(p) = &self.portal
+            && crate::portal_shortcuts::can_configure()
+        {
+            p.configure();
+            return true;
+        }
+        false
+    }
+
+    /// Whether the desktop's own shortcut editor can be opened for them.
+    pub fn desktop_configurable(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if self.portal.is_some() {
+            return crate::portal_shortcuts::can_configure();
+        }
+        false
+    }
+
     pub fn error_for(&self, action: ShortcutAction) -> Option<String> {
         if let Some((_, e)) = self.errors.iter().find(|(a, _)| *a == action) {
             return Some(e.clone());
@@ -191,7 +213,11 @@ impl Registered {
             return match p.state() {
                 State::Failed(e) => Some(format!("the desktop didn't take it ({e})")),
                 State::Bound(list) if list.iter().any(|(a, keys)| *a == action && keys.trim().is_empty()) => {
-                    Some("the desktop gave it no keys — set them in its keyboard settings".into())
+                    Some(if crate::portal_shortcuts::can_configure() {
+                        "your desktop has no keys for it: set them with Change in system settings".into()
+                    } else {
+                        "your desktop has no keys for it: set them in its keyboard settings".into()
+                    })
                 }
                 _ => None,
             };

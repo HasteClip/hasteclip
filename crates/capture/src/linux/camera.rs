@@ -427,7 +427,19 @@ fn apply_remembered(device: &str) {
     let all = controls(device);
     let kind_first = |id: u32| all.iter().find(|c| c.id == id).is_some_and(|c| !matches!(c.kind, crate::webcam::ControlKind::Int { .. }));
     let (first, rest): (Vec<_>, Vec<_>) = saved.into_iter().partition(|(id, _)| kind_first(*id));
-    for (id, value) in first.into_iter().chain(rest) {
+    for (id, value) in first {
+        if let Err(e) = set_control(device, id, value) {
+            eprintln!("camera setting {id:#x}: {e:#}");
+        }
+    }
+    // The rest, unless the switches just set leave them doing nothing (a
+    // white balance temperature while white balance is automatic): the camera
+    // refuses those.
+    let now = controls(device);
+    for (id, value) in rest {
+        if now.iter().any(|c| c.id == id && c.inactive) {
+            continue;
+        }
         if let Err(e) = set_control(device, id, value) {
             eprintln!("camera setting {id:#x}: {e:#}");
         }

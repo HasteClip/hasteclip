@@ -536,6 +536,17 @@ impl App {
                 let note = problem.clone().unwrap_or_else(|| note.to_owned());
                 l.row(Row::new(action.label()).note(note).warn(problem.is_some()), |ui| self.shortcut_editor(ui, action));
             }
+            // On Wayland the desktop keeps the keys (the user's, once set):
+            // they're changed in its own editor.
+            if desktop && self.hotkeys.as_ref().is_ok_and(|h| h.desktop_configurable()) && f.shows(&["shortcut", "hotkey", "keyboard", "system settings"]) {
+                let mut open = false;
+                l.row(Row::new("Keys in your desktop").note("Your desktop keeps the keys it gave these shortcuts. Change them in its own shortcut settings."), |ui| {
+                    open = Btn::normal("Change in system settings").small().show(ui).clicked();
+                });
+                if open && let Ok(h) = &self.hotkeys {
+                    h.configure_desktop();
+                }
+            }
             #[cfg(target_os = "macos")]
             if f.shows(&["fullscreen games", "input monitoring", "shortcut", "hotkey", "keyboard", "permission"]) {
                 let allowed = crate::key_tap::allowed();
