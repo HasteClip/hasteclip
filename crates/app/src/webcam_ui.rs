@@ -367,6 +367,54 @@ impl App {
                     }
                 });
             });
+            // Where there's no Camera page (its settings are the driver's
+            // window, or none), the format is picked here.
+            if !capture::webcam::HAS_CONTROLS {
+                let formats = capture::webcam::formats(&cam.id);
+                let current = cam.format.map(capture::webcam::Format::from);
+                let mut pick: Option<Option<capture::webcam::Format>> = None;
+                crate::ui_kit::divider(ui, 0.0);
+                row(ui, "Resolution", &mut |ui| {
+                    let label = current.map_or_else(|| "Automatic".to_owned(), |f| size_label(f.width, f.height));
+                    let r = crate::ui_kit::select(ui, &label, 180.0);
+                    crate::ui_kit::menu_popup(&r, false, 250.0, |ui| {
+                        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                            if Item::new("Automatic").check(current.is_none()).tip("The sharpest picture up to 1080p at 30 fps or more").show(ui).clicked() {
+                                pick = Some(None);
+                            }
+                            if formats.is_empty() {
+                                crate::ui_kit::menu_head(ui, "The camera's sizes show once it's open.");
+                            }
+                            for (w, h) in sizes(&formats) {
+                                let on = current.is_some_and(|f| (f.width, f.height) == (w, h));
+                                let fastest = formats.iter().filter(|f| (f.width, f.height) == (w, h)).map(|f| f.fps()).fold(0.0, f32::max);
+                                if Item::new(size_label(w, h)).value(format!("up to {}", fps_label(fastest))).check(on).show(ui).clicked() && !on {
+                                    pick = Some(rate_for(&formats, (w, h), current));
+                                }
+                            }
+                        });
+                    });
+                });
+                if let Some(f) = current {
+                    crate::ui_kit::divider(ui, 0.0);
+                    row(ui, "Frame rate", &mut |ui| {
+                        let r = crate::ui_kit::select(ui, &fps_label(f.fps()), 180.0);
+                        crate::ui_kit::menu_popup(&r, false, 200.0, |ui| {
+                            for o in formats.iter().filter(|o| (o.width, o.height) == (f.width, f.height)) {
+                                if Item::new(fps_label(o.fps())).check(*o == f).show(ui).clicked() && *o != f {
+                                    pick = Some(Some(*o));
+                                }
+                            }
+                        });
+                    });
+                }
+                if let Some(p) = pick {
+                    if let Some(w) = self.settings.webcam.as_mut() {
+                        w.format = p.map(Into::into);
+                    }
+                    self.webcam_view.ask_fit();
+                }
+            }
             crate::ui_kit::divider(ui, 0.0);
             ui.horizontal(|ui| {
                 ui.set_min_height(42.0);
