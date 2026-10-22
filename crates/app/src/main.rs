@@ -1242,7 +1242,10 @@ impl eframe::App for App {
             let id = w.id.clone();
             CAMERA_PANEL.call_once(|| {
                 self.page = Page::Sources;
-                self.camera_panel = Some(crate::webcam_ui::CameraPanel::open(&id));
+                let mut panel = crate::webcam_ui::CameraPanel::open(&id);
+                // `=crop`: cropping already.
+                panel.set_cropping(std::env::var("HASTECLIP_DEV_CAMERA_PANEL").is_ok_and(|v| v == "crop"));
+                self.camera_panel = Some(panel);
             });
         }
         // `HASTECLIP_DEV_PAGES=<secs>`: go round Clips, Sources and Settings,

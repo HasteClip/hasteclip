@@ -733,11 +733,31 @@ pub(crate) struct CameraPanel {
     new_pictures: u64,
     counted: Option<(std::time::Instant, u64)>,
     fps: Option<f32>,
+    /// Cropping on the picture: the whole of it shown, its edges dragged.
+    cropping: bool,
+    /// The crop's edge (or all of it) being dragged.
+    crop_drag: Option<CropGrip>,
+}
+
+/// What of the crop is being dragged, on the picture as shown.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CropGrip {
+    Left,
+    Top,
+    Right,
+    Bottom,
+    /// All of it, moved.
+    Move,
 }
 
 impl CameraPanel {
+    /// Start cropping on the picture (or not).
+    pub(crate) fn set_cropping(&mut self, on: bool) {
+        self.cropping = on;
+    }
+
     pub(crate) fn open(device: &str) -> Self {
-        Self { device: device.to_owned(), controls: capture::webcam::camera_controls(device), picture: None, seq: 0, new_pictures: 0, counted: None, fps: None }
+        Self { device: device.to_owned(), controls: capture::webcam::camera_controls(device), picture: None, seq: 0, new_pictures: 0, counted: None, fps: None, cropping: false, crop_drag: None }
     }
 }
 
@@ -929,6 +949,9 @@ impl App {
         // How it's turned and mirrored in the clips (the webcam's placement).
         let orient = self.settings.webcam.as_ref().map_or_else(Orientation::default, |w| Orientation { flip_h: w.placement.flip_h, flip_v: w.placement.flip_v, turns: w.placement.turns });
         let mut reorient: Option<Orientation> = None;
+        // Its crop (the camera's sides cut off), and a new one.
+        let crop = self.settings.webcam.as_ref().map_or([0.0; 4], |w| w.placement.crop);
+        let mut recrop: Option<[f32; 4]> = None;
         // The frame rate the camera runs at: as picked, or Automatic's pick.
         let fps = current.or_else(|| self.camera_panel.as_ref().and_then(|p| capture::webcam::formats(&p.device).into_iter().max_by_key(|f| f.auto_rank()))).map(|f| f.fps());
         let Some(panel) = self.camera_panel.as_mut() else { return };
@@ -944,24 +967,24 @@ impl App {
                 ui.allocate_ui_with_layout(vec2(col, h), egui::Layout::top_down(egui::Align::Min), |ui| {
                     ui.set_width(col);
                     ui.add_space(4.0);
-                    picture_side(ui, panel, &name, fps, orient, h * 0.7, &mut reset);
+                    picture_side(ui, panel, &name, fps, orient, crop, h * 0.7, &mut reset, &mut recrop);
                 });
                 ui.allocate_ui_with_layout(vec2(col, h), egui::Layout::top_down(egui::Align::Min), |ui| {
                     ui.set_width(col);
                     crate::ui_kit::scroll(ui, "camera_controls", |ui| {
                         format_view(ui, &panel.device, current, &mut pick);
-                        orientation_view(ui, orient, &mut reorient);
+                        orientation_view(ui, orient, &mut reorient, &mut panel.cropping, crop != [0.0; 4], &mut recrop);
                         controls_view(ui, panel, fps, &mut set);
                         ui.add_space(28.0);
                     });
                 });
             });
         } else {
-            picture_side(ui, panel, &name, fps, orient, h * 0.4, &mut reset);
+            picture_side(ui, panel, &name, fps, orient, crop, h * 0.4, &mut reset, &mut recrop);
             crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
             crate::ui_kit::scroll(ui, "camera_controls", |ui| {
                 format_view(ui, &panel.device, current, &mut pick);
-                orientation_view(ui, orient, &mut reorient);
+                orientation_view(ui, orient, &mut reorient, &mut panel.cropping, crop != [0.0; 4], &mut recrop);
                 controls_view(ui, panel, fps, &mut set);
                 ui.add_space(28.0);
             });
@@ -1002,6 +1025,24 @@ impl App {
                 w.format = p.map(Into::into);
             }
             self.webcam_view.ask_fit();
+        }
+        // Cropped: the box takes the shape of what's left (its width and
+        // middle kept), so nothing more is cut off to fill it; inside the frame.
+        if let (Some(c), Some(w)) = (recrop, self.settings.webcam.as_mut()) {
+            let aspect = w.placement.frame_aspect.unwrap_or(16.0 / 9.0);
+            let mut p: Placement = w.placement.into();
+            if let capture::webcam::Status::Live { width, height } = capture::webcam::status() {
+                let raw = width as f32 / height.max(1) as f32;
+                let full = if p.turns % 2 == 1 { 1.0 / raw } else { raw };
+                let kept = crop_shown(orient, c);
+                let visible = full * kept.width() / kept.height().max(0.01);
+                let (cx, cy) = (p.x + p.w / 2.0, p.y + p.h / 2.0);
+                p.h = p.w * aspect / visible;
+                p.x = cx - p.w / 2.0;
+                p.y = cy - p.h / 2.0;
+            }
+            p.crop = c;
+            w.placement = PlacementCfg::laid_out(contain(p), aspect);
         }
         // Turned or mirrored: the placement, as the preview's right-click does
         // it (a quarter turn swaps the box's sides).
@@ -1121,10 +1162,13 @@ fn curve_value(pos: f32, min: i64, max: i64) -> i64 {
 
 /// The Camera page's still side: the picture, which camera it is and in what
 /// size, and resetting its settings.
-fn picture_side(ui: &mut egui::Ui, panel: &mut CameraPanel, name: &str, fps: Option<f32>, orient: Orientation, max_h: f32, reset: &mut bool) {
+#[allow(clippy::too_many_arguments)]
+fn picture_side(ui: &mut egui::Ui, panel: &mut CameraPanel, name: &str, fps: Option<f32>, orient: Orientation, crop: [f32; 4], max_h: f32, reset: &mut bool, recrop: &mut Option<[f32; 4]>) {
     use crate::theme::{self, W};
     let pal = theme::pal(ui);
-    picture_view(ui, panel, orient, max_h);
+    if let Some(c) = picture_view(ui, panel, orient, crop, max_h) {
+        *recrop = Some(c);
+    }
     crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
     let status = match (capture::webcam::status(), panel.fps) {
         (capture::webcam::Status::Live { width, height }, Some(fps)) => format!("{name} · {width}×{height} · {fps:.0} new pictures/s"),
@@ -1160,7 +1204,7 @@ fn slowdown(measured: Option<f32>, fps: Option<f32>) -> Option<String> {
 
 /// The camera's own picture, live, as wide as there's room for and at most
 /// `max_h` tall.
-fn picture_view(ui: &mut egui::Ui, panel: &mut CameraPanel, orient: Orientation, max_h: f32) {
+fn picture_view(ui: &mut egui::Ui, panel: &mut CameraPanel, orient: Orientation, crop: [f32; 4], max_h: f32) -> Option<[f32; 4]> {
     let pal = crate::theme::pal(ui);
     let w = ui.available_width();
     if let Some(p) = capture::webcam::camera_picture((w * ui.ctx().pixels_per_point()) as u32, panel.seq) {
@@ -1184,30 +1228,132 @@ fn picture_view(ui: &mut egui::Ui, panel: &mut CameraPanel, orient: Orientation,
         _ => {}
     }
     ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
-    // As it is in the clips: turned, then mirrored or flipped.
+    // As it is in the clips: turned, then mirrored or flipped; cropped,
+    // unless the crop's being set (then all of it, the rest dimmed).
     let raw = panel.picture.as_ref().map_or(16.0 / 9.0, |t| t.size()[0] as f32 / t.size()[1].max(1) as f32);
     let sideways = orient.turns % 2 == 1;
-    let aspect = if sideways { 1.0 / raw } else { raw };
+    let full_aspect = if sideways { 1.0 / raw } else { raw };
+    // The crop, as shown: its sides along and down the shown picture (0 to 1).
+    let shown = crop_shown(orient, crop);
+    let aspect = if panel.cropping { full_aspect } else { full_aspect * shown.width() / shown.height().max(0.01) };
     let pw = w.min(max_h.max(120.0) * aspect);
+    let mut changed = None;
     ui.vertical_centered(|ui| {
-        let (rect, _) = ui.allocate_exact_size(vec2(pw, pw / aspect), egui::Sense::hover());
-        match &panel.picture {
-            Some(t) => {
-                // Drawn unturned, then turned about its middle; the mirror and
-                // flip are the clip's (after turning), so sideways they swap axes.
-                let unturned = if sideways { egui::Rect::from_center_size(rect.center(), vec2(rect.height(), rect.width())) } else { rect };
-                let (fu, fv) = if sideways { (orient.flip_v, orient.flip_h) } else { (orient.flip_h, orient.flip_v) };
-                let uv = egui::Rect::from_min_max(egui::pos2(if fu { 1.0 } else { 0.0 }, if fv { 1.0 } else { 0.0 }), egui::pos2(if fu { 0.0 } else { 1.0 }, if fv { 0.0 } else { 1.0 }));
-                let mut image = egui::Image::from_texture((t.id(), unturned.size())).uv(uv);
-                image = if orient.turns % 4 == 0 { image.corner_radius(crate::ui_kit::RADIUS) } else { image.rotate(orient.turns as f32 * std::f32::consts::FRAC_PI_2, vec2(0.5, 0.5)) };
-                image.paint_at(ui, unturned);
+        let sense = if panel.cropping { egui::Sense::click_and_drag() } else { egui::Sense::hover() };
+        let (rect, resp) = ui.allocate_exact_size(vec2(pw, pw / aspect), sense);
+        let Some(t) = &panel.picture else {
+            ui.painter().rect_filled(rect, crate::ui_kit::RADIUS, pal.control);
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "Waiting for the camera…", egui::FontId::proportional(13.0), pal.text3);
+            return;
+        };
+        // The whole picture's place: the rect itself while cropping, else as
+        // much bigger as puts the crop on the rect (drawn clipped to it).
+        let full = if panel.cropping {
+            rect
+        } else {
+            let fw = rect.width() / shown.width().max(0.01);
+            let fh = rect.height() / shown.height().max(0.01);
+            egui::Rect::from_min_size(egui::pos2(rect.left() - shown.left() * fw, rect.top() - shown.top() * fh), vec2(fw, fh))
+        };
+        // Drawn unturned, then turned about its middle; the mirror and flip
+        // are the clip's (after turning), so sideways they swap axes.
+        let unturned = if sideways { egui::Rect::from_center_size(full.center(), vec2(full.height(), full.width())) } else { full };
+        let (fu, fv) = if sideways { (orient.flip_v, orient.flip_h) } else { (orient.flip_h, orient.flip_v) };
+        let uv = egui::Rect::from_min_max(egui::pos2(if fu { 1.0 } else { 0.0 }, if fv { 1.0 } else { 0.0 }), egui::pos2(if fu { 0.0 } else { 1.0 }, if fv { 0.0 } else { 1.0 }));
+        let mut image = egui::Image::from_texture((t.id(), unturned.size())).uv(uv);
+        if orient.turns % 4 != 0 {
+            image = image.rotate(orient.turns as f32 * std::f32::consts::FRAC_PI_2, vec2(0.5, 0.5));
+        }
+        let mut clipped = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+        clipped.set_clip_rect(rect.intersect(ui.clip_rect()));
+        image.paint_at(&mut clipped, unturned);
+        if !panel.cropping {
+            return;
+        }
+        // The crop on the whole picture: the rest dimmed, its edges dragged.
+        let at = |n: egui::Pos2| egui::pos2(rect.left() + n.x * rect.width(), rect.top() + n.y * rect.height());
+        let c = egui::Rect::from_min_max(at(shown.min), at(shown.max));
+        let dim = Color32::from_black_alpha(150);
+        let p = ui.painter();
+        p.rect_filled(egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), c.top())), 0.0, dim);
+        p.rect_filled(egui::Rect::from_min_max(egui::pos2(rect.left(), c.bottom()), rect.max), 0.0, dim);
+        p.rect_filled(egui::Rect::from_min_max(egui::pos2(rect.left(), c.top()), egui::pos2(c.left(), c.bottom())), 0.0, dim);
+        p.rect_filled(egui::Rect::from_min_max(egui::pos2(c.right(), c.top()), egui::pos2(rect.right(), c.bottom())), 0.0, dim);
+        p.rect_stroke(c, 0.0, Stroke::new(1.5, Color32::WHITE), egui::StrokeKind::Inside);
+        for (a, b) in [(c.left_center(), vec2(4.0, 24.0)), (c.right_center(), vec2(4.0, 24.0)), (c.center_top(), vec2(24.0, 4.0)), (c.center_bottom(), vec2(24.0, 4.0))] {
+            p.rect_filled(egui::Rect::from_center_size(a, b), 2.0, Color32::WHITE);
+        }
+        // Which edge is near the pointer (else inside: all of it).
+        let grip_at = |at: egui::Pos2| -> Option<CropGrip> {
+            let near = 10.0;
+            let between_y = at.y > c.top() - near && at.y < c.bottom() + near;
+            let between_x = at.x > c.left() - near && at.x < c.right() + near;
+            if between_y && (at.x - c.left()).abs() < near {
+                Some(CropGrip::Left)
+            } else if between_y && (at.x - c.right()).abs() < near {
+                Some(CropGrip::Right)
+            } else if between_x && (at.y - c.top()).abs() < near {
+                Some(CropGrip::Top)
+            } else if between_x && (at.y - c.bottom()).abs() < near {
+                Some(CropGrip::Bottom)
+            } else {
+                c.contains(at).then_some(CropGrip::Move)
             }
-            None => {
-                ui.painter().rect_filled(rect, crate::ui_kit::RADIUS, pal.control);
-                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "Waiting for the camera…", egui::FontId::proportional(13.0), pal.text3);
+        };
+        let hover = resp.hover_pos().and_then(grip_at);
+        let cursor = |g: CropGrip| match g {
+            CropGrip::Left | CropGrip::Right => egui::CursorIcon::ResizeHorizontal,
+            CropGrip::Top | CropGrip::Bottom => egui::CursorIcon::ResizeVertical,
+            CropGrip::Move => egui::CursorIcon::Grab,
+        };
+        if resp.drag_started() {
+            panel.crop_drag = resp.interact_pointer_pos().and_then(grip_at);
+        }
+        if let Some(g) = panel.crop_drag.or(hover) {
+            ui.ctx().set_cursor_icon(cursor(g));
+        }
+        if let (Some(g), true) = (panel.crop_drag, resp.dragged()) {
+            let d = resp.drag_delta();
+            let (dx, dy) = (d.x / rect.width(), d.y / rect.height());
+            let mut s = shown;
+            let least = 0.1;
+            match g {
+                CropGrip::Left => s.min.x = (s.min.x + dx).clamp(0.0, s.max.x - least),
+                CropGrip::Right => s.max.x = (s.max.x + dx).clamp(s.min.x + least, 1.0),
+                CropGrip::Top => s.min.y = (s.min.y + dy).clamp(0.0, s.max.y - least),
+                CropGrip::Bottom => s.max.y = (s.max.y + dy).clamp(s.min.y + least, 1.0),
+                CropGrip::Move => {
+                    let (mx, my) = (dx.clamp(-s.min.x, 1.0 - s.max.x), dy.clamp(-s.min.y, 1.0 - s.max.y));
+                    s = s.translate(vec2(mx, my));
+                }
             }
+            changed = Some(crop_from_shown(orient, s));
+        }
+        if resp.drag_stopped() {
+            panel.crop_drag = None;
         }
     });
+    changed
+}
+
+/// The crop (left, top, right, bottom cut off) as the part of the picture
+/// as shown that's kept. A placement's crop is of the turned picture before
+/// it's mirrored or flipped (as the recording draws it, `Canvas::draw_camera`,
+/// and as turning moves it round, `Placement::turn`): shown, a mirrored
+/// picture's left is the crop's right.
+fn crop_shown(o: Orientation, [l, t, r, b]: [f32; 4]) -> egui::Rect {
+    let (left, right) = if o.flip_h { (r, l) } else { (l, r) };
+    let (top, bottom) = if o.flip_v { (b, t) } else { (t, b) };
+    egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(1.0 - right, 1.0 - bottom))
+}
+
+/// The crop that keeps this part of the picture as shown.
+fn crop_from_shown(o: Orientation, s: egui::Rect) -> [f32; 4] {
+    let (left, right) = (s.min.x.max(0.0), (1.0 - s.max.x).max(0.0));
+    let (top, bottom) = (s.min.y.max(0.0), (1.0 - s.max.y).max(0.0));
+    let (l, r) = if o.flip_h { (right, left) } else { (left, right) };
+    let (t, b) = if o.flip_v { (bottom, top) } else { (top, bottom) };
+    [l, t, r, b]
 }
 
 /// How the webcam is turned (quarter turns clockwise) and mirrored or
@@ -1231,7 +1377,7 @@ impl Orientation {
 /// The webcam's orientation in the clips, after its format: the same as the
 /// preview's right-click. What's wanted goes in `reorient`, its `turns` as
 /// seen (`Orientation::seen_turns`).
-fn orientation_view(ui: &mut egui::Ui, now: Orientation, reorient: &mut Option<Orientation>) {
+fn orientation_view(ui: &mut egui::Ui, now: Orientation, reorient: &mut Option<Orientation>, cropping: &mut bool, cropped: bool, recrop: &mut Option<[f32; 4]>) {
     use crate::ui_kit::{Item, Row};
     crate::ui_kit::section_head(ui, "Orientation", false, |_| {});
     crate::ui_kit::list(ui, "camera_orientation", |l| {
@@ -1245,6 +1391,17 @@ fn orientation_view(ui: &mut egui::Ui, now: Orientation, reorient: &mut Option<O
             let mut on = now.flip_v;
             if crate::ui_kit::switch(ui, &mut on).changed() {
                 *reorient = Some(Orientation { flip_v: on, turns: now.seen_turns(), ..now });
+            }
+        });
+        let tip = "Drag the picture's edges to cut off what you don't want; the rest stays dimmed while you do. The camera's own Zoom crops inside the camera instead, from its sensor, which can be sharper.";
+        l.row(Row::new("Crop").tip("Crop", tip), |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let label = if *cropping { "Done" } else { "Crop" };
+            if crate::ui_kit::Btn::normal(label).small().show(ui).clicked() {
+                *cropping = !*cropping;
+            }
+            if cropped && crate::ui_kit::Btn::ghost("Reset").small().tip("The whole picture again").show(ui).clicked() {
+                *recrop = Some([0.0; 4]);
             }
         });
         l.row(Row::new("Rotation"), |ui| {
@@ -1393,6 +1550,25 @@ mod panel_tests {
         let said = slowdown(Some(30.0), Some(60.0)).unwrap();
         assert!(said.starts_with("Sending 30 of 60") && said.contains("light") && said.contains("exposure"));
         assert_eq!(slowdown(None, Some(60.0)), None);
+    }
+
+    /// A crop set on the picture as shown is the same crop shown again, in
+    /// every orientation; mirrored, the shown left is the crop's right (as
+    /// the recording draws it).
+    #[test]
+    fn crop_through_every_orientation() {
+        let kept = egui::Rect::from_min_max(egui::pos2(0.1, 0.2), egui::pos2(0.6, 0.9));
+        for turns in 0..4u8 {
+            for (flip_h, flip_v) in [(false, false), (true, false), (false, true), (true, true)] {
+                let o = Orientation { flip_h, flip_v, turns };
+                let again = crop_shown(o, crop_from_shown(o, kept));
+                assert!((again.min - kept.min).length() < 1e-5 && (again.max - kept.max).length() < 1e-5, "{o:?}");
+            }
+        }
+        let close = |c: [f32; 4], want: [f32; 4]| c.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-5);
+        assert!(close(crop_from_shown(Orientation::default(), kept), [0.1, 0.2, 0.4, 0.1]));
+        let mirrored = Orientation { flip_h: true, ..Default::default() };
+        assert!(close(crop_from_shown(mirrored, kept), [0.4, 0.2, 0.1, 0.1]));
     }
 
     #[test]
