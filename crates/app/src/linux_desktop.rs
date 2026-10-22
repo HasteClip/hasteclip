@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use crate::portal_shortcuts::APP_ID;
 
 const DESKTOP_FILE: &str = include_str!("../assets/io.github.kaillr.HasteClip.desktop");
-const ICON: &[u8] = include_bytes!("../assets/icon.svg");
+/// The glyph without the macOS plate, as on Windows.
+const ICON: &[u8] = include_bytes!("../assets/icon-glyph.svg");
 
 /// Make sure the desktop can find us. Call before talking to the portal.
 pub fn integrate() {

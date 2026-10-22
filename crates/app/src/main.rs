@@ -308,14 +308,14 @@ enum RecState {
     Recording,
 }
 
-/// The app icon (`assets/icon.svg` rendered to PNG), shown in the Dock and taskbar
+/// The app icon (`assets/icon-mac.svg` rendered to PNG), shown in the Dock and taskbar
 /// while running. Release bundles use `assets/hasteclip.icns` instead. On
-/// Windows, where icons are small, the glyph without the macOS plate
-/// (`assets/icon-windows.svg`).
+/// Windows and Linux, where app icons aren't drawn on a plate, the glyph
+/// without the macOS one (`assets/icon-glyph.svg`): with it, it looked small.
 pub(crate) fn app_icon() -> egui::IconData {
-    #[cfg(windows)]
-    let png = include_bytes!("../assets/icon-windows-256.png");
-    #[cfg(not(windows))]
+    #[cfg(not(target_os = "macos"))]
+    let png = include_bytes!("../assets/icon-glyph-256.png");
+    #[cfg(target_os = "macos")]
     let png = include_bytes!("../assets/icon-1024.png");
     let img = image::load_from_memory_with_format(png, image::ImageFormat::Png)
         .expect("bundled icon is a valid PNG")
@@ -637,7 +637,7 @@ impl App {
         if let Some(listener) = instance {
             tray::serve(listener, &ctx, tray_tx.clone());
         }
-        let tray = tray::Tray::new(&ctx, &app_icon(), tray_tx, tray_rx);
+        let tray = tray::Tray::new(&ctx, tray_tx, tray_rx);
         let mut app = Self {
             page: Page::Clips,
             rec_state: RecState::Idle,

@@ -63,7 +63,7 @@ cp "$work/$ffmpeg_build/LICENSE.txt" "$stage/ffmpeg-LICENSE.txt"
 "$stage/ffmpeg" -hide_banner -version >/dev/null
 "$stage/ffprobe" -hide_banner -version >/dev/null
 
-cp crates/app/assets/io.github.kaillr.HasteClip.desktop crates/app/assets/icon.svg "$stage/"
+cp crates/app/assets/io.github.kaillr.HasteClip.desktop crates/app/assets/icon-glyph.svg "$stage/"
 cat > "$stage/README.txt" <<EOF
 HasteClip $version for Linux (x86-64)
 
