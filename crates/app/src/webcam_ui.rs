@@ -155,11 +155,13 @@ pub(crate) fn drag(start: Placement, handle: Handle, dx: f32, dy: f32, mods: Mod
     };
     let kx = axis(l, r, start.x, start.w, dx);
     let ky = axis(t, b, start.y, start.h, dy);
-    // One uniform scale: the axis that moved more decides (a corner), or the
-    // only one dragged (an edge).
+    // One uniform scale: for a corner, the pointer's place along the box's
+    // diagonal (so it scales the same whichever way it's moved; each axis
+    // still flips on its own), or the only axis dragged (an edge).
     let k = match (kx, ky) {
         (Some((_, a)), Some((_, b))) => {
-            if (a.abs() - 1.0).abs() >= (b.abs() - 1.0).abs() { a.abs() } else { b.abs() }
+            let (w2, h2) = (start.w * start.w, start.h * start.h);
+            (a.abs() * w2 + b.abs() * h2) / (w2 + h2).max(1e-9)
         }
         (Some((_, a)), None) | (None, Some((_, a))) => a.abs(),
         (None, None) => 1.0,
@@ -235,8 +237,8 @@ fn crop(start: Placement, sides: [bool; 4], dx: f32, dy: f32, keep: bool) -> Pla
 
 /// `start` with the sides in `sides` dragged by `d`, inside `bounds`, at
 /// least `least` across and down. With `keep`, its shape is kept: scaled
-/// from the opposite corner or side (centred on an axis not dragged), by
-/// whichever way the pointer moved more.
+/// from the opposite corner or side (centred on an axis not dragged), a
+/// corner following the pointer's place along the diagonal.
 pub(crate) fn resize_within(start: Rect, [l, t, r, b]: [bool; 4], d: egui::Vec2, keep: bool, bounds: Rect, least: egui::Vec2) -> Rect {
     if !keep {
         let mut s = start;
@@ -257,10 +259,9 @@ pub(crate) fn resize_within(start: Rect, [l, t, r, b]: [bool; 4], d: egui::Vec2,
     let (w, h) = (start.width().max(1e-6), start.height().max(1e-6));
     let kx = (l || r).then(|| (w + if l { -d.x } else { d.x }) / w);
     let ky = (t || b).then(|| (h + if t { -d.y } else { d.y }) / h);
+    // A corner: the pointer's place along the diagonal.
     let k = match (kx, ky) {
-        (Some(a), Some(b)) => {
-            if (a - 1.0).abs() >= (b - 1.0).abs() { a } else { b }
-        }
+        (Some(a), Some(b)) => (a * w * w + b * h * h) / (w * w + h * h),
         (Some(a), None) | (None, Some(a)) => a,
         (None, None) => 1.0,
     };
@@ -753,8 +754,12 @@ mod tests {
     #[test]
     fn every_handle_keeps_the_shape() {
         let start = at(0.5, 0.5, 0.2, 0.1);
-        let p = drag(start, Handle::SE, 0.1, 0.0, PLAIN);
+        let p = drag(start, Handle::SE, 0.1, 0.05, PLAIN);
         assert!(close(p.w, 0.3) && close(p.h, 0.15) && close(p.x, 0.5) && close(p.y, 0.5));
+        // Off the diagonal, its nearest place on it: no jump when the pointer
+        // crosses from mostly across to mostly down.
+        let (a, b) = (drag(start, Handle::SE, 0.1, 0.049, PLAIN), drag(start, Handle::SE, 0.1, 0.051, PLAIN));
+        assert!((a.w - b.w).abs() < 0.002, "{a:?} {b:?}");
         // From the top-left corner: the bottom-right stays put.
         let p = drag(start, Handle::NW, -0.1, 0.0, PLAIN);
         assert!(close(p.x + p.w, 0.7) && close(p.y + p.h, 0.6) && close(p.w / p.h, 2.0));
@@ -811,7 +816,7 @@ mod tests {
         let p = drag(start, Handle::E, -0.05, 0.0, keep);
         assert!(close(p.w / p.h, 2.0) && close(p.w, 0.15) && close(p.crop[1], p.crop[3]) && p.crop[1] > 0.0, "{p:?}");
         // A corner: the opposite corner stays put.
-        let p = drag(start, Handle::SE, -0.1, -0.01, keep);
+        let p = drag(start, Handle::SE, -0.1, -0.05, keep);
         assert!(close(p.w / p.h, 2.0) && close(p.x, 0.4) && close(p.y, 0.4) && close(p.w, 0.1), "{p:?}");
     }
 
