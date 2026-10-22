@@ -519,7 +519,9 @@ impl App {
             ui.label(theme::text(format!("Shortcuts are unavailable: {e}"), 12.5, W::Regular).color(p.warn));
             ui.add_space(6.0);
         }
-        let desktop = self.hotkeys.as_ref().is_ok_and(|h| h.via_desktop());
+        // The desktop keeps the keys (Wayland, but KDE Plasma, where they're
+        // set from here): it may ask to confirm them, and has the last word.
+        let desktop = self.hotkeys.as_ref().is_ok_and(|h| h.via_desktop() && !h.keys_set_here());
         ui_kit::list(ui, "shortcuts", |l| {
             for action in ShortcutAction::ALL.into_iter().filter(|a| a.available()) {
                 if !f.shows(&[action.label(), "shortcut", "hotkey", "keyboard"]) {
@@ -542,8 +544,8 @@ impl App {
             // they're changed in its own editor.
             if desktop && self.hotkeys.as_ref().is_ok_and(|h| h.desktop_configurable()) && f.shows(&["shortcut", "hotkey", "keyboard", "system settings"]) {
                 let mut open = false;
-                l.row(Row::new("Keys in your desktop").note("Your desktop keeps the keys it gave these shortcuts. Change them in its own shortcut settings."), |ui| {
-                    open = Btn::normal("Change in system settings").small().show(ui).clicked();
+                l.row(Row::new("Keys").note("Your desktop decides these shortcuts' keys. Set or change them in its window, opened from here."), |ui| {
+                    open = Btn::normal("Set up keys").small().show(ui).clicked();
                 });
                 if open && let Ok(h) = &self.hotkeys {
                     h.configure_desktop();
@@ -989,7 +991,11 @@ impl App {
                 if let Some(e) = self.hotkeys.as_ref().ok().and_then(|h| h.error_for(action)) {
                     return Some(format!("Not working: {e}."));
                 }
-                // The desktop has the last word on Wayland: say if it chose differently.
+                // The desktop has the last word on Wayland: say if it chose
+                // differently (where it isn't told from here).
+                if self.hotkeys.as_ref().is_ok_and(|h| h.keys_set_here()) {
+                    return None;
+                }
                 let current = self.settings.shortcuts.get(action).to_owned();
                 let keys = self.hotkeys.as_ref().ok().and_then(|h| h.assigned(action))?;
                 let asked = shortcuts::label(&current);

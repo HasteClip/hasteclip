@@ -1314,6 +1314,10 @@ impl App {
         let pressed = match &mut self.hotkeys {
             Ok(h) => {
                 h.sync(&self.settings.shortcuts);
+                // Changed in the desktop's own settings: ours follow.
+                for (action, keys) in h.adopted() {
+                    self.settings.shortcuts.set(action, keys);
+                }
                 h.pressed()
             }
             Err(_) => Vec::new(),

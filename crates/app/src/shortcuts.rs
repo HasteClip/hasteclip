@@ -156,9 +156,11 @@ impl Registered {
         #[cfg(target_os = "linux")]
         if self.mgr.is_none() {
             // The old set goes (dropping it unbinds them), the new one is bound.
+            // Changed in Settings (not starting up): ours win in the desktop.
+            let ours = self.from.is_some();
             self.portal = None;
             let list = valid.iter().map(|(_, a)| (*a, wanted.get(*a).to_owned())).collect();
-            self.portal = Some(crate::portal_shortcuts::Portal::bind(list, self.ctx.clone()));
+            self.portal = Some(crate::portal_shortcuts::Portal::bind(list, ours, self.ctx.clone()));
         }
         let _ = valid;
         if let Ok(mut ids) = self.ids.lock() {
@@ -181,6 +183,33 @@ impl Registered {
         out
     }
 
+    /// Keys changed in the desktop's own settings (KDE Plasma), for Settings
+    /// to take: already in place, so they aren't bound again.
+    pub fn adopted(&mut self) -> Vec<(ShortcutAction, String)> {
+        #[cfg(target_os = "linux")]
+        if let Some(p) = &self.portal {
+            let list = p.adopted();
+            if let Some(from) = &mut self.from {
+                for (a, keys) in &list {
+                    from.set(*a, keys.clone());
+                }
+            }
+            return list;
+        }
+        Vec::new()
+    }
+
+    /// Whether the keys set in Settings are the ones that work: always, but
+    /// on a Wayland desktop that keeps its own (not KDE Plasma, where they're
+    /// set from here).
+    pub fn keys_set_here(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(p) = &self.portal {
+            return p.managed();
+        }
+        self.mgr.is_some()
+    }
+
     /// Open the desktop's editor for its shortcuts, where it keeps theirs
     /// (Wayland, through the portal). False where it can't.
     pub fn configure_desktop(&self) -> bool {
@@ -197,8 +226,8 @@ impl Registered {
     /// Whether the desktop's own shortcut editor can be opened for them.
     pub fn desktop_configurable(&self) -> bool {
         #[cfg(target_os = "linux")]
-        if self.portal.is_some() {
-            return crate::portal_shortcuts::can_configure();
+        if let Some(p) = &self.portal {
+            return !p.managed() && crate::portal_shortcuts::can_configure();
         }
         false
     }
@@ -212,11 +241,11 @@ impl Registered {
             use crate::portal_shortcuts::State;
             return match p.state() {
                 State::Failed(e) => Some(format!("the desktop didn't take it ({e})")),
-                State::Bound(list) if list.iter().any(|(a, keys)| *a == action && keys.trim().is_empty()) => {
+                State::Bound(list) if !p.managed() && list.iter().any(|(a, keys)| *a == action && keys.trim().is_empty()) => {
                     Some(if crate::portal_shortcuts::can_configure() {
-                        "your desktop has no keys for it: set them with Change in system settings".into()
+                        "no key yet. Your desktop gives the keys: use Set up keys below".into()
                     } else {
-                        "your desktop has no keys for it: set them in its keyboard settings".into()
+                        "no key yet. Your desktop gives the keys: add one in its keyboard settings".into()
                     })
                 }
                 _ => None,
