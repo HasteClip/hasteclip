@@ -1296,6 +1296,11 @@ impl<'a> Row<'a> {
         // fit, else under it (narrow windows), never over it.
         let key = ui.id().with(("row_control_w", self.label));
         let control_w = ui.data(|d| d.get_temp::<f32>(key)).unwrap_or(0.0);
+        // The label's height as last drawn, to centre it on the control (its
+        // line is as tall as a control can be, not just its text).
+        let label_key = ui.id().with(("row_label_h", self.label));
+        let label_h = ui.data(|d| d.get_temp::<f32>(label_key)).unwrap_or(20.0);
+        let mut drawn_label_h = 0.0;
         let inner_w = width - pad_x * 2.0;
         let stacked = control_w > 0.0 && control_w + 16.0 + 140.0 > inner_w;
         let label_w = if stacked { inner_w } else { (inner_w - control_w - 16.0).max(120.0) };
@@ -1364,9 +1369,9 @@ impl<'a> Row<'a> {
                     if self.note.is_some() {
                         ui.add_space(9.0);
                     } else {
-                        ui.add_space(((min_h - 20.0) / 2.0).max(0.0));
+                        ui.add_space(((min_h - label_h) / 2.0).max(0.0));
                     }
-                    label(ui);
+                    drawn_label_h = ui.scope(label).response.rect.height();
                     if self.note.is_some() {
                         ui.add_space(8.0);
                     }
@@ -1382,6 +1387,10 @@ impl<'a> Row<'a> {
         if control_rect.is_positive() && (control_rect.width() - control_w).abs() > 0.5 {
             ui.data_mut(|d| d.insert_temp(key, control_rect.width()));
             ui.ctx().request_discard("a settings row's control changed width");
+        }
+        if self.note.is_none() && drawn_label_h > 0.0 && (drawn_label_h - label_h).abs() > 0.5 {
+            ui.data_mut(|d| d.insert_temp(label_key, drawn_label_h));
+            ui.ctx().request_discard("a settings row's label changed height");
         }
         (r, clicked_locked)
     }
