@@ -725,6 +725,12 @@ fn control_widget(ui: &mut egui::Ui, c: &CameraControl, set: &mut Vec<(u32, i64)
                     set.push((c.id, stepped));
                 }
             }
+            if let Some(d) = arrow_steps(ui, &slider) {
+                let to = (c.value + d * step).clamp(*min, *max);
+                if to != c.value {
+                    set.push((c.id, to));
+                }
+            }
             if slider.double_clicked() {
                 set.push((c.id, c.default));
             }
@@ -879,6 +885,30 @@ fn exposure_step(value: i64, up: bool, step: i64, min: i64, max: i64) -> i64 {
     (value + if up { step } else { -step }).clamp(min, max)
 }
 
+/// Arrow keys on a camera slider: clicking or dragging it gives it the keys,
+/// then ← and → (or ↓ and ↑) step it, ten at a time with Shift. How many
+/// steps, if any were pressed.
+fn arrow_steps(ui: &egui::Ui, slider: &egui::Response) -> Option<i64> {
+    if slider.clicked() || slider.drag_started() {
+        slider.request_focus();
+    }
+    if !slider.has_focus() {
+        return None;
+    }
+    let mut d = 0;
+    ui.input_mut(|i| {
+        let shift = i.modifiers.shift;
+        let by = if shift { 10 } else { 1 };
+        let mods = if shift { egui::Modifiers::SHIFT } else { egui::Modifiers::NONE };
+        for (key, sign) in [(egui::Key::ArrowLeft, -1), (egui::Key::ArrowDown, -1), (egui::Key::ArrowRight, 1), (egui::Key::ArrowUp, 1)] {
+            while i.consume_key(mods, key) {
+                d += sign * by;
+            }
+        }
+    });
+    (d != 0).then_some(d)
+}
+
 /// Film's guides for an exposure time at `fps`, in V4L2's units of 100 µs:
 /// the 180° shutter (half a frame, for motion blur that looks natural), and
 /// the whole frame (longer, and the frame rate drops).
@@ -887,10 +917,9 @@ fn exposure_guides(fps: f32) -> (i64, i64) {
     ((frame / 2.0).round() as i64, frame.round() as i64)
 }
 
-/// The exposure time: − and + to step it finely (to where lights' flicker
-/// leaves no bands, found by eye), the slider with the guides for `fps`
-/// marked on it, its time in ms.
-fn exposure_widget(ui: &mut egui::Ui, c: &CameraControl, fps: Option<f32>, set: &mut Vec<(u32, i64)>) {
+/// The exposure time: − and + (or the arrow keys) to step it finely, to
+/// where lights' flicker leaves no bands, found by eye; the slider; its time in ms.
+fn exposure_widget(ui: &mut egui::Ui, c: &CameraControl, set: &mut Vec<(u32, i64)>) {
     use crate::theme::{self, W};
     let ControlKind::Int { min, max, step } = c.kind else { return control_widget(ui, c, set) };
     let pal = theme::pal(ui);
@@ -911,20 +940,10 @@ fn exposure_widget(ui: &mut egui::Ui, c: &CameraControl, fps: Option<f32>, set: 
             set.push((c.id, to));
         }
     }
-    // The guides, as ticks across the track (where the slider draws it).
-    if let Some(fps) = fps {
-        let (half, whole) = exposure_guides(fps);
-        let r = slider.rect;
-        let (left, right) = (r.left() + 7.0, r.right() - 7.0);
-        let marks = [(half, pal.text2, format!("180° shutter at {fps:.0} fps: {:.1} ms", half as f64 / 10.0)), (whole, pal.warn, format!("A whole frame at {fps:.0} fps: {:.1} ms. Longer lowers the frame rate", whole as f64 / 10.0))];
-        for (at, color, tip) in marks {
-            if !(min..=max).contains(&at) {
-                continue;
-            }
-            let x = left + (right - left) * (at - min) as f32 / span;
-            let tick = egui::Rect::from_center_size(egui::pos2(x, r.center().y), vec2(2.0, 12.0));
-            ui.painter().rect_filled(tick, 1.0, color);
-            ui.interact(tick.expand2(vec2(3.0, 0.0)), ui.id().with(("exposure_guide", at)), egui::Sense::hover()).on_hover_text(tip);
+    if let Some(d) = arrow_steps(ui, &slider) {
+        let to = (c.value + d * step).clamp(min, max);
+        if to != c.value {
+            set.push((c.id, to));
         }
     }
     if crate::ui_kit::Btn::icon(crate::ui_kit::Kind::Ghost, egui_phosphor::regular::MINUS).small().tip("Shorter").show(ui).clicked()
@@ -1057,11 +1076,20 @@ fn controls_view(ui: &mut egui::Ui, panel: &CameraPanel, fps: Option<f32>, set: 
                         if let Some((label, m)) = manual {
                             l.well(("camera_manual", auto.id), !on, |l| {
                                 if m.id == v4l2::EXPOSURE {
-                                    let note = fps.map(|fps| {
+                                    let tip = fps.map(|fps| {
                                         let (half, whole) = exposure_guides(fps);
-                                        format!("180° shutter at {fps:.0} fps: {:.1} ms. Longer than {:.1} ms lowers the frame rate", half as f64 / 10.0, whole as f64 / 10.0)
+                                        format!(
+                                            "How long each picture takes in light. Film's rule of thumb is half a frame, a 180° shutter: {:.1} ms at {fps:.0} fps, for motion blur that looks natural. Longer than a whole frame ({:.1} ms) and the camera lowers its frame rate. Under lamps, step it with − and + (or the arrow keys) to where no bands roll through the picture.",
+                                            half as f64 / 10.0,
+                                            whole as f64 / 10.0
+                                        )
                                     });
-                                    l.row(crate::ui_kit::Row::new(label).kid().note(note.unwrap_or_default()), |ui| exposure_widget(ui, m, fps, set));
+                                    let row = crate::ui_kit::Row::new(label).kid();
+                                    let row = match &tip {
+                                        Some(t) => row.tip("Exposure time", t),
+                                        None => row,
+                                    };
+                                    l.row(row, |ui| exposure_widget(ui, m, set));
                                 } else {
                                     l.row(crate::ui_kit::Row::new(label).kid(), |ui| control_widget(ui, m, set));
                                 }
