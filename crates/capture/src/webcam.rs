@@ -35,14 +35,13 @@ pub struct Placement {
 }
 
 impl Placement {
-    /// The bottom-right corner, a quarter of the frame wide, for a camera whose
-    /// picture is `camera_aspect` (width / height) in a frame of `frame_aspect`.
+    /// Right in the bottom-right corner, a quarter of the frame wide, for a
+    /// camera whose picture is `camera_aspect` (width / height) in a frame of
+    /// `frame_aspect`.
     pub fn default_for(camera_aspect: f32, frame_aspect: f32) -> Self {
         let w = 0.25;
         let h = w * frame_aspect / camera_aspect;
-        let margin_x = 0.02;
-        let margin_y = margin_x * frame_aspect;
-        Self { x: 1.0 - w - margin_x, y: 1.0 - h - margin_y, w, h, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0 }
+        Self { x: 1.0 - w, y: 1.0 - h, w, h, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0 }
     }
 
     /// The webcam switched off: a box of no size, which is never drawn, so a
