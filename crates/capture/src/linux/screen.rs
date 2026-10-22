@@ -292,6 +292,17 @@ pub(crate) fn open_kwin_window(uuid: &str) -> Result<Screen> {
     Ok(screen)
 }
 
+/// A window on the X server (`x11win:<id>`, see `super::x11_windows`), read
+/// through XComposite at its own size; not shared.
+pub(crate) fn open_x11_window(id: &str) -> Result<Screen> {
+    let screen = Screen::start_direct(id, super::x11_windows::Grab::open, super::x11_windows::run)?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !screen.latest.has_frame() && screen.latest.ended().is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(screen)
+}
+
 /// Don't hand out the running cast anymore: the next [`acquire`] starts a new
 /// one (it ends once its holders let go).
 pub(crate) fn forget() {

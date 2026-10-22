@@ -1,7 +1,10 @@
-//! Games and apps (`VideoSource::Apps`) on KDE Plasma: whichever of the
-//! picked programs was last in focus, one window at a time, streamed by KWin
-//! at the window's own size (`super::kwin`), found in KWin's window list
-//! (`super::kwin_windows`).
+//! Games and apps (`VideoSource::Apps`): whichever of the picked programs
+//! was last in focus, one window at a time, at the window's own size. On KDE
+//! Plasma every window, listed by KWin (`super::kwin_windows`) and streamed
+//! by it (`super::kwin`); elsewhere the X server's windows
+//! (`super::x11_windows`): every window on an X11 session, and on a Wayland
+//! one XWayland's, where Proton and Wine games run. A native Wayland window
+//! on GNOME can't be followed (GNOME keeps its window list to itself).
 //!
 //! A thread follows the window list. When a window of a picked program comes
 //! into focus, its stream replaces the one before; clicking into something
@@ -20,13 +23,74 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use super::screen::{self, Frame, Order, Screen};
-use super::{focus, kwin, kwin_windows};
+use super::{focus, kwin, kwin_windows, x11_windows};
 use crate::{Device, StillImage};
 
+/// A window, as the desktop describes it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Window {
+    /// What it's read by: KWin's uuid, or `x11win:<id>`.
+    pub id: String,
+    pub pid: Option<u32>,
+    pub title: String,
+    /// Its Wayland app id or X11 class: often its `.desktop` file's name.
+    pub app_id: String,
+    pub active: bool,
+    pub minimized: bool,
+    /// Not in the taskbar: a panel, a popup, a tooltip.
+    pub skip_taskbar: bool,
+}
+
+/// Where windows are listed and read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Kde,
+    X11,
+}
+
+/// The way windows are followed here, if any: asked once.
+fn source() -> Option<Source> {
+    static SOURCE: std::sync::OnceLock<Option<Source>> = std::sync::OnceLock::new();
+    *SOURCE.get_or_init(|| {
+        // `HASTECLIP_APPS_X11`: the X server's windows even on KDE (to try them).
+        let x11_first = std::env::var_os("HASTECLIP_APPS_X11").is_some();
+        if x11_first && x11_windows::available() {
+            Some(Source::X11)
+        } else if kwin::available() && kwin_windows::following() {
+            Some(Source::Kde)
+        } else if x11_windows::available() {
+            Some(Source::X11)
+        } else {
+            None
+        }
+    })
+}
+
+impl Source {
+    fn windows(self) -> Vec<Window> {
+        match self {
+            Self::Kde => kwin_windows::windows()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|w| Window { id: w.uuid, pid: w.pid, title: w.title, app_id: w.app_id, active: w.active, minimized: w.minimized, skip_taskbar: w.skip_taskbar })
+                .collect(),
+            Self::X11 => x11_windows::windows(),
+        }
+    }
+
+    fn open(self, id: &str) -> anyhow::Result<Screen> {
+        match self {
+            Self::Kde => screen::open_kwin_window(id),
+            Self::X11 => screen::open_x11_window(id),
+        }
+    }
+}
+
 /// Whether games and apps can be recorded here: KDE Plasma's Wayland
-/// session, with its screencast and window list ours.
+/// session (its screencast and window list ours), or an X server's windows
+/// (an X11 session, or XWayland's on any Wayland desktop).
 pub(crate) fn available() -> bool {
-    kwin::available() && kwin_windows::following()
+    source().is_some()
 }
 
 /// Running programs with a window in the taskbar (not ours), by program,
@@ -35,7 +99,8 @@ pub(crate) fn list() -> Vec<Device> {
     let me = std::process::id();
     let mut programs = Programs::default();
     let mut out: Vec<Device> = Vec::new();
-    for w in kwin_windows::windows().unwrap_or_default() {
+    let Some(source) = source() else { return out };
+    for w in source.windows() {
         if w.skip_taskbar || w.pid.is_none_or(|p| p == me) {
             continue;
         }
@@ -157,6 +222,13 @@ impl Apps {
         }
     }
 
+    /// Ask a window read on request (an X11 window) for its next picture.
+    pub(crate) fn want(&self) {
+        if let Some((_, _, s)) = &self.shared.now.lock().unwrap().window {
+            s.latest.want();
+        }
+    }
+
     /// Keep every picture of the windows recorded as it arrives, for `drain`.
     pub(crate) fn queue_arrivals(&self) {
         self.shared.queue.store(true, Ordering::Relaxed);
@@ -205,31 +277,32 @@ fn follow(shared: &Shared, stop: &AtomicBool) {
     let mut programs = Programs::default();
     let mut failed: HashMap<String, Instant> = HashMap::new();
     let me = std::process::id();
+    let Some(source) = source() else { return };
     while !stop.load(Ordering::Relaxed) {
-        let windows = kwin_windows::windows().unwrap_or_default();
+        let windows = source.windows();
         let ids = shared.ids.lock().unwrap().clone();
-        let mut program = |w: &kwin_windows::Window| programs.of(w.pid).filter(|p| ids.iter().any(|i| i.eq_ignore_ascii_case(p)));
+        let mut program = |w: &Window| programs.of(w.pid).filter(|p| ids.iter().any(|i| i.eq_ignore_ascii_case(p)));
         let current = shared.now.lock().unwrap().window.as_ref().map(|(uuid, _, s)| (uuid.clone(), s.latest.ended().is_some()));
         // Its window, if it's still there (and its stream still runs) and still picked.
-        let kept = current.as_ref().and_then(|(uuid, ended)| windows.iter().find(|w| &w.uuid == uuid && !ended)).filter(|w| program(w).is_some());
+        let kept = current.as_ref().and_then(|(uuid, ended)| windows.iter().find(|w| &w.id == uuid && !ended)).filter(|w| program(w).is_some());
         // One of theirs in focus takes over.
         let focused = windows.iter().find(|w| w.active && !w.skip_taskbar && w.pid != Some(me)).and_then(|w| Some((w, program(w)?)));
         let minimized = kept.is_some_and(|w| w.minimized);
         match focused {
-            Some((w, id)) if current.as_ref().is_none_or(|(uuid, _)| uuid != &w.uuid) && failed.get(&w.uuid).is_none_or(|t| t.elapsed() > RETRY_AFTER) => {
-                match screen::open_kwin_window(&w.uuid) {
+            Some((w, id)) if current.as_ref().is_none_or(|(uuid, _)| uuid != &w.id) && failed.get(&w.id).is_none_or(|t| t.elapsed() > RETRY_AFTER) => {
+                match source.open(&w.id) {
                     Ok(s) => {
-                        failed.remove(&w.uuid);
+                        failed.remove(&w.id);
                         if shared.queue.load(Ordering::Relaxed) {
                             s.latest.queue_arrivals();
                         }
-                        let old = std::mem::replace(&mut *shared.now.lock().unwrap(), Now { window: Some((w.uuid.clone(), id, Arc::new(s))), minimized: false });
+                        let old = std::mem::replace(&mut *shared.now.lock().unwrap(), Now { window: Some((w.id.clone(), id, Arc::new(s))), minimized: false });
                         shared.generation.fetch_add(1, Ordering::Release);
                         drop(old);
                     }
                     Err(e) => {
                         eprintln!("couldn't record {id}'s window: {e:#}");
-                        failed.insert(w.uuid.clone(), Instant::now());
+                        failed.insert(w.id.clone(), Instant::now());
                     }
                 }
             }

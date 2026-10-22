@@ -48,6 +48,7 @@ mod screen;
 mod wlr;
 mod wlr_windows;
 mod x11;
+mod x11_windows;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -446,8 +447,9 @@ impl Feed {
 
     /// Ask a source that reads the screen on request (X11) for the next picture.
     fn want(&self) {
-        if let Self::Screen(s) = self {
-            s.latest.want();
+        match self {
+            Self::Screen(s) => s.latest.want(),
+            Self::Apps(a) => a.want(),
         }
     }
 
@@ -981,6 +983,44 @@ mod tests {
             let _ = std::process::Command::new("ffmpeg").args(["-v", "error", "-y", "-sseof", "-1", "-i"]).arg(&file).args(["-frames:v", "1"]).arg(out).status();
         }
         assert!(shot.bgra.chunks_exact(4).any(|p| p[0] > 16 || p[1] > 16 || p[2] > 16), "black screenshot");
+    }
+
+    /// An X11 window (XWayland's, as a Proton game's) is followed and read
+    /// through XComposite: HASTECLIP_APPS_X11=1 on KDE.
+    #[test]
+    #[ignore = "opens an X11 window and captures it: HASTECLIP_APPS_X11=1 cargo test -p capture records_an_x11_window -- --ignored"]
+    fn records_an_x11_window() {
+        let mut cube = std::process::Command::new("vkcube").args(["--wsi", "xcb"]).spawn().expect("vkcube");
+        thread::sleep(Duration::from_millis(1500));
+        let listed = list_windowed_apps();
+        eprintln!("apps: {:?}", listed.iter().map(|d| format!("{} = {}", d.id, d.name)).collect::<Vec<_>>());
+        let video = VideoSource::Apps { ids: vec!["vkcube".into()], away_when_unfocused: true, hook: crate::GameHook { auto: false, allowed: Vec::new() } };
+        let feed = Feed::open(&video, None).unwrap();
+        let t = Instant::now();
+        while feed.app().is_none() && t.elapsed() < Duration::from_secs(3) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let app = feed.app();
+        thread::sleep(Duration::from_millis(300));
+        let (frame, seq) = feed.get().unwrap();
+        for _ in 0..30 {
+            feed.want();
+            thread::sleep(Duration::from_millis(16));
+        }
+        let (_, seq2) = feed.get().unwrap();
+        let lit = frame.data.chunks_exact(4).filter(|p| p[0] > 16 || p[1] > 16 || p[2] > 16).count();
+        eprintln!("app {app:?}: {}x{}, {lit} lit pixels, pictures {seq:#x} → {seq2:#x}", frame.width, frame.height);
+        if let Some(out) = std::env::var_os("HASTECLIP_SHOT") {
+            let (w, h) = (frame.width, frame.height);
+            let rgb: Vec<u8> = frame.data.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
+            std::fs::write(out, [format!("P6\n{w} {h}\n255\n").as_bytes(), &rgb].concat()).unwrap();
+        }
+        let _ = cube.kill();
+        thread::sleep(Duration::from_millis(500));
+        eprintln!("after closing: app {:?}, waiting {}", feed.app(), feed.waiting());
+        assert_eq!(app.as_deref(), Some("vkcube"));
+        assert!(lit > 0, "all black");
+        assert!(seq2 > seq, "no new pictures");
     }
 
     /// A screenshot is all of the screen at its own size, opaque.

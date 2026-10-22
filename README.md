@@ -160,12 +160,14 @@ HasteClip is in beta (versions 0.x). It works day to day, but not every feature 
 | Replay buffer, recording, editor, library | ✅ | ✅ | ✅ |
 | Share links, copy, export and import | ✅ | ✅ | ✅ |
 | Voice saving, named clips, per-app sound, webcam | ✅ | ✅ | ✅ |
-| Record a single game or app window | ✅ | ✅ | ✅ (KDE Plasma) |
+| Record a single game or app window | ✅ | ✅ | ✅ (see below) |
 | Drag clips out, system share sheet | ✅ | ✅ | — (use Copy clip) |
 | Frame blending | ✅ | ✅ | ✅ |
 | Automatic updates | — | ✅ | ✅ |
 | Screenshots | — | ✅ | ✅ |
 | Game capture for fullscreen games | — | ✅ | — |
+
+**Games and apps on Linux:** every window on KDE Plasma and on X11 desktops. On other Wayland desktops, the windows of X11 apps, which includes games run through Proton or Wine; a native Wayland app's window can't be followed there yet, so record the whole screen for those.
 
 **Encoders:** VideoToolbox on macOS. NVENC, AMF or Quick Sync through Media Foundation on Windows. NVENC or VA-API through ffmpeg on Linux, with x264 when there's no GPU encoder.
 
