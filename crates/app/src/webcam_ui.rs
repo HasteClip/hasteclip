@@ -121,6 +121,9 @@ pub(crate) struct Mods {
 /// Resizing never stretches: every handle scales the whole picture, from the
 /// opposite corner or edge (an edge handle keeps the other axis centred).
 /// Dragging past that opposite side flips the picture on that axis.
+///
+/// The box stays inside the frame: moving stops at its edges, and so does
+/// growing (what's not wanted of the picture is cropped instead).
 pub(crate) fn drag(start: Placement, handle: Handle, dx: f32, dy: f32, mods: Mods) -> Placement {
     let mut p = start;
     if handle == Handle::Move {
@@ -130,6 +133,8 @@ pub(crate) fn drag(start: Placement, handle: Handle, dx: f32, dy: f32, mods: Mod
             p.x += snap_offset(&[p.x, p.x + p.w], p.x + p.w / 2.0);
             p.y += snap_offset(&[p.y, p.y + p.h], p.y + p.h / 2.0);
         }
+        p.x = p.x.clamp(0.0, (1.0 - p.w).max(0.0));
+        p.y = p.y.clamp(0.0, (1.0 - p.h).max(0.0));
         return p;
     }
     let [l, t, r, b] = handle.sides();
@@ -157,7 +162,21 @@ pub(crate) fn drag(start: Placement, handle: Handle, dx: f32, dy: f32, mods: Mod
         (Some((_, a)), None) | (None, Some((_, a))) => a.abs(),
         (None, None) => 1.0,
     };
-    let k = k.max(MIN_SIZE / start.w.min(start.h));
+    // No bigger than fits between its anchor and the frame's edge it grows
+    // toward (both edges, for an axis kept centred).
+    let room = |near: bool, ka: Option<(f32, f32)>, pos: f32, size: f32| -> f32 {
+        match ka {
+            Some((anchor, k)) => {
+                if near != (k < 0.0) { anchor } else { 1.0 - anchor }
+            }
+            None => {
+                let c = pos + size / 2.0;
+                2.0 * c.min(1.0 - c)
+            }
+        }
+    };
+    let most = (room(l, kx, start.x, start.w) / start.w).min(room(t, ky, start.y, start.h) / start.h);
+    let k = k.min(most).max(MIN_SIZE / start.w.min(start.h));
     let (w, h) = (start.w * k, start.h * k);
     // Place each axis: from its anchor, on the side the drag ended up on; an
     // axis that wasn't dragged stays centred.
@@ -196,30 +215,49 @@ fn crop(start: Placement, [l, t, r, b]: [bool; 4], dx: f32, dy: f32) -> Placemen
     let sx = start.w / (1.0 - c[0] - c[2]).max(0.01);
     let sy = start.h / (1.0 - c[1] - c[3]).max(0.01);
     let most = 0.95;
+    // Uncropping stops where the box would leave the frame.
+    let low = |side: f32, room: f32, scale: f32| (side - room / scale).max(0.0);
     if l {
-        let new = (c[left] + dx / sx).clamp(0.0, (most - c[right]).max(0.0));
+        let new = (c[left] + dx / sx).clamp(low(c[left], start.x, sx), (most - c[right]).max(0.0));
         let d = (new - c[left]) * sx;
         p.crop[left] = new;
         p.x = start.x + d;
         p.w = start.w - d;
     }
     if r {
-        let new = (c[right] - dx / sx).clamp(0.0, (most - c[left]).max(0.0));
+        let new = (c[right] - dx / sx).clamp(low(c[right], 1.0 - start.x - start.w, sx), (most - c[left]).max(0.0));
         p.crop[right] = new;
         p.w += (c[right] - new) * sx;
     }
     if t {
-        let new = (c[top] + dy / sy).clamp(0.0, (most - c[bottom]).max(0.0));
+        let new = (c[top] + dy / sy).clamp(low(c[top], start.y, sy), (most - c[bottom]).max(0.0));
         let d = (new - c[top]) * sy;
         p.crop[top] = new;
         p.y = start.y + d;
         p.h = start.h - d;
     }
     if b {
-        let new = (c[bottom] - dy / sy).clamp(0.0, (most - c[top]).max(0.0));
+        let new = (c[bottom] - dy / sy).clamp(low(c[bottom], 1.0 - start.y - start.h, sy), (most - c[top]).max(0.0));
         p.crop[bottom] = new;
         p.h += (c[bottom] - new) * sy;
     }
+    p
+}
+
+/// The box inside the frame: shrunk about its centre if it's bigger than the
+/// frame (keeping its shape), then moved in. For a box that may have left it
+/// (turned a quarter, which swaps its sides).
+pub(crate) fn contain(mut p: Placement) -> Placement {
+    let k = (1.0 / p.w).min(1.0 / p.h).min(1.0);
+    if k < 1.0 {
+        let (cx, cy) = (p.x + p.w / 2.0, p.y + p.h / 2.0);
+        p.w *= k;
+        p.h *= k;
+        p.x = cx - p.w / 2.0;
+        p.y = cy - p.h / 2.0;
+    }
+    p.x = p.x.clamp(0.0, 1.0 - p.w);
+    p.y = p.y.clamp(0.0, 1.0 - p.h);
     p
 }
 
@@ -515,11 +553,11 @@ impl App {
                     }
                 };
                 if ui.button("Turn clockwise").clicked() {
-                    change(&|p| p.turn(1, aspect));
+                    change(&|p| contain(p.turn(1, aspect)));
                     ui.close();
                 }
                 if ui.button("Turn anticlockwise").clicked() {
-                    change(&|p| p.turn(-1, aspect));
+                    change(&|p| contain(p.turn(-1, aspect)));
                     ui.close();
                 }
                 ui.separator();
@@ -590,6 +628,32 @@ mod tests {
         // Centre near the middle: snaps to it.
         let p = drag(at(0.0, 0.0, 0.2, 0.2), Handle::Move, 0.405, 0.0, Mods { snap: true, ..PLAIN });
         assert!(close(p.x + p.w / 2.0, 0.5));
+    }
+
+    /// The box stays in the frame: moving stops at the edge, growing stops at
+    /// it (shape kept), uncropping stops at it, and a turned box is put back.
+    #[test]
+    fn stays_inside_the_frame() {
+        let in_frame = |p: Placement| p.x >= -1e-4 && p.y >= -1e-4 && p.x + p.w <= 1.0 + 1e-4 && p.y + p.h <= 1.0 + 1e-4;
+        let p = drag(at(0.7, 0.7, 0.2, 0.2), Handle::Move, 0.5, -0.9, PLAIN);
+        assert!(in_frame(p) && close(p.x, 0.8) && close(p.y, 0.0));
+        // From the top-left, the bottom-right corner can only grow to the frame's corner.
+        let p = drag(at(0.6, 0.7, 0.2, 0.1), Handle::SE, 0.9, 0.9, PLAIN);
+        assert!(in_frame(p) && close(p.x, 0.6) && close(p.y, 0.7) && close(p.w / p.h, 2.0));
+        assert!(close(p.x + p.w, 1.0) || close(p.y + p.h, 1.0));
+        // An edge handle grows both ways about the middle, as far as the nearer edge.
+        let p = drag(at(0.1, 0.4, 0.2, 0.2), Handle::E, 0.9, 0.0, PLAIN);
+        assert!(in_frame(p), "{p:?}");
+        // Flipped past its anchor, toward the left edge: only as far as it.
+        let p = drag(at(0.3, 0.3, 0.2, 0.2), Handle::E, -0.9, 0.0, PLAIN);
+        assert!(in_frame(p) && p.flip_h, "{p:?}");
+        // Uncropping the left side stops at the frame's left edge.
+        let cropped = Placement { crop: [0.5, 0.0, 0.0, 0.0], ..at(0.05, 0.5, 0.2, 0.2) };
+        let p = drag(cropped, Handle::W, -0.5, 0.0, Mods { crop: true, ..PLAIN });
+        assert!(in_frame(p) && close(p.x, 0.0) && p.crop[0] > 0.0, "{p:?}");
+        // Turned near the edge, a tall box is moved back in.
+        let p = contain(at(0.8, 0.0, 0.3, 1.2));
+        assert!(in_frame(p) && close(p.w / p.h, 0.25), "{p:?}");
     }
 
     #[test]
@@ -955,7 +1019,7 @@ impl App {
                 3 => p = p.turn(-1, aspect),
                 _ => {}
             }
-            w.placement = PlacementCfg::laid_out(p, aspect);
+            w.placement = PlacementCfg::laid_out(contain(p), aspect);
         }
         if back {
             self.camera_panel = None;
