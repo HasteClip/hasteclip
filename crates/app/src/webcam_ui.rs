@@ -404,19 +404,21 @@ impl App {
             });
             return;
         };
-        crate::sources_ui::group(ui, "webcam", |ui| {
+        crate::sources_ui::group_rows(ui, "webcam", |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             if let Status::Unavailable(why) = &status {
                 let mut why = why.clone();
                 if let Some(first) = why.get(..1) {
                     why.replace_range(..1, &first.to_uppercase());
                 }
+                // As far from the top as the rows' controls are.
+                ui.add_space((crate::sources_ui::GROUP_ROW_H - crate::ui_kit::CONTROL_H) / 2.0);
                 ui.add(egui::Label::new(theme::text(format!("{why}."), 12.5, W::Regular).color(pal.warn)).wrap());
-                ui.add_space(8.0);
+                ui.add_space(4.0);
             }
             let row = |ui: &mut egui::Ui, label: &str, add: &mut dyn FnMut(&mut egui::Ui)| {
                 ui.horizontal(|ui| {
-                    ui.set_min_height(42.0);
+                    ui.set_min_height(crate::sources_ui::GROUP_ROW_H);
                     ui.label(theme::text(label, 13.5, W::Regular).color(pal.text));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| add(ui));
                 });

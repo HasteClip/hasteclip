@@ -411,7 +411,7 @@ impl App {
             _ => {
                 group(ui, "display", |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(crate::theme::text("Display", 13.5, crate::theme::W::Medium).color(pal.text));
+                        ui.label(crate::theme::text("Display", 13.5, crate::theme::W::Regular).color(pal.text));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let names: Vec<String> = self.screens.iter().map(|d| d.name.clone()).collect();
                             let at = self.display_at();
@@ -1275,8 +1275,24 @@ fn status_text(status: SourceStatus) -> Option<(&'static str, fn(&crate::theme::
 /// A group on the Sources page: its height eases when what's in it changes
 /// (see [`crate::ui_kit::eased_frame`]); `id` names it on the page.
 pub(crate) fn group(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, add: impl FnOnce(&mut egui::Ui)) {
+    framed(ui, id, egui::Margin::same(GROUP_PAD as i8), add);
+}
+
+/// Space between a group's edge and what's in it.
+pub(crate) const GROUP_PAD: f32 = 12.0;
+/// How tall a row in a group of rows is (`group_rows`).
+pub(crate) const GROUP_ROW_H: f32 = 42.0;
+
+/// A group of rows (`GROUP_ROW_H` tall, their control centred): less above
+/// and below, so the controls are as far from its edges as from its sides.
+pub(crate) fn group_rows(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, add: impl FnOnce(&mut egui::Ui)) {
+    let y = (GROUP_PAD - (GROUP_ROW_H - crate::ui_kit::CONTROL_H) / 2.0).max(0.0) as i8;
+    framed(ui, id, egui::Margin { left: GROUP_PAD as i8, right: GROUP_PAD as i8, top: y, bottom: y }, add);
+}
+
+fn framed(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, margin: egui::Margin, add: impl FnOnce(&mut egui::Ui)) {
     let pal = crate::theme::pal(ui);
-    let frame = egui::Frame::new().fill(pal.raise).corner_radius(8).inner_margin(egui::Margin { left: 14, right: 12, top: 12, bottom: 12 });
+    let frame = egui::Frame::new().fill(pal.raise).corner_radius(8).inner_margin(margin);
     crate::ui_kit::eased_frame(ui, egui::Id::new(("sources_group", id)), frame, |ui| {
         ui.set_width(ui.available_width());
         add(ui);

@@ -891,8 +891,11 @@ pub fn segmented_opts(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::De
 pub fn select(ui: &mut egui::Ui, value: &str, min_w: f32) -> Response {
     let p = theme::pal(ui);
     let font = theme::font(13.0, W::Medium);
-    let g = ui.painter().layout_no_wrap(value.to_owned(), font, p.text);
-    let target = (g.size().x + 11.0 + 10.0 + 14.0 + 8.0).max(min_w);
+    // Never wider than there's room for: a long value is cut short (…).
+    let chrome = 11.0 + 10.0 + 14.0 + 8.0;
+    let room = ui.available_width().max(min_w.min(ui.available_width()));
+    let g = ui.painter().layout_job(single_line_job(value, font, p.text, (room - chrome).max(20.0)));
+    let target = (g.size().x + chrome).max(min_w).min(room);
     let id = ui.next_auto_id();
     let w = theme::value(ui.ctx(), id.with("w"), target, theme::NORMAL);
     let (rect, resp) = ui.allocate_exact_size(vec2(w, CONTROL_H), Sense::click());
@@ -902,7 +905,9 @@ pub fn select(ui: &mut egui::Ui, value: &str, min_w: f32) -> Response {
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, RADIUS, theme::mix(p.control, p.control_h, hv));
     let tc = if enabled { p.text } else { theme::fade(p.text, 0.55) };
+    let elided = g.elided;
     painter.galley(Pos2::new(rect.left() + 11.0, rect.center().y - g.size().y / 2.0), g, tc);
+    let resp = if elided { resp.on_hover_text(value) } else { resp };
     let rot = theme::toggle(ui.ctx(), resp.id.with("open"), open, theme::NORMAL);
     chevron(&painter, Pos2::new(rect.right() - 15.0, rect.center().y), 4.0, rot, p.text3);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
