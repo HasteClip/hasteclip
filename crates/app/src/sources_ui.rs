@@ -619,8 +619,8 @@ impl App {
         group(ui, "tabbed_out", |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                ui.label(theme::text("Show “Tabbed out” when it's minimized", 13.5, W::Regular).color(pal.text));
-                crate::ui_kit::info(ui, "Tabbed out", "When the game you were in stops showing (most games minimize when you alt-tab), clips show the HasteClip logo with “Tabbed out”. Off: they keep the last picture. A window that's still on screen keeps being recorded either way.");
+                ui.label(theme::text("Show “Tabbed out” when you leave it", 13.5, W::Regular).color(pal.text));
+                crate::ui_kit::info(ui, "Tabbed out", "When the game you were in stops showing (most games minimize when you alt-tab), or none of yours is open, clips show the HasteClip logo with “Tabbed out”. Off: they keep the game's last picture, or show black when none is open. A window that's still on screen keeps being recorded either way.");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     crate::ui_kit::switch(ui, &mut away);
                 });
@@ -1202,14 +1202,17 @@ fn mic_picker(ui: &mut egui::Ui, source: &mut AudioSourceCfg, audio: &capture::a
     use crate::ui_kit::Item;
     use capture::audio::DEFAULT_DEVICE;
     let SourceKind::Microphone { device } = &mut source.kind else { return None };
+    // Devices by their names ("AT2020USB+ Analog Stereo"), not their ids
+    // (on Linux, PipeWire's "alsa_input.usb-…").
+    let name_of = |id: &str| audio.inputs.iter().find(|d| d.id == id).map(|d| d.name.clone());
     let default_label = match &audio.default_input {
-        Some(name) => format!("Default ({name})"),
+        Some(id) => format!("Default ({})", name_of(id).unwrap_or_else(|| id.clone())),
         None => "Default".to_owned(),
     };
     let selected = if device == DEFAULT_DEVICE {
         default_label.clone()
-    } else if audio.inputs.iter().any(|d| &d.id == device) {
-        device.clone()
+    } else if let Some(name) = name_of(device) {
+        name
     } else {
         format!("{device} (disconnected)")
     };

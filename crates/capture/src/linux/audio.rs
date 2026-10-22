@@ -378,6 +378,20 @@ fn open_stream(core: &pw::core::CoreRc, source: &AudioSource, feed: Arc<SourceFe
         })
         .register()?;
 
+    let pod = stereo_format()?;
+    let mut params = [spa::pod::Pod::from_bytes(&pod).ok_or_else(|| anyhow!("bad audio format"))?];
+    // Mics are connected by the session manager; desktop and apps by us.
+    let mut flags = pw::stream::StreamFlags::MAP_BUFFERS;
+    if device.is_some() {
+        flags |= pw::stream::StreamFlags::AUTOCONNECT;
+    }
+    stream.connect(spa::utils::Direction::Input, None, flags, &mut params)?;
+    Ok((stream, listener))
+}
+
+/// The format our streams ask for: 32-bit float stereo at [`RATE`]
+/// (PipeWire converts), as a serialized pod.
+pub(super) fn stereo_format() -> Result<Vec<u8>> {
     let mut info = spa::param::audio::AudioInfoRaw::new();
     info.set_format(spa::param::audio::AudioFormat::F32LE);
     info.set_rate(RATE);
@@ -386,7 +400,7 @@ fn open_stream(core: &pw::core::CoreRc, source: &AudioSource, feed: Arc<SourceFe
     position[0] = spa::sys::SPA_AUDIO_CHANNEL_FL;
     position[1] = spa::sys::SPA_AUDIO_CHANNEL_FR;
     info.set_position(position);
-    let pod = spa::pod::serialize::PodSerializer::serialize(
+    Ok(spa::pod::serialize::PodSerializer::serialize(
         std::io::Cursor::new(Vec::new()),
         &spa::pod::Value::Object(spa::pod::Object {
             type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
@@ -396,15 +410,7 @@ fn open_stream(core: &pw::core::CoreRc, source: &AudioSource, feed: Arc<SourceFe
     )
     .map_err(|_| anyhow!("bad audio format"))?
     .0
-    .into_inner();
-    let mut params = [spa::pod::Pod::from_bytes(&pod).ok_or_else(|| anyhow!("bad audio format"))?];
-    // Mics are connected by the session manager; desktop and apps by us.
-    let mut flags = pw::stream::StreamFlags::MAP_BUFFERS;
-    if device.is_some() {
-        flags |= pw::stream::StreamFlags::AUTOCONNECT;
-    }
-    stream.connect(spa::utils::Direction::Input, None, flags, &mut params)?;
-    Ok((stream, listener))
+    .into_inner())
 }
 
 /// Make `c`'s links match what it should hear now, and update its status.

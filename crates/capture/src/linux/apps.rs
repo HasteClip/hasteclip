@@ -8,9 +8,9 @@
 //!
 //! A thread follows the window list. When a window of a picked program comes
 //! into focus, its stream replaces the one before; clicking into something
-//! else keeps it. When it's minimized, the away screen shows instead (or its
-//! last picture stays, without the away screen); when it closes, or while
-//! none of them is open, the away screen (else black) shows.
+//! else keeps it. With the away screen on, it shows whenever none of them
+//! does: minimized, closed, or none open (as on macOS). Off, a minimized
+//! one's last picture stays, and black shows while none is open.
 //!
 //! A program is known by its file name (`cs2`, or `Game.exe` for a Proton
 //! game), as games are everywhere else (`super::focus::program_of`).
@@ -200,10 +200,12 @@ pub(crate) struct Apps {
 struct Shared {
     /// The programs to record.
     ids: Mutex<Vec<String>>,
-    /// Show the away screen while the window is minimized (else its last picture).
+    /// Show the away screen while none of them shows (else a minimized one's
+    /// last picture, or black).
     away_when_unfocused: AtomicBool,
-    /// Shown while none of them is: the away screen, or black.
+    /// The away screen (black if there's none), and black.
     away: Arc<Frame>,
+    black: Arc<Frame>,
     now: Mutex<Now>,
     /// Counts changes of what's shown, so a new window's (or the away
     /// screen's) pictures read as new.
@@ -229,6 +231,7 @@ impl Apps {
             ids: Mutex::new(ids.to_vec()),
             away_when_unfocused: AtomicBool::new(away_when_unfocused),
             away: Arc::new(away_screen.map_or_else(black, still_frame)),
+            black: Arc::new(black()),
             now: Mutex::new(Now::default()),
             generation: AtomicU64::new(1),
             queue: AtomicBool::new(false),
@@ -244,14 +247,22 @@ impl Apps {
     /// Record these programs instead, without restarting.
     pub(crate) fn set(&self, ids: &[String], away_when_unfocused: bool) {
         *self.shared.ids.lock().unwrap() = ids.to_vec();
-        self.shared.away_when_unfocused.store(away_when_unfocused, Ordering::Relaxed);
+        // What shows changes with it: numbered on, so it's taken as new.
+        if self.shared.away_when_unfocused.swap(away_when_unfocused, Ordering::Relaxed) != away_when_unfocused {
+            self.shared.generation.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// Shown while none of them is: the away screen, if it's on.
+    fn away(&self) -> Arc<Frame> {
+        if self.shared.away_when_unfocused.load(Ordering::Relaxed) { self.shared.away.clone() } else { self.shared.black.clone() }
     }
 
     /// The picture to record now and a number that changes whenever it does.
     pub(crate) fn get(&self) -> Option<(Arc<Frame>, u64)> {
         let now = self.shared.now.lock().unwrap();
         let generation = self.shared.generation.load(Ordering::Acquire) << 40;
-        let away = (generation, self.shared.away.clone());
+        let away = (generation, self.away());
         match &now.window {
             Some((_, _, screen)) if !(now.minimized && self.shared.away_when_unfocused.load(Ordering::Relaxed)) => {
                 Some(screen.latest.get().map_or((away.1, away.0), |(f, seq)| (f, generation | seq)))

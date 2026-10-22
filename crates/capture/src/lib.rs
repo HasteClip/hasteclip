@@ -15,7 +15,11 @@ pub mod audio;
 #[cfg(target_os = "macos")]
 mod avwriter;
 pub mod mixer;
+/// Hearing a microphone live: through PipeWire on Linux (`linux::monitor`).
+#[cfg(not(target_os = "linux"))]
 pub mod monitor;
+#[cfg(target_os = "linux")]
+pub use linux::monitor;
 pub mod mp4meta;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(crate) mod mp4read;

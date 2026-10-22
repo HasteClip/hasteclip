@@ -43,6 +43,7 @@ mod gpu_frame;
 mod icons;
 mod kwin;
 mod kwin_windows;
+pub mod monitor;
 mod mutter;
 mod portal;
 mod screen;
