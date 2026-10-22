@@ -609,15 +609,16 @@ pub(crate) struct CameraPanel {
     controls: Vec<CameraControl>,
     picture: Option<egui::TextureHandle>,
     seq: u64,
-    /// The camera's frame rate, measured from its pictures' numbers: since
-    /// when, from which, and the last second's.
+    /// The camera's real frame rate, measured: new pictures (not repeats)
+    /// since when, from how many, and the last second's.
+    new_pictures: u64,
     counted: Option<(std::time::Instant, u64)>,
     fps: Option<f32>,
 }
 
 impl CameraPanel {
     pub(crate) fn open(device: &str) -> Self {
-        Self { device: device.to_owned(), controls: capture::webcam::camera_controls(device), picture: None, seq: 0, counted: None, fps: None }
+        Self { device: device.to_owned(), controls: capture::webcam::camera_controls(device), picture: None, seq: 0, new_pictures: 0, counted: None, fps: None }
     }
 }
 
@@ -941,14 +942,14 @@ fn exposure_widget(ui: &mut egui::Ui, c: &CameraControl, fps: Option<f32>, set: 
     {
         set.push((c.id, v));
     }
-    // In stops, as cameras set shutter speed: each doubling of the time the
-    // same way along, so the short times everyone uses aren't squeezed into
-    // the slider's first fifth.
-    let mut v = log_pos(c.value, min, max);
-    let zone = whole.zip(fps).map(|(w, fps)| (log_pos(w, min, max), format!("Longer than a frame at {fps:.0} fps ({:.1} ms): the camera's frame rate drops", w as f64 / 10.0)));
+    // On a curve: the times worth having get the slider's room, not the
+    // shortest (linear squeezed them into its first fifth; stops gave the
+    // too-dark ones as much as the rest).
+    let mut v = curve_pos(c.value, min, max);
+    let zone = whole.zip(fps).map(|(w, fps)| (curve_pos(w, min, max), format!("Longer than a frame at {fps:.0} fps ({:.1} ms): the camera's frame rate drops", w as f64 / 10.0)));
     let slider = zone_slider(ui, &mut v, 130.0, zone);
     if slider.changed() {
-        let to = log_value(v, min, max);
+        let to = curve_value(v, min, max);
         if to != c.value {
             set.push((c.id, to));
         }
@@ -966,16 +967,21 @@ fn exposure_widget(ui: &mut egui::Ui, c: &CameraControl, fps: Option<f32>, set: 
     }
 }
 
-/// Where `value` sits along a slider from `min` to `max` in stops (0 to 1).
-fn log_pos(value: i64, min: i64, max: i64) -> f32 {
-    let (lo, hi) = ((min.max(1)) as f64, max.max(min.max(1) + 1) as f64);
-    ((value.max(1) as f64 / lo).ln() / (hi / lo).ln()).clamp(0.0, 1.0) as f32
+/// How steep the exposure slider's curve is: near linear at the bottom (the
+/// shortest times, too dark indoors, get little room), each step up longer.
+/// 5 puts a C922's 0.3–205 ms at: 1 ms 8% along, 16.7 ms half way, 100 ms 85%.
+const EXPOSURE_CURVE: f64 = 5.0;
+
+/// Where `value` sits along the exposure slider from `min` to `max` (0 to 1).
+fn curve_pos(value: i64, min: i64, max: i64) -> f32 {
+    let t = (value - min) as f64 / (max - min).max(1) as f64;
+    ((t * (EXPOSURE_CURVE.exp() - 1.0)).ln_1p() / EXPOSURE_CURVE).clamp(0.0, 1.0) as f32
 }
 
-/// The value at `pos` (0 to 1) along a slider from `min` to `max` in stops.
-fn log_value(pos: f32, min: i64, max: i64) -> i64 {
-    let (lo, hi) = ((min.max(1)) as f64, max.max(min.max(1) + 1) as f64);
-    ((lo * (hi / lo).powf(pos as f64)).round() as i64).clamp(min, max)
+/// The value at `pos` (0 to 1) along the exposure slider from `min` to `max`.
+fn curve_value(pos: f32, min: i64, max: i64) -> i64 {
+    let t = (EXPOSURE_CURVE * pos as f64).exp_m1() / EXPOSURE_CURVE.exp_m1();
+    (min + (t * (max - min) as f64).round() as i64).clamp(min, max)
 }
 
 /// The slim slider (`transport::slider`'s look) with the track past `zone`
@@ -1031,7 +1037,7 @@ fn picture_side(ui: &mut egui::Ui, panel: &mut CameraPanel, name: &str, max_h: f
     picture_view(ui, panel, max_h);
     crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
     let status = match (capture::webcam::status(), panel.fps) {
-        (capture::webcam::Status::Live { width, height }, Some(fps)) => format!("{name} · {width}×{height} · {fps:.0} fps"),
+        (capture::webcam::Status::Live { width, height }, Some(fps)) => format!("{name} · {width}×{height} · {fps:.0} new pictures/s"),
         (capture::webcam::Status::Live { width, height }, None) => format!("{name} · {width}×{height}"),
         _ => name.to_owned(),
     };
@@ -1058,16 +1064,17 @@ fn picture_view(ui: &mut egui::Ui, panel: &mut CameraPanel, max_h: f32) {
             t => *t = Some(ui.ctx().load_texture("camera page", image, egui::TextureOptions::LINEAR)),
         }
         panel.seq = p.seq;
+        panel.new_pictures = p.new_pictures;
     }
-    // Pictures are numbered as the camera delivers them: how many came in
-    // the last second is its frame rate, whatever this page shows.
+    // How many new pictures (not the camera repeating one, as it does with a
+    // long exposure) came in the last second: its real frame rate.
     let now = std::time::Instant::now();
     match panel.counted {
         Some((at, from)) if now.duration_since(at).as_secs_f32() >= 1.0 => {
-            panel.fps = Some((panel.seq.saturating_sub(from)) as f32 / now.duration_since(at).as_secs_f32());
-            panel.counted = Some((now, panel.seq));
+            panel.fps = Some((panel.new_pictures.saturating_sub(from)) as f32 / now.duration_since(at).as_secs_f32());
+            panel.counted = Some((now, panel.new_pictures));
         }
-        None if panel.seq > 0 => panel.counted = Some((now, panel.seq)),
+        None if panel.new_pictures > 0 => panel.counted = Some((now, panel.new_pictures)),
         _ => {}
     }
     ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
@@ -1195,15 +1202,17 @@ mod panel_tests {
     /// A Logitech C922's controls: named and grouped, automatic modes paired
     /// with the setting they take over, the rest under More.
     /// Half a frame and a whole one: at 30 fps 16.7 and 33.3 ms, at 60 fps 8.3 and 16.7 ms.
-    /// In stops: a C922's 0.3–204.7 ms puts 16.7 ms (a frame at 60 fps) past
-    /// the middle, not at 8%; and back again.
+    /// On a C922's 0.3–204.7 ms: 1 ms near the start, 16.7 ms (a frame at
+    /// 60 fps) half way, 100 ms near the end; and back again.
     #[test]
-    fn exposure_slider_in_stops() {
-        let p = log_pos(167, 3, 2047);
-        assert!((0.55..0.7).contains(&p), "{p}");
-        assert_eq!(log_value(p, 3, 2047), 167);
-        assert_eq!(log_value(0.0, 3, 2047), 3);
-        assert_eq!(log_value(1.0, 3, 2047), 2047);
+    fn exposure_slider_curve() {
+        let at = |ms: i64| curve_pos(ms * 10, 3, 2047);
+        assert!(at(1) < 0.1, "{}", at(1));
+        assert!((0.45..0.56).contains(&at(17)), "{}", at(17));
+        assert!((0.8..0.9).contains(&at(100)), "{}", at(100));
+        assert_eq!(curve_value(curve_pos(167, 3, 2047), 3, 2047), 167);
+        assert_eq!(curve_value(0.0, 3, 2047), 3);
+        assert_eq!(curve_value(1.0, 3, 2047), 2047);
     }
 
     #[test]

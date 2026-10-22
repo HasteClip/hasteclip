@@ -41,6 +41,19 @@ static CURRENT: Mutex<Option<Arc<CameraFeed>>> = Mutex::new(None);
 /// waiting for one newer than the last it had would wait for as many again).
 static PICTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Counts the camera's pictures that differ from the one before. With a long
+/// exposure a camera keeps sending frames at its rate but repeats pictures in
+/// them (the very same bytes): this counts what's new, its real rate.
+static NEW_PICTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A quick fingerprint of a picture: a few thousand of its bytes, spread
+/// over it. A repeated picture has the same; a new one (sensor noise alone)
+/// a different one.
+fn fingerprint(bytes: &[u8]) -> u64 {
+    let step = (bytes.len() / 4096).max(1);
+    bytes.iter().step_by(step).fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100_0000_01b3))
+}
+
 impl CameraFeed {
     fn latest(&self) -> Option<Arc<CameraPicture>> {
         self.frame.lock().unwrap().clone()
@@ -166,6 +179,7 @@ fn stream(feed: &CameraFeed) -> Result<()> {
     let mut live = false;
     // The picture before last's memory, once nobody holds it, for the next one.
     let mut spare: Option<Vec<u8>> = None;
+    let mut last_print = None;
     let result = loop {
         if feed.stop.load(Ordering::Relaxed) {
             break Ok(());
@@ -174,6 +188,11 @@ fn stream(feed: &CameraFeed) -> Result<()> {
         buf.resize(size, 0);
         if out.read_exact(&mut buf).is_err() {
             break Err(anyhow!("the camera stopped"));
+        }
+        let print = fingerprint(&buf);
+        if last_print != Some(print) {
+            NEW_PICTURES.fetch_add(1, Ordering::Relaxed);
+            last_print = Some(print);
         }
         let old = feed.frame.lock().unwrap().replace(Arc::new(CameraPicture { width: w, height: h, bgra: buf }));
         feed.seq.store(PICTURES.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Release);
@@ -428,7 +447,7 @@ pub(crate) fn picture(max_width: u32, newer_than: u64) -> Option<crate::webcam::
     let (w, h) = (((p.width as f64 * scale).round() as u32).max(1), ((p.height as f64 * scale).round() as u32).max(1));
     let mut rgba = vec![0u8; w as usize * h as usize * 4];
     super::image::resample(&p.bgra, (p.width as usize, p.height as usize), p.width as usize * 4, true, &mut rgba, (w as usize, h as usize));
-    Some(crate::webcam::CameraPreview { width: w, height: h, rgba, seq })
+    Some(crate::webcam::CameraPreview { width: w, height: h, rgba, seq, new_pictures: NEW_PICTURES.load(Ordering::Relaxed) })
 }
 
 /// Set a camera's control `id` to `value`; it applies at once, in every app.
@@ -599,6 +618,36 @@ mod tests {
         thread::sleep(Duration::from_millis(300));
         assert!(!second.iter().any(|s| matches!(s, crate::webcam::Status::Unavailable(_))), "busy on the way");
         assert_eq!(second.last(), Some(&crate::webcam::Status::Live { width: b.width, height: b.height }));
+    }
+
+    /// With a long exposure the camera repeats pictures: frames keep coming
+    /// at its rate, new pictures far fewer.
+    #[test]
+    #[ignore = "changes a camera's exposure for a moment: HASTECLIP_WEBCAM=<device> cargo test -p capture repeats_pictures -- --ignored"]
+    fn repeats_pictures_with_a_long_exposure() {
+        let device = std::env::var("HASTECLIP_WEBCAM").unwrap();
+        let all = controls(&device);
+        let auto = all.iter().find(|c| c.id == 0x9a0901).expect("auto exposure").clone();
+        let time = all.iter().find(|c| c.id == 0x9a0902).expect("exposure time").clone();
+        keep_open(Some((device.clone(), None)));
+        thread::sleep(Duration::from_secs(2));
+        let rate = |secs: u64| {
+            let (f0, n0) = (PICTURES.load(Ordering::Relaxed), NEW_PICTURES.load(Ordering::Relaxed));
+            thread::sleep(Duration::from_secs(secs));
+            ((PICTURES.load(Ordering::Relaxed) - f0) / secs, (NEW_PICTURES.load(Ordering::Relaxed) - n0) / secs)
+        };
+        set_control(&device, auto.id, 1).unwrap();
+        set_control(&device, time.id, 50).unwrap();
+        thread::sleep(Duration::from_millis(500));
+        let short = rate(2);
+        set_control(&device, time.id, 1000).unwrap();
+        thread::sleep(Duration::from_millis(500));
+        let long = rate(2);
+        set_control(&device, time.id, time.value).unwrap();
+        set_control(&device, auto.id, auto.value).unwrap();
+        keep_open(None);
+        eprintln!("frames, new pictures a second: 5 ms {short:?}, 100 ms {long:?}");
+        assert!(long.1 < long.0, "no repeats at 100 ms");
     }
 
     /// Settings remembered for a camera go back on when it's opened.

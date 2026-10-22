@@ -333,6 +333,9 @@ pub struct CameraPreview {
     pub rgba: Vec<u8>,
     /// Its number: pass it back to only get newer ones.
     pub seq: u64,
+    /// How many of the camera's pictures so far were new, not repeats of
+    /// the one before: over time, its real frame rate.
+    pub new_pictures: u64,
 }
 
 /// The open camera's newest picture, shrunk to at most `max_width` wide,
