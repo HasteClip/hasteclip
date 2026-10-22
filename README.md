@@ -161,7 +161,7 @@ HasteClip is in beta (versions 0.x). It works day to day, but not every feature 
 | Share links, copy, export and import | ✅ | ✅ | ✅ |
 | Voice saving, named clips, per-app sound, webcam | ✅ | ✅ | ✅ |
 | Record a single game or app window | ✅ | ✅ | ✅ (see below) |
-| Drag clips out, system share sheet | ✅ | ✅ | — (use Copy clip) |
+| Drag clips out, system share sheet | ✅ | ✅ | Drag out on Wayland (no share sheet) |
 | Frame blending | ✅ | ✅ | ✅ |
 | Automatic updates | — | ✅ | ✅ |
 | Screenshots | — | ✅ | ✅ |
