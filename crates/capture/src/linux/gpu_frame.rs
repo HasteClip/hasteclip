@@ -245,6 +245,18 @@ pub(crate) struct GpuPicture {
     nv12_bind: wgpu::BindGroup,
     /// Frame blending's sums, once it's started.
     blend: Option<Blend>,
+    /// The preview, shrunk on the card: its texture, where it's read back,
+    /// and its uniforms.
+    preview: Option<PreviewTarget>,
+}
+
+/// A small copy of the frame for the preview, kept for its size.
+struct PreviewTarget {
+    texture: wgpu::Texture,
+    readback: wgpu::Buffer,
+    uniforms: wgpu::Buffer,
+    /// Bytes from one row to the next in `readback` (as wgpu pads them).
+    row: u32,
 }
 
 /// Frame blending on the card: each open frame's sum of light, and the
@@ -328,7 +340,7 @@ impl GpuPicture {
         let size_bytes: Vec<u8> = [width, height, 0, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
         gpu.queue.write_buffer(&sizes, 0, &size_bytes);
         let layer = Layer { canvas: Canvas::new(width, height), texture: overlay, rows: None, on: false };
-        Self { gpu, width, height, framing, scale, nv12, frame, uniforms, nv12_buf, readback, layer, uploaded: None, nv12_bind, blend: None }
+        Self { gpu, width, height, framing, scale, nv12, frame, uniforms, nv12_buf, readback, layer, uploaded: None, nv12_bind, blend: None, preview: None }
     }
 
     /// Draw the webcam's layer: `cam` placed at `place`, or none.
@@ -581,17 +593,76 @@ impl GpuPicture {
         self.readback.unmap();
     }
 
-    /// The frame shrunk to fit `max`, as R, G, B, A, for the preview. Its size.
-    pub(crate) fn preview(&self, max: (u32, u32), out: &mut Vec<u8>) -> (u32, u32) {
-        let mut small = Canvas::new(self.width, self.height);
-        // Read back at full size and shrunk on the CPU: only while the
-        // preview shows, a few times a second.
-        let px = self.gpu.read(&self.frame);
-        // The frame is R, G, B, A; the canvas is B, G, R, A.
-        for (o, p) in small.bgra.chunks_exact_mut(4).zip(px.chunks_exact(4)) {
-            o.copy_from_slice(&[p[2], p[1], p[0], 255]);
+    /// The frame shrunk to fit `max`, as R, G, B, A, for the preview. Its
+    /// size. Shrunk on the card (as the frame is made) and only that read
+    /// back: reading the whole frame back and shrinking it on the CPU took
+    /// 20 ms, a 60 fps frame's time and more.
+    pub(crate) fn preview(&mut self, max: (u32, u32), out: &mut Vec<u8>) -> (u32, u32) {
+        let scale = (max.0 as f64 / self.width as f64).min(max.1 as f64 / self.height as f64).min(1.0);
+        let w = ((self.width as f64 * scale).round() as u32).max(1);
+        let h = ((self.height as f64 * scale).round() as u32).max(1);
+        let device = &self.gpu.device;
+        if self.preview.as_ref().is_none_or(|p| (p.texture.width(), p.texture.height()) != (w, h)) {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("preview"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let row = (w * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+            let readback = device.create_buffer(&wgpu::BufferDescriptor { label: Some("preview read"), size: row as u64 * h as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+            let uniforms = device.create_buffer(&wgpu::BufferDescriptor { label: Some("preview scale"), size: 64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            self.preview = Some(PreviewTarget { texture, readback, uniforms, row });
         }
-        small.to_preview(max, out)
+        let p = self.preview.as_ref().expect("made above");
+        // The whole frame into the whole preview, no webcam layer (it's in the frame).
+        let bytes: Vec<u8> = [0.0f32, 0.0, self.width as f32, self.height as f32, 0.0, 0.0, w as f32, h as f32]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .chain([w, h, 0, 0].iter().flat_map(|v| v.to_le_bytes()))
+            .collect();
+        self.gpu.queue.write_buffer(&p.uniforms, 0, &bytes);
+        let frame_view = self.frame.create_view(&Default::default());
+        let preview_view = p.texture.create_view(&Default::default());
+        let overlay_view = self.layer.texture.create_view(&Default::default());
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("preview"),
+            layout: &self.scale.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&frame_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&preview_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: p.uniforms.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&overlay_view) },
+            ],
+        });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("preview") });
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.scale);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
+        }
+        enc.copy_texture_to_buffer(
+            p.texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo { buffer: &p.readback, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(p.row), rows_per_image: Some(h) } },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        let done = self.gpu.queue.submit([enc.finish()]);
+        let slice = p.readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::Wait { submission_index: Some(done), timeout: Some(std::time::Duration::from_secs(1)) });
+        out.clear();
+        if let Ok(data) = slice.get_mapped_range() {
+            for r in data.chunks(p.row as usize).take(h as usize) {
+                out.extend_from_slice(&r[..w as usize * 4]);
+            }
+        }
+        p.readback.unmap();
+        (w, h)
     }
 
     /// A picture from our memory on the card: uploaded once per picture.
@@ -671,6 +742,34 @@ mod tests {
         // A quarter of white's light is sRGB 137: luma ((220 * 137 + 128) >> 8) + 16 = 134.
         eprintln!("frame 2 luma {}", out[0]);
         assert!((out[0] as i32 - 134).abs() <= 1, "luma {}", out[0]);
+    }
+
+    /// How long a preview frame takes (drawing it, NV12, and the preview).
+    #[test]
+    #[ignore = "uses the graphics card: cargo test -p capture preview_time -- --ignored"]
+    fn preview_time() {
+        let gpu = super::super::gpu::gpu().expect("a graphics card");
+        let (sw, sh) = (2560u32, 1440u32);
+        let frame = Frame { width: sw, height: sh, stride: sw as usize * 4, order: Order::Bgr, data: vec![90; (sw * sh * 4) as usize], texture: None };
+        let mut pic = GpuPicture::new(gpu, 1920, 1080, crate::Framing::Fit);
+        let mut out = Vec::new();
+        let mut nv12 = Vec::new();
+        for i in 0..3 {
+            pic.draw(&frame, i);
+            pic.preview((1280, 720), &mut out);
+        }
+        let n = 30;
+        let t = std::time::Instant::now();
+        for i in 0..n {
+            pic.draw(&frame, 10 + i);
+            pic.nv12(&mut nv12);
+        }
+        let frame_ms = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            pic.preview((1280, 720), &mut out);
+        }
+        eprintln!("frame + nv12: {frame_ms:.2} ms; preview: {:.2} ms", t.elapsed().as_secs_f64() * 1000.0 / n as f64);
     }
 
     /// The card makes the same NV12 as the CPU, give or take a step from

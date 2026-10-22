@@ -245,7 +245,7 @@ pub(super) fn spawn_blend_pacer(fps: u32, looks: u32, shutter: Shutter, mut pict
                     eprintln!("{why}");
                     ended = true;
                 }
-                submit_preview(&p.picture, &mut sent);
+                submit_preview(&mut p.picture, &mut sent);
             }
             p.encoder.finish();
             crate::preview::clear(sent.generation);

@@ -740,13 +740,13 @@ impl Previewed {
 /// Hand the preview the picture, if it's wanted and has changed since the
 /// last one (a still screen sends nothing new: no work here, and none for
 /// the UI to upload).
-fn submit_preview(picture: &Picture, sent: &mut Previewed) {
+fn submit_preview(picture: &mut Picture, sent: &mut Previewed) {
     if sent.version == Some(picture.version) || !crate::preview::wants_frame() {
         return;
     }
     sent.version = Some(picture.version);
     let mut rgba = sent.spare.take().and_then(|f| Arc::try_unwrap(f).ok()).map(|f| f.rgba).unwrap_or_default();
-    let (w, h) = match &picture.gpu {
+    let (w, h) = match &mut picture.gpu {
         Some(g) => g.preview(PREVIEW_MAX, &mut rgba),
         None => picture.canvas.to_preview(PREVIEW_MAX, &mut rgba),
     };
@@ -808,7 +808,7 @@ fn spawn_pacer(fps: u32, mut picture: Picture, encoder: ffmpeg::H264, clock: Arc
                     }
                 }
                 // The Sources page is showing the preview: hand it this picture too.
-                submit_preview(&picture, &mut sent);
+                submit_preview(&mut picture, &mut sent);
                 let wait = t0 + next as f64 / fps_f - host_now();
                 if wait > 0.0 {
                     thread::sleep(Duration::from_secs_f64(wait));
@@ -868,7 +868,7 @@ impl PreviewCapture {
                     break;
                 }
                 if crate::preview::wants_frame() && picture.update(false) {
-                    submit_preview(&picture, &mut sent);
+                    submit_preview(&mut picture, &mut sent);
                 }
                 n += 1;
                 let wait = t0 + n as f64 * every - host_now();
