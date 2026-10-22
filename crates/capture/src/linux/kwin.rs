@@ -24,6 +24,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::{wl_output, wl_registry};
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum, delegate_noop};
+use wayland_protocols_plasma::output_order::v1::client::kde_output_order_v1 as output_order;
 use wayland_protocols_plasma::screencast::v1::client::{
     zkde_screencast_stream_unstable_v1 as stream, zkde_screencast_unstable_v1 as screencast,
 };
@@ -51,13 +52,17 @@ pub(crate) struct Monitor {
     pub name: String,
     pub width: u32,
     pub height: u32,
+    /// The main monitor: first in Plasma's display settings.
+    pub primary: bool,
 }
 
-/// The monitors, leftmost first. Empty if KWin can't be reached.
+/// The monitors, the main one first, then leftmost first. Empty if KWin
+/// can't be reached.
 pub(crate) fn monitors() -> Vec<Monitor> {
     let Ok(session) = Session::connect() else { return Vec::new() };
     let mut outputs: Vec<&Output> = session.state.outputs.iter().collect();
-    outputs.sort_by_key(|o| o.position);
+    outputs.sort_by_key(|o| session.state.rank(o));
+    let main = session.state.order.first();
     outputs
         .into_iter()
         .filter_map(|o| {
@@ -67,7 +72,8 @@ pub(crate) fn monitors() -> Vec<Monitor> {
                 Some(d) if !d.trim().is_empty() && d.trim() != name => format!("{name} ({})", d.trim()),
                 _ => name.clone(),
             };
-            Some(Monitor { id: format!("kde:{name}"), name: label, width: w as u32, height: h as u32 })
+            let primary = main == Some(&name);
+            Some(Monitor { id: format!("kde:{name}"), name: label, width: w as u32, height: h as u32, primary })
         })
         .collect()
 }
@@ -83,10 +89,23 @@ struct Output {
 #[derive(Default)]
 struct State {
     outputs: Vec<Output>,
+    /// The outputs' names in Plasma's order (its display settings' priority),
+    /// the main one first. Empty if KWin doesn't say.
+    order: Vec<String>,
+    /// The order being announced, until KWin says it's complete.
+    next_order: Vec<String>,
     /// The stream's PipeWire node, once KWin has made it.
     node: Option<u32>,
     /// Why KWin stopped (or never started) the stream.
     ended: Option<String>,
+}
+
+impl State {
+    /// Where an output sorts: by Plasma's order, then leftmost first.
+    fn rank(&self, o: &Output) -> (usize, (i32, i32)) {
+        let at = o.name.as_ref().and_then(|n| self.order.iter().position(|m| m == n));
+        (at.unwrap_or(usize::MAX), o.position)
+    }
 }
 
 struct Session {
@@ -104,6 +123,8 @@ impl Session {
         let screencast: screencast::ZkdeScreencastUnstableV1 = globals
             .bind(&qh, 1..=4, ())
             .map_err(|_| anyhow!("KDE doesn't let this app record the screen directly (its .desktop file isn't known yet)"))?;
+        // Only to know which monitor is the main one, so it's fine without.
+        let _order: Option<output_order::KdeOutputOrderV1> = globals.bind(&qh, 1..=1, ()).ok();
         let mut state = State::default();
         for g in globals.contents().clone_list() {
             if g.interface == wl_output::WlOutput::interface().name {
@@ -146,13 +167,13 @@ pub(crate) struct Cast {
 }
 
 impl Cast {
-    /// Ask KWin to stream the monitor with this id (the leftmost if there's
+    /// Ask KWin to stream the monitor with this id (the main one if there's
     /// none such). `ended` is called if KWin stops the stream.
     pub(crate) fn open(id: &str, ended: impl FnOnce(String) + Send + 'static) -> Result<Self> {
         let mut session = Session::connect()?;
         let want = id.strip_prefix("kde:");
         let mut outputs: Vec<&Output> = session.state.outputs.iter().filter(|o| o.size.is_some()).collect();
-        outputs.sort_by_key(|o| o.position);
+        outputs.sort_by_key(|o| session.state.rank(o));
         let output = outputs.iter().find(|o| o.name.as_deref() == want).or(outputs.first()).context("the desktop has no monitor")?;
         let output = output.wl.clone();
         let qh = session.queue.handle();
@@ -219,6 +240,16 @@ impl Dispatch<wl_output::WlOutput, ()> for State {
             wl_output::Event::Mode { flags: WEnum::Value(f), width, height, .. } if f.contains(wl_output::Mode::Current) => {
                 o.size = Some((width, height));
             }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<output_order::KdeOutputOrderV1, ()> for State {
+    fn event(state: &mut Self, _: &output_order::KdeOutputOrderV1, event: output_order::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        match event {
+            output_order::Event::Output { output_name } => state.next_order.push(output_name),
+            output_order::Event::Done => state.order = std::mem::take(&mut state.next_order),
             _ => {}
         }
     }

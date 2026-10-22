@@ -80,9 +80,8 @@ pub fn screens_listed() -> bool {
     x11::session() || wlr::available() || kwin::available() || mutter::available()
 }
 
-/// Screens to record. On X11, every monitor, the main one first; on
-/// wlroots-style desktops and KDE every monitor, leftmost first; on GNOME
-/// every monitor, the main one first. Elsewhere the
+/// Screens to record. On X11, KDE and GNOME, every monitor, the main one
+/// first; on wlroots-style desktops every monitor, leftmost first. Elsewhere the
 /// desktop doesn't tell apps what screens there are, so there's one entry,
 /// and the desktop asks which screen it is the first time.
 pub fn list_screens() -> Vec<Device> {
@@ -111,7 +110,10 @@ pub fn list_screens() -> Vec<Device> {
         if !monitors.is_empty() {
             return monitors
                 .into_iter()
-                .map(|m| Device { name: format!("{} ({}×{})", m.name, m.width, m.height), id: m.id })
+                .map(|m| {
+                    let main = if m.primary { ", main" } else { "" };
+                    Device { name: format!("{} ({}×{}{main})", m.name, m.width, m.height), id: m.id }
+                })
                 .collect();
         }
     } else if mutter::available() {
