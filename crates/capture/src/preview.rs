@@ -156,11 +156,9 @@ impl VideoPreview {
         {
             Self { inner: crate::mac::preview::PreviewCapture::start(source.clone(), target_height, shape, fps, away_screen, webcam) }
         }
-        // No away screen: it's for games and apps, which Linux doesn't record.
         #[cfg(target_os = "linux")]
         {
-            let _ = away_screen;
-            Self { inner: crate::linux::PreviewCapture::start(source.clone(), target_height, shape, fps, webcam) }
+            Self { inner: crate::linux::PreviewCapture::start(source.clone(), target_height, shape, fps, away_screen, webcam) }
         }
         #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
         {
@@ -170,14 +168,14 @@ impl VideoPreview {
     }
 
     /// Change what the preview shows without restarting it, if the change
-    /// allows (a different list of games and apps). Returns whether it did.
+    /// allows (a different list of games and apps; on Linux, anything it
+    /// shows). Returns whether it did.
     pub fn update(&self, source: &VideoSource) -> bool {
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
         {
             self.inner.update(source)
         }
-        // Only the screen: nothing changes without a restart.
-        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
         {
             let _ = source;
             false

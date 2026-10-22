@@ -356,13 +356,18 @@ impl Recorder for LinuxRecorder {
         self.session.as_mut().and_then(|s| s.audio.as_mut()).is_some_and(|a| a.set_mic(id, device))
     }
 
+    /// Record something else without restarting: another list of games and
+    /// apps, or the whole screen instead of them (or the other way round, or
+    /// another display), into the same picture. False if it couldn't.
     fn update_video(&mut self, video: &VideoSource) -> bool {
-        match (self.session.as_ref().and_then(|s| s.feed.as_ref()), video) {
-            (Some(Feed::Apps(a)), VideoSource::Apps { ids, away_when_unfocused, .. }) => {
-                a.set(ids, *away_when_unfocused);
-                true
+        let Some(session) = self.session.as_ref() else { return false };
+        let Some(feed) = session.feed.as_ref() else { return false };
+        match feed.switch(video, session.away_screen.as_deref()) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("can't switch what's recorded: {e:#}");
+                false
             }
-            _ => false,
         }
     }
 }
@@ -422,14 +427,30 @@ enum Target {
 /// are exact, so this only delays writing — it never shifts audio against video.
 const MIX_LATENCY: f64 = 0.3;
 
-/// Where the pictures come from: a screen, or games and apps.
+/// Where the pictures come from: a screen, or games and apps. Switched while
+/// capturing (`switch`), it carries on with the new one's pictures, numbered
+/// on from the old one's.
 #[derive(Clone)]
-enum Feed {
+struct Feed(Arc<Switchable>);
+
+struct Switchable {
+    source: std::sync::RwLock<Source>,
+    /// Added to the source's own picture numbers: past the last one handed
+    /// out before it was switched in, so they keep going up.
+    base: std::sync::atomic::AtomicU64,
+    /// The highest picture number handed out.
+    last: std::sync::atomic::AtomicU64,
+    /// Every picture is kept as it arrives (`queue_arrivals`): the next
+    /// source too.
+    queuing: AtomicBool,
+}
+
+enum Source {
     Screen(Arc<screen::Screen>),
     Apps(Arc<apps::Apps>),
 }
 
-impl Feed {
+impl Source {
     /// Start `source`'s pictures. Games and apps show the away screen (else
     /// black) until one of them is found.
     fn open(source: &VideoSource, away_screen: Option<&crate::StillImage>) -> Result<Self> {
@@ -442,77 +463,6 @@ impl Feed {
         }
     }
 
-    /// The size pictures are fitted into before scaling: the screen's, or
-    /// for games and apps the main display's.
-    fn size(&self) -> (u32, u32) {
-        match self {
-            Self::Screen(s) => s.latest.get().map_or((1920, 1080), |(f, _)| (f.width, f.height)),
-            Self::Apps(_) => display_pixels(None).unwrap_or((1920, 1080)),
-        }
-    }
-
-    /// Ask a source that reads the screen on request (X11) for the next picture.
-    fn want(&self) {
-        match self {
-            Self::Screen(s) => s.latest.want(),
-            Self::Apps(a) => a.want(),
-        }
-    }
-
-    /// The newest picture and a number that changes with it.
-    fn get(&self) -> Option<(Arc<screen::Frame>, u64)> {
-        match self {
-            Self::Screen(s) => s.latest.get(),
-            Self::Apps(a) => a.get(),
-        }
-    }
-
-    /// Keep every picture as it arrives, for `drain` (frame blending).
-    fn queue_arrivals(&self) {
-        match self {
-            Self::Screen(s) => s.latest.queue_arrivals(),
-            Self::Apps(a) => a.queue_arrivals(),
-        }
-    }
-
-    /// The pictures arrived since the last drain, oldest first.
-    fn drain(&self) -> Vec<screen::Arrival> {
-        match self {
-            Self::Screen(s) => s.latest.drain(),
-            Self::Apps(a) => a.drain(),
-        }
-    }
-
-    /// Wait up to `timeout` for a picture newer than `seen` (a screen; games
-    /// and apps just wait).
-    fn wait(&self, seen: u64, timeout: Duration) {
-        match self {
-            Self::Screen(s) => s.latest.wait(seen, timeout),
-            Self::Apps(_) => thread::sleep(timeout.min(Duration::from_millis(1))),
-        }
-    }
-
-    /// Why the pictures stopped, if they did (games and apps don't stop).
-    fn ended(&self) -> Option<String> {
-        match self {
-            Self::Screen(s) => s.latest.ended(),
-            Self::Apps(_) => None,
-        }
-    }
-
-    /// Whether none of the games and apps recorded is showing.
-    fn waiting(&self) -> bool {
-        matches!(self, Self::Apps(a) if a.waiting())
-    }
-
-    /// The game or app whose window is recorded, while it shows.
-    fn app(&self) -> Option<String> {
-        match self {
-            Self::Apps(a) => a.app(),
-            Self::Screen(_) => None,
-        }
-    }
-
     /// Let go. A screen keeps running a little longer, in case it's taken up
     /// again right away (`screen::release`).
     fn release(self) {
@@ -522,10 +472,147 @@ impl Feed {
     }
 }
 
+impl Feed {
+    fn open(source: &VideoSource, away_screen: Option<&crate::StillImage>) -> Result<Self> {
+        let source = Source::open(source, away_screen)?;
+        Ok(Self(Arc::new(Switchable {
+            source: std::sync::RwLock::new(source),
+            base: Default::default(),
+            last: Default::default(),
+            queuing: AtomicBool::new(false),
+        })))
+    }
+
+    fn source(&self) -> std::sync::RwLockReadGuard<'_, Source> {
+        self.0.source.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A picture number of the source's as one of ours.
+    fn ours(&self, seq: u64) -> u64 {
+        let n = seq + self.0.base.load(Ordering::Relaxed);
+        self.0.last.fetch_max(n, Ordering::Relaxed);
+        n
+    }
+
+    /// Carry on with `video`'s pictures: the same games and apps take the
+    /// new list as they run; anything else is opened, then put in place of
+    /// what was there.
+    fn switch(&self, video: &VideoSource, away_screen: Option<&crate::StillImage>) -> Result<()> {
+        if let (Source::Apps(a), VideoSource::Apps { ids, away_when_unfocused, .. }) = (&*self.source(), video) {
+            a.set(ids, *away_when_unfocused);
+            return Ok(());
+        }
+        let new = Source::open(video, away_screen)?;
+        let queuing = self.0.queuing.load(Ordering::Relaxed);
+        match &new {
+            Source::Screen(s) if queuing => s.latest.queue_arrivals(),
+            Source::Apps(a) if queuing => a.queue_arrivals(),
+            _ => {}
+        }
+        let old = {
+            let mut source = self.0.source.write().unwrap_or_else(|e| e.into_inner());
+            self.0.base.store(self.0.last.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+            std::mem::replace(&mut *source, new)
+        };
+        old.release();
+        Ok(())
+    }
+
+    /// The size pictures are fitted into before scaling: the screen's, or
+    /// for games and apps the main display's.
+    fn size(&self) -> (u32, u32) {
+        match &*self.source() {
+            Source::Screen(s) => s.latest.get().map_or((1920, 1080), |(f, _)| (f.width, f.height)),
+            Source::Apps(_) => display_pixels(None).unwrap_or((1920, 1080)),
+        }
+    }
+
+    /// Ask a source that reads the screen on request (X11) for the next picture.
+    fn want(&self) {
+        match &*self.source() {
+            Source::Screen(s) => s.latest.want(),
+            Source::Apps(a) => a.want(),
+        }
+    }
+
+    /// The newest picture and a number that changes with it.
+    fn get(&self) -> Option<(Arc<screen::Frame>, u64)> {
+        let source = self.source();
+        let got = match &*source {
+            Source::Screen(s) => s.latest.get(),
+            Source::Apps(a) => a.get(),
+        };
+        got.map(|(f, n)| (f, self.ours(n)))
+    }
+
+    /// Keep every picture as it arrives, for `drain` (frame blending).
+    fn queue_arrivals(&self) {
+        self.0.queuing.store(true, Ordering::Relaxed);
+        match &*self.source() {
+            Source::Screen(s) => s.latest.queue_arrivals(),
+            Source::Apps(a) => a.queue_arrivals(),
+        }
+    }
+
+    /// The pictures arrived since the last drain, oldest first.
+    fn drain(&self) -> Vec<screen::Arrival> {
+        let source = self.source();
+        let mut list = match &*source {
+            Source::Screen(s) => s.latest.drain(),
+            Source::Apps(a) => a.drain(),
+        };
+        for a in &mut list {
+            a.seq = self.ours(a.seq);
+        }
+        list
+    }
+
+    /// Wait up to `timeout` for a picture newer than `seen` (a screen; games
+    /// and apps just wait).
+    fn wait(&self, seen: u64, timeout: Duration) {
+        match &*self.source() {
+            Source::Screen(s) => s.latest.wait(seen.saturating_sub(self.0.base.load(Ordering::Relaxed)), timeout),
+            Source::Apps(_) => thread::sleep(timeout.min(Duration::from_millis(1))),
+        }
+    }
+
+    /// Why the pictures stopped, if they did (games and apps don't stop).
+    fn ended(&self) -> Option<String> {
+        match &*self.source() {
+            Source::Screen(s) => s.latest.ended(),
+            Source::Apps(_) => None,
+        }
+    }
+
+    /// Whether none of the games and apps recorded is showing.
+    fn waiting(&self) -> bool {
+        matches!(&*self.source(), Source::Apps(a) if a.waiting())
+    }
+
+    /// The game or app whose window is recorded, while it shows.
+    fn app(&self) -> Option<String> {
+        match &*self.source() {
+            Source::Apps(a) => a.app(),
+            Source::Screen(_) => None,
+        }
+    }
+
+    /// Let go (what's left of it goes with the last copy). A screen keeps
+    /// running a little longer, in case it's taken up again right away
+    /// (`screen::release`).
+    fn release(self) {
+        if let Source::Screen(s) = &*self.source() {
+            screen::release(s.clone());
+        }
+    }
+}
+
 /// Everything a running capture owns. Torn down in `finish` in an order that
 /// lets every encoder flush into the writer before it closes the file.
 struct Session {
     feed: Option<Feed>,
+    /// Shown while none of the games and apps is, for switching to them.
+    away_screen: Option<Arc<crate::StillImage>>,
     pacer: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
     audio: Option<AudioCapture>,
     mixer: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
@@ -556,6 +643,7 @@ impl Session {
 
         let mut session = Self {
             feed: Some(feed.clone()),
+            away_screen: s.away_screen.clone(),
             pacer: None,
             audio: None,
             mixer: None,
@@ -828,13 +916,17 @@ fn spawn_pacer(fps: u32, mut picture: Picture, encoder: ffmpeg::H264, clock: Arc
 pub(crate) struct PreviewCapture {
     stop: Arc<AtomicBool>,
     error: Arc<Mutex<Option<String>>>,
+    /// Its pictures' source once open, switched in place (`update`).
+    feed: Arc<Mutex<Option<Feed>>>,
+    away_screen: Option<Arc<crate::StillImage>>,
 }
 
 impl PreviewCapture {
-    pub(crate) fn start(source: VideoSource, target_height: Option<u32>, shape: Option<crate::Shape>, fps: u32, webcam: Option<crate::webcam::Webcam>) -> Self {
+    pub(crate) fn start(source: VideoSource, target_height: Option<u32>, shape: Option<crate::Shape>, fps: u32, away_screen: Option<Arc<crate::StillImage>>, webcam: Option<crate::webcam::Webcam>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let error = Arc::new(Mutex::new(None));
-        let (stop2, error2) = (stop.clone(), error.clone());
+        let opened: Arc<Mutex<Option<Feed>>> = Default::default();
+        let (stop2, error2, opened2, away2) = (stop.clone(), error.clone(), opened.clone(), away_screen.clone());
         let generation = crate::preview::new_producer();
         PREVIEWS.fetch_add(1, Ordering::AcqRel);
         thread::spawn(move || {
@@ -846,13 +938,14 @@ impl PreviewCapture {
                 }
             }
             let _running = Running;
-            let feed = match Feed::open(&source, None) {
+            let feed = match Feed::open(&source, away2.as_deref()) {
                 Ok(f) => f,
                 Err(e) => {
                     *error2.lock().unwrap() = Some(format!("{e:#}"));
                     return;
                 }
             };
+            *opened2.lock().unwrap() = Some(feed.clone());
             let (w, h) = feed.size();
             let (width, height) = crate::recorded_size(w, h, target_height, shape);
             let framing = shape.map_or(crate::Framing::Fit, |shape| shape.framing);
@@ -878,10 +971,18 @@ impl PreviewCapture {
                     n = ((host_now() - t0) / every) as u64; // fell far behind: skip ahead
                 }
             }
+            opened2.lock().unwrap().take();
             drop(picture);
             feed.release();
         });
-        Self { stop, error }
+        Self { stop, error, feed: opened, away_screen }
+    }
+
+    /// Show `source` instead, without starting over (as a running capture
+    /// switches). False if it isn't open yet, or couldn't.
+    pub(crate) fn update(&self, source: &VideoSource) -> bool {
+        let Some(feed) = self.feed.lock().unwrap().clone() else { return false };
+        feed.switch(source, self.away_screen.as_deref()).inspect_err(|e| eprintln!("preview: can't switch: {e:#}")).is_ok()
     }
 
     pub(crate) fn error(&self) -> Option<String> {

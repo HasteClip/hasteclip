@@ -363,10 +363,8 @@ impl App {
         });
 
         // What to record: changes right away, while capturing too (the clip
-        // switches mid-way; nothing restarts). The display too, except on
-        // Linux, where the desktop picks it when capture starts.
-        let stop_first = self.stop_first();
-        let display_locked = !idle && cfg!(target_os = "linux");
+        // switches mid-way; nothing restarts), the display included. (Where
+        // the desktop's dialog picks the screen, that waits: see below.)
         if capture::app_capture() {
             let opts = [
                 crate::ui_kit::Seg { icon: Some(egui_phosphor::regular::MONITOR), label: "Whole screen", tip: Some("Everything on one display") },
@@ -416,20 +414,15 @@ impl App {
                             let names: Vec<String> = self.screens.iter().map(|d| d.name.clone()).collect();
                             let at = self.display_at();
                             let current = names.get(at).cloned().unwrap_or_else(|| "Main display".to_owned());
-                            let r = crate::ui_kit::select(ui, &current, 180.0).on_hover_text(if display_locked { stop_first } else { "" });
-                            if display_locked && r.clicked() {
-                                egui::Popup::close_id(ui.ctx(), r.id.with("menu"));
-                                self.toast_icon(egui_phosphor::regular::LOCK_SIMPLE, stop_first.trim_end_matches('.'));
-                            } else if !display_locked {
-                                crate::ui_kit::menu_popup(&r, false, 240.0, |ui| {
-                                    for (i, name) in names.iter().enumerate() {
-                                        if crate::ui_kit::Item::new(name.clone()).check(at == i).show(ui).clicked() {
-                                            self.settings.display_id = Some(self.screens[i].id.clone());
-                                            self.settings.display_index = i;
-                                        }
+                            let r = crate::ui_kit::select(ui, &current, 180.0);
+                            crate::ui_kit::menu_popup(&r, false, 240.0, |ui| {
+                                for (i, name) in names.iter().enumerate() {
+                                    if crate::ui_kit::Item::new(name.clone()).check(at == i).show(ui).clicked() {
+                                        self.settings.display_id = Some(self.screens[i].id.clone());
+                                        self.settings.display_index = i;
                                     }
-                                });
-                            }
+                                }
+                            });
                         });
                     });
                 });
@@ -518,12 +511,13 @@ impl App {
                 }
                 _ => false,
             };
-            match (drawn, frame) {
-                (true, Some(_)) => {}
-                _ => match self.video_preview.as_ref().and_then(|(_, p)| p.error()) {
-                    Some(e) => message(&format!("No preview: {e}")),
-                    None => message("Starting preview…"),
-                },
+            // While a new preview starts (another frame rate, size, webcam)
+            // the last picture stays up; the message is only for when there's
+            // none to show.
+            match self.video_preview.as_ref().and_then(|(_, p)| p.error()) {
+                Some(e) => message(&format!("No preview: {e}")),
+                None if !drawn => message("Starting preview…"),
+                None => {}
             }
             if self.settings.webcam.is_some() && frame.is_some() {
                 self.webcam_on_preview(ui, rect, &response);
