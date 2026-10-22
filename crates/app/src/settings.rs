@@ -673,6 +673,10 @@ pub struct RecordSettings {
     /// id to value), by camera id: put back each time it's opened, as
     /// cameras forget them when unplugged.
     pub camera_controls: std::collections::BTreeMap<String, std::collections::BTreeMap<u32, i64>>,
+    /// How much longer than it says each camera's exposure time really is,
+    /// as found by fitting its flicker-free steps (a Logitech C922's, about
+    /// 2% longer), by camera id.
+    pub camera_exposure_fit: std::collections::BTreeMap<String, f64>,
     /// The chosen display's id (`capture::Device::id`), so the choice stays
     /// with that display when others are plugged in or listed in another
     /// order. The main display when it isn't connected.
@@ -784,6 +788,7 @@ impl Default for RecordSettings {
             idle_apps: None,
             webcam: None,
             camera_controls: Default::default(),
+            camera_exposure_fit: Default::default(),
             display_id: None,
             display_index: 0,
             fps: 60,

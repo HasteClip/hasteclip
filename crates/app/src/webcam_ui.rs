@@ -796,6 +796,8 @@ impl App {
         let name = self.settings.webcam.as_ref().map(|w| w.name.clone()).unwrap_or_default();
         let current = self.settings.webcam.as_ref().and_then(|w| w.format).map(capture::webcam::Format::from);
         let mut pick: Option<Option<capture::webcam::Format>> = None;
+        let mut refit: Option<Option<f64>> = None;
+        let fit = self.camera_panel.as_ref().and_then(|p| self.settings.camera_exposure_fit.get(&p.device)).copied().unwrap_or(1.0);
         let Some(panel) = self.camera_panel.as_mut() else { return };
         let mut set: Vec<(u32, i64)> = Vec::new();
         let mut reset = false;
@@ -815,7 +817,7 @@ impl App {
                     ui.set_width(col);
                     crate::ui_kit::scroll(ui, "camera_controls", |ui| {
                         format_view(ui, &panel.device, current, &mut pick);
-                        controls_view(ui, panel, &mut set);
+                        controls_view(ui, panel, fit, &mut set, &mut refit);
                         ui.add_space(28.0);
                     });
                 });
@@ -825,7 +827,7 @@ impl App {
             crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
             crate::ui_kit::scroll(ui, "camera_controls", |ui| {
                 format_view(ui, &panel.device, current, &mut pick);
-                controls_view(ui, panel, &mut set);
+                controls_view(ui, panel, fit, &mut set, &mut refit);
                 ui.add_space(28.0);
             });
         }
@@ -860,6 +862,12 @@ impl App {
             capture::webcam::remember_controls(&device, values);
             panel.controls = capture::webcam::camera_controls(&device);
         }
+        if let Some(f) = refit {
+            match f {
+                Some(f) => self.settings.camera_exposure_fit.insert(device.clone(), f),
+                None => self.settings.camera_exposure_fit.remove(&device),
+            };
+        }
         if let Some(p) = pick {
             if let Some(w) = self.settings.webcam.as_mut() {
                 w.format = p.map(Into::into);
@@ -873,11 +881,22 @@ impl App {
 }
 
 /// Exposure times that don't band under lights flickering at twice the mains
-/// frequency `mains` (Hz): whole flickers, in V4L2's units of 100 µs (10 ms
-/// at 50 Hz, 8.33 ms at 60 Hz), within `min..=max`.
-fn flicker_free(mains: f64, min: i64, max: i64) -> Vec<i64> {
-    let period = 10_000.0 / (2.0 * mains);
+/// frequency `mains` (Hz): whole flickers (10 ms at 50 Hz, 8.33 ms at 60 Hz),
+/// in V4L2's units of 100 µs times `fit`, the camera's own (its sensor times
+/// exposure in rows, not quite as V4L2 says: a C922's are 2% long), within
+/// `min..=max`.
+fn flicker_free(mains: f64, min: i64, max: i64, fit: f64) -> Vec<i64> {
+    let period = 10_000.0 / (2.0 * mains) * fit;
     (1..).map(|k| (k as f64 * period).round() as i64).take_while(|v| *v <= max).filter(|v| *v >= min).collect()
+}
+
+/// The camera's fit from an exposure time found by eye to show no bands: how
+/// far it is from the whole flicker nearest it. `None` if it's too far off to
+/// be one (more than a fifth).
+fn fit_from(value: i64, mains: f64) -> Option<f64> {
+    let period = 10_000.0 / (2.0 * mains);
+    let k = (value as f64 / period).round().max(1.0);
+    Some(value as f64 / (k * period)).filter(|f| (0.8..=1.25).contains(f))
 }
 
 /// The next exposure time up (`up`) or down from `value`: among `steps` if
@@ -1020,7 +1039,7 @@ fn format_view(ui: &mut egui::Ui, device: &str, current: Option<capture::webcam:
 }
 
 /// The camera's settings in groups, each a card of rows. What's changed goes in `set`.
-fn controls_view(ui: &mut egui::Ui, panel: &CameraPanel, set: &mut Vec<(u32, i64)>) {
+fn controls_view(ui: &mut egui::Ui, panel: &CameraPanel, fit: f64, set: &mut Vec<(u32, i64)>, refit: &mut Option<Option<f64>>) {
     use crate::theme::{self, W};
     let pal = theme::pal(ui);
     if panel.controls.is_empty() {
@@ -1055,15 +1074,42 @@ fn controls_view(ui: &mut egui::Ui, panel: &CameraPanel, set: &mut Vec<(u32, i64
                             l.well(("camera_manual", auto.id), !on, |l| {
                                 if m.id == v4l2::EXPOSURE {
                                     let steps = match (mains, m.kind.clone()) {
-                                        (Some(hz), ControlKind::Int { min, max, .. }) if snap => Some(flicker_free(hz, min, max)),
+                                        (Some(hz), ControlKind::Int { min, max, .. }) if snap => Some(flicker_free(hz, min, max, fit)),
                                         _ => None,
                                     };
                                     l.row(crate::ui_kit::Row::new(label).kid(), |ui| exposure_widget(ui, m, steps.as_deref(), set));
                                     if let Some(hz) = mains {
-                                        let note = format!("Whole flickers of {hz:.0} Hz lights (every {:.2} ms), so no bands roll through the picture", 1000.0 / (2.0 * hz));
+                                        let step_ms = 1000.0 / (2.0 * hz) * fit;
+                                        let note = if snap {
+                                            format!("Every {step_ms:.2} ms: whole flickers of {hz:.0} Hz lights, so no bands roll through the picture")
+                                        } else {
+                                            "Off: steps of 0.1 ms. Where no bands show, fit the steps to this camera.".to_owned()
+                                        };
                                         l.row(crate::ui_kit::Row::new("Flicker-free steps").kid().note(note), |ui| {
                                             crate::ui_kit::switch(ui, &mut snap);
                                         });
+                                        // Cameras time exposure their own way: fitted once, by eye.
+                                        let fitted = (fit - 1.0).abs() > 0.0005;
+                                        if !snap || fitted {
+                                            let note = if fitted {
+                                                format!("Fitted to this camera: its times are {:+.1}% off what it says", (fit - 1.0) * 100.0)
+                                            } else {
+                                                "Step to where no bands show, then fit to it".to_owned()
+                                            };
+                                            l.row(crate::ui_kit::Row::new("Fit to this camera").kid().note(note), |ui| {
+                                                if fitted && crate::ui_kit::Btn::ghost("Reset fit").small().tip("Back to the steps the camera says").show(ui).clicked() {
+                                                    *refit = Some(None);
+                                                }
+                                                if !snap {
+                                                    let found = fit_from(m.value, hz);
+                                                    let tip = "This exposure time shows no bands: take the camera's steps from it";
+                                                    if crate::ui_kit::Btn::ghost("Fit steps to this").small().enabled(found.is_some()).tip(tip).show(ui).clicked() {
+                                                        *refit = found.map(Some);
+                                                        snap = true;
+                                                    }
+                                                }
+                                            });
+                                        }
                                     }
                                 } else {
                                     l.row(crate::ui_kit::Row::new(label).kid(), |ui| control_widget(ui, m, set));
@@ -1086,12 +1132,23 @@ mod panel_tests {
     /// stepped through by − and +.
     #[test]
     fn flicker_free_exposure_times() {
-        assert_eq!(flicker_free(50.0, 3, 450), [100, 200, 300, 400]);
-        assert_eq!(flicker_free(60.0, 3, 340), [83, 167, 250, 333]);
-        let steps = flicker_free(60.0, 3, 2047);
+        assert_eq!(flicker_free(50.0, 3, 450, 1.0), [100, 200, 300, 400]);
+        assert_eq!(flicker_free(60.0, 3, 340, 1.0), [83, 167, 250, 333]);
+        let steps = flicker_free(60.0, 3, 2047, 1.0);
         assert_eq!(exposure_step(250, true, Some(&steps), 1, 3, 2047), 333);
         assert_eq!(exposure_step(260, false, Some(&steps), 1, 3, 2047), 250);
         assert_eq!(exposure_step(250, true, None, 1, 3, 2047), 251);
+    }
+
+    /// A C922 at 50 Hz showed no bands at 30.6–30.7 ms and 40.8–40.9 ms:
+    /// fitted at one, the steps land on the other.
+    #[test]
+    fn fits_a_cameras_steps() {
+        let fit = fit_from(306, 50.0).unwrap();
+        assert!((fit - 1.02).abs() < 0.001, "{fit}");
+        let steps = flicker_free(50.0, 3, 450, fit);
+        assert_eq!(steps, [102, 204, 306, 408]);
+        assert_eq!(fit_from(150, 50.0), None, "halfway between: not a whole flicker");
     }
 
     fn ctl(id: u32, name: &str, kind: ControlKind, value: i64) -> CameraControl {
