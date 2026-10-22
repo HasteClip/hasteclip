@@ -221,8 +221,9 @@ fn main() -> eframe::Result<()> {
             );
         }
     }
-    // The app is gone by now (capture stopped, files finished): an update
-    // can go in.
+    // The app is gone by now (capture stopped, files finished): end what
+    // capture keeps running in the background, then an update can go in.
+    capture::shutdown();
     update::apply_queued();
     result
 }

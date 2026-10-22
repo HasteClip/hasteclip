@@ -256,10 +256,32 @@ pub(crate) fn forget() {
 /// takes it up again right away (the preview after a recording, or the other
 /// way round).
 pub(crate) fn release(screen: Arc<Screen>) {
-    thread::spawn(move || {
-        thread::sleep(Duration::from_secs(3));
-        drop(screen);
+    static REAPER: std::sync::Once = std::sync::Once::new();
+    RELEASED.lock().unwrap().push((Instant::now() + Duration::from_secs(3), screen));
+    REAPER.call_once(|| {
+        let _ = thread::Builder::new().name("screen-release".into()).spawn(|| loop {
+            thread::sleep(Duration::from_millis(250));
+            let now = Instant::now();
+            let expired: Vec<_> = {
+                let mut released = RELEASED.lock().unwrap();
+                let (gone, kept) = std::mem::take(&mut *released).into_iter().partition(|(at, _)| *at <= now);
+                *released = kept;
+                gone
+            };
+            drop(expired);
+        });
     });
+}
+
+/// Casts let go of, still running a moment in case they're taken up again.
+static RELEASED: Mutex<Vec<(Instant, Arc<Screen>)>> = Mutex::new(Vec::new());
+
+/// Stop the casts let go of now (the app is quitting): one left running
+/// would still be drawing on the graphics card while the process exits and
+/// its driver is unloaded.
+pub(crate) fn shutdown() {
+    let released = std::mem::take(&mut *RELEASED.lock().unwrap());
+    drop(released);
 }
 
 impl Screen {
@@ -361,10 +383,10 @@ struct StreamState {
     failed: bool,
 }
 
-/// Whether pictures are taken on the graphics card when it can. Until the
-/// card's side of recording is done, only when `HASTECLIP_GPU_CAPTURE` asks.
+/// The graphics card, when pictures are taken and worked on it (whenever
+/// Vulkan can import DMA-BUFs; `HASTECLIP_NO_GPU_CAPTURE` turns it off).
 pub(crate) fn gpu_frames() -> Option<Arc<gpu::Gpu>> {
-    std::env::var_os("HASTECLIP_GPU_CAPTURE").and(gpu::gpu())
+    gpu::gpu()
 }
 
 /// Read the cast until told to stop (or it ends). Sends the stopper once the
@@ -643,9 +665,9 @@ mod gpu_tests {
     /// With the graphics card taking pictures, they arrive as textures, as
     /// fast as the screen changes, and read back as the screen.
     #[test]
-    #[ignore = "captures the screen on the graphics card: HASTECLIP_GPU_CAPTURE=1 cargo test -p capture pictures_on_the_card -- --ignored"]
+    #[ignore = "captures the screen on the graphics card: cargo test -p capture pictures_on_the_card -- --ignored"]
     fn pictures_on_the_card() {
-        let card = gpu_frames().expect("HASTECLIP_GPU_CAPTURE=1 and a graphics card");
+        let card = gpu_frames().expect("a graphics card that imports DMA-BUFs");
         let id = super::super::list_screens().into_iter().next().unwrap().id;
         let scr = acquire(&id).unwrap();
         thread::sleep(Duration::from_millis(500));

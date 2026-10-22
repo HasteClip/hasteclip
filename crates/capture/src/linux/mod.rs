@@ -10,9 +10,11 @@
 //!   (`kwin`), on GNOME Mutter does (`mutter`). Elsewhere the portal asks which screen to share (once; the
 //!   choice is remembered) and hands over a PipeWire stream of it (`portal`,
 //!   `screen`). A pacer thread takes the newest picture every 1/fps, scales
-//!   it to the output size, draws the webcam over it and converts it to NV12
-//!   (`image`), so the output is constant frame rate even when the screen is
-//!   still and nothing new arrives. ffmpeg encodes it (`ffmpeg`): NVENC or
+//!   it to the output size, draws the webcam over it and converts it to NV12,
+//!   so the output is constant frame rate even when the screen is still and
+//!   nothing new arrives. Where the compositor hands pictures over on the
+//!   graphics card (DMA-BUF, `gpu`), that's done there (`gpu_frame`) and only
+//!   the NV12 frame comes down; else on the CPU (`image`). ffmpeg encodes it (`ffmpeg`): NVENC or
 //!   VA-API on the GPU where it can, x264 or OpenH264 otherwise.
 //! - **Audio**: everything through PipeWire (`audio`): mics, the desktop
 //!   (every app but us), and single apps. **Mixing** happens in Rust
@@ -35,6 +37,7 @@ pub mod ffmpeg;
 mod image;
 pub mod focus;
 mod gpu;
+mod gpu_frame;
 mod icons;
 mod kwin;
 mod kwin_windows;
@@ -132,6 +135,19 @@ pub fn list_screens() -> Vec<Device> {
         }
     }
     vec![Device { id: SCREEN_ID.into(), name: "Screen (picked when recording first starts)".into() }]
+}
+
+/// Previews running on their threads, which `shutdown` waits for.
+static PREVIEWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Before the app exits: stop every capture still running in the
+/// background, so none is using the graphics card while its driver unloads.
+pub(crate) fn shutdown() {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while PREVIEWS.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    screen::shutdown();
 }
 
 /// Whether games and apps can be recorded (KDE Plasma, so far).
@@ -323,6 +339,16 @@ fn shot_of(feed: &Feed) -> Result<crate::PendingShot> {
     }
     let (frame, _) = feed.get().context("nothing has been captured yet. Try again in a moment")?;
     Ok(crate::PendingShot::new(move || {
+        // On the graphics card: read back.
+        if let Some(t) = &frame.texture {
+            let card = gpu::gpu().context("the graphics card went away")?;
+            let mut bgra = card.read(t);
+            if t.format() == wgpu::TextureFormat::Rgba8Unorm {
+                bgra.chunks_exact_mut(4).for_each(|p| p.swap(0, 2));
+            }
+            bgra.chunks_exact_mut(4).for_each(|p| p[3] = 255);
+            return Ok(crate::StillImage { width: t.width(), height: t.height(), bgra });
+        }
         let row = frame.width as usize * 4;
         let mut bgra = Vec::with_capacity(row * frame.height as usize);
         for line in frame.data.chunks(frame.stride).take(frame.height as usize) {
@@ -536,7 +562,12 @@ impl Session {
 /// webcam on top. Redraws only when one of them changed.
 struct Picture {
     feed: Feed,
+    width: u32,
+    height: u32,
+    /// Made on the CPU here, or on the graphics card (`gpu`) when the
+    /// screen's pictures arrive there.
     canvas: Canvas,
+    gpu: Option<gpu_frame::GpuPicture>,
     framing: crate::Framing,
     camera: Option<(camera::CameraLayer, SharedPlacement)>,
     /// What the canvas shows: the screen picture's number, the camera picture
@@ -551,9 +582,10 @@ struct Picture {
 impl Picture {
     fn new(feed: Feed, width: u32, height: u32, framing: crate::Framing, webcam: Option<&crate::webcam::Webcam>) -> Self {
         let camera = webcam.map(|w| (camera::CameraLayer::new(w), w.placement.clone()));
-        let mut canvas = Canvas::new(width, height);
+        let gpu = screen::gpu_frames().map(|g| gpu_frame::GpuPicture::new(g, width, height, framing));
+        let mut canvas = if gpu.is_some() { Canvas::new(0, 0) } else { Canvas::new(width, height) };
         canvas.clear();
-        Self { feed, canvas, framing, camera, shows: None, nv12: Vec::new(), version: 0 }
+        Self { feed, width, height, canvas, gpu, framing, camera, shows: None, nv12: Vec::new(), version: 0 }
     }
 
     /// Bring the canvas up to date. Returns whether there's a picture yet.
@@ -570,16 +602,32 @@ impl Picture {
         };
         let now = (seq, cam.as_ref().map(|c| Arc::as_ptr(c) as usize), place);
         if self.shows.as_ref() != Some(&now) {
-            self.canvas.fill_from(&frame, self.framing);
-            if let (Some(cam), Some(place)) = (&cam, &place) {
-                self.canvas.draw_camera(cam, place);
+            match &mut self.gpu {
+                Some(g) => {
+                    // The webcam's layer is drawn again only when it changed.
+                    if self.shows.as_ref().is_none_or(|s| (s.1, s.2) != (now.1, now.2)) {
+                        g.set_camera(cam.as_deref().zip(place.as_ref()));
+                    }
+                    if !g.draw(&frame, seq) {
+                        return false;
+                    }
+                }
+                None => {
+                    self.canvas.fill_from(&frame, self.framing);
+                    if let (Some(cam), Some(place)) = (&cam, &place) {
+                        self.canvas.draw_camera(cam, place);
+                    }
+                }
             }
             self.shows = Some(now);
             self.nv12.clear();
             self.version += 1;
         }
         if nv12 && self.nv12.is_empty() {
-            self.canvas.to_nv12(&mut self.nv12);
+            match &self.gpu {
+                Some(g) => g.nv12(&mut self.nv12),
+                None => self.canvas.to_nv12(&mut self.nv12),
+            }
         }
         true
     }
@@ -614,13 +662,15 @@ fn submit_preview(picture: &Picture, sent: &mut Previewed) {
         return;
     }
     sent.version = Some(picture.version);
-    let canvas = &picture.canvas;
     let mut rgba = sent.spare.take().and_then(|f| Arc::try_unwrap(f).ok()).map(|f| f.rgba).unwrap_or_default();
-    let (w, h) = canvas.to_preview(PREVIEW_MAX, &mut rgba);
+    let (w, h) = match &picture.gpu {
+        Some(g) => g.preview(PREVIEW_MAX, &mut rgba),
+        None => picture.canvas.to_preview(PREVIEW_MAX, &mut rgba),
+    };
     let frame = crate::preview::PreviewFrame {
         width: w,
         height: h,
-        recorded: (canvas.width, canvas.height),
+        recorded: (picture.width, picture.height),
         rgba,
         seq: 0,
         waiting: picture.feed.waiting(),
@@ -703,7 +753,16 @@ impl PreviewCapture {
         let error = Arc::new(Mutex::new(None));
         let (stop2, error2) = (stop.clone(), error.clone());
         let generation = crate::preview::new_producer();
+        PREVIEWS.fetch_add(1, Ordering::AcqRel);
         thread::spawn(move || {
+            // Counted down however the thread ends.
+            struct Running;
+            impl Drop for Running {
+                fn drop(&mut self) {
+                    PREVIEWS.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+            let _running = Running;
             let feed = match Feed::open(&source, None) {
                 Ok(f) => f,
                 Err(e) => {
@@ -787,6 +846,64 @@ mod tests {
         assert!(lit > 0, "all black");
         assert!(seq2 > seq, "no new pictures");
         assert!(feed.waiting());
+    }
+
+    /// Recording the main screen at 1080p60 for 5 seconds: a file with every
+    /// frame, the CPU it took (HASTECLIP_NO_GPU_CAPTURE=1 for the CPU's way),
+    /// and a screenshot meanwhile.
+    #[test]
+    #[ignore = "records the screen: cargo test -p capture records_the_screen -- --ignored"]
+    fn records_the_screen() {
+        let screen = list_screens().into_iter().next().expect("a screen");
+        let video = VideoSource::Screen { id: screen.id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() }, method: Default::default() };
+        let dir = std::env::temp_dir().join("hc-record-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let settings = EncodeSettings {
+            output_dir: dir.clone(),
+            container_ext: "mp4".into(),
+            fps: 60,
+            blend_samples: 1,
+            blend_shape: crate::BlendShape::Even,
+            video_bitrate_kbps: 8000,
+            target_height: Some(1080),
+            shape: None,
+            use_hardware: true,
+            replay_seconds: 5,
+            video: video.clone(),
+            away_screen: None,
+            // HASTECLIP_WEBCAM=<device> draws a webcam in the corner.
+            webcam: std::env::var("HASTECLIP_WEBCAM").ok().map(|device| crate::webcam::Webcam {
+                device,
+                format: None,
+                placement: Arc::new(Mutex::new(crate::webcam::Placement::default_for(16.0 / 9.0, 16.0 / 9.0))),
+            }),
+            sources: Vec::new(),
+        };
+        let cpu = || {
+            let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+            // SAFETY: a struct to fill.
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
+            u.ru_utime.tv_sec as f64 + u.ru_utime.tv_usec as f64 / 1e6 + u.ru_stime.tv_sec as f64 + u.ru_stime.tv_usec as f64 / 1e6
+        };
+        let mut rec = LinuxRecorder::new(Arc::new(LiveAudio::default()));
+        rec.start(Mode::Record, &settings).unwrap();
+        thread::sleep(Duration::from_secs(1));
+        let (t, c) = (Instant::now(), cpu());
+        thread::sleep(Duration::from_secs(4));
+        let used = (cpu() - c) / t.elapsed().as_secs_f64();
+        let shot = rec.screenshot(&video).unwrap().finish().unwrap();
+        let file = rec.stop(None).unwrap().expect("a file");
+        shutdown();
+        let probe = std::process::Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "v:0", "-count_frames", "-show_entries", "stream=width,height,nb_read_frames:format=duration", "-of", "csv=p=0"])
+            .arg(&file)
+            .output()
+            .unwrap();
+        eprintln!("gpu: {}, {:.0}% of a core, screenshot {}x{}, file: {}", screen::gpu_frames().is_some(), used * 100.0, shot.width, shot.height, String::from_utf8_lossy(&probe.stdout).replace('\n', " "));
+        if let Some(out) = std::env::var_os("HASTECLIP_FRAME") {
+            let _ = std::process::Command::new("ffmpeg").args(["-v", "error", "-y", "-sseof", "-1", "-i"]).arg(&file).args(["-frames:v", "1"]).arg(out).status();
+        }
+        assert!(shot.bgra.chunks_exact(4).any(|p| p[0] > 16 || p[1] > 16 || p[2] > 16), "black screenshot");
     }
 
     /// A screenshot is all of the screen at its own size, opaque.

@@ -422,6 +422,14 @@ pub struct StillImage {
     pub bgra: Vec<u8>,
 }
 
+/// Before the app exits, once capture has stopped: end what still runs in
+/// the background (on Linux a screen cast kept a moment for reuse), so none
+/// of it is using the graphics card while the process exits.
+pub fn shutdown() {
+    #[cfg(target_os = "linux")]
+    linux::shutdown();
+}
+
 /// Whether games and apps can be recorded here ([`VideoSource::Apps`]):
 /// on Windows and macOS, and on Linux on KDE Plasma's Wayland session so far.
 /// Asked once; quick after that.
