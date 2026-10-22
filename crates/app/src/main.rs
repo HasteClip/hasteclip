@@ -159,6 +159,15 @@ fn main() -> eframe::Result<()> {
     // file before exiting, since destructors don't run on a signal.
     let _ = ctrlc::set_handler(|| {
         service::stop_all_and_wait(std::time::Duration::from_secs(10));
+        // Without running the C library's exit handlers: they unload the
+        // graphics driver while the UI thread may still be drawing with it,
+        // which crashed (NVIDIA on Linux). The recording is already written.
+        #[cfg(unix)]
+        // SAFETY: ends the process at once; nothing runs after it.
+        unsafe {
+            libc::_exit(0)
+        };
+        #[cfg(not(unix))]
         std::process::exit(0);
     });
 
