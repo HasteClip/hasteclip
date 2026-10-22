@@ -29,12 +29,17 @@ pub(crate) struct CameraFeed {
     pub device: String,
     pub format: Option<Format>,
     frame: Mutex<Option<Arc<CameraPicture>>>,
-    /// Counts pictures, so a reader can tell a new one.
+    /// The newest picture's number (`PICTURES`), so a reader can tell a new one.
     seq: std::sync::atomic::AtomicU64,
     stop: AtomicBool,
 }
 
 static CURRENT: Mutex<Option<Arc<CameraFeed>>> = Mutex::new(None);
+
+/// Numbers every camera picture, whichever camera or format it's from: a
+/// new format's pictures carry on from the last ones, not from 0 (a reader
+/// waiting for one newer than the last it had would wait for as many again).
+static PICTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl CameraFeed {
     fn latest(&self) -> Option<Arc<CameraPicture>> {
@@ -171,7 +176,7 @@ fn stream(feed: &CameraFeed) -> Result<()> {
             break Err(anyhow!("the camera stopped"));
         }
         let old = feed.frame.lock().unwrap().replace(Arc::new(CameraPicture { width: w, height: h, bgra: buf }));
-        feed.seq.fetch_add(1, Ordering::Release);
+        feed.seq.store(PICTURES.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Release);
         spare = old.and_then(|a| Arc::try_unwrap(a).ok()).map(|p| p.bgra);
         if !live {
             // Open: what was set for this camera before goes back on (it
