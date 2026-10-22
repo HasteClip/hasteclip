@@ -164,7 +164,7 @@ HasteClip is in beta (versions 0.x). It works day to day, but not every feature 
 | Drag clips out, system share sheet | ✅ | ✅ | — (use Copy clip) |
 | Frame blending | ✅ | ✅ | — |
 | Automatic updates | — | ✅ | ✅ |
-| Screenshots | — | ✅ | — |
+| Screenshots | — | ✅ | ✅ |
 | Game capture for fullscreen games | — | ✅ | — |
 
 **Encoders:** VideoToolbox on macOS. NVENC, AMF or Quick Sync through Media Foundation on Windows. NVENC or VA-API through ffmpeg on Linux, with x264 when there's no GPU encoder.

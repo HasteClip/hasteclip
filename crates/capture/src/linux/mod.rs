@@ -47,7 +47,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
@@ -262,6 +262,41 @@ impl Recorder for LinuxRecorder {
             let _ = session.writer_tx.send(writer::Command::SetWindow(seconds as f64));
         }
     }
+
+    fn screenshot(&mut self, video: &VideoSource) -> Result<crate::PendingShot> {
+        if let Some(screen) = self.session.as_ref().and_then(|s| s.screen.as_ref()) {
+            return shot_of(&screen.latest);
+        }
+        // Nothing running: a capture of its own, for one picture.
+        let screen = open_screen(video)?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !screen.latest.has_frame() && Instant::now() < deadline {
+            screen.latest.want();
+            thread::sleep(Duration::from_millis(10));
+        }
+        let shot = shot_of(&screen.latest);
+        screen::release(screen);
+        shot
+    }
+}
+
+/// A screenshot of the newest picture in `latest`: all of the screen at its
+/// own size, without the webcam. Made opaque B, G, R, A rows when finished.
+fn shot_of(latest: &screen::Latest) -> Result<crate::PendingShot> {
+    let (frame, _) = latest.get().context("nothing has been captured yet. Try again in a moment")?;
+    Ok(crate::PendingShot::new(move || {
+        let row = frame.width as usize * 4;
+        let mut bgra = Vec::with_capacity(row * frame.height as usize);
+        for line in frame.data.chunks(frame.stride).take(frame.height as usize) {
+            for p in line[..row].chunks_exact(4) {
+                match frame.order {
+                    screen::Order::Bgr => bgra.extend_from_slice(&[p[0], p[1], p[2], 255]),
+                    screen::Order::Rgb => bgra.extend_from_slice(&[p[2], p[1], p[0], 255]),
+                }
+            }
+        }
+        Ok(crate::StillImage { width: frame.width, height: frame.height, bgra })
+    }))
 }
 
 impl Drop for LinuxRecorder {
@@ -612,5 +647,31 @@ impl Drop for PreviewCapture {
     /// Tell the thread to stop; it closes the capture by itself.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A screenshot is all of the screen at its own size, opaque.
+    #[test]
+    #[ignore = "captures the screen: cargo test -p capture screenshot_of_the_screen -- --ignored"]
+    fn screenshot_of_the_screen() {
+        let screen = list_screens().into_iter().next().expect("a screen");
+        let video = VideoSource::Screen { id: screen.id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() }, method: Default::default() };
+        let mut rec = LinuxRecorder::new(Arc::new(LiveAudio::default()));
+        let t = Instant::now();
+        let img = rec.screenshot(&video).unwrap().finish().unwrap();
+        eprintln!("{} {}×{} in {} ms", screen.name, img.width, img.height, t.elapsed().as_millis());
+        assert_eq!(img.bgra.len(), (img.width * img.height * 4) as usize);
+        assert!(img.bgra.chunks_exact(4).all(|p| p[3] == 255));
+        assert!(img.bgra.chunks_exact(4).any(|p| p[0] > 16 || p[1] > 16 || p[2] > 16), "all black");
+        if let Some(out) = std::env::var_os("HASTECLIP_SHOT") {
+            let (w, h) = (img.width, img.height);
+            let rgb: Vec<u8> = img.bgra.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
+            let header = format!("P6\n{w} {h}\n255\n");
+            std::fs::write(out, [header.as_bytes(), &rgb].concat()).unwrap();
+        }
     }
 }

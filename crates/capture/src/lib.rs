@@ -726,8 +726,8 @@ impl PendingClip {
     }
 }
 
-/// Whether [`Recorder::screenshot`] can take one here (Windows, so far).
-pub const SCREENSHOTS: bool = cfg!(target_os = "windows");
+/// Whether [`Recorder::screenshot`] can take one here (Windows and Linux, so far).
+pub const SCREENSHOTS: bool = cfg!(any(target_os = "windows", target_os = "linux"));
 
 /// A screenshot being taken: its picture is the one up when it was asked
 /// for, copied aside on the graphics card; [`PendingShot::finish`] reads it
@@ -735,7 +735,7 @@ pub const SCREENSHOTS: bool = cfg!(target_os = "windows");
 pub struct PendingShot(Box<dyn FnOnce() -> anyhow::Result<StillImage> + Send>);
 
 impl PendingShot {
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
     pub(crate) fn new(finish: impl FnOnce() -> anyhow::Result<StillImage> + Send + 'static) -> Self {
         Self(Box::new(finish))
     }
