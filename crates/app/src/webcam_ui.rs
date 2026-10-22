@@ -533,7 +533,7 @@ impl App {
             if response.drag_stopped() || !response.dragged() && !ui.input(|i| i.pointer.any_down()) {
                 self.webcam_view.drag = None;
             }
-        } else if let Some(h) = pointer.filter(|at| frame_rect.contains(*at)).and_then(hit) {
+        } else if let Some(h) = pointer.filter(|at| frame_rect.expand(HANDLE).contains(*at)).and_then(hit) {
             ui.ctx().set_cursor_icon(h.cursor());
         }
 
@@ -573,34 +573,87 @@ impl App {
             self.webcam_view.menu = keep;
         }
 
-        // The box and its handles, over the picture.
+        // The box and its handles, over the picture. Not clipped to the
+        // picture: a box against its edge keeps all of its outline.
         let p: Placement = self.settings.webcam.as_ref().map_or(p, |c| c.placement.into());
         let bx = Rect::from_min_max(to_screen(p.x, p.y), to_screen(p.x + p.w, p.y + p.h));
-        let painter = ui.painter_at(frame_rect);
-        // The handles turn green while Alt is held (they'll crop); each side of
-        // the box is green only if it's cropped.
-        let color = if modifiers.alt { CROP } else { ACCENT };
+        let painter = ui.painter().clone();
+        let dragging = self.webcam_view.drag.map(|(h, _, _)| h);
+        let cropping = modifiers.alt && dragging != Some(Handle::Move);
         // Outlined only while it's held or the pointer is over it.
         let bx_hit = |at: Pos2| Handle::ALL.iter().any(|h| h.pos(bx).distance(at) <= HANDLE) || bx.expand(2.0).contains(at);
-        let active = self.webcam_view.drag.is_some() || pointer.is_some_and(|at| frame_rect.contains(at) && bx_hit(at));
-        if active {
-            // The camera's own sides, as they show: a mirrored picture's left is
-            // the camera's right.
-            let [cl, ct, cr, cb] = p.crop.map(|c| c > 0.0);
-            let (left, right) = if p.flip_h { (cr, cl) } else { (cl, cr) };
-            let (top, bottom) = if p.flip_v { (cb, ct) } else { (ct, cb) };
-            let side = |cropped: bool| Stroke::new(2.0, if cropped { CROP } else { ACCENT });
-            painter.line_segment([bx.left_top(), bx.right_top()], side(top));
-            painter.line_segment([bx.left_bottom(), bx.right_bottom()], side(bottom));
-            painter.line_segment([bx.left_top(), bx.left_bottom()], side(left));
-            painter.line_segment([bx.right_top(), bx.right_bottom()], side(right));
-            for h in Handle::ALL {
-                let c = h.pos(bx);
-                let r = Rect::from_center_size(c, vec2(HANDLE, HANDLE));
-                painter.rect_filled(r, 1.0, Color32::WHITE);
-                painter.rect_stroke(r, 1.0, Stroke::new(1.0, color), egui::StrokeKind::Inside);
+        let hovered = pointer.is_some_and(|at| frame_rect.expand(HANDLE).contains(at) && bx_hit(at));
+        if dragging.is_none() && !hovered {
+            return;
+        }
+        let shadow = Stroke::new(3.0, Color32::from_black_alpha(110));
+
+        // Cropping: where the whole camera picture would be, dashed, so it's
+        // clear what's cut off and how far it can grow back.
+        if cropping {
+            let sx = p.w / (1.0 - p.crop[0] - p.crop[2]).max(0.01);
+            let sy = p.h / (1.0 - p.crop[1] - p.crop[3]).max(0.01);
+            let (cl, cr) = if p.flip_h { (p.crop[2], p.crop[0]) } else { (p.crop[0], p.crop[2]) };
+            let (ct, cb) = if p.flip_v { (p.crop[3], p.crop[1]) } else { (p.crop[1], p.crop[3]) };
+            let whole = Rect::from_min_max(to_screen(p.x - cl * sx, p.y - ct * sy), to_screen(p.x + p.w + cr * sx, p.y + p.h + cb * sy));
+            if whole != bx {
+                let ghost = Stroke::new(1.0, CROP.gamma_multiply(0.8));
+                let c = [whole.left_top(), whole.right_top(), whole.right_bottom(), whole.left_bottom(), whole.left_top()];
+                painter.extend(egui::Shape::dashed_line(&c, ghost, 4.0, 3.0));
             }
         }
+
+        // Moved onto the frame's middle (snapped): a guide across it.
+        if dragging == Some(Handle::Move) && !modifiers.ctrl {
+            let guide = Stroke::new(1.0, ACCENT.gamma_multiply(0.6));
+            if ((p.x + p.w / 2.0) - 0.5).abs() < 1e-4 {
+                let x = frame_rect.center().x;
+                painter.extend(egui::Shape::dashed_line(&[Pos2::new(x, frame_rect.top()), Pos2::new(x, frame_rect.bottom())], guide, 5.0, 4.0));
+            }
+            if ((p.y + p.h / 2.0) - 0.5).abs() < 1e-4 {
+                let y = frame_rect.center().y;
+                painter.extend(egui::Shape::dashed_line(&[Pos2::new(frame_rect.left(), y), Pos2::new(frame_rect.right(), y)], guide, 5.0, 4.0));
+            }
+        }
+
+        // The outline, just inside the box, over a soft dark edge so it shows
+        // on a bright picture. The camera's own sides, as they show (a
+        // mirrored picture's left is the camera's right), are green if cropped.
+        let [cl, ct, cr, cb] = p.crop.map(|c| c > 0.0);
+        let (left, right) = if p.flip_h { (cr, cl) } else { (cl, cr) };
+        let (top, bottom) = if p.flip_v { (cb, ct) } else { (ct, cb) };
+        let line = bx.shrink(1.0);
+        painter.rect_stroke(bx.shrink(0.5), 0.0, shadow, egui::StrokeKind::Middle);
+        let side = |cropped: bool| Stroke::new(2.0, if cropped || cropping { CROP } else { ACCENT });
+        painter.line_segment([line.left_top(), line.right_top()], side(top));
+        painter.line_segment([line.left_bottom(), line.right_bottom()], side(bottom));
+        painter.line_segment([line.left_top(), line.left_bottom()], side(left));
+        painter.line_segment([line.right_top(), line.right_bottom()], side(right));
+
+        // Handles: round, white, green while Alt is held (they'll crop); the
+        // one held or under the pointer a little bigger.
+        let under = dragging.or_else(|| pointer.and_then(|at| Handle::ALL.into_iter().find(|h| h.pos(bx).distance(at) <= HANDLE)));
+        for h in Handle::ALL {
+            let r = if Some(h) == under { HANDLE * 0.65 } else { HANDLE * 0.5 };
+            let c = h.pos(line);
+            painter.circle(c, r, if modifiers.alt { CROP } else { Color32::WHITE }, Stroke::new(1.0, Color32::from_black_alpha(140)));
+        }
+
+        // What the keys do, along the picture's foot (or top, if the box is
+        // down there).
+        let hint = match dragging {
+            Some(Handle::Move) => "Ctrl: place freely",
+            Some(_) if modifiers.alt => "Cropping · let go of Alt to scale",
+            Some(_) => "Alt: crop · past the other side: flip",
+            None if self.webcam_view.menu => return,
+            None => "Drag to move · Alt + handle to crop · right-click to turn or flip",
+        };
+        let galley = painter.layout_no_wrap(hint.into(), egui::FontId::proportional(11.5), Color32::from_gray(235));
+        let size = galley.size() + vec2(14.0, 6.0);
+        let y = if bx.center().y > frame_rect.center().y { frame_rect.top() + 8.0 + size.y / 2.0 } else { frame_rect.bottom() - 8.0 - size.y / 2.0 };
+        let pill = Rect::from_center_size(Pos2::new(frame_rect.center().x, y), size);
+        painter.rect_filled(pill, pill.height() / 2.0, Color32::from_black_alpha(170));
+        painter.galley(pill.center() - galley.size() / 2.0, galley, Color32::WHITE);
     }
 }
 
