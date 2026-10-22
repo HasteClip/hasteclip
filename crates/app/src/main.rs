@@ -62,6 +62,8 @@ mod transfer;
 mod time_field;
 mod ui_kit;
 mod update;
+#[cfg(target_os = "macos")]
+mod update_mac;
 mod upload_watch;
 #[cfg(target_os = "linux")]
 mod update_linux;
@@ -133,6 +135,10 @@ fn main() -> eframe::Result<()> {
     velopack::VelopackApp::build().run();
     #[cfg(target_os = "linux")]
     if update_linux::apply_pending_at_launch() {
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    if update_mac::apply_pending_at_launch() {
         return Ok(());
     }
     // One HasteClip at a time: another launch shows the running one and
@@ -606,8 +612,12 @@ impl App {
             channel.set_denoise(s.noise_reduction.into());
             channel.set_mono(s.mono);
         }
-        // macOS: what it needs allowed is shown once, before clipping starts.
-        let setup_open = cfg!(target_os = "macos") && !settings.setup_shown && !demo::on();
+        // macOS: what it needs allowed is shown once, before clipping starts
+        // (and once more when a release needs it allowed again).
+        #[cfg(target_os = "macos")]
+        let setup_open = settings.setup_shown < setup::SETUP_ROUND && !demo::on();
+        #[cfg(not(target_os = "macos"))]
+        let setup_open = false;
         let updater = update::Updater::new(ctx.clone(), settings.auto_update);
         let (tray_tx, tray_rx) = std::sync::mpsc::channel();
         if let Some(listener) = instance {

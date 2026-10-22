@@ -717,9 +717,10 @@ pub struct RecordSettings {
     pub close_to_tray: bool,
     /// The first close asked which (then it just does it).
     pub close_asked: bool,
-    /// macOS: the permissions HasteClip uses were shown at launch (once,
-    /// to everyone, including those who had it before it asked).
-    pub setup_shown: bool,
+    /// macOS: which time the permissions screen was last shown at launch
+    /// ([`crate::setup::SETUP_ROUND`]): it's shown again, once, when a
+    /// release needs everyone to allow them again.
+    pub setup_shown: u32,
     /// Deleting a clip removes it for good instead of moving it to the
     /// Recycle Bin / Trash (then it asks first).
     pub delete_permanently: bool,
@@ -806,7 +807,7 @@ impl Default for RecordSettings {
             theme: Theme::System,
             close_to_tray: true,
             close_asked: false,
-            setup_shown: false,
+            setup_shown: 0,
             game_titles: GameTitles::default(),
             audio_sources: default_sources(),
             limiter: true,
