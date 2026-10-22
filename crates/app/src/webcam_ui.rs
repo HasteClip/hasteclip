@@ -1,6 +1,4 @@
-//! The webcam on the Sources page: picking a camera and its format, its own
-//! settings (the driver's window on Windows, a dialog of its controls on
-//! Linux), and placing it on the live preview the way OBS does — drag
+//! The webcam on the Sources page: picking a camera, and placing it on the live preview the way OBS does — drag
 //! to move, any handle to resize (always keeping its shape: it's never
 //! stretched), past the opposite side to flip it, Alt with a handle to crop,
 //! right-click to flip or turn it a quarter. Moves snap to the frame's edges and centre (Ctrl to place
@@ -370,52 +368,6 @@ impl App {
                 });
             });
             crate::ui_kit::divider(ui, 0.0);
-            // The format in two short choices: the size, then the rates it comes at.
-            let formats = capture::webcam::formats(&cam.id);
-            let current = cam.format.map(capture::webcam::Format::from);
-            let mut pick: Option<Option<capture::webcam::Format>> = None;
-            row(ui, "Resolution", &mut |ui| {
-                let label = current.map_or_else(|| "Automatic".to_owned(), |f| size_label(f.width, f.height));
-                let r = crate::ui_kit::select(ui, &label, 180.0);
-                crate::ui_kit::menu_popup(&r, false, 240.0, |ui| {
-                    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                        if Item::new("Automatic").check(current.is_none()).tip("The sharpest picture up to 1080p at 30 fps or more").show(ui).clicked() {
-                            pick = Some(None);
-                        }
-                        if formats.is_empty() {
-                            crate::ui_kit::menu_head(ui, "The camera's sizes show once it's open.");
-                        }
-                        for (w, h) in sizes(&formats) {
-                            let on = current.is_some_and(|f| (f.width, f.height) == (w, h));
-                            if Item::new(size_label(w, h)).check(on).show(ui).clicked() && !on {
-                                pick = Some(rate_for(&formats, (w, h), current));
-                            }
-                        }
-                    });
-                });
-            });
-            if let Some(f) = current {
-                crate::ui_kit::divider(ui, 0.0);
-                row(ui, "Frame rate", &mut |ui| {
-                    let r = crate::ui_kit::select(ui, &fps_label(f.fps()), 180.0);
-                    crate::ui_kit::menu_popup(&r, false, 200.0, |ui| {
-                        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                            for o in formats.iter().filter(|o| (o.width, o.height) == (f.width, f.height)) {
-                                if Item::new(fps_label(o.fps())).check(*o == f).show(ui).clicked() && *o != f {
-                                    pick = Some(Some(*o));
-                                }
-                            }
-                        });
-                    });
-                });
-            }
-            if let Some(p) = pick {
-                if let Some(w) = self.settings.webcam.as_mut() {
-                    w.format = p.map(Into::into);
-                }
-                self.webcam_view.ask_fit();
-            }
-            crate::ui_kit::divider(ui, 0.0);
             ui.horizontal(|ui| {
                 ui.set_min_height(42.0);
                 ui.label(theme::text("Drag it on the preview to move it.", 12.5, W::Regular).color(pal.text3)).on_hover_text(
@@ -432,19 +384,12 @@ impl App {
                             w.placement = PlacementCfg::laid_out(Placement::default_for(camera_aspect, frame_aspect), frame_aspect);
                         }
                     }
-                    let label = match (capture::webcam::HAS_CONTROLS, self.camera_panel.is_some()) {
-                        (true, true) => "Done adjusting",
-                        (true, false) => "Adjust camera",
-                        (false, _) => "Camera settings…",
-                    };
+                    let label = if capture::webcam::HAS_CONTROLS { "Adjust camera" } else { "Camera settings…" };
                     if (capture::webcam::HAS_SETTINGS || capture::webcam::HAS_CONTROLS)
                         && Btn::ghost(label).small().tip("The camera's own settings: exposure, focus, white balance. They apply right away, in every app, and are put back each time it's opened.").show(ui).clicked()
                     {
                         if capture::webcam::HAS_CONTROLS {
-                            self.camera_panel = match self.camera_panel {
-                                Some(_) => None,
-                                None => Some(CameraPanel::open(&cam.id)),
-                            };
+                            self.camera_panel = Some(CameraPanel::open(&cam.id));
                         } else {
                             capture::webcam::open_settings(&cam.id, &cam.name);
                         }
@@ -837,22 +782,20 @@ impl App {
         if self.camera_panel.is_none() {
             return;
         }
-        let pal = theme::pal(ui);
-        // Back to Sources: the breadcrumb, Done, or Esc.
-        let mut back = ui.input(|i| i.key_pressed(egui::Key::Escape)) && !ui.ctx().any_popup_open();
+        // Back to Sources: the arrow, or Esc (as Settings' own pages).
+        if !crate::ui_kit::overlay_open(ui.ctx()) && !ui.ctx().egui_wants_keyboard_input() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.camera_panel = None;
+            return;
+        }
+        let mut back = false;
         self.page_head(ui, "", |_, ui| {
-            let crumb = ui.add(egui::Label::new(theme::text("Sources", 20.0, W::Semibold).color(pal.text3)).sense(egui::Sense::click()));
-            if crumb.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Back to Sources  (Esc)").clicked() {
-                back = true;
-            }
-            ui.label(theme::ic(egui_phosphor::regular::CARET_RIGHT, 16.0).color(pal.text3));
-            ui.label(theme::text("Camera", 20.0, W::Semibold).color(pal.text));
-            ui.add_space(8.0);
-            if Btn::primary("Done").small().tip("Back to Sources  (Esc)").show(ui).clicked() {
-                back = true;
-            }
+            back = Btn::icon(crate::ui_kit::Kind::Ghost, egui_phosphor::regular::CARET_LEFT).tip("Back to Sources  (Esc)").show(ui).clicked();
+            let p = theme::pal(ui);
+            ui.label(theme::text("Camera", 20.0, W::Semibold).color(p.text));
         });
         let name = self.settings.webcam.as_ref().map(|w| w.name.clone()).unwrap_or_default();
+        let current = self.settings.webcam.as_ref().and_then(|w| w.format).map(capture::webcam::Format::from);
+        let mut pick: Option<Option<capture::webcam::Format>> = None;
         let Some(panel) = self.camera_panel.as_mut() else { return };
         let mut set: Vec<(u32, i64)> = Vec::new();
         let mut reset = false;
@@ -871,6 +814,7 @@ impl App {
                 ui.allocate_ui_with_layout(vec2(col, h), egui::Layout::top_down(egui::Align::Min), |ui| {
                     ui.set_width(col);
                     crate::ui_kit::scroll(ui, "camera_controls", |ui| {
+                        format_view(ui, &panel.device, current, &mut pick);
                         controls_view(ui, panel, &mut set);
                         ui.add_space(28.0);
                     });
@@ -880,6 +824,7 @@ impl App {
             picture_side(ui, panel, &name, h * 0.4, &mut reset);
             crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
             crate::ui_kit::scroll(ui, "camera_controls", |ui| {
+                format_view(ui, &panel.device, current, &mut pick);
                 controls_view(ui, panel, &mut set);
                 ui.add_space(28.0);
             });
@@ -914,6 +859,12 @@ impl App {
             let values = self.settings.camera_controls.get(&device).map(|m| m.iter().map(|(k, v)| (*k, *v)).collect()).unwrap_or_default();
             capture::webcam::remember_controls(&device, values);
             panel.controls = capture::webcam::camera_controls(&device);
+        }
+        if let Some(p) = pick {
+            if let Some(w) = self.settings.webcam.as_mut() {
+                w.format = p.map(Into::into);
+            }
+            self.webcam_view.ask_fit();
         }
         if back {
             self.camera_panel = None;
@@ -1024,6 +975,50 @@ fn picture_view(ui: &mut egui::Ui, panel: &mut CameraPanel, max_h: f32) {
     });
 }
 
+/// The camera's format, first on the Camera page: its resolution, then the
+/// frame rates that size comes at (once one is picked). What's picked goes in `pick`.
+fn format_view(ui: &mut egui::Ui, device: &str, current: Option<capture::webcam::Format>, pick: &mut Option<Option<capture::webcam::Format>>) {
+    use crate::ui_kit::{Item, Row};
+    let formats = capture::webcam::formats(device);
+    crate::ui_kit::section_head(ui, "Format", true, |_| {});
+    crate::ui_kit::list(ui, "camera_format", |l| {
+        l.row(Row::new("Resolution"), |ui| {
+            let label = current.map_or_else(|| "Automatic".to_owned(), |f| size_label(f.width, f.height));
+            let r = crate::ui_kit::select(ui, &label, 150.0);
+            crate::ui_kit::menu_popup(&r, false, 220.0, |ui| {
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    if Item::new("Automatic").check(current.is_none()).tip("The sharpest picture up to 1080p at 30 fps or more").show(ui).clicked() {
+                        *pick = Some(None);
+                    }
+                    if formats.is_empty() {
+                        crate::ui_kit::menu_head(ui, "The camera's sizes show once it's open.");
+                    }
+                    for (w, h) in sizes(&formats) {
+                        let on = current.is_some_and(|f| (f.width, f.height) == (w, h));
+                        if Item::new(size_label(w, h)).check(on).show(ui).clicked() && !on {
+                            *pick = Some(rate_for(&formats, (w, h), current));
+                        }
+                    }
+                });
+            });
+        });
+        if let Some(f) = current {
+            l.row(Row::new("Frame rate"), |ui| {
+                let r = crate::ui_kit::select(ui, &fps_label(f.fps()), 150.0);
+                crate::ui_kit::menu_popup(&r, false, 200.0, |ui| {
+                    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                        for o in formats.iter().filter(|o| (o.width, o.height) == (f.width, f.height)) {
+                            if Item::new(fps_label(o.fps())).check(*o == f).show(ui).clicked() && *o != f {
+                                *pick = Some(Some(*o));
+                            }
+                        }
+                    });
+                });
+            });
+        }
+    });
+}
+
 /// The camera's settings in groups, each a card of rows. What's changed goes in `set`.
 fn controls_view(ui: &mut egui::Ui, panel: &CameraPanel, set: &mut Vec<(u32, i64)>) {
     use crate::theme::{self, W};
@@ -1039,8 +1034,8 @@ fn controls_view(ui: &mut egui::Ui, panel: &CameraPanel, set: &mut Vec<(u32, i64
     });
     let snap_id = egui::Id::new("camera_flicker_free");
     let mut snap = ui.data(|d| d.get_temp::<bool>(snap_id)).unwrap_or(true);
-    for (n, (heading, rows)) in panel_groups(&panel.controls).into_iter().enumerate() {
-        crate::ui_kit::section_head(ui, heading, n == 0, |_| {});
+    for (heading, rows) in panel_groups(&panel.controls) {
+        crate::ui_kit::section_head(ui, heading, false, |_| {});
         crate::ui_kit::list(ui, ("camera", heading), |l| {
             for r in &rows {
                 match r {
