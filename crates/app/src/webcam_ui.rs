@@ -113,6 +113,8 @@ pub(crate) struct Mods {
     pub crop: bool,
     /// Snap to the frame's edges and centre (unless Ctrl).
     pub snap: bool,
+    /// Crop keeping the box's shape (Shift).
+    pub keep: bool,
 }
 
 /// The placement after dragging `handle` by `(dx, dy)` (fractions of the
@@ -139,7 +141,7 @@ pub(crate) fn drag(start: Placement, handle: Handle, dx: f32, dy: f32, mods: Mod
     }
     let [l, t, r, b] = handle.sides();
     if mods.crop {
-        return crop(start, [l, t, r, b], dx, dy);
+        return crop(start, [l, t, r, b], dx, dy, mods.keep);
     }
     // Per axis: the fixed side (anchor), and how far the dragged side is from
     // it, signed, before and after. A sign change means it crossed: a flip.
@@ -204,8 +206,9 @@ pub(crate) fn drag(start: Placement, handle: Handle, dx: f32, dy: f32, mods: Mod
 
 /// Crop the sides in `sides` (as seen: a flipped picture's left side is the
 /// camera's right) as they're dragged: the picture keeps its scale, the box
-/// shrinks (or grows back) with the crop, like OBS's Alt-drag.
-fn crop(start: Placement, [l, t, r, b]: [bool; 4], dx: f32, dy: f32) -> Placement {
+/// shrinks (or grows back) with the crop, like OBS's Alt-drag. With `keep`,
+/// the box keeps its shape.
+fn crop(start: Placement, sides: [bool; 4], dx: f32, dy: f32, keep: bool) -> Placement {
     let mut p = start;
     let c = start.crop;
     // Which camera side each visible side is.
@@ -214,34 +217,71 @@ fn crop(start: Placement, [l, t, r, b]: [bool; 4], dx: f32, dy: f32) -> Placemen
     // Frame fraction per camera fraction, across and down.
     let sx = start.w / (1.0 - c[0] - c[2]).max(0.01);
     let sy = start.h / (1.0 - c[1] - c[3]).max(0.01);
-    let most = 0.95;
-    // Uncropping stops where the box would leave the frame.
-    let low = |side: f32, room: f32, scale: f32| (side - room / scale).max(0.0);
-    if l {
-        let new = (c[left] + dx / sx).clamp(low(c[left], start.x, sx), (most - c[right]).max(0.0));
-        let d = (new - c[left]) * sx;
-        p.crop[left] = new;
-        p.x = start.x + d;
-        p.w = start.w - d;
-    }
-    if r {
-        let new = (c[right] - dx / sx).clamp(low(c[right], 1.0 - start.x - start.w, sx), (most - c[left]).max(0.0));
-        p.crop[right] = new;
-        p.w += (c[right] - new) * sx;
-    }
-    if t {
-        let new = (c[top] + dy / sy).clamp(low(c[top], start.y, sy), (most - c[bottom]).max(0.0));
-        let d = (new - c[top]) * sy;
-        p.crop[top] = new;
-        p.y = start.y + d;
-        p.h = start.h - d;
-    }
-    if b {
-        let new = (c[bottom] - dy / sy).clamp(low(c[bottom], 1.0 - start.y - start.h, sy), (most - c[top]).max(0.0));
-        p.crop[bottom] = new;
-        p.h += (c[bottom] - new) * sy;
-    }
+    // The whole camera picture, on the frame: the box stays inside it (it
+    // can't uncrop past it) and inside the frame, showing at least 5% of it.
+    let whole = Rect::from_min_max(Pos2::new(start.x - c[left] * sx, start.y - c[top] * sy), Pos2::new(start.x + start.w + c[right] * sx, start.y + start.h + c[bottom] * sy));
+    let bounds = whole.intersect(Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)));
+    let from = Rect::from_min_size(Pos2::new(start.x, start.y), vec2(start.w, start.h));
+    let to = resize_within(from, sides, vec2(dx, dy), keep, bounds, vec2(0.05 * sx, 0.05 * sy));
+    p.crop[left] = (to.min.x - whole.min.x) / sx;
+    p.crop[right] = (whole.max.x - to.max.x) / sx;
+    p.crop[top] = (to.min.y - whole.min.y) / sy;
+    p.crop[bottom] = (whole.max.y - to.max.y) / sy;
+    // Uncropped sides stay exactly uncropped.
+    p.crop = p.crop.map(|v| if v < 1e-6 { 0.0 } else { v });
+    (p.x, p.y, p.w, p.h) = (to.min.x, to.min.y, to.width(), to.height());
     p
+}
+
+/// `start` with the sides in `sides` dragged by `d`, inside `bounds`, at
+/// least `least` across and down. With `keep`, its shape is kept: scaled
+/// from the opposite corner or side (centred on an axis not dragged), by
+/// whichever way the pointer moved more.
+pub(crate) fn resize_within(start: Rect, [l, t, r, b]: [bool; 4], d: egui::Vec2, keep: bool, bounds: Rect, least: egui::Vec2) -> Rect {
+    if !keep {
+        let mut s = start;
+        if l {
+            s.min.x = (s.min.x + d.x).clamp(bounds.min.x, (s.max.x - least.x).max(bounds.min.x));
+        }
+        if r {
+            s.max.x = (s.max.x + d.x).clamp((s.min.x + least.x).min(bounds.max.x), bounds.max.x);
+        }
+        if t {
+            s.min.y = (s.min.y + d.y).clamp(bounds.min.y, (s.max.y - least.y).max(bounds.min.y));
+        }
+        if b {
+            s.max.y = (s.max.y + d.y).clamp((s.min.y + least.y).min(bounds.max.y), bounds.max.y);
+        }
+        return s;
+    }
+    let (w, h) = (start.width().max(1e-6), start.height().max(1e-6));
+    let kx = (l || r).then(|| (w + if l { -d.x } else { d.x }) / w);
+    let ky = (t || b).then(|| (h + if t { -d.y } else { d.y }) / h);
+    let k = match (kx, ky) {
+        (Some(a), Some(b)) => {
+            if (a - 1.0).abs() >= (b - 1.0).abs() { a } else { b }
+        }
+        (Some(a), None) | (None, Some(a)) => a,
+        (None, None) => 1.0,
+    };
+    // How far it can grow, per axis: from its anchor to the edge it grows
+    // toward, or both ways from its middle.
+    let room = |near: bool, far: bool, lo: f32, hi: f32, blo: f32, bhi: f32| -> f32 {
+        if near {
+            hi - blo
+        } else if far {
+            bhi - lo
+        } else {
+            let c = (lo + hi) / 2.0;
+            2.0 * (c - blo).min(bhi - c)
+        }
+    };
+    let most = (room(l, r, start.min.x, start.max.x, bounds.min.x, bounds.max.x) / w).min(room(t, b, start.min.y, start.max.y, bounds.min.y, bounds.max.y) / h);
+    let k = k.max((least.x / w).max(least.y / h)).min(most);
+    let (nw, nh) = (w * k, h * k);
+    let x = if l { start.max.x - nw } else if r { start.min.x } else { start.center().x - nw / 2.0 };
+    let y = if t { start.max.y - nh } else if b { start.min.y } else { start.center().y - nh / 2.0 };
+    Rect::from_min_size(Pos2::new(x, y), vec2(nw, nh))
 }
 
 /// The box inside the frame: shrunk about its centre if it's bigger than the
@@ -520,7 +560,7 @@ impl App {
         if let Some((handle, from, start)) = self.webcam_view.drag {
             if response.dragged() {
                 if let Some(now) = response.interact_pointer_pos() {
-                    let mods = Mods { crop: modifiers.alt, snap: !modifiers.ctrl };
+                    let mods = Mods { crop: modifiers.alt, snap: !modifiers.ctrl, keep: modifiers.shift };
                     let (dx, dy) = ((now.x - from.x) / frame_rect.width(), (now.y - from.y) / frame_rect.height());
                     let moved = drag(start, handle, dx, dy, mods);
                     let aspect = frame_rect.width() / frame_rect.height().max(1.0);
@@ -643,7 +683,8 @@ impl App {
         // down there).
         let hint = match dragging {
             Some(Handle::Move) => "Ctrl: place freely",
-            Some(_) if modifiers.alt => "Cropping · let go of Alt to scale",
+            Some(_) if modifiers.alt && modifiers.shift => "Cropping, keeping the shape",
+            Some(_) if modifiers.alt => "Cropping · Shift keeps the shape",
             Some(_) => "Alt: crop · past the other side: flip",
             None if self.webcam_view.menu => return,
             None => "Drag to move · Alt + handle to crop · right-click to turn or flip",
@@ -665,7 +706,7 @@ mod tests {
         Placement { x, y, w, h, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0 }
     }
 
-    const PLAIN: Mods = Mods { crop: false, snap: false };
+    const PLAIN: Mods = Mods { crop: false, snap: false, keep: false };
 
     fn close(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-4
@@ -763,6 +804,18 @@ mod tests {
     }
 
     #[test]
+    fn crop_keeping_the_shape() {
+        let start = at(0.4, 0.4, 0.2, 0.1);
+        let keep = Mods { crop: true, keep: true, ..PLAIN };
+        // The right edge in: the box keeps 2:1, cropped top and bottom alike.
+        let p = drag(start, Handle::E, -0.05, 0.0, keep);
+        assert!(close(p.w / p.h, 2.0) && close(p.w, 0.15) && close(p.crop[1], p.crop[3]) && p.crop[1] > 0.0, "{p:?}");
+        // A corner: the opposite corner stays put.
+        let p = drag(start, Handle::SE, -0.1, -0.01, keep);
+        assert!(close(p.w / p.h, 2.0) && close(p.x, 0.4) && close(p.y, 0.4) && close(p.w, 0.1), "{p:?}");
+    }
+
+    #[test]
     fn crop_follows_a_flipped_picture() {
         // Mirrored: the visible left side is the camera's right side.
         let start = Placement { flip_h: true, ..at(0.5, 0.5, 0.2, 0.2) };
@@ -788,19 +841,9 @@ pub(crate) struct CameraPanel {
     fps: Option<f32>,
     /// Cropping on the picture: the whole of it shown, its edges dragged.
     cropping: bool,
-    /// The crop's edge (or all of it) being dragged.
-    crop_drag: Option<CropGrip>,
-}
-
-/// What of the crop is being dragged, on the picture as shown.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum CropGrip {
-    Left,
-    Top,
-    Right,
-    Bottom,
-    /// All of it, moved.
-    Move,
+    /// The crop's corner or edge (or all of it) being dragged, the crop as
+    /// shown when it started, and where the pointer was.
+    crop_drag: Option<(Handle, egui::Rect, Pos2)>,
 }
 
 impl CameraPanel {
@@ -1333,53 +1376,54 @@ fn picture_view(ui: &mut egui::Ui, panel: &mut CameraPanel, orient: Orientation,
         p.rect_filled(egui::Rect::from_min_max(egui::pos2(rect.left(), c.top()), egui::pos2(c.left(), c.bottom())), 0.0, dim);
         p.rect_filled(egui::Rect::from_min_max(egui::pos2(c.right(), c.top()), egui::pos2(rect.right(), c.bottom())), 0.0, dim);
         p.rect_stroke(c, 0.0, Stroke::new(1.5, Color32::WHITE), egui::StrokeKind::Inside);
+        // Edge bars, and corner brackets.
         for (a, b) in [(c.left_center(), vec2(4.0, 24.0)), (c.right_center(), vec2(4.0, 24.0)), (c.center_top(), vec2(24.0, 4.0)), (c.center_bottom(), vec2(24.0, 4.0))] {
             p.rect_filled(egui::Rect::from_center_size(a, b), 2.0, Color32::WHITE);
         }
-        // Which edge is near the pointer (else inside: all of it).
-        let grip_at = |at: egui::Pos2| -> Option<CropGrip> {
-            let near = 10.0;
-            let between_y = at.y > c.top() - near && at.y < c.bottom() + near;
-            let between_x = at.x > c.left() - near && at.x < c.right() + near;
-            if between_y && (at.x - c.left()).abs() < near {
-                Some(CropGrip::Left)
-            } else if between_y && (at.x - c.right()).abs() < near {
-                Some(CropGrip::Right)
-            } else if between_x && (at.y - c.top()).abs() < near {
-                Some(CropGrip::Top)
-            } else if between_x && (at.y - c.bottom()).abs() < near {
-                Some(CropGrip::Bottom)
-            } else {
-                c.contains(at).then_some(CropGrip::Move)
-            }
+        let arm = 16.0_f32.min(c.width() / 3.0).min(c.height() / 3.0);
+        for (corner, sx, sy) in [(c.left_top(), 1.0, 1.0), (c.right_top(), -1.0, 1.0), (c.left_bottom(), 1.0, -1.0), (c.right_bottom(), -1.0, -1.0)] {
+            let stroke = Stroke::new(4.0, Color32::WHITE);
+            let inner = corner + vec2(sx * 1.5, sy * 1.5);
+            p.line_segment([inner, inner + vec2(sx * arm, 0.0)], stroke);
+            p.line_segment([inner, inner + vec2(0.0, sy * arm)], stroke);
+        }
+        // What's near the pointer: a corner, else an edge, else (inside) all of it.
+        let grip_at = |at: Pos2| -> Option<Handle> {
+            let near = 12.0;
+            let corner = [Handle::NW, Handle::NE, Handle::SW, Handle::SE].into_iter().find(|h| h.pos(c).distance(at) < near);
+            corner.or_else(|| {
+                let between_y = at.y > c.top() && at.y < c.bottom();
+                let between_x = at.x > c.left() && at.x < c.right();
+                if between_y && (at.x - c.left()).abs() < near {
+                    Some(Handle::W)
+                } else if between_y && (at.x - c.right()).abs() < near {
+                    Some(Handle::E)
+                } else if between_x && (at.y - c.top()).abs() < near {
+                    Some(Handle::N)
+                } else if between_x && (at.y - c.bottom()).abs() < near {
+                    Some(Handle::S)
+                } else {
+                    c.contains(at).then_some(Handle::Move)
+                }
+            })
         };
         let hover = resp.hover_pos().and_then(grip_at);
-        let cursor = |g: CropGrip| match g {
-            CropGrip::Left | CropGrip::Right => egui::CursorIcon::ResizeHorizontal,
-            CropGrip::Top | CropGrip::Bottom => egui::CursorIcon::ResizeVertical,
-            CropGrip::Move => egui::CursorIcon::Grab,
-        };
         if resp.drag_started() {
-            panel.crop_drag = resp.interact_pointer_pos().and_then(grip_at);
+            let origin = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos());
+            panel.crop_drag = origin.and_then(|at| grip_at(at).map(|g| (g, shown, at)));
         }
-        if let Some(g) = panel.crop_drag.or(hover) {
-            ui.ctx().set_cursor_icon(cursor(g));
+        if let Some(g) = panel.crop_drag.map(|(g, _, _)| g).or(hover) {
+            ui.ctx().set_cursor_icon(if g == Handle::Move && panel.crop_drag.is_some() { egui::CursorIcon::Grabbing } else { g.cursor() });
         }
-        if let (Some(g), true) = (panel.crop_drag, resp.dragged()) {
-            let d = resp.drag_delta();
-            let (dx, dy) = (d.x / rect.width(), d.y / rect.height());
-            let mut s = shown;
-            let least = 0.1;
-            match g {
-                CropGrip::Left => s.min.x = (s.min.x + dx).clamp(0.0, s.max.x - least),
-                CropGrip::Right => s.max.x = (s.max.x + dx).clamp(s.min.x + least, 1.0),
-                CropGrip::Top => s.min.y = (s.min.y + dy).clamp(0.0, s.max.y - least),
-                CropGrip::Bottom => s.max.y = (s.max.y + dy).clamp(s.min.y + least, 1.0),
-                CropGrip::Move => {
-                    let (mx, my) = (dx.clamp(-s.min.x, 1.0 - s.max.x), dy.clamp(-s.min.y, 1.0 - s.max.y));
-                    s = s.translate(vec2(mx, my));
-                }
-            }
+        if let (Some((g, start, from)), true, Some(now)) = (panel.crop_drag, resp.dragged(), resp.interact_pointer_pos()) {
+            let d = vec2((now.x - from.x) / rect.width(), (now.y - from.y) / rect.height());
+            let unit = egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+            let s = if g == Handle::Move {
+                start.translate(vec2(d.x.clamp(-start.min.x, 1.0 - start.max.x), d.y.clamp(-start.min.y, 1.0 - start.max.y)))
+            } else {
+                // Shift keeps its shape.
+                resize_within(start, g.sides(), d, ui.input(|i| i.modifiers.shift), unit, vec2(0.1, 0.1))
+            };
             changed = Some(crop_from_shown(orient, s));
         }
         if resp.drag_stopped() {
@@ -1446,7 +1490,7 @@ fn orientation_view(ui: &mut egui::Ui, now: Orientation, reorient: &mut Option<O
                 *reorient = Some(Orientation { flip_v: on, turns: now.seen_turns(), ..now });
             }
         });
-        let tip = "Drag the picture's edges to cut off what you don't want; the rest stays dimmed while you do. The camera's own Zoom crops inside the camera instead, from its sensor, which can be sharper.";
+        let tip = "Drag the picture's edges or corners to cut off what you don't want (hold Shift to keep its shape); the rest stays dimmed while you do. The camera's own Zoom crops inside the camera instead, from its sensor, which can be sharper.";
         l.row(Row::new("Crop").tip("Crop", tip), |ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             let label = if *cropping { "Done" } else { "Crop" };
