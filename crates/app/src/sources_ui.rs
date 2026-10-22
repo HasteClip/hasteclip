@@ -21,7 +21,7 @@ const FADER_MAX_DB: f32 = 12.0;
 /// How long the "limiting" note stays after the limiter last worked.
 const LIMIT_HOLD: Duration = Duration::from_secs(3);
 /// Picture and sound side by side from this page width.
-const TWO_COLUMNS: f32 = 860.0;
+pub(crate) const TWO_COLUMNS: f32 = 860.0;
 
 /// Meters for one source: what it delivers (before volume) and what goes into
 /// the clip (after volume and mute).
@@ -95,6 +95,11 @@ impl App {
         let every = if capture::preview::AVAILABLE { Duration::from_secs_f64(0.5 / self.settings.fps.max(1) as f64) } else { Duration::from_millis(16) };
         crate::ui_kit::repaint_after(ui.ctx(), every);
 
+        // Adjusting the camera: its own page, in Sources' place.
+        if self.camera_panel.is_some() {
+            self.camera_page(ui);
+            return;
+        }
         self.page_head(ui, "Sources", |_, _| {});
         crate::ui_kit::arrive(ui, |ui| crate::ui_kit::scroll(ui, "sources_page", |ui| {
             // The headings' tops level with the other pages' first heading
@@ -113,12 +118,7 @@ impl App {
                     });
                     ui.allocate_ui_with_layout(egui::vec2(col, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
                         ui.set_width(col);
-                        // The camera's settings take the Sound column's place while open.
-                        if self.camera_panel.is_some() {
-                            self.camera_panel(ui);
-                        } else {
-                            self.sound_column(ui, now, dt);
-                        }
+                        self.sound_column(ui, now, dt);
                     });
                 });
             } else {
@@ -126,11 +126,6 @@ impl App {
                     ui.set_width(w);
                     if capture::preview::AVAILABLE {
                         self.picture_column(ui);
-                        ui.add_space(24.0);
-                    }
-                    // One column: the camera's settings under the webcam, then Sound.
-                    if self.camera_panel.is_some() {
-                        self.camera_panel(ui);
                         ui.add_space(24.0);
                     }
                     self.sound_column(ui, now, dt);

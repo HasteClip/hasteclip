@@ -655,12 +655,10 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// Camera panel (Linux)
+// Camera page (Linux)
 // ---------------------------------------------------------------------------
 
-/// The camera's settings, in place of the Sound column while open: its own
-/// picture, big and live, then its controls in groups, each automatic mode
-/// with its manual setting shown only while it's off.
+/// The Camera page's state: the camera's settings as last read, and its picture.
 pub(crate) struct CameraPanel {
     device: String,
     controls: Vec<CameraControl>,
@@ -707,12 +705,12 @@ enum PanelRow<'a> {
     Control { label: String, control: &'a CameraControl },
 }
 
-/// The heading of the settings shown only when asked for.
-const MORE: &str = "More settings";
+/// The heading of the camera's own settings, not named here.
+const OTHER: &str = "Other";
 
-/// The camera's controls in groups (heading, rows): the everyday ones named
-/// for people, each automatic mode with the setting it takes over; the rest
-/// (rarely changed, or the camera's own) under More settings.
+/// The camera's controls in groups (heading, rows), all shown: named for
+/// people, each automatic mode with the setting it takes over, and the
+/// camera's own under Other.
 fn panel_groups(controls: &[CameraControl]) -> Vec<(&'static str, Vec<PanelRow<'_>>)> {
     use v4l2::*;
     let find = |id: u32| controls.iter().find(|c| c.id == id);
@@ -722,22 +720,31 @@ fn panel_groups(controls: &[CameraControl]) -> Vec<(&'static str, Vec<PanelRow<'
         find(auto).map(|a| PanelRow::Auto { label, auto: a, manual: find(manual).map(|m| (manual_label, m)) }).or_else(|| named(manual, manual_label))
     };
     let groups: Vec<(&'static str, Vec<Option<PanelRow>>)> = vec![
-        ("Image", vec![named(BRIGHTNESS, "Brightness"), named(CONTRAST, "Contrast"), named(SATURATION, "Saturation"), named(SHARPNESS, "Sharpness")]),
-        ("Exposure", vec![auto(AUTO_EXPOSURE, "Automatic exposure", EXPOSURE, "Exposure time")]),
+        (
+            "Image",
+            vec![named(BRIGHTNESS, "Brightness"), named(CONTRAST, "Contrast"), named(SATURATION, "Saturation"), named(SHARPNESS, "Sharpness"), named(HUE, "Hue"), named(GAMMA, "Gamma")],
+        ),
+        (
+            "Exposure",
+            vec![
+                auto(AUTO_EXPOSURE, "Automatic exposure", EXPOSURE, "Exposure time"),
+                named(GAIN, "Gain"),
+                named(BACKLIGHT, "Backlight compensation"),
+                named(EXPOSURE_DYNAMIC_FPS, "Lower frame rate in the dark"),
+                named(POWER_LINE, "Flicker (mains frequency)"),
+            ],
+        ),
         ("White balance", vec![auto(AUTO_WHITE_BALANCE, "Automatic white balance", WHITE_BALANCE, "Temperature")]),
         ("Focus", vec![auto(AUTO_FOCUS, "Autofocus", FOCUS, "Focus distance")]),
         ("Zoom and framing", vec![named(ZOOM, "Zoom"), named(PAN, "Pan"), named(TILT, "Tilt")]),
-        (
-            MORE,
-            vec![named(GAIN, "Gain"), named(BACKLIGHT, "Backlight compensation"), named(EXPOSURE_DYNAMIC_FPS, "Lower frame rate in the dark"), named(POWER_LINE, "Flicker (mains frequency)"), named(HUE, "Hue"), named(GAMMA, "Gamma")],
-        ),
+        (OTHER, Vec::new()),
     ];
     let known = [BRIGHTNESS, CONTRAST, SATURATION, HUE, AUTO_WHITE_BALANCE, GAMMA, GAIN, POWER_LINE, WHITE_BALANCE, SHARPNESS, BACKLIGHT, AUTO_EXPOSURE, EXPOSURE, EXPOSURE_DYNAMIC_FPS, PAN, TILT, FOCUS, AUTO_FOCUS, ZOOM];
     let own = controls.iter().filter(|c| !known.contains(&c.id)).map(|c| Some(PanelRow::Control { label: c.name.clone(), control: c }));
     groups
         .into_iter()
         .map(|(h, mut rows)| {
-            if h == MORE {
+            if h == OTHER {
                 rows.extend(own.clone());
             }
             (h, rows.into_iter().flatten().collect::<Vec<_>>())
@@ -816,8 +823,9 @@ fn auto_value(c: &CameraControl, on: bool) -> i64 {
 }
 
 impl App {
-    /// The camera panel: its picture, its settings in groups, Back and Reset.
-    pub(crate) fn camera_panel(&mut self, ui: &mut egui::Ui) {
+    /// The Camera page, in Sources' place while it's open: the camera's own
+    /// picture, held still, beside (or above) its settings, which scroll.
+    pub(crate) fn camera_page(&mut self, ui: &mut egui::Ui) {
         use crate::theme::{self, W};
         use crate::ui_kit::Btn;
         // Another camera picked: its settings; none: closed.
@@ -826,99 +834,54 @@ impl App {
             (None, _) => self.camera_panel = None,
             _ => {}
         }
-        let Some(panel) = self.camera_panel.as_mut() else { return };
+        if self.camera_panel.is_none() {
+            return;
+        }
         let pal = theme::pal(ui);
-        // Back to Sound: the arrow, Done, or Esc.
+        // Back to Sources: the breadcrumb, Done, or Esc.
         let mut back = ui.input(|i| i.key_pressed(egui::Key::Escape)) && !ui.ctx().any_popup_open();
-        ui.horizontal(|ui| {
-            ui.set_min_height(30.0);
-            if Btn::icon(crate::ui_kit::Kind::Ghost, egui_phosphor::regular::CARET_LEFT).small().tip("Back to Sound  (Esc)").show(ui).clicked() {
+        self.page_head(ui, "", |_, ui| {
+            let crumb = ui.add(egui::Label::new(theme::text("Sources", 20.0, W::Semibold).color(pal.text3)).sense(egui::Sense::click()));
+            if crumb.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Back to Sources  (Esc)").clicked() {
                 back = true;
             }
-            ui.label(theme::text("Camera", 15.0, W::Semibold).color(pal.text));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if Btn::primary("Done").small().tip("Back to Sound  (Esc)").show(ui).clicked() {
-                    back = true;
-                }
-            });
+            ui.label(theme::ic(egui_phosphor::regular::CARET_RIGHT, 16.0).color(pal.text3));
+            ui.label(theme::text("Camera", 20.0, W::Semibold).color(pal.text));
+            ui.add_space(8.0);
+            if Btn::primary("Done").small().tip("Back to Sources  (Esc)").show(ui).clicked() {
+                back = true;
+            }
         });
-        ui.add_space(4.0);
-        // Its own picture, big and live.
-        let w = ui.available_width();
-        if let Some(p) = capture::webcam::camera_picture((w * ui.ctx().pixels_per_point()) as u32, panel.seq) {
-            let image = egui::ColorImage::from_rgba_unmultiplied([p.width as usize, p.height as usize], &p.rgba);
-            match &mut panel.picture {
-                Some(t) if t.size() == [p.width as usize, p.height as usize] => t.set(image, egui::TextureOptions::LINEAR),
-                t => *t = Some(ui.ctx().load_texture("camera panel", image, egui::TextureOptions::LINEAR)),
-            }
-            panel.seq = p.seq;
-        }
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
-        let aspect = panel.picture.as_ref().map_or(16.0 / 9.0, |t| t.size()[0] as f32 / t.size()[1].max(1) as f32);
-        let (rect, _) = ui.allocate_exact_size(vec2(w, w / aspect), egui::Sense::hover());
-        match &panel.picture {
-            Some(t) => {
-                egui::Image::from_texture((t.id(), rect.size())).corner_radius(crate::ui_kit::RADIUS).paint_at(ui, rect);
-            }
-            None => {
-                ui.painter().rect_filled(rect, crate::ui_kit::RADIUS, pal.control);
-                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "Waiting for the camera…", egui::FontId::proportional(13.0), pal.text3);
-            }
-        }
-        crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
-
+        let name = self.settings.webcam.as_ref().map(|w| w.name.clone()).unwrap_or_default();
+        let Some(panel) = self.camera_panel.as_mut() else { return };
         let mut set: Vec<(u32, i64)> = Vec::new();
         let mut reset = false;
-        if panel.controls.is_empty() {
-            ui.label(theme::text("This camera has no settings to change, or they couldn't be read.", 13.0, W::Regular).color(pal.text3));
-        }
-        let more_id = ui.id().with("camera_more");
-        let mut more_open = ui.data(|d| d.get_temp::<bool>(more_id)).unwrap_or(false);
-        for (n, (heading, rows)) in panel_groups(&panel.controls).into_iter().enumerate() {
-            let more = heading == MORE;
-            crate::ui_kit::section_head(ui, heading, n == 0, |ui| {
-                if more && Btn::ghost(if more_open { "Hide" } else { "Show" }).small().show(ui).clicked() {
-                    more_open = !more_open;
-                }
-            });
-            if more && !more_open {
-                continue;
-            }
-            crate::ui_kit::list(ui, ("camera", heading), |l| {
-                for r in &rows {
-                    match r {
-                        PanelRow::Control { label, control } => {
-                            l.row(crate::ui_kit::Row::new(label), |ui| control_widget(ui, control, &mut set));
-                        }
-                        PanelRow::Auto { label, auto, manual } => {
-                            let on = auto_on(auto);
-                            l.row(crate::ui_kit::Row::new(label), |ui| {
-                                let mut v = on;
-                                if crate::ui_kit::switch(ui, &mut v).changed() {
-                                    set.push((auto.id, auto_value(auto, v)));
-                                }
-                            });
-                            // The setting it takes over, while it's off.
-                            if let Some((label, m)) = manual {
-                                l.well(("camera_manual", auto.id), !on, |l| {
-                                    l.row(crate::ui_kit::Row::new(label).kid(), |ui| control_widget(ui, m, &mut set));
-                                });
-                            }
-                        }
-                    }
-                }
-            });
-        }
-        ui.data_mut(|d| d.insert_temp(more_id, more_open));
-        if !panel.controls.is_empty() {
-            crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
-            ui.horizontal(|ui| {
-                ui.label(theme::text("Kept for this camera, and put back each time it's opened.", 12.0, W::Regular).color(pal.text3));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if Btn::ghost("Reset to defaults").small().tip("Back to the camera's own defaults").show(ui).clicked() {
-                        reset = true;
-                    }
+        ui.add_space(4.0);
+        let w = ui.available_width();
+        let h = ui.available_height();
+        if w >= crate::sources_ui::TWO_COLUMNS {
+            let col = (w - 28.0) / 2.0;
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 28.0;
+                ui.allocate_ui_with_layout(vec2(col, h), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.set_width(col);
+                    ui.add_space(4.0);
+                    picture_side(ui, panel, &name, h * 0.7, &mut reset);
                 });
+                ui.allocate_ui_with_layout(vec2(col, h), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.set_width(col);
+                    crate::ui_kit::scroll(ui, "camera_controls", |ui| {
+                        controls_view(ui, panel, &mut set);
+                        ui.add_space(28.0);
+                    });
+                });
+            });
+        } else {
+            picture_side(ui, panel, &name, h * 0.4, &mut reset);
+            crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
+            crate::ui_kit::scroll(ui, "camera_controls", |ui| {
+                controls_view(ui, panel, &mut set);
+                ui.add_space(28.0);
             });
         }
 
@@ -958,6 +921,94 @@ impl App {
     }
 }
 
+/// The Camera page's still side: the picture, which camera it is and in what
+/// size, and resetting its settings.
+fn picture_side(ui: &mut egui::Ui, panel: &mut CameraPanel, name: &str, max_h: f32, reset: &mut bool) {
+    use crate::theme::{self, W};
+    let pal = theme::pal(ui);
+    picture_view(ui, panel, max_h);
+    crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
+    let status = match capture::webcam::status() {
+        capture::webcam::Status::Live { width, height } => format!("{name} · {width}×{height}"),
+        _ => name.to_owned(),
+    };
+    ui.horizontal(|ui| {
+        ui.label(theme::text(&status, 13.0, W::Regular).color(pal.text2));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if !panel.controls.is_empty() && crate::ui_kit::Btn::ghost("Reset to defaults").small().tip("Back to the camera's own defaults").show(ui).clicked() {
+                *reset = true;
+            }
+        });
+    });
+    ui.add(egui::Label::new(theme::text("Changes apply right away, in every app, and are put back each time HasteClip opens this camera.", 12.0, W::Regular).color(pal.text3)).wrap());
+}
+
+/// The camera's own picture, live, as wide as there's room for and at most
+/// `max_h` tall.
+fn picture_view(ui: &mut egui::Ui, panel: &mut CameraPanel, max_h: f32) {
+    let pal = crate::theme::pal(ui);
+    let w = ui.available_width();
+    if let Some(p) = capture::webcam::camera_picture((w * ui.ctx().pixels_per_point()) as u32, panel.seq) {
+        let image = egui::ColorImage::from_rgba_unmultiplied([p.width as usize, p.height as usize], &p.rgba);
+        match &mut panel.picture {
+            Some(t) if t.size() == [p.width as usize, p.height as usize] => t.set(image, egui::TextureOptions::LINEAR),
+            t => *t = Some(ui.ctx().load_texture("camera page", image, egui::TextureOptions::LINEAR)),
+        }
+        panel.seq = p.seq;
+    }
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+    let aspect = panel.picture.as_ref().map_or(16.0 / 9.0, |t| t.size()[0] as f32 / t.size()[1].max(1) as f32);
+    let pw = w.min(max_h.max(120.0) * aspect);
+    ui.vertical_centered(|ui| {
+        let (rect, _) = ui.allocate_exact_size(vec2(pw, pw / aspect), egui::Sense::hover());
+        match &panel.picture {
+            Some(t) => {
+                egui::Image::from_texture((t.id(), rect.size())).corner_radius(crate::ui_kit::RADIUS).paint_at(ui, rect);
+            }
+            None => {
+                ui.painter().rect_filled(rect, crate::ui_kit::RADIUS, pal.control);
+                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "Waiting for the camera…", egui::FontId::proportional(13.0), pal.text3);
+            }
+        }
+    });
+}
+
+/// The camera's settings in groups, each a card of rows. What's changed goes in `set`.
+fn controls_view(ui: &mut egui::Ui, panel: &CameraPanel, set: &mut Vec<(u32, i64)>) {
+    use crate::theme::{self, W};
+    let pal = theme::pal(ui);
+    if panel.controls.is_empty() {
+        ui.label(theme::text("This camera has no settings to change, or they couldn't be read.", 13.0, W::Regular).color(pal.text3));
+    }
+    for (n, (heading, rows)) in panel_groups(&panel.controls).into_iter().enumerate() {
+        crate::ui_kit::section_head(ui, heading, n == 0, |_| {});
+        crate::ui_kit::list(ui, ("camera", heading), |l| {
+            for r in &rows {
+                match r {
+                    PanelRow::Control { label, control } => {
+                        l.row(crate::ui_kit::Row::new(label), |ui| control_widget(ui, control, set));
+                    }
+                    PanelRow::Auto { label, auto, manual } => {
+                        let on = auto_on(auto);
+                        l.row(crate::ui_kit::Row::new(label), |ui| {
+                            let mut v = on;
+                            if crate::ui_kit::switch(ui, &mut v).changed() {
+                                set.push((auto.id, auto_value(auto, v)));
+                            }
+                        });
+                        // The setting it takes over, while it's off.
+                        if let Some((label, m)) = manual {
+                            l.well(("camera_manual", auto.id), !on, |l| {
+                                l.row(crate::ui_kit::Row::new(label).kid(), |ui| control_widget(ui, m, set));
+                            });
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod panel_tests {
     use super::*;
@@ -984,11 +1035,11 @@ mod panel_tests {
         ];
         let groups = panel_groups(&controls);
         let headings: Vec<_> = groups.iter().map(|(h, _)| *h).collect();
-        assert_eq!(headings, ["Image", "Exposure", "White balance", MORE]);
-        assert!(matches!(groups[1].1[0], PanelRow::Auto { label: "Automatic exposure", manual: Some(("Exposure time", _)), .. }));
-        let more = &groups[3].1;
-        assert!(matches!(&more[0], PanelRow::Control { label, .. } if label == "Flicker (mains frequency)"));
-        assert!(matches!(&more[1], PanelRow::Control { label, .. } if label == "Something New"));
+        assert_eq!(headings, ["Image", "Exposure", "White balance", OTHER]);
+        let exposure = &groups[1].1;
+        assert!(matches!(exposure[0], PanelRow::Auto { label: "Automatic exposure", manual: Some(("Exposure time", _)), .. }));
+        assert!(matches!(&exposure[1], PanelRow::Control { label, .. } if label == "Flicker (mains frequency)"));
+        assert!(matches!(&groups[3].1[0], PanelRow::Control { label, .. } if label == "Something New"));
         // Aperture priority is automatic; turning it off picks manual, on picks the default.
         let ae = &controls[4];
         assert!(auto_on(ae));
