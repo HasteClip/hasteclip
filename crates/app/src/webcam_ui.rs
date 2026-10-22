@@ -1104,7 +1104,7 @@ fn format_view(ui: &mut egui::Ui, device: &str, current: Option<capture::webcam:
         l.row(Row::new("Resolution"), |ui| {
             let label = current.map_or_else(|| "Automatic".to_owned(), |f| size_label(f.width, f.height));
             let r = crate::ui_kit::select(ui, &label, 150.0);
-            crate::ui_kit::menu_popup(&r, false, 220.0, |ui| {
+            crate::ui_kit::menu_popup(&r, false, 250.0, |ui| {
                 egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                     if Item::new("Automatic").check(current.is_none()).tip("The sharpest picture up to 1080p at 30 fps or more").show(ui).clicked() {
                         *pick = Some(None);
@@ -1114,7 +1114,9 @@ fn format_view(ui: &mut egui::Ui, device: &str, current: Option<capture::webcam:
                     }
                     for (w, h) in sizes(&formats) {
                         let on = current.is_some_and(|f| (f.width, f.height) == (w, h));
-                        if Item::new(size_label(w, h)).check(on).show(ui).clicked() && !on {
+                        // How fast it goes at most: some sizes only come slowly.
+                        let fastest = formats.iter().filter(|f| (f.width, f.height) == (w, h)).map(|f| f.fps()).fold(0.0, f32::max);
+                        if Item::new(size_label(w, h)).value(format!("up to {}", fps_label(fastest))).check(on).show(ui).clicked() && !on {
                             *pick = Some(rate_for(&formats, (w, h), current));
                         }
                     }
