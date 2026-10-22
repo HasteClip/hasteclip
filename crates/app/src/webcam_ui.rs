@@ -891,8 +891,8 @@ fn exposure_step(value: i64, up: bool, step: i64, min: i64, max: i64) -> i64 {
 }
 
 /// Arrow keys on a camera slider: clicking or dragging it gives it the keys,
-/// then ← and → (or ↓ and ↑) step it, ten at a time with Shift. How many
-/// steps, if any were pressed.
+/// then ← and → step it, ten at a time with Shift (↑ and ↓ move between the
+/// page's controls, as egui has them). How many steps, if any were pressed.
 fn arrow_steps(ui: &egui::Ui, slider: &egui::Response) -> Option<i64> {
     if slider.clicked() || slider.drag_started() {
         slider.request_focus();
@@ -905,7 +905,7 @@ fn arrow_steps(ui: &egui::Ui, slider: &egui::Response) -> Option<i64> {
         let shift = i.modifiers.shift;
         let by = if shift { 10 } else { 1 };
         let mods = if shift { egui::Modifiers::SHIFT } else { egui::Modifiers::NONE };
-        for (key, sign) in [(egui::Key::ArrowLeft, -1), (egui::Key::ArrowDown, -1), (egui::Key::ArrowRight, 1), (egui::Key::ArrowUp, 1)] {
+        for (key, sign) in [(egui::Key::ArrowLeft, -1), (egui::Key::ArrowRight, 1)] {
             while i.consume_key(mods, key) {
                 d += sign * by;
             }
@@ -1134,7 +1134,7 @@ fn controls_view(ui: &mut egui::Ui, panel: &CameraPanel, fps: Option<f32>, set: 
                                     let tip = fps.map(|fps| {
                                         let (half, whole) = exposure_guides(fps);
                                         format!(
-                                            "How long each picture takes in light. Film's rule of thumb is half a frame, a 180° shutter: {:.1} ms at {fps:.0} fps, for motion blur that looks natural. About a whole frame ({:.1} ms) or longer, a camera can't keep its frame rate; where exactly is the camera's own, as is how much light it wants (watch the pictures a second under the picture). Under lamps, step it with − and + (or the arrow keys) to where no bands roll through the picture.",
+                                            "How long each picture takes in light. Film's rule of thumb is half a frame, a 180° shutter: {:.1} ms at {fps:.0} fps, for motion blur that looks natural. About a whole frame ({:.1} ms) or longer, a camera can't keep its frame rate; where exactly is the camera's own, as is how much light it wants (watch the pictures a second under the picture). Under lamps, step it with − and + (or ← and →) to where no bands roll through the picture.",
                                             half as f64 / 10.0,
                                             whole as f64 / 10.0
                                         )
