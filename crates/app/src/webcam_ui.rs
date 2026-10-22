@@ -707,36 +707,89 @@ enum PanelRow<'a> {
     Control { label: String, control: &'a CameraControl },
 }
 
-/// The camera's controls in groups (heading, rows), the known ones named
-/// for people, the rest under More.
+/// The heading of the settings shown only when asked for.
+const MORE: &str = "More settings";
+
+/// The camera's controls in groups (heading, rows): the everyday ones named
+/// for people, each automatic mode with the setting it takes over; the rest
+/// (rarely changed, or the camera's own) under More settings.
 fn panel_groups(controls: &[CameraControl]) -> Vec<(&'static str, Vec<PanelRow<'_>>)> {
     use v4l2::*;
     let find = |id: u32| controls.iter().find(|c| c.id == id);
     let named = |id: u32, label: &str| find(id).map(|control| PanelRow::Control { label: label.to_owned(), control });
     let auto = |auto: u32, label: &'static str, manual: u32, manual_label: &'static str| {
-        find(auto).map(|a| PanelRow::Auto { label, auto: a, manual: find(manual).map(|m| (manual_label, m)) })
+        // No automatic mode: the manual setting stands alone.
+        find(auto).map(|a| PanelRow::Auto { label, auto: a, manual: find(manual).map(|m| (manual_label, m)) }).or_else(|| named(manual, manual_label))
     };
-    let image = [(BRIGHTNESS, "Brightness"), (CONTRAST, "Contrast"), (SATURATION, "Saturation"), (HUE, "Hue"), (GAMMA, "Gamma"), (SHARPNESS, "Sharpness")];
     let groups: Vec<(&'static str, Vec<Option<PanelRow>>)> = vec![
-        ("Image", image.iter().map(|(id, l)| named(*id, l)).collect()),
-        (
-            "Exposure",
-            vec![
-                // No automatic mode: the manual setting stands alone.
-                auto(AUTO_EXPOSURE, "Automatic", EXPOSURE, "Exposure time").or_else(|| named(EXPOSURE, "Exposure time")),
-                named(GAIN, "Gain"),
-                named(BACKLIGHT, "Backlight compensation"),
-                named(EXPOSURE_DYNAMIC_FPS, "Lower frame rate in the dark"),
-                named(POWER_LINE, "Flicker (mains frequency)"),
-            ],
-        ),
-        ("White balance", vec![auto(AUTO_WHITE_BALANCE, "Automatic", WHITE_BALANCE, "Temperature").or_else(|| named(WHITE_BALANCE, "Temperature"))]),
-        ("Focus", vec![auto(AUTO_FOCUS, "Automatic", FOCUS, "Distance").or_else(|| named(FOCUS, "Distance"))]),
+        ("Image", vec![named(BRIGHTNESS, "Brightness"), named(CONTRAST, "Contrast"), named(SATURATION, "Saturation"), named(SHARPNESS, "Sharpness")]),
+        ("Exposure", vec![auto(AUTO_EXPOSURE, "Automatic exposure", EXPOSURE, "Exposure time")]),
+        ("White balance", vec![auto(AUTO_WHITE_BALANCE, "Automatic white balance", WHITE_BALANCE, "Temperature")]),
+        ("Focus", vec![auto(AUTO_FOCUS, "Autofocus", FOCUS, "Focus distance")]),
         ("Zoom and framing", vec![named(ZOOM, "Zoom"), named(PAN, "Pan"), named(TILT, "Tilt")]),
+        (
+            MORE,
+            vec![named(GAIN, "Gain"), named(BACKLIGHT, "Backlight compensation"), named(EXPOSURE_DYNAMIC_FPS, "Lower frame rate in the dark"), named(POWER_LINE, "Flicker (mains frequency)"), named(HUE, "Hue"), named(GAMMA, "Gamma")],
+        ),
     ];
     let known = [BRIGHTNESS, CONTRAST, SATURATION, HUE, AUTO_WHITE_BALANCE, GAMMA, GAIN, POWER_LINE, WHITE_BALANCE, SHARPNESS, BACKLIGHT, AUTO_EXPOSURE, EXPOSURE, EXPOSURE_DYNAMIC_FPS, PAN, TILT, FOCUS, AUTO_FOCUS, ZOOM];
-    let more: Vec<Option<PanelRow>> = controls.iter().filter(|c| !known.contains(&c.id)).map(|c| Some(PanelRow::Control { label: c.name.clone(), control: c })).collect();
-    groups.into_iter().chain([("More", more)]).map(|(h, rows)| (h, rows.into_iter().flatten().collect::<Vec<_>>())).filter(|(_, rows)| !rows.is_empty()).collect()
+    let own = controls.iter().filter(|c| !known.contains(&c.id)).map(|c| Some(PanelRow::Control { label: c.name.clone(), control: c }));
+    groups
+        .into_iter()
+        .map(|(h, mut rows)| {
+            if h == MORE {
+                rows.extend(own.clone());
+            }
+            (h, rows.into_iter().flatten().collect::<Vec<_>>())
+        })
+        .filter(|(_, rows)| !rows.is_empty())
+        .collect()
+}
+
+/// A control's widget, the same width for each kind so they line up: a
+/// slider with its value, a switch (also for a slider that's only 0 or 1),
+/// or a menu. What's changed goes in `set`.
+fn control_widget(ui: &mut egui::Ui, c: &CameraControl, set: &mut Vec<(u32, i64)>) {
+    use crate::theme::{self, W};
+    let pal = theme::pal(ui);
+    match &c.kind {
+        ControlKind::Bool | ControlKind::Int { min: 0, max: 1, .. } => {
+            let mut on = c.value != 0;
+            if crate::ui_kit::switch(ui, &mut on).changed() {
+                set.push((c.id, i64::from(on)));
+            }
+        }
+        ControlKind::Int { min, max, step } => {
+            // Right to left: the value, then the slider.
+            let shown = if c.id == v4l2::WHITE_BALANCE { format!("{} K", c.value) } else { c.value.to_string() };
+            ui.add_sized([46.0, 20.0], egui::Label::new(theme::text(&shown, 12.5, W::Regular).color(pal.text3)));
+            let span = (max - min).max(1) as f32;
+            let mut v = (c.value - min) as f32 / span;
+            let slider = crate::transport::slider(ui, &mut v, 150.0);
+            if slider.changed() {
+                let raw = *min as f32 + v * span;
+                let stepped = (min + ((raw - *min as f32) / *step as f32).round() as i64 * step).clamp(*min, *max);
+                if stepped != c.value {
+                    set.push((c.id, stepped));
+                }
+            }
+            if slider.double_clicked() {
+                set.push((c.id, c.default));
+            }
+            slider.on_hover_text("Double-click for the camera's default");
+        }
+        ControlKind::Menu(items) => {
+            let current = items.iter().find(|(v, _)| *v == c.value).map_or_else(|| c.value.to_string(), |(_, n)| n.clone());
+            let r = crate::ui_kit::select(ui, &current, 150.0);
+            crate::ui_kit::menu_popup(&r, false, 200.0, |ui| {
+                for (v, name) in items {
+                    if crate::ui_kit::Item::new(name.clone()).check(*v == c.value).show(ui).clicked() {
+                        set.push((c.id, *v));
+                    }
+                }
+            });
+        }
+    }
 }
 
 /// Whether an automatic mode is on, and the value that turns it on or off.
@@ -819,74 +872,44 @@ impl App {
         if panel.controls.is_empty() {
             ui.label(theme::text("This camera has no settings to change, or they couldn't be read.", 13.0, W::Regular).color(pal.text3));
         }
-        let row = |ui: &mut egui::Ui, label: &str, indent: bool, add: &mut dyn FnMut(&mut egui::Ui)| {
-            ui.horizontal(|ui| {
-                ui.set_min_height(30.0);
-                if indent {
-                    ui.add_space(14.0);
+        let more_id = ui.id().with("camera_more");
+        let mut more_open = ui.data(|d| d.get_temp::<bool>(more_id)).unwrap_or(false);
+        for (n, (heading, rows)) in panel_groups(&panel.controls).into_iter().enumerate() {
+            let more = heading == MORE;
+            crate::ui_kit::section_head(ui, heading, n == 0, |ui| {
+                if more && Btn::ghost(if more_open { "Hide" } else { "Show" }).small().show(ui).clicked() {
+                    more_open = !more_open;
                 }
-                ui.label(theme::text(label, 13.0, W::Regular).color(pal.text2));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| add(ui));
             });
-        };
-        let control = |ui: &mut egui::Ui, c: &CameraControl, set: &mut Vec<(u32, i64)>| match &c.kind {
-            ControlKind::Bool => {
-                let mut on = c.value != 0;
-                if crate::ui_kit::switch(ui, &mut on).changed() {
-                    set.push((c.id, i64::from(on)));
-                }
+            if more && !more_open {
+                continue;
             }
-            ControlKind::Int { min, max, step } => {
-                let shown = if c.id == v4l2::WHITE_BALANCE { format!("{} K", c.value) } else { c.value.to_string() };
-                ui.add_sized([44.0, 18.0], egui::Label::new(theme::text(&shown, 12.5, W::Regular).color(pal.text3)));
-                let span = (max - min).max(1) as f32;
-                let mut v = (c.value - min) as f32 / span;
-                let slider = crate::transport::slider(ui, &mut v, (ui.available_width() - 150.0).clamp(90.0, 220.0));
-                if slider.changed() {
-                    let raw = *min as f32 + v * span;
-                    let stepped = (min + ((raw - *min as f32) / *step as f32).round() as i64 * step).clamp(*min, *max);
-                    if stepped != c.value {
-                        set.push((c.id, stepped));
-                    }
-                }
-                if slider.double_clicked() {
-                    set.push((c.id, c.default));
-                }
-                slider.on_hover_text("Double-click for the camera's default");
-            }
-            ControlKind::Menu(items) => {
-                let current = items.iter().find(|(v, _)| *v == c.value).map_or_else(|| c.value.to_string(), |(_, n)| n.clone());
-                let r = crate::ui_kit::select(ui, &current, 150.0);
-                crate::ui_kit::menu_popup(&r, false, 200.0, |ui| {
-                    for (v, name) in items {
-                        if crate::ui_kit::Item::new(name.clone()).check(*v == c.value).show(ui).clicked() {
-                            set.push((c.id, *v));
+            crate::ui_kit::list(ui, ("camera", heading), |l| {
+                for r in &rows {
+                    match r {
+                        PanelRow::Control { label, control } => {
+                            l.row(crate::ui_kit::Row::new(label), |ui| control_widget(ui, control, &mut set));
                         }
-                    }
-                });
-            }
-        };
-        for (heading, rows) in panel_groups(&panel.controls) {
-            ui.add_space(6.0);
-            ui.label(theme::text(heading, 12.0, W::Semibold).color(pal.text3));
-            for r in rows {
-                match r {
-                    PanelRow::Control { label, control: c } => row(ui, &label, false, &mut |ui| control(ui, c, &mut set)),
-                    PanelRow::Auto { label, auto, manual } => {
-                        let on = auto_on(auto);
-                        row(ui, label, false, &mut |ui| {
-                            let mut v = on;
-                            if crate::ui_kit::switch(ui, &mut v).changed() {
-                                set.push((auto.id, auto_value(auto, v)));
+                        PanelRow::Auto { label, auto, manual } => {
+                            let on = auto_on(auto);
+                            l.row(crate::ui_kit::Row::new(label), |ui| {
+                                let mut v = on;
+                                if crate::ui_kit::switch(ui, &mut v).changed() {
+                                    set.push((auto.id, auto_value(auto, v)));
+                                }
+                            });
+                            // The setting it takes over, while it's off.
+                            if let Some((label, m)) = manual {
+                                l.well(("camera_manual", auto.id), !on, |l| {
+                                    l.row(crate::ui_kit::Row::new(label).kid(), |ui| control_widget(ui, m, &mut set));
+                                });
                             }
-                        });
-                        if let Some((label, m)) = manual.filter(|_| !on) {
-                            row(ui, label, true, &mut |ui| control(ui, m, &mut set));
                         }
                     }
                 }
-            }
+            });
         }
+        ui.data_mut(|d| d.insert_temp(more_id, more_open));
         if !panel.controls.is_empty() {
             crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
             ui.horizontal(|ui| {
@@ -961,11 +984,11 @@ mod panel_tests {
         ];
         let groups = panel_groups(&controls);
         let headings: Vec<_> = groups.iter().map(|(h, _)| *h).collect();
-        assert_eq!(headings, ["Image", "Exposure", "White balance", "More"]);
-        let exposure = &groups[1].1;
-        assert!(matches!(exposure[0], PanelRow::Auto { label: "Automatic", manual: Some(("Exposure time", _)), .. }));
-        assert!(matches!(&exposure[1], PanelRow::Control { label, .. } if label == "Flicker (mains frequency)"));
-        assert!(matches!(&groups[3].1[0], PanelRow::Control { label, .. } if label == "Something New"));
+        assert_eq!(headings, ["Image", "Exposure", "White balance", MORE]);
+        assert!(matches!(groups[1].1[0], PanelRow::Auto { label: "Automatic exposure", manual: Some(("Exposure time", _)), .. }));
+        let more = &groups[3].1;
+        assert!(matches!(&more[0], PanelRow::Control { label, .. } if label == "Flicker (mains frequency)"));
+        assert!(matches!(&more[1], PanelRow::Control { label, .. } if label == "Something New"));
         // Aperture priority is automatic; turning it off picks manual, on picks the default.
         let ae = &controls[4];
         assert!(auto_on(ae));

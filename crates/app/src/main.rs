@@ -1206,6 +1206,18 @@ impl eframe::App for App {
             eprintln!("dev: quitting");
             self.quit(ctx);
         }
+        // `HASTECLIP_DEV_CAMERA_PANEL`: open on Sources with the camera panel
+        // (to look at it without clicking there).
+        static CAMERA_PANEL: std::sync::Once = std::sync::Once::new();
+        if std::env::var_os("HASTECLIP_DEV_CAMERA_PANEL").is_some()
+            && let Some(w) = &self.settings.webcam
+        {
+            let id = w.id.clone();
+            CAMERA_PANEL.call_once(|| {
+                self.page = Page::Sources;
+                self.camera_panel = Some(crate::webcam_ui::CameraPanel::open(&id));
+            });
+        }
         // `HASTECLIP_DEV_PAGES=<secs>`: go round Clips, Sources and Settings,
         // one every so many seconds (with `HASTECLIP_DEV_LAPS` to time it).
         if let Some(every) = std::env::var("HASTECLIP_DEV_PAGES").ok().and_then(|s| s.parse::<f64>().ok()) {
