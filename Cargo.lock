@@ -2457,6 +2457,8 @@ dependencies = [
  "ureq",
  "uuid 1.27.0",
  "velopack",
+ "wayland-backend",
+ "wayland-client",
  "windows 0.62.2",
  "windows-collections",
  "windows-core 0.62.2",

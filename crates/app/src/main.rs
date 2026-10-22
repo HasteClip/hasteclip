@@ -46,6 +46,8 @@ mod settings;
 mod settings_ui;
 mod share;
 mod transport;
+#[cfg(target_os = "linux")]
+mod wayland_drag;
 mod shell;
 mod shortcuts;
 mod sound;
@@ -1193,6 +1195,9 @@ impl eframe::App for App {
     /// What runs every frame whether the window shows or not (it's hidden
     /// in the tray): shortcuts, voice, capture events, saves and uploads.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // From the first frame, so the press that starts a drag out is heard.
+        #[cfg(target_os = "linux")]
+        crate::wayland_drag::prepare(_frame);
         static LAUNCHED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
         let launched = *LAUNCHED.get_or_init(Instant::now);
         if let Some(secs) = std::env::var("HASTECLIP_DEV_BUFFER_QUIT").ok().and_then(|s| s.parse::<f64>().ok())

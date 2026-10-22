@@ -188,8 +188,12 @@ fn works(codec: Codec) -> bool {
 // H.264
 // ---------------------------------------------------------------------------
 
-/// Frames waiting for ffmpeg before the pacer starts dropping them.
-const QUEUE: usize = 4;
+/// Frames waiting for ffmpeg before the pacer starts dropping them: a
+/// quarter of a second's, so a busy moment (a compile on every core) is
+/// waited out instead of dropped. Only taken while ffmpeg is behind.
+fn queue_len(fps: u32) -> usize {
+    (fps as usize / 4).clamp(4, 60)
+}
 
 /// A running H.264 encoder.
 pub(crate) struct H264 {
@@ -219,7 +223,7 @@ impl H264 {
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
         let errors = spawn_stderr(stderr);
-        let (tx, rx) = mpsc::sync_channel::<(Vec<u8>, i64)>(QUEUE);
+        let (tx, rx) = mpsc::sync_channel::<(Vec<u8>, i64)>(queue_len(s.fps));
         let (spare_tx, spare) = mpsc::channel();
         // The frame numbers sent, in order: the Nth packet back is the Nth sent.
         let sent = Arc::new(Mutex::new(VecDeque::<i64>::new()));
