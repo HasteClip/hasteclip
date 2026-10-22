@@ -469,7 +469,12 @@ fn web_copy(clip: &Path, out: &Path) -> Result<(), String> {
 /// Discord ([`EMBED_MAX_MB`]), as Save smaller makes one: the biggest
 /// picture that fits, and the mix.
 fn playable_size(clip: &Path, work: &Path, progress: &Progress) -> Result<PathBuf, String> {
-    let fits = u64::from(EMBED_MAX_MB) << 20;
+    fit_under(clip, work, EMBED_MAX_MB, progress)
+}
+
+/// `clip`, or a copy of it made in `work` that's at most `mb` MB.
+fn fit_under(clip: &Path, work: &Path, mb: u32, progress: &Progress) -> Result<PathBuf, String> {
+    let fits = u64::from(mb) << 20;
     if std::fs::metadata(clip).map_err(|e| e.to_string())?.len() <= fits {
         return Ok(clip.to_path_buf());
     }
@@ -478,24 +483,31 @@ fn playable_size(clip: &Path, work: &Path, progress: &Progress) -> Result<PathBu
     let info = media::probe(clip).map_err(|e| e.to_string())?;
     let mut edit = media::Edit::new(&info);
     edit.output.mix_only = true;
-    let mut aim = EMBED_MAX_MB;
-    for _ in 0..2 {
-        edit.output.max_mb = Some(aim);
+    edit.output.max_mb = Some(mb);
+    loop {
         progress.made.store(0, Ordering::Relaxed);
         media::render_with_progress(clip, &info, &edit, &small, None, |f| progress.made.store(f.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed))
             .map_err(|e| format!("couldn't make a copy small enough to play in Discord: {e}"))?;
         progress.cancelled()?;
         let size = std::fs::metadata(&small).map_err(|e| e.to_string())?.len();
         if size <= fits {
-            break;
+            return Ok(small);
         }
-        // The encoder went over (a picture too busy for the bitrate, like
-        // noise): once more, aimed as far under as it went over. Still over
-        // after that, it goes as it is: the link plays, if not in a chat.
-        aim = (f64::from(aim) * fits as f64 / size as f64 * 0.95) as u32;
+        // The encoder went over: a picture too busy for the bitrate. macOS's
+        // won't go under what it spends on a frame of that size however low
+        // it's asked to (1080p noise asked for 5 Mbit/s came out at 39; at
+        // 720p, 3.5), so asking again for less does nothing: a smaller
+        // picture, until it fits. At the smallest, it goes as it is: the
+        // link plays, if not in a chat.
+        let (_, h) = edit.output.size(&info);
+        let Some(next) = SMALLER.into_iter().find(|&s| s < h) else { return Ok(small) };
+        edit.output.height = Some(next);
     }
-    Ok(small)
 }
+
+/// The picture heights a copy for Discord steps down through when it comes
+/// out too big.
+const SMALLER: [u32; 5] = [1080, 720, 540, 480, 360];
 
 /// The picture a link's preview shows: a frame a second in (or from the
 /// middle of a shorter clip), at most 1280 wide. `false` if there isn't one.
@@ -1390,6 +1402,33 @@ mod tests {
         assert_eq!(page_title(&clip("osu!/Ace clutch.mp4")), "Ace clutch");
         assert_eq!(page_title(&clip("osu!/recording_2026-10-19_23-28-15.mp4")), "osu! recording");
         assert_eq!(page_title(&clip("recording_2026-10-19_23-28-15.mp4")), "Recording");
+    }
+
+    /// Noise asked to fit a bitrate macOS's encoder won't go down to at the
+    /// picture it was planned at: the copy is made smaller until it fits,
+    /// instead of going out over.
+    #[test]
+    #[ignore = "encodes 10 s of 1080p60 noise a few times: cargo test -p hasteclip busy_copies_fit -- --ignored"]
+    #[cfg(target_os = "macos")]
+    fn busy_copies_fit() {
+        let dir = std::env::temp_dir().join(format!("hc-busy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("Noise.mp4");
+        let made = media::ffmpeg()
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "nullsrc=s=1920x1080:r=60,geq=random(1)*255:128:128", "-f", "lavfi", "-i", "sine=f=440"])
+            .args(["-t", "10", "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "60M", "-c:a", "aac", "-pix_fmt", "yuv420p"])
+            .arg(&clip)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        // 10 s in 12 MB: under 10 Mbit/s, which the plan puts at 1080p, and
+        // macOS's encoder makes 44 MB of there.
+        let small = fit_under(&clip, &dir, 12, &Progress::default()).unwrap();
+        let size = std::fs::metadata(&small).unwrap().len();
+        assert!(size <= 12 << 20, "{:.1} MB, over 12", size as f64 / 1e6);
+        // And it uses what it may: aiming lower made 1.9 MB of it.
+        assert!(size >= 6 << 20, "{:.1} MB of the 12 it could have", size as f64 / 1e6);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A clip too big to play in Discord goes as a copy that fits, still an
