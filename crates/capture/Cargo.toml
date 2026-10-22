@@ -105,3 +105,7 @@ wayland-protocols-plasma = { version = "0.3", features = ["client"] }
 # App icons from the desktop's icon theme, PNG or SVG.
 image = { version = "0.25", default-features = false, features = ["png"] }
 resvg = { version = "0.48", default-features = false }
+# Pictures that arrive on the graphics card (DMA-BUF) are worked there, in
+# Vulkan; the same wgpu the app draws with.
+wgpu = { version = "30", default-features = false, features = ["vulkan", "wgsl"] }
+ash = "0.38"

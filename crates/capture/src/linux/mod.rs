@@ -34,6 +34,7 @@ mod camera;
 pub mod ffmpeg;
 mod image;
 pub mod focus;
+mod gpu;
 mod icons;
 mod kwin;
 mod kwin_windows;

@@ -815,6 +815,7 @@ name = "capture"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ash",
  "ashpd",
  "async-io",
  "block2 0.6.2",
@@ -848,6 +849,7 @@ dependencies = [
  "wayland-client",
  "wayland-protocols-plasma",
  "wayland-protocols-wlr",
+ "wgpu",
  "windows 0.62.2",
  "windows-core 0.62.2",
  "x11rb",

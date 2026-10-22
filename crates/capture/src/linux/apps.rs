@@ -226,12 +226,12 @@ fn follow(shared: &Shared, stop: &AtomicBool) {
 
 /// A picture from a still image.
 fn still_frame(img: &StillImage) -> Frame {
-    Frame { width: img.width, height: img.height, stride: img.width as usize * 4, order: Order::Bgr, data: img.bgra.clone() }
+    Frame { width: img.width, height: img.height, stride: img.width as usize * 4, order: Order::Bgr, data: img.bgra.clone(), texture: None }
 }
 
 /// A small black picture: scaled to the frame, all black.
 fn black() -> Frame {
     let (width, height) = (16, 9);
     let data = [0, 0, 0, 255].repeat(width * height);
-    Frame { width: width as u32, height: height as u32, stride: width * 4, order: Order::Bgr, data }
+    Frame { width: width as u32, height: height as u32, stride: width * 4, order: Order::Bgr, data, texture: None }
 }

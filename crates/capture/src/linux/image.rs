@@ -394,7 +394,7 @@ mod tests {
     use super::*;
 
     fn frame(w: u32, h: u32, px: [u8; 4], order: Order) -> Frame {
-        Frame { width: w, height: h, stride: w as usize * 4, order, data: px.repeat((w * h) as usize) }
+        Frame { width: w, height: h, stride: w as usize * 4, order, data: px.repeat((w * h) as usize), texture: None }
     }
 
     #[test]
