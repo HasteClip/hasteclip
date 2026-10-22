@@ -62,6 +62,7 @@ mod transfer;
 mod time_field;
 mod ui_kit;
 mod update;
+mod upload_watch;
 #[cfg(target_os = "linux")]
 mod update_linux;
 #[cfg(hw_decode)]
