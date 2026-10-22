@@ -207,7 +207,7 @@ fn bands(buf: &mut [u8], row: usize, f: impl Fn(usize, &mut [u8]) + Sync) {
 /// Scale a picture of 4-byte pixels (`size`, rows `stride` bytes apart) into
 /// `out` (`to`, rows packed), averaging the area each output pixel covers;
 /// swapping the first and third bytes (red and blue) if asked. Alpha opaque.
-fn resample(src: &[u8], size: (usize, usize), stride: usize, swap: bool, out: &mut [u8], to: (usize, usize)) {
+pub(crate) fn resample(src: &[u8], size: (usize, usize), stride: usize, swap: bool, out: &mut [u8], to: (usize, usize)) {
     let ((sw, sh), (dw, dh)) = (size, to);
     if size == to {
         bands(out, dw * 4, |y0, rows| {

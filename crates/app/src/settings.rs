@@ -669,6 +669,10 @@ pub struct RecordSettings {
     pub idle_apps: Option<CaptureTarget>,
     /// A webcam over the picture, if any.
     pub webcam: Option<WebcamCfg>,
+    /// Each camera's settings changed from its defaults (Linux: V4L2 control
+    /// id to value), by camera id: put back each time it's opened, as
+    /// cameras forget them when unplugged.
+    pub camera_controls: std::collections::BTreeMap<String, std::collections::BTreeMap<u32, i64>>,
     /// The chosen display's id (`capture::Device::id`), so the choice stays
     /// with that display when others are plugged in or listed in another
     /// order. The main display when it isn't connected.
@@ -779,6 +783,7 @@ impl Default for RecordSettings {
             capture: CaptureTarget::Screen,
             idle_apps: None,
             webcam: None,
+            camera_controls: Default::default(),
             display_id: None,
             display_index: 0,
             fps: 60,

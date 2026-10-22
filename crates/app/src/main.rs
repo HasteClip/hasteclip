@@ -398,8 +398,8 @@ struct App {
     pub(crate) recording_shortcut: Option<(settings::ShortcutAction, Option<&'static str>)>,
     /// The "Reset all settings?" confirmation is open.
     pub(crate) confirm_reset: bool,
-    /// The camera settings dialog (Linux): the camera and its settings as last read.
-    pub(crate) camera_controls: Option<(String, Vec<capture::webcam::CameraControl>)>,
+    /// The camera panel (Linux), in place of the Sound column while it's open.
+    pub(crate) camera_panel: Option<crate::webcam_ui::CameraPanel>,
     /// Scroll the library to this clip next time it's shown.
     pub(crate) reveal_clip: Option<PathBuf>,
     /// Days folded away in the library.
@@ -639,7 +639,7 @@ impl App {
             hotkeys,
             recording_shortcut: None,
             confirm_reset: false,
-            camera_controls: None,
+            camera_panel: None,
             reveal_clip: None,
             folded,
             permission: capture::screen_permission(),
@@ -1092,7 +1092,6 @@ impl eframe::App for App {
             || self.confirm_delete.is_some()
             || self.link_dialog.is_some()
             || self.confirm_reset
-            || self.camera_controls.is_some()
             || self.close_dialog
             || self.show_keys.is_some()
             || ctx.memory(|m| m.top_modal_layer().is_some())
@@ -1344,6 +1343,10 @@ impl App {
         let on = self.settings.webcam.as_ref().is_some_and(|w| w.enabled);
         let camera = self.webcam_source().filter(|_| on).map(|w| (w.device, w.format));
         if camera != self.kept_camera {
+            // Its settings go back on as it opens.
+            if let Some((device, _)) = &camera {
+                capture::webcam::remember_controls(device, self.settings.camera_controls.get(device).map(|m| m.iter().map(|(k, v)| (*k, *v)).collect()).unwrap_or_default());
+            }
             capture::webcam::keep_open(camera.clone());
             self.kept_camera = camera;
         }

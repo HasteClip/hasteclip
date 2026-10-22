@@ -177,6 +177,11 @@ pub(crate) fn app_capture() -> bool {
     apps::available()
 }
 
+/// The open camera's own picture, shrunk.
+pub(crate) fn camera_picture(max_width: u32, newer_than: u64) -> Option<crate::webcam::CameraPreview> {
+    camera::picture(max_width, newer_than)
+}
+
 /// A camera's settings (V4L2 controls).
 pub(crate) fn camera_controls(device: &str) -> Vec<crate::webcam::CameraControl> {
     camera::controls(device)

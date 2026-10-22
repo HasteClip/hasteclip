@@ -325,6 +325,45 @@ pub fn camera_controls(device: &str) -> Vec<CameraControl> {
     }
 }
 
+/// The open camera's own picture, for showing it alone while its settings
+/// are changed: R, G, B, A rows.
+pub struct CameraPreview {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+    /// Its number: pass it back to only get newer ones.
+    pub seq: u64,
+}
+
+/// The open camera's newest picture, shrunk to at most `max_width` wide,
+/// if there's one newer than picture `newer_than` (Linux, so far).
+pub fn camera_picture(max_width: u32, newer_than: u64) -> Option<CameraPreview> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::camera_picture(max_width, newer_than)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (max_width, newer_than);
+        None
+    }
+}
+
+/// Settings set for each camera, by device: put back each time it's opened.
+static REMEMBERED: Mutex<Option<std::collections::HashMap<String, Vec<(u32, i64)>>>> = Mutex::new(None);
+
+/// Remember these settings for camera `device` (control id, value), to put
+/// back each time it's opened: cameras forget theirs when unplugged. Replaces
+/// what was remembered for it.
+pub fn remember_controls(device: &str, values: Vec<(u32, i64)>) {
+    REMEMBERED.lock().unwrap().get_or_insert_with(Default::default).insert(device.to_owned(), values);
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn remembered_controls(device: &str) -> Vec<(u32, i64)> {
+    REMEMBERED.lock().unwrap().as_ref().and_then(|m| m.get(device).cloned()).unwrap_or_default()
+}
+
 /// Set a camera setting; it applies at once, in every app (Linux).
 pub fn set_camera_control(device: &str, id: u32, value: i64) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]

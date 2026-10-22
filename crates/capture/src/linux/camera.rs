@@ -29,6 +29,8 @@ pub(crate) struct CameraFeed {
     pub device: String,
     pub format: Option<Format>,
     frame: Mutex<Option<Arc<CameraPicture>>>,
+    /// Counts pictures, so a reader can tell a new one.
+    seq: std::sync::atomic::AtomicU64,
     stop: AtomicBool,
 }
 
@@ -92,7 +94,7 @@ pub fn keep_open(want: Option<(String, Option<Format>)>) {
         set_status(Status::Off);
         return;
     };
-    let feed = Arc::new(CameraFeed { device, format, frame: Mutex::new(None), stop: AtomicBool::new(false) });
+    let feed = Arc::new(CameraFeed { device, format, frame: Mutex::new(None), seq: Default::default(), stop: AtomicBool::new(false) });
     *current = Some(feed.clone());
     thread::spawn(move || run(feed));
 }
@@ -157,8 +159,12 @@ fn stream(feed: &CameraFeed) -> Result<()> {
             break Err(anyhow!("the camera stopped"));
         }
         let old = feed.frame.lock().unwrap().replace(Arc::new(CameraPicture { width: w, height: h, bgra: buf }));
+        feed.seq.fetch_add(1, Ordering::Release);
         spare = old.and_then(|a| Arc::try_unwrap(a).ok()).map(|p| p.bgra);
         if !live {
+            // Open: what was set for this camera before goes back on (it
+            // forgets when it's unplugged).
+            apply_remembered(&feed.device);
             set_status(Status::Live { width: w, height: h });
             live = true;
         }
@@ -374,6 +380,40 @@ pub(crate) fn controls(device: &str) -> Vec<crate::webcam::CameraControl> {
     out
 }
 
+/// Put back the settings remembered for camera `device`: switches and menus
+/// first (a manual exposure time is only taken once automatic exposure is
+/// off), then the rest.
+fn apply_remembered(device: &str) {
+    let saved = crate::webcam::remembered_controls(device);
+    if saved.is_empty() {
+        return;
+    }
+    let all = controls(device);
+    let kind_first = |id: u32| all.iter().find(|c| c.id == id).is_some_and(|c| !matches!(c.kind, crate::webcam::ControlKind::Int { .. }));
+    let (first, rest): (Vec<_>, Vec<_>) = saved.into_iter().partition(|(id, _)| kind_first(*id));
+    for (id, value) in first.into_iter().chain(rest) {
+        if let Err(e) = set_control(device, id, value) {
+            eprintln!("camera setting {id:#x}: {e:#}");
+        }
+    }
+}
+
+/// The open camera's newest picture, shrunk to at most `max_width` wide, as
+/// R, G, B, A; `None` if there's none newer than picture `newer_than`.
+pub(crate) fn picture(max_width: u32, newer_than: u64) -> Option<crate::webcam::CameraPreview> {
+    let feed = CURRENT.lock().unwrap().clone().filter(|f| !f.stop.load(Ordering::Relaxed))?;
+    let seq = feed.seq.load(Ordering::Acquire);
+    if seq <= newer_than {
+        return None;
+    }
+    let p = feed.latest()?;
+    let scale = (max_width as f64 / p.width as f64).min(1.0);
+    let (w, h) = (((p.width as f64 * scale).round() as u32).max(1), ((p.height as f64 * scale).round() as u32).max(1));
+    let mut rgba = vec![0u8; w as usize * h as usize * 4];
+    super::image::resample(&p.bgra, (p.width as usize, p.height as usize), p.width as usize * 4, true, &mut rgba, (w as usize, h as usize));
+    Some(crate::webcam::CameraPreview { width: w, height: h, rgba, seq })
+}
+
 /// Set a camera's control `id` to `value`; it applies at once, in every app.
 pub(crate) fn set_control(device: &str, id: u32, value: i64) -> Result<()> {
     let fd = open(Path::new(device)).context("can't open the camera")?;
@@ -509,6 +549,27 @@ fn intervals(fd: &std::fs::File, pixel: u32, width: u32, height: u32) -> Vec<(u3
 mod tests {
     use super::*;
 
+
+    /// Settings remembered for a camera go back on when it's opened.
+    #[test]
+    #[ignore = "uses a camera nothing else has open: HASTECLIP_WEBCAM=<device> cargo test -p capture remembered_settings -- --ignored"]
+    fn remembered_settings_go_back_on() {
+        let device = std::env::var("HASTECLIP_WEBCAM").unwrap();
+        let b = controls(&device).into_iter().find(|c| c.name.to_lowercase().contains("brightness")).expect("brightness");
+        crate::webcam::remember_controls(&device, vec![(b.id, b.default + 7)]);
+        keep_open(Some((device.clone(), None)));
+        let t = std::time::Instant::now();
+        while !matches!(crate::webcam::status(), crate::webcam::Status::Live { .. }) && t.elapsed() < Duration::from_secs(10) {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let now = controls(&device).into_iter().find(|c| c.id == b.id).unwrap().value;
+        let picture = picture(320, 0).map(|p| (p.width, p.height));
+        keep_open(None);
+        set_control(&device, b.id, b.default).unwrap();
+        eprintln!("brightness after opening: {now} (default {}), picture {picture:?}", b.default);
+        assert_eq!(now, b.default + 7);
+        assert!(picture.is_some_and(|(w, _)| w == 320));
+    }
 
     /// A camera's settings are listed with their values, and one set reads back.
     #[test]

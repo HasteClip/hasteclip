@@ -1029,6 +1029,7 @@ impl App {
                     fresh.capture = std::mem::take(&mut self.settings.capture);
                     fresh.idle_apps = self.settings.idle_apps.take();
                     fresh.webcam = self.settings.webcam.take();
+                    fresh.camera_controls = std::mem::take(&mut self.settings.camera_controls);
                     fresh.display_id = self.settings.display_id.take();
                     fresh.display_index = self.settings.display_index;
                     fresh.limiter = self.settings.limiter;

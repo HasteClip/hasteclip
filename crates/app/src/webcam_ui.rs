@@ -15,6 +15,7 @@ use capture::webcam::{Placement, Status};
 use egui::{Color32, CursorIcon, Pos2, Rect, Stroke, vec2};
 
 use crate::App;
+use capture::webcam::{CameraControl, ControlKind};
 /// The webcam's box outline on the preview.
 const ACCENT: Color32 = Color32::WHITE;
 use crate::settings::{PlacementCfg, WebcamCfg};
@@ -411,11 +412,15 @@ impl App {
                             w.placement = PlacementCfg::laid_out(Placement::default_for(camera_aspect, frame_aspect), frame_aspect);
                         }
                     }
+                    let label = if capture::webcam::HAS_CONTROLS { "Adjust camera" } else { "Camera settings…" };
                     if (capture::webcam::HAS_SETTINGS || capture::webcam::HAS_CONTROLS)
-                        && Btn::ghost("Camera settings…").small().tip("The camera's own settings: exposure, focus, white balance. They apply right away, in every app.").show(ui).clicked()
+                        && Btn::ghost(label).small().tip("The camera's own settings: exposure, focus, white balance. They apply right away, in every app, and are put back each time it's opened.").show(ui).clicked()
                     {
                         if capture::webcam::HAS_CONTROLS {
-                            self.camera_controls = Some((cam.id.clone(), capture::webcam::camera_controls(&cam.id)));
+                            self.camera_panel = match self.camera_panel {
+                                Some(_) => None,
+                                None => Some(CameraPanel::open(&cam.id)),
+                            };
                         } else {
                             capture::webcam::open_settings(&cam.id, &cam.name);
                         }
@@ -423,86 +428,6 @@ impl App {
                 });
             });
         });
-    }
-
-    /// The camera settings dialog (Linux): each of the camera's controls, set
-    /// as it's changed. Read again after each change, as one can turn others
-    /// on or off (automatic exposure, the exposure time).
-    pub(crate) fn camera_controls_dialog(&mut self, ctx: &egui::Context) {
-        use crate::theme::{self, W};
-        use crate::ui_kit::Dismissed;
-        use capture::webcam::ControlKind;
-        let Some((device, controls)) = self.camera_controls.as_ref() else { return };
-        let device = device.clone();
-        let mut set: Vec<(u32, i64)> = Vec::new();
-        let mut done = false;
-        let modal = crate::ui_kit::dialog(ctx, "camera_controls", 460.0, |ui| {
-            crate::ui_kit::dialog_title(ui, "Camera settings");
-            let pal = theme::pal(ui);
-            if controls.is_empty() {
-                crate::ui_kit::dialog_text(ui, "This camera has no settings to change, or it couldn't be read.");
-            }
-            egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
-                for c in controls {
-                    ui.horizontal(|ui| {
-                        ui.set_min_height(30.0);
-                        ui.add_enabled_ui(!c.inactive, |ui| {
-                            ui.label(theme::text(&c.name, 13.0, W::Regular).color(pal.text2));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| match &c.kind {
-                                ControlKind::Bool => {
-                                    let mut on = c.value != 0;
-                                    if crate::ui_kit::switch(ui, &mut on).changed() {
-                                        set.push((c.id, i64::from(on)));
-                                    }
-                                }
-                                ControlKind::Int { min, max, step } => {
-                                    ui.label(theme::text(&c.value.to_string(), 12.5, W::Regular).color(pal.text3));
-                                    let span = (max - min).max(1) as f32;
-                                    let mut v = (c.value - min) as f32 / span;
-                                    if crate::transport::slider(ui, &mut v, 180.0).changed() {
-                                        let raw = *min as f32 + v * span;
-                                        let stepped = min + ((raw - *min as f32) / *step as f32).round() as i64 * step;
-                                        if stepped != c.value {
-                                            set.push((c.id, stepped.clamp(*min, *max)));
-                                        }
-                                    }
-                                }
-                                ControlKind::Menu(items) => {
-                                    let current = items.iter().find(|(v, _)| *v == c.value).map_or_else(|| c.value.to_string(), |(_, n)| n.clone());
-                                    let r = crate::ui_kit::select(ui, &current, 180.0);
-                                    crate::ui_kit::menu_popup(&r, false, 220.0, |ui| {
-                                        for (v, name) in items {
-                                            if crate::ui_kit::Item::new(name.clone()).check(*v == c.value).show(ui).clicked() {
-                                                set.push((c.id, *v));
-                                            }
-                                        }
-                                    });
-                                }
-                            });
-                        });
-                    });
-                }
-            });
-            crate::ui_kit::dialog_buttons(ui, |ui| {
-                if ui.add(crate::ui_kit::button("Done", true)).clicked() {
-                    done = true;
-                }
-                if !controls.is_empty() && ui.add(crate::ui_kit::button("Reset all", false).ghost()).on_hover_text("Back to the camera's defaults").clicked() {
-                    set.extend(controls.iter().filter(|c| c.value != c.default).map(|c| (c.id, c.default)));
-                }
-            });
-        });
-        if !set.is_empty() {
-            for (id, value) in set {
-                if let Err(e) = capture::webcam::set_camera_control(&device, id, value) {
-                    eprintln!("camera setting: {e:#}");
-                }
-            }
-            self.camera_controls = Some((device.clone(), capture::webcam::camera_controls(&device)));
-        }
-        if done || modal.dismissed() {
-            self.camera_controls = None;
-        }
     }
 
     /// The webcam's box on the preview, its handles, and dragging them.
@@ -702,5 +627,316 @@ mod tests {
         let start = Placement { flip_h: true, ..at(0.5, 0.5, 0.2, 0.2) };
         let p = drag(start, Handle::W, 0.05, 0.0, Mods { crop: true, ..PLAIN });
         assert!(close(p.crop[2], 0.25) && close(p.crop[0], 0.0) && close(p.x, 0.55));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Camera panel (Linux)
+// ---------------------------------------------------------------------------
+
+/// The camera's settings, in place of the Sound column while open: its own
+/// picture, big and live, then its controls in groups, each automatic mode
+/// with its manual setting shown only while it's off.
+pub(crate) struct CameraPanel {
+    device: String,
+    controls: Vec<CameraControl>,
+    picture: Option<egui::TextureHandle>,
+    seq: u64,
+}
+
+impl CameraPanel {
+    pub(crate) fn open(device: &str) -> Self {
+        Self { device: device.to_owned(), controls: capture::webcam::camera_controls(device), picture: None, seq: 0 }
+    }
+}
+
+/// V4L2's control ids, for the ones grouped and named here.
+mod v4l2 {
+    pub const BRIGHTNESS: u32 = 0x980900;
+    pub const CONTRAST: u32 = 0x980901;
+    pub const SATURATION: u32 = 0x980902;
+    pub const HUE: u32 = 0x980903;
+    pub const AUTO_WHITE_BALANCE: u32 = 0x98090c;
+    pub const GAMMA: u32 = 0x980910;
+    pub const GAIN: u32 = 0x980913;
+    pub const POWER_LINE: u32 = 0x980918;
+    pub const WHITE_BALANCE: u32 = 0x98091a;
+    pub const SHARPNESS: u32 = 0x98091b;
+    pub const BACKLIGHT: u32 = 0x98091c;
+    pub const AUTO_EXPOSURE: u32 = 0x9a0901;
+    pub const EXPOSURE: u32 = 0x9a0902;
+    pub const EXPOSURE_DYNAMIC_FPS: u32 = 0x9a0903;
+    pub const PAN: u32 = 0x9a0908;
+    pub const TILT: u32 = 0x9a0909;
+    pub const FOCUS: u32 = 0x9a090a;
+    pub const AUTO_FOCUS: u32 = 0x9a090c;
+    pub const ZOOM: u32 = 0x9a090d;
+    /// `V4L2_EXPOSURE_MANUAL`, among the automatic exposure menu's items.
+    pub const EXPOSURE_MANUAL: i64 = 1;
+}
+
+/// One row of the panel.
+#[derive(Debug, PartialEq)]
+enum PanelRow<'a> {
+    /// An automatic mode as a switch, and the setting it takes over (shown while it's off).
+    Auto { label: &'static str, auto: &'a CameraControl, manual: Option<(&'static str, &'a CameraControl)> },
+    Control { label: String, control: &'a CameraControl },
+}
+
+/// The camera's controls in groups (heading, rows), the known ones named
+/// for people, the rest under More.
+fn panel_groups(controls: &[CameraControl]) -> Vec<(&'static str, Vec<PanelRow<'_>>)> {
+    use v4l2::*;
+    let find = |id: u32| controls.iter().find(|c| c.id == id);
+    let named = |id: u32, label: &str| find(id).map(|control| PanelRow::Control { label: label.to_owned(), control });
+    let auto = |auto: u32, label: &'static str, manual: u32, manual_label: &'static str| {
+        find(auto).map(|a| PanelRow::Auto { label, auto: a, manual: find(manual).map(|m| (manual_label, m)) })
+    };
+    let image = [(BRIGHTNESS, "Brightness"), (CONTRAST, "Contrast"), (SATURATION, "Saturation"), (HUE, "Hue"), (GAMMA, "Gamma"), (SHARPNESS, "Sharpness")];
+    let groups: Vec<(&'static str, Vec<Option<PanelRow>>)> = vec![
+        ("Image", image.iter().map(|(id, l)| named(*id, l)).collect()),
+        (
+            "Exposure",
+            vec![
+                // No automatic mode: the manual setting stands alone.
+                auto(AUTO_EXPOSURE, "Automatic", EXPOSURE, "Exposure time").or_else(|| named(EXPOSURE, "Exposure time")),
+                named(GAIN, "Gain"),
+                named(BACKLIGHT, "Backlight compensation"),
+                named(EXPOSURE_DYNAMIC_FPS, "Lower frame rate in the dark"),
+                named(POWER_LINE, "Flicker (mains frequency)"),
+            ],
+        ),
+        ("White balance", vec![auto(AUTO_WHITE_BALANCE, "Automatic", WHITE_BALANCE, "Temperature").or_else(|| named(WHITE_BALANCE, "Temperature"))]),
+        ("Focus", vec![auto(AUTO_FOCUS, "Automatic", FOCUS, "Distance").or_else(|| named(FOCUS, "Distance"))]),
+        ("Zoom and framing", vec![named(ZOOM, "Zoom"), named(PAN, "Pan"), named(TILT, "Tilt")]),
+    ];
+    let known = [BRIGHTNESS, CONTRAST, SATURATION, HUE, AUTO_WHITE_BALANCE, GAMMA, GAIN, POWER_LINE, WHITE_BALANCE, SHARPNESS, BACKLIGHT, AUTO_EXPOSURE, EXPOSURE, EXPOSURE_DYNAMIC_FPS, PAN, TILT, FOCUS, AUTO_FOCUS, ZOOM];
+    let more: Vec<Option<PanelRow>> = controls.iter().filter(|c| !known.contains(&c.id)).map(|c| Some(PanelRow::Control { label: c.name.clone(), control: c })).collect();
+    groups.into_iter().chain([("More", more)]).map(|(h, rows)| (h, rows.into_iter().flatten().collect::<Vec<_>>())).filter(|(_, rows)| !rows.is_empty()).collect()
+}
+
+/// Whether an automatic mode is on, and the value that turns it on or off.
+fn auto_on(c: &CameraControl) -> bool {
+    match c.kind {
+        // Automatic exposure is a menu: anything but manual.
+        ControlKind::Menu(_) => c.value != v4l2::EXPOSURE_MANUAL,
+        _ => c.value != 0,
+    }
+}
+
+fn auto_value(c: &CameraControl, on: bool) -> i64 {
+    match &c.kind {
+        ControlKind::Menu(items) if on => {
+            if c.default != v4l2::EXPOSURE_MANUAL {
+                c.default
+            } else {
+                items.iter().map(|(v, _)| *v).find(|v| *v != v4l2::EXPOSURE_MANUAL).unwrap_or(c.default)
+            }
+        }
+        ControlKind::Menu(_) => v4l2::EXPOSURE_MANUAL,
+        _ => i64::from(on),
+    }
+}
+
+impl App {
+    /// The camera panel: its picture, its settings in groups, Back and Reset.
+    pub(crate) fn camera_panel(&mut self, ui: &mut egui::Ui) {
+        use crate::theme::{self, W};
+        use crate::ui_kit::Btn;
+        // Another camera picked: its settings; none: closed.
+        match (&self.settings.webcam, &self.camera_panel) {
+            (Some(w), Some(p)) if w.id != p.device => self.camera_panel = Some(CameraPanel::open(&w.id)),
+            (None, _) => self.camera_panel = None,
+            _ => {}
+        }
+        let Some(panel) = self.camera_panel.as_mut() else { return };
+        let pal = theme::pal(ui);
+        let mut back = false;
+        crate::sources_ui::column_head(ui, "Camera", |ui| {
+            if Btn::ghost("Back").with_icon(egui_phosphor::regular::CARET_LEFT).small().tip("Back to Sound").show(ui).clicked() {
+                back = true;
+            }
+        });
+        // Its own picture, big and live.
+        let w = ui.available_width();
+        if let Some(p) = capture::webcam::camera_picture((w * ui.ctx().pixels_per_point()) as u32, panel.seq) {
+            let image = egui::ColorImage::from_rgba_unmultiplied([p.width as usize, p.height as usize], &p.rgba);
+            match &mut panel.picture {
+                Some(t) if t.size() == [p.width as usize, p.height as usize] => t.set(image, egui::TextureOptions::LINEAR),
+                t => *t = Some(ui.ctx().load_texture("camera panel", image, egui::TextureOptions::LINEAR)),
+            }
+            panel.seq = p.seq;
+        }
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+        let aspect = panel.picture.as_ref().map_or(16.0 / 9.0, |t| t.size()[0] as f32 / t.size()[1].max(1) as f32);
+        let (rect, _) = ui.allocate_exact_size(vec2(w, w / aspect), egui::Sense::hover());
+        match &panel.picture {
+            Some(t) => {
+                egui::Image::from_texture((t.id(), rect.size())).corner_radius(crate::ui_kit::RADIUS).paint_at(ui, rect);
+            }
+            None => {
+                ui.painter().rect_filled(rect, crate::ui_kit::RADIUS, pal.control);
+                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "Waiting for the camera…", egui::FontId::proportional(13.0), pal.text3);
+            }
+        }
+        crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
+
+        let mut set: Vec<(u32, i64)> = Vec::new();
+        let mut reset = false;
+        if panel.controls.is_empty() {
+            ui.label(theme::text("This camera has no settings to change, or they couldn't be read.", 13.0, W::Regular).color(pal.text3));
+        }
+        let row = |ui: &mut egui::Ui, label: &str, indent: bool, add: &mut dyn FnMut(&mut egui::Ui)| {
+            ui.horizontal(|ui| {
+                ui.set_min_height(30.0);
+                if indent {
+                    ui.add_space(14.0);
+                }
+                ui.label(theme::text(label, 13.0, W::Regular).color(pal.text2));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| add(ui));
+            });
+        };
+        let control = |ui: &mut egui::Ui, c: &CameraControl, set: &mut Vec<(u32, i64)>| match &c.kind {
+            ControlKind::Bool => {
+                let mut on = c.value != 0;
+                if crate::ui_kit::switch(ui, &mut on).changed() {
+                    set.push((c.id, i64::from(on)));
+                }
+            }
+            ControlKind::Int { min, max, step } => {
+                let shown = if c.id == v4l2::WHITE_BALANCE { format!("{} K", c.value) } else { c.value.to_string() };
+                ui.add_sized([44.0, 18.0], egui::Label::new(theme::text(&shown, 12.5, W::Regular).color(pal.text3)));
+                let span = (max - min).max(1) as f32;
+                let mut v = (c.value - min) as f32 / span;
+                let slider = crate::transport::slider(ui, &mut v, (ui.available_width() - 150.0).clamp(90.0, 220.0));
+                if slider.changed() {
+                    let raw = *min as f32 + v * span;
+                    let stepped = (min + ((raw - *min as f32) / *step as f32).round() as i64 * step).clamp(*min, *max);
+                    if stepped != c.value {
+                        set.push((c.id, stepped));
+                    }
+                }
+                if slider.double_clicked() {
+                    set.push((c.id, c.default));
+                }
+                slider.on_hover_text("Double-click for the camera's default");
+            }
+            ControlKind::Menu(items) => {
+                let current = items.iter().find(|(v, _)| *v == c.value).map_or_else(|| c.value.to_string(), |(_, n)| n.clone());
+                let r = crate::ui_kit::select(ui, &current, 150.0);
+                crate::ui_kit::menu_popup(&r, false, 200.0, |ui| {
+                    for (v, name) in items {
+                        if crate::ui_kit::Item::new(name.clone()).check(*v == c.value).show(ui).clicked() {
+                            set.push((c.id, *v));
+                        }
+                    }
+                });
+            }
+        };
+        for (heading, rows) in panel_groups(&panel.controls) {
+            ui.add_space(6.0);
+            ui.label(theme::text(heading, 12.0, W::Semibold).color(pal.text3));
+            for r in rows {
+                match r {
+                    PanelRow::Control { label, control: c } => row(ui, &label, false, &mut |ui| control(ui, c, &mut set)),
+                    PanelRow::Auto { label, auto, manual } => {
+                        let on = auto_on(auto);
+                        row(ui, label, false, &mut |ui| {
+                            let mut v = on;
+                            if crate::ui_kit::switch(ui, &mut v).changed() {
+                                set.push((auto.id, auto_value(auto, v)));
+                            }
+                        });
+                        if let Some((label, m)) = manual.filter(|_| !on) {
+                            row(ui, label, true, &mut |ui| control(ui, m, &mut set));
+                        }
+                    }
+                }
+            }
+        }
+        if !panel.controls.is_empty() {
+            crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
+            ui.horizontal(|ui| {
+                ui.label(theme::text("Kept for this camera, and put back each time it's opened.", 12.0, W::Regular).color(pal.text3));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if Btn::ghost("Reset to defaults").small().tip("Back to the camera's own defaults").show(ui).clicked() {
+                        reset = true;
+                    }
+                });
+            });
+        }
+
+        let device = panel.device.clone();
+        if reset {
+            // Manual values first, while they're still taken, then the automatic modes.
+            let (autos, rest): (Vec<_>, Vec<_>) = panel.controls.iter().filter(|c| c.value != c.default).partition(|c| !matches!(c.kind, ControlKind::Int { .. }));
+            set = rest.into_iter().chain(autos).map(|c| (c.id, c.default)).collect();
+            self.settings.camera_controls.remove(&device);
+        }
+        if !set.is_empty() {
+            let saved = self.settings.camera_controls.entry(device.clone()).or_default();
+            for (id, value) in &set {
+                if let Err(e) = capture::webcam::set_camera_control(&device, *id, *value) {
+                    eprintln!("camera setting: {e:#}");
+                }
+                // Kept only while it isn't the camera's default.
+                match panel.controls.iter().find(|c| c.id == *id) {
+                    Some(c) if c.default == *value || reset => {
+                        saved.remove(id);
+                    }
+                    _ => {
+                        saved.insert(*id, *value);
+                    }
+                }
+            }
+            if saved.is_empty() {
+                self.settings.camera_controls.remove(&device);
+            }
+            let values = self.settings.camera_controls.get(&device).map(|m| m.iter().map(|(k, v)| (*k, *v)).collect()).unwrap_or_default();
+            capture::webcam::remember_controls(&device, values);
+            panel.controls = capture::webcam::camera_controls(&device);
+        }
+        if back {
+            self.camera_panel = None;
+        }
+    }
+}
+
+#[cfg(test)]
+mod panel_tests {
+    use super::*;
+
+    fn ctl(id: u32, name: &str, kind: ControlKind, value: i64) -> CameraControl {
+        CameraControl { id, name: name.into(), kind, value, default: value, inactive: false }
+    }
+
+    /// A Logitech C922's controls: named and grouped, automatic modes paired
+    /// with the setting they take over, the rest under More.
+    #[test]
+    fn groups_a_webcams_controls() {
+        use v4l2::*;
+        let int = ControlKind::Int { min: 0, max: 255, step: 1 };
+        let menu = |items: &[(i64, &str)]| ControlKind::Menu(items.iter().map(|(v, n)| (*v, n.to_string())).collect());
+        let controls = vec![
+            ctl(BRIGHTNESS, "Brightness", int.clone(), 128),
+            ctl(AUTO_WHITE_BALANCE, "White Balance, Automatic", ControlKind::Bool, 1),
+            ctl(POWER_LINE, "Power Line Frequency", menu(&[(0, "Disabled"), (1, "50 Hz"), (2, "60 Hz")]), 2),
+            ctl(WHITE_BALANCE, "White Balance Temperature", ControlKind::Int { min: 2000, max: 6500, step: 1 }, 4000),
+            ctl(AUTO_EXPOSURE, "Auto Exposure", menu(&[(1, "Manual Mode"), (3, "Aperture Priority Mode")]), 3),
+            ctl(EXPOSURE, "Exposure Time, Absolute", ControlKind::Int { min: 3, max: 2047, step: 1 }, 250),
+            ctl(0x9a0921, "Something New", int.clone(), 0),
+        ];
+        let groups = panel_groups(&controls);
+        let headings: Vec<_> = groups.iter().map(|(h, _)| *h).collect();
+        assert_eq!(headings, ["Image", "Exposure", "White balance", "More"]);
+        let exposure = &groups[1].1;
+        assert!(matches!(exposure[0], PanelRow::Auto { label: "Automatic", manual: Some(("Exposure time", _)), .. }));
+        assert!(matches!(&exposure[1], PanelRow::Control { label, .. } if label == "Flicker (mains frequency)"));
+        assert!(matches!(&groups[3].1[0], PanelRow::Control { label, .. } if label == "Something New"));
+        // Aperture priority is automatic; turning it off picks manual, on picks the default.
+        let ae = &controls[4];
+        assert!(auto_on(ae));
+        assert_eq!(auto_value(ae, false), v4l2::EXPOSURE_MANUAL);
+        assert_eq!(auto_value(ae, true), 3);
     }
 }

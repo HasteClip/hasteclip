@@ -113,7 +113,12 @@ impl App {
                     });
                     ui.allocate_ui_with_layout(egui::vec2(col, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
                         ui.set_width(col);
-                        self.sound_column(ui, now, dt);
+                        // The camera's settings take the Sound column's place while open.
+                        if self.camera_panel.is_some() {
+                            self.camera_panel(ui);
+                        } else {
+                            self.sound_column(ui, now, dt);
+                        }
                     });
                 });
             } else {
@@ -121,6 +126,11 @@ impl App {
                     ui.set_width(w);
                     if capture::preview::AVAILABLE {
                         self.picture_column(ui);
+                        ui.add_space(24.0);
+                    }
+                    // One column: the camera's settings under the webcam, then Sound.
+                    if self.camera_panel.is_some() {
+                        self.camera_panel(ui);
                         ui.add_space(24.0);
                     }
                     self.sound_column(ui, now, dt);
@@ -138,7 +148,6 @@ impl App {
         if capture::webcam::AVAILABLE {
             crate::ui_kit::gap(ui, crate::ui_kit::SECTION_GAP);
             self.webcam_card(ui);
-            self.camera_controls_dialog(ui.ctx());
         }
     }
 
