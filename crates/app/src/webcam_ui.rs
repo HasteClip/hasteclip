@@ -609,11 +609,15 @@ pub(crate) struct CameraPanel {
     controls: Vec<CameraControl>,
     picture: Option<egui::TextureHandle>,
     seq: u64,
+    /// The camera's frame rate, measured from its pictures' numbers: since
+    /// when, from which, and the last second's.
+    counted: Option<(std::time::Instant, u64)>,
+    fps: Option<f32>,
 }
 
 impl CameraPanel {
     pub(crate) fn open(device: &str) -> Self {
-        Self { device: device.to_owned(), controls: capture::webcam::camera_controls(device), picture: None, seq: 0 }
+        Self { device: device.to_owned(), controls: capture::webcam::camera_controls(device), picture: None, seq: 0, counted: None, fps: None }
     }
 }
 
@@ -919,12 +923,18 @@ fn exposure_guides(fps: f32) -> (i64, i64) {
 
 /// The exposure time: − and + (or the arrow keys) to step it finely, to
 /// where lights' flicker leaves no bands, found by eye; the slider; its time in ms.
-fn exposure_widget(ui: &mut egui::Ui, c: &CameraControl, set: &mut Vec<(u32, i64)>) {
+fn exposure_widget(ui: &mut egui::Ui, c: &CameraControl, fps: Option<f32>, set: &mut Vec<(u32, i64)>) {
     use crate::theme::{self, W};
     let ControlKind::Int { min, max, step } = c.kind else { return control_widget(ui, c, set) };
     let pal = theme::pal(ui);
+    // Longer than a frame, the camera can't keep its frame rate.
+    let whole = fps.map(|fps| exposure_guides(fps).1).filter(|w| (min..max).contains(w));
+    let dropping = whole.is_some_and(|w| c.value > w);
     // Right to left: the time, +, the slider, −.
-    ui.add_sized([56.0, 20.0], egui::Label::new(theme::text(&format!("{:.1} ms", c.value as f64 / 10.0), 12.5, W::Regular).color(pal.text3)));
+    let time = ui.add_sized([56.0, 20.0], egui::Label::new(theme::text(&format!("{:.1} ms", c.value as f64 / 10.0), 12.5, W::Regular).color(if dropping { pal.warn } else { pal.text3 })));
+    if let (true, Some(fps)) = (dropping, fps) {
+        time.on_hover_text(format!("Longer than a frame at {fps:.0} fps: the camera's frame rate drops"));
+    }
     let next = |up: bool| Some(exposure_step(c.value, up, step, min, max)).filter(|v| *v != c.value);
     if crate::ui_kit::Btn::icon(crate::ui_kit::Kind::Ghost, egui_phosphor::regular::PLUS).small().tip("Longer").show(ui).clicked()
         && let Some(v) = next(true)
@@ -933,7 +943,8 @@ fn exposure_widget(ui: &mut egui::Ui, c: &CameraControl, set: &mut Vec<(u32, i64
     }
     let span = (max - min).max(1) as f32;
     let mut v = (c.value - min) as f32 / span;
-    let slider = crate::transport::slider(ui, &mut v, 110.0);
+    let zone = whole.zip(fps).map(|(w, fps)| ((w - min) as f32 / span, format!("Longer than a frame at {fps:.0} fps ({:.1} ms): the camera's frame rate drops", w as f64 / 10.0)));
+    let slider = zone_slider(ui, &mut v, 110.0, zone);
     if slider.changed() {
         let to = min + (v * span).round() as i64;
         if to != c.value {
@@ -953,6 +964,40 @@ fn exposure_widget(ui: &mut egui::Ui, c: &CameraControl, set: &mut Vec<(u32, i64
     }
 }
 
+/// The slim slider (`transport::slider`'s look) with the track past `zone`
+/// (0 to 1, and what it means) coloured as a warning.
+fn zone_slider(ui: &mut egui::Ui, value: &mut f32, width: f32, zone: Option<(f32, String)>) -> egui::Response {
+    use crate::theme;
+    let p = theme::pal(ui);
+    let (rect, mut resp) = ui.allocate_exact_size(vec2(width, 20.0), egui::Sense::click_and_drag());
+    if let Some(pos) = resp.interact_pointer_pos()
+        && (resp.dragged() || resp.clicked() || resp.drag_started())
+    {
+        let v = ((pos.x - rect.left() - 7.0) / (rect.width() - 14.0)).clamp(0.0, 1.0);
+        if v != *value {
+            *value = v;
+            resp.mark_changed();
+        }
+    }
+    let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered() || resp.dragged(), theme::FAST);
+    let track = egui::Rect::from_min_max(egui::pos2(rect.left() + 7.0, rect.center().y - 2.0), egui::pos2(rect.right() - 7.0, rect.center().y + 2.0));
+    ui.painter().rect_filled(track, 2, p.control_h);
+    let at = |v: f32| track.left() + track.width() * v.clamp(0.0, 1.0);
+    if let Some((from, tip)) = &zone {
+        let part = egui::Rect::from_min_max(egui::pos2(at(*from), track.top()), track.max);
+        ui.painter().rect_filled(part, 2, theme::fade(p.warn, 0.55));
+        if resp.hover_pos().is_some_and(|h| h.x >= part.left()) && !resp.dragged() {
+            resp = resp.on_hover_text(tip.as_str());
+        }
+    }
+    let x = at(*value);
+    ui.painter().rect_filled(egui::Rect::from_min_max(track.min, egui::pos2(x, track.bottom())), 2, theme::mix(p.text2, p.text, hv));
+    let k = 7.0 + hv;
+    ui.painter().circle_filled(egui::pos2(x, rect.center().y + 1.0), k, Color32::from_black_alpha(60));
+    ui.painter().circle_filled(egui::pos2(x, rect.center().y), k, Color32::WHITE);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 /// The Camera page's still side: the picture, which camera it is and in what
 /// size, and resetting its settings.
 fn picture_side(ui: &mut egui::Ui, panel: &mut CameraPanel, name: &str, max_h: f32, reset: &mut bool) {
@@ -960,8 +1005,9 @@ fn picture_side(ui: &mut egui::Ui, panel: &mut CameraPanel, name: &str, max_h: f
     let pal = theme::pal(ui);
     picture_view(ui, panel, max_h);
     crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
-    let status = match capture::webcam::status() {
-        capture::webcam::Status::Live { width, height } => format!("{name} · {width}×{height}"),
+    let status = match (capture::webcam::status(), panel.fps) {
+        (capture::webcam::Status::Live { width, height }, Some(fps)) => format!("{name} · {width}×{height} · {fps:.0} fps"),
+        (capture::webcam::Status::Live { width, height }, None) => format!("{name} · {width}×{height}"),
         _ => name.to_owned(),
     };
     ui.horizontal(|ui| {
@@ -987,6 +1033,17 @@ fn picture_view(ui: &mut egui::Ui, panel: &mut CameraPanel, max_h: f32) {
             t => *t = Some(ui.ctx().load_texture("camera page", image, egui::TextureOptions::LINEAR)),
         }
         panel.seq = p.seq;
+    }
+    // Pictures are numbered as the camera delivers them: how many came in
+    // the last second is its frame rate, whatever this page shows.
+    let now = std::time::Instant::now();
+    match panel.counted {
+        Some((at, from)) if now.duration_since(at).as_secs_f32() >= 1.0 => {
+            panel.fps = Some((panel.seq.saturating_sub(from)) as f32 / now.duration_since(at).as_secs_f32());
+            panel.counted = Some((now, panel.seq));
+        }
+        None if panel.seq > 0 => panel.counted = Some((now, panel.seq)),
+        _ => {}
     }
     ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
     let aspect = panel.picture.as_ref().map_or(16.0 / 9.0, |t| t.size()[0] as f32 / t.size()[1].max(1) as f32);
@@ -1089,7 +1146,7 @@ fn controls_view(ui: &mut egui::Ui, panel: &CameraPanel, fps: Option<f32>, set: 
                                         Some(t) => row.tip("Exposure time", t),
                                         None => row,
                                     };
-                                    l.row(row, |ui| exposure_widget(ui, m, set));
+                                    l.row(row, |ui| exposure_widget(ui, m, fps, set));
                                 } else {
                                     l.row(crate::ui_kit::Row::new(label).kid(), |ui| control_widget(ui, m, set));
                                 }
