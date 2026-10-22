@@ -10,6 +10,12 @@
 //! checked again as the window comes back.
 
 use crate::theme::{self, W, icon};
+
+/// The permissions screen shows at launch until it's been closed in this
+/// round. Raised when a release needs everyone to allow them again.
+/// 1: the first, with the switch from ad hoc signing (macOS forgot what
+/// each version was allowed) to HasteClip's own certificate (it doesn't).
+pub(crate) const SETUP_ROUND: u32 = 1;
 use crate::ui_kit::{self, Btn, Dismissed as _};
 use crate::App;
 
@@ -69,7 +75,7 @@ impl App {
         }
         if done || modal.dismissed() {
             self.setup_open = false;
-            self.settings.setup_shown = true;
+            self.settings.setup_shown = SETUP_ROUND;
             // Clipping starts as it would have at launch, now it can.
             if self.settings.auto_start_buffer && self.rec_state == crate::RecState::Idle && capture::screen_permission() != capture::Permission::Denied {
                 self.start_replay_buffer();
