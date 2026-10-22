@@ -102,3 +102,6 @@ x11rb = { version = "0.13", features = ["randr", "res", "shm", "xfixes"] }
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 wayland-protocols-plasma = { version = "0.3", features = ["client"] }
+# App icons from the desktop's icon theme, PNG or SVG.
+image = { version = "0.25", default-features = false, features = ["png"] }
+resvg = { version = "0.48", default-features = false }

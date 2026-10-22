@@ -458,9 +458,10 @@ pub fn list_windowed_apps() -> Vec<Device> {
 }
 
 /// The icon of an app source's app ([`sources::SourceKind::App`]'s id: a
-/// bundle id on macOS, an executable on Windows), as `size`×`size` RGBA with
-/// straight alpha. `None` where there isn't one to show: Linux, a program
-/// without an app bundle, or on Windows an app that isn't running. Slow-ish
+/// bundle id on macOS, an executable on Windows, a program's file name on
+/// Linux), as `size`×`size` RGBA with straight alpha. `None` where there
+/// isn't one to show: a program without an app bundle, on Windows an app
+/// that isn't running, on Linux one the icon theme doesn't have. Slow-ish
 /// (it reads files): call it off the UI thread.
 pub fn app_icon(id: &str, size: u32) -> Option<Vec<u8>> {
     #[cfg(target_os = "windows")]
@@ -471,7 +472,11 @@ pub fn app_icon(id: &str, size: u32) -> Option<Vec<u8>> {
     {
         mac::windows::app_icon(id, size)
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::app_icon(id, size)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         let _ = (id, size);
         None

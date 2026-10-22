@@ -34,6 +34,7 @@ mod camera;
 pub mod ffmpeg;
 mod image;
 pub mod focus;
+mod icons;
 mod kwin;
 mod kwin_windows;
 mod mutter;
@@ -135,6 +136,11 @@ pub fn list_screens() -> Vec<Device> {
 /// Whether games and apps can be recorded (KDE Plasma, so far).
 pub(crate) fn app_capture() -> bool {
     apps::available()
+}
+
+/// A program's icon from the desktop's icon theme.
+pub(crate) fn app_icon(id: &str, size: u32) -> Option<Vec<u8>> {
+    icons::app_icon(id, size)
 }
 
 /// Running programs with a window, for `VideoSource::Apps`.
