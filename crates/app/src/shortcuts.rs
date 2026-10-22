@@ -40,6 +40,9 @@ pub struct Registered {
     from: Option<Shortcuts>,
     /// Shortcuts that couldn't be registered (taken by another app, invalid).
     pub errors: Vec<(ShortcutAction, String)>,
+    /// What a press does, for the key tap to hand its presses to as well.
+    #[cfg(target_os = "macos")]
+    press: Arc<dyn Fn(u32) + Send + Sync>,
 }
 
 impl Registered {
@@ -58,23 +61,35 @@ impl Registered {
             eprintln!("the desktop has no GlobalShortcuts portal: shortcuts only work while an X11 app is focused");
         }
         let mgr = GlobalHotKeyManager::new().map_err(|e| e.to_string())?;
-        // Runs as the OS delivers the key, on the thread pumping the window's
-        // messages, whether the app is drawing frames or not.
+        // The shortcut with this id was pressed: save the clip (or take the
+        // screenshot) right away, and tell the app.
         let (handler_ids, wake) = (ids.clone(), ctx.clone());
-        GlobalHotKeyEvent::set_event_handler(Some(move |ev: GlobalHotKeyEvent| {
-            if ev.state != HotKeyState::Pressed {
-                return;
-            }
-            let action = handler_ids.lock().ok().and_then(|ids| ids.iter().find(|(id, _)| *id == ev.id).map(|(_, a)| *a));
+        let tx = Mutex::new(tx);
+        let press: Arc<dyn Fn(u32) + Send + Sync> = Arc::new(move |id: u32| {
+            let action = handler_ids.lock().ok().and_then(|ids| ids.iter().find(|(i, _)| *i == id).map(|(_, a)| *a));
             if let Some(action) = action {
                 let saved = match action {
                     ShortcutAction::SaveClip => quick.save(),
                     ShortcutAction::Screenshot => quick.screenshot(),
                     _ => false,
                 };
-                let _ = tx.send((action, saved));
+                let _ = tx.lock().unwrap().send((action, saved));
                 wake.request_repaint();
             }
+        });
+        // Runs as the OS delivers the key, on the thread pumping the window's
+        // messages, whether the app is drawing frames or not.
+        let regular = press.clone();
+        GlobalHotKeyEvent::set_event_handler(Some(move |ev: GlobalHotKeyEvent| {
+            if ev.state != HotKeyState::Pressed {
+                return;
+            }
+            // The key tap has it (and saw it too): one press, one clip.
+            #[cfg(target_os = "macos")]
+            if crate::key_tap::watches(ev.id) && !crate::key_tap::keys_hidden() {
+                return;
+            }
+            regular(ev.id);
         }));
         Ok(Self {
             mgr: Some(mgr),
@@ -86,7 +101,25 @@ impl Registered {
             presses,
             from: None,
             errors: Vec::new(),
+            #[cfg(target_os = "macos")]
+            press,
         })
+    }
+
+    /// macOS: start the key tap, if Input Monitoring is granted, so the
+    /// shortcuts also work while a game holds the screen. Cheap to call again.
+    /// Whether it runs.
+    #[cfg(target_os = "macos")]
+    pub fn start_key_tap(&mut self) -> bool {
+        if crate::key_tap::running() {
+            return true;
+        }
+        let press = self.press.clone();
+        if !crate::key_tap::start(Box::new(move |id| press(id))) {
+            return false;
+        }
+        crate::key_tap::watch(&self.active.iter().map(|(h, _)| *h).collect::<Vec<_>>());
+        true
     }
 
     /// Make the OS shortcuts match `wanted`. Cheap when nothing changed.
@@ -131,6 +164,8 @@ impl Registered {
         if let Ok(mut ids) = self.ids.lock() {
             *ids = self.active.iter().map(|(h, a)| (h.id(), *a)).collect();
         }
+        #[cfg(target_os = "macos")]
+        crate::key_tap::watch(&self.active.iter().map(|(h, _)| *h).collect::<Vec<_>>());
         self.from = Some(wanted.clone());
     }
 

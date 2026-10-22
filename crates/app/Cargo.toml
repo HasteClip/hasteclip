@@ -81,6 +81,9 @@ objc2-io-surface = { version = "0.3.2", default-features = false, features = ["s
 objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLAllocation", "MTLDevice", "MTLPixelFormat", "MTLResource", "MTLTexture", "objc2-io-surface"] }
 objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSString", "NSURL", "NSGeometry", "NSFileManager", "NSError"] }
 objc2-app-kit = { version = "0.3.2", features = ["NSSharingService", "NSView", "NSResponder", "NSWindow", "NSToolbar", "NSButton", "NSControl"] }
+# Shortcuts while a game holds the screen: a listen-only key tap (key_tap.rs).
+objc2-core-foundation = { version = "0.3.2", features = ["CFMachPort", "CFRunLoop"] }
+objc2-core-graphics = { version = "0.3.2", features = ["CGEvent", "CGEventTypes"] }
 
 # Windows-only: the system Share UI, and opening files with their default app.
 [target.'cfg(target_os = "windows")'.dependencies]
