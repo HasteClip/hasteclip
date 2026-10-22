@@ -52,6 +52,8 @@ pub(crate) struct Monitor {
     pub name: String,
     pub width: u32,
     pub height: u32,
+    /// Its refresh rate, in Hz (rounded), if KWin says.
+    pub refresh: Option<u32>,
     /// The main monitor: first in Plasma's display settings.
     pub primary: bool,
 }
@@ -73,7 +75,8 @@ pub(crate) fn monitors() -> Vec<Monitor> {
                 _ => name.clone(),
             };
             let primary = main == Some(&name);
-            Some(Monitor { id: format!("kde:{name}"), name: label, width: w as u32, height: h as u32, primary })
+            let refresh = o.refresh.filter(|r| *r > 0).map(|r| ((r + 500) / 1000) as u32);
+            Some(Monitor { id: format!("kde:{name}"), name: label, width: w as u32, height: h as u32, refresh, primary })
         })
         .collect()
 }
@@ -84,6 +87,8 @@ struct Output {
     description: Option<String>,
     size: Option<(i32, i32)>,
     position: (i32, i32),
+    /// The current mode's refresh rate, in mHz.
+    refresh: Option<i32>,
 }
 
 #[derive(Default)]
@@ -129,7 +134,7 @@ impl Session {
         for g in globals.contents().clone_list() {
             if g.interface == wl_output::WlOutput::interface().name {
                 let wl = globals.registry().bind::<wl_output::WlOutput, _, _>(g.name, g.version.min(4), &qh, ());
-                state.outputs.push(Output { wl, name: None, description: None, size: None, position: (0, 0) });
+                state.outputs.push(Output { wl, name: None, description: None, size: None, position: (0, 0), refresh: None });
             }
         }
         queue.roundtrip(&mut state).context("the Wayland compositor didn't answer")?;
@@ -253,8 +258,9 @@ impl Dispatch<wl_output::WlOutput, ()> for State {
                     o.description = Some(format!("{make} {model}").trim().to_owned());
                 }
             }
-            wl_output::Event::Mode { flags: WEnum::Value(f), width, height, .. } if f.contains(wl_output::Mode::Current) => {
+            wl_output::Event::Mode { flags: WEnum::Value(f), width, height, refresh } if f.contains(wl_output::Mode::Current) => {
                 o.size = Some((width, height));
+                o.refresh = Some(refresh);
             }
             _ => {}
         }

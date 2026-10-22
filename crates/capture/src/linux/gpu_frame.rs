@@ -80,6 +80,97 @@ fn scale(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+const BLEND_SHADER: &str = r#"
+struct Look {
+    src: vec4<f32>,
+    dst: vec4<f32>,
+    size: vec2<u32>,
+    weight: f32,
+    _pad: f32,
+}
+
+@group(0) @binding(0) var source: texture_2d<f32>;
+@group(0) @binding(1) var<storage, read_write> sum: array<vec4<f32>>;
+@group(0) @binding(2) var<uniform> l: Look;
+
+fn span(i: f32, scale: f32, n: f32) -> vec2<f32> {
+    var a = i * scale;
+    var b = (i + 1.0) * scale;
+    if (b - a < 1.0) {
+        let c = (a + b) / 2.0;
+        a = max(c - 0.5, 0.0);
+        b = min(a + 1.0, n);
+        a = b - 1.0;
+    }
+    return vec2<f32>(a, b);
+}
+
+// sRGB's values to light.
+fn linear(c: vec3<f32>) -> vec3<f32> {
+    return select(pow((c + 0.055) / 1.055, vec3<f32>(2.4)), c / 12.92, c <= vec3<f32>(0.04045));
+}
+
+// A look: the picture put into the frame's size (as `scale`), its light
+// added to the frame's sum with the look's weight.
+@compute @workgroup_size(8, 8)
+fn accumulate(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x >= l.size.x || id.y >= l.size.y) {
+        return;
+    }
+    var c = vec3<f32>(0.0);
+    let p = vec2<f32>(id.xy);
+    if (p.x >= l.dst.x && p.y >= l.dst.y && p.x < l.dst.x + l.dst.z && p.y < l.dst.y + l.dst.w) {
+        let sx = span(p.x - l.dst.x, l.src.z / l.dst.z, l.src.z) + l.src.x;
+        let sy = span(p.y - l.dst.y, l.src.w / l.dst.w, l.src.w) + l.src.y;
+        var total = 0.0;
+        for (var y = floor(sy.x); y < sy.y; y += 1.0) {
+            let wy = min(sy.y, y + 1.0) - max(sy.x, y);
+            for (var x = floor(sx.x); x < sx.y; x += 1.0) {
+                let w = (min(sx.y, x + 1.0) - max(sx.x, x)) * wy;
+                c += textureLoad(source, vec2<i32>(i32(x), i32(y)), 0).rgb * w;
+                total += w;
+            }
+        }
+        c = linear(c / max(total, 1e-6));
+    }
+    let i = id.y * l.size.x + id.x;
+    sum[i] += vec4<f32>(c * l.weight, 0.0);
+}
+"#;
+
+const RESOLVE_SHADER: &str = r#"
+struct Resolve {
+    size: vec2<u32>,
+    total: f32,
+    layer: u32,
+}
+
+@group(0) @binding(0) var<storage, read> sum: array<vec4<f32>>;
+@group(0) @binding(1) var frame: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(2) var<uniform> r: Resolve;
+@group(0) @binding(3) var overlay: texture_2d<f32>;
+
+fn srgb(c: vec3<f32>) -> vec3<f32> {
+    return select(1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - 0.055, c * 12.92, c <= vec3<f32>(0.0031308));
+}
+
+// The frame: its looks' average light, back to sRGB; the webcam over it.
+@compute @workgroup_size(8, 8)
+fn resolve(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x >= r.size.x || id.y >= r.size.y) {
+        return;
+    }
+    var c = srgb(clamp(sum[id.y * r.size.x + id.x].rgb / r.total, vec3<f32>(0.0), vec3<f32>(1.0)));
+    if (r.layer != 0u) {
+        let l = textureLoad(overlay, vec2<i32>(id.xy), 0);
+        if (l.a > 0.5) {
+            c = l.rgb;
+        }
+    }
+    textureStore(frame, vec2<i32>(id.xy), vec4<f32>(c, 1.0));
+}
+"#;
+
 const NV12_SHADER: &str = r#"
 struct Size {
     width: u32,
@@ -152,6 +243,29 @@ pub(crate) struct GpuPicture {
     /// A picture from our memory, uploaded: its texture and its number.
     uploaded: Option<(wgpu::Texture, u64)>,
     nv12_bind: wgpu::BindGroup,
+    /// Frame blending's sums, once it's started.
+    blend: Option<Blend>,
+}
+
+/// Frame blending on the card: each open frame's sum of light, and the
+/// picture the looks now see.
+struct Blend {
+    accumulate: wgpu::ComputePipeline,
+    resolve: wgpu::ComputePipeline,
+    slots: Vec<Slot>,
+    resolve_uniforms: wgpu::Buffer,
+    held: Option<wgpu::Texture>,
+}
+
+/// One open frame: its sum, which frame it is, its looks' weight so far
+/// added and still to add (a picture seen by several looks in a row is
+/// added once, with all their weight).
+struct Slot {
+    sum: wgpu::Buffer,
+    uniforms: wgpu::Buffer,
+    frame: Option<i64>,
+    added: f32,
+    pending: f32,
 }
 
 /// The webcam over the frame: drawn into a frame-size canvas of ours (clear
@@ -214,7 +328,7 @@ impl GpuPicture {
         let size_bytes: Vec<u8> = [width, height, 0, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
         gpu.queue.write_buffer(&sizes, 0, &size_bytes);
         let layer = Layer { canvas: Canvas::new(width, height), texture: overlay, rows: None, on: false };
-        Self { gpu, width, height, framing, scale, nv12, frame, uniforms, nv12_buf, readback, layer, uploaded: None, nv12_bind }
+        Self { gpu, width, height, framing, scale, nv12, frame, uniforms, nv12_buf, readback, layer, uploaded: None, nv12_bind, blend: None }
     }
 
     /// Draw the webcam's layer: `cam` placed at `place`, or none.
@@ -287,6 +401,159 @@ impl GpuPicture {
         }
         self.gpu.queue.submit([enc.finish()]);
         true
+    }
+
+    /// Blend frames from now on, `open` of them at once (`Shutter::frames_open`).
+    pub(crate) fn start_blending(&mut self, open: usize) {
+        let device = &self.gpu.device;
+        let pipeline = |source: &str, entry: &str| {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(entry), source: wgpu::ShaderSource::Wgsl(source.into()) });
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some(entry), layout: None, module: &module, entry_point: Some(entry), compilation_options: Default::default(), cache: None })
+        };
+        let uniform = |label| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: 64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let bytes = self.width as u64 * self.height as u64 * 16;
+        let slots = (0..open.max(1))
+            .map(|_| Slot {
+                sum: device.create_buffer(&wgpu::BufferDescriptor { label: Some("blend sum"), size: bytes, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
+                uniforms: uniform("look"),
+                frame: None,
+                added: 0.0,
+                pending: 0.0,
+            })
+            .collect();
+        self.blend = Some(Blend { accumulate: pipeline(BLEND_SHADER, "accumulate"), resolve: pipeline(RESOLVE_SHADER, "resolve"), slots, resolve_uniforms: uniform("resolve"), held: None });
+    }
+
+    /// The looks from now on see this picture (number `seq`).
+    pub(crate) fn hold(&mut self, src: &Frame, seq: u64) {
+        self.flush();
+        let texture = match &src.texture {
+            Some(t) => Some(t.clone()),
+            None => self.upload(src, seq),
+        };
+        if let Some(b) = &mut self.blend {
+            b.held = texture;
+        }
+    }
+
+    /// A look at the held picture counts toward frame `k` with `weight`.
+    pub(crate) fn add(&mut self, k: i64, weight: f32) {
+        let Some(b) = &self.blend else { return };
+        if b.held.is_none() {
+            return;
+        }
+        let at = k.rem_euclid(b.slots.len() as i64) as usize;
+        if b.slots[at].frame != Some(k) {
+            // A frame left open whose slot is wanted again: it's dropped.
+            if b.slots[at].added > 0.0 {
+                self.clear_slot(at);
+            }
+            let Some(b) = &mut self.blend else { return };
+            let slot = &mut b.slots[at];
+            slot.frame = Some(k);
+            slot.added = 0.0;
+            slot.pending = 0.0;
+        }
+        if let Some(b) = &mut self.blend {
+            b.slots[at].pending += weight;
+        }
+    }
+
+    /// Frame `k`'s looks are all in: make it (into the frame, for `nv12`).
+    /// False if it saw no picture.
+    pub(crate) fn finish(&mut self, k: i64) -> bool {
+        self.flush();
+        let (width, height, layer) = (self.width, self.height, self.layer.on);
+        let Some(b) = &mut self.blend else { return false };
+        let n = b.slots.len() as i64;
+        let at = k.rem_euclid(n) as usize;
+        let slot = &mut b.slots[at];
+        if slot.frame != Some(k) || slot.added <= 0.0 {
+            slot.frame = None;
+            slot.added = 0.0;
+            return false;
+        }
+        let bytes: Vec<u8> = [width.to_le_bytes(), height.to_le_bytes(), slot.added.to_le_bytes(), u32::from(layer).to_le_bytes()].concat();
+        self.gpu.queue.write_buffer(&b.resolve_uniforms, 0, &bytes);
+        let device = &self.gpu.device;
+        let frame_view = self.frame.create_view(&Default::default());
+        let overlay_view = self.layer.texture.create_view(&Default::default());
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("resolve"),
+            layout: &b.resolve.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: slot.sum.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&frame_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: b.resolve_uniforms.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&overlay_view) },
+            ],
+        });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("resolve") });
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&b.resolve);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
+        }
+        enc.clear_buffer(&slot.sum, 0, None);
+        self.gpu.queue.submit([enc.finish()]);
+        slot.frame = None;
+        slot.added = 0.0;
+        true
+    }
+
+    /// Add each open frame's waiting weight of the held picture to its sum.
+    fn flush(&mut self) {
+        let (width, height, framing) = (self.width, self.height, self.framing);
+        let Some(b) = &mut self.blend else { return };
+        let Some(held) = &b.held else {
+            b.slots.iter_mut().for_each(|s| s.pending = 0.0);
+            return;
+        };
+        if b.slots.iter().all(|s| s.pending <= 0.0) {
+            return;
+        }
+        let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = crate::placement((held.width(), held.height()), (width, height), framing);
+        let device = &self.gpu.device;
+        let source_view = held.create_view(&Default::default());
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("looks") });
+        for slot in b.slots.iter_mut().filter(|s| s.pending > 0.0) {
+            let bytes: Vec<u8> = [sx, sy, sw, sh, dx, dy, dw, dh]
+                .iter()
+                .flat_map(|v| (*v as f32).to_le_bytes())
+                .chain(width.to_le_bytes())
+                .chain(height.to_le_bytes())
+                .chain(slot.pending.to_le_bytes())
+                .chain(0f32.to_le_bytes())
+                .collect();
+            self.gpu.queue.write_buffer(&slot.uniforms, 0, &bytes);
+            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("look"),
+                layout: &b.accumulate.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&source_view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: slot.sum.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: slot.uniforms.as_entire_binding() },
+                ],
+            });
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&b.accumulate);
+                pass.set_bind_group(0, &bind, &[]);
+                pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
+            }
+            slot.added += slot.pending;
+            slot.pending = 0.0;
+        }
+        self.gpu.queue.submit([enc.finish()]);
+    }
+
+    /// Empty a slot's sum.
+    fn clear_slot(&mut self, at: usize) {
+        let Some(b) = &self.blend else { return };
+        let mut enc = self.gpu.device.create_command_encoder(&Default::default());
+        enc.clear_buffer(&b.slots[at].sum, 0, None);
+        self.gpu.queue.submit([enc.finish()]);
     }
 
     /// The frame as NV12, into `out`: converted on the card, read back.
@@ -375,6 +642,36 @@ fn nv12_len(width: u32, height: u32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Blending black and white evenly averages their light (sRGB 188, luma
+    /// 178), not their values (128); a frame no look saw isn't made; two
+    /// frames open at once keep their sums apart.
+    #[test]
+    #[ignore = "uses the graphics card: cargo test -p capture blends_light -- --ignored"]
+    fn blends_light() {
+        let gpu = super::super::gpu::gpu().expect("a graphics card");
+        let solid = |v: u8| Frame { width: 16, height: 16, stride: 64, order: Order::Bgr, data: [v, v, v, 255].repeat(256), texture: None };
+        let mut pic = GpuPicture::new(gpu, 16, 16, crate::Framing::Fit);
+        pic.start_blending(2);
+        assert!(!pic.finish(0), "no look, no frame");
+        pic.hold(&solid(0), 1);
+        pic.add(1, 1.0);
+        pic.add(2, 3.0);
+        pic.hold(&solid(255), 2);
+        pic.add(1, 1.0);
+        assert!(pic.finish(1));
+        let mut out = Vec::new();
+        pic.nv12(&mut out);
+        eprintln!("frame 1 luma {}", out[0]);
+        assert!((out[0] as i32 - 178).abs() <= 1, "luma {}", out[0]);
+        // Frame 2: three parts black, one white: a quarter of the light.
+        pic.add(2, 1.0);
+        assert!(pic.finish(2));
+        pic.nv12(&mut out);
+        // A quarter of white's light is sRGB 137: luma ((220 * 137 + 128) >> 8) + 16 = 134.
+        eprintln!("frame 2 luma {}", out[0]);
+        assert!((out[0] as i32 - 134).abs() <= 1, "luma {}", out[0]);
+    }
 
     /// The card makes the same NV12 as the CPU, give or take a step from
     /// rounding when scaling.

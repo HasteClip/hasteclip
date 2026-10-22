@@ -217,9 +217,10 @@ pub fn frame_size(source: &VideoSource, target_height: Option<u32>, shape: Optio
 }
 
 /// The fastest a recording of `source` can look at the screen for frame
-/// blending, if there's a limit: on macOS the display's refresh rate (games
-/// and apps: the main display's), as ScreenCaptureKit only sees what the
-/// display shows. Windows takes the game's own pictures: no limit.
+/// blending, if there's a limit: on macOS and Linux the display's refresh
+/// rate (games and apps: the main display's on macOS, the fastest's on
+/// Linux), as ScreenCaptureKit and the compositor only see what the display
+/// shows. Windows takes the game's own pictures: no limit.
 pub fn max_blend_rate(source: &VideoSource) -> Option<u32> {
     #[cfg(target_os = "macos")]
     {
@@ -229,10 +230,28 @@ pub fn max_blend_rate(source: &VideoSource) -> Option<u32> {
         };
         mac::display_refresh(id)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        display_refresh(source)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = source;
         None
+    }
+}
+
+/// Whether frame blending can be done here: Windows and macOS, and Linux
+/// where the graphics card takes the screen's pictures (Vulkan that imports
+/// DMA-BUFs). Quick after the first time.
+pub fn frame_blending() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux::frame_blending()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        cfg!(any(target_os = "windows", target_os = "macos"))
     }
 }
 
@@ -252,7 +271,11 @@ pub fn display_refresh(source: &VideoSource) -> Option<u32> {
     {
         win::system::display_refresh(id)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::display_refresh(id)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         let _ = id;
         None

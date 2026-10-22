@@ -68,7 +68,23 @@ pub(crate) struct Latest {
     /// request (X11), and the signal to it.
     wanted: Mutex<bool>,
     wake: Condvar,
+    /// For frame blending: every picture as it arrives, not just the newest
+    /// (`queue_arrivals`), and the signal that one has.
+    arrivals: Mutex<Option<std::collections::VecDeque<Arrival>>>,
+    arrived: Condvar,
 }
+
+/// A picture as it arrived, for frame blending.
+pub(crate) struct Arrival {
+    /// When (CLOCK_MONOTONIC seconds).
+    pub at: f64,
+    pub frame: Arc<Frame>,
+    pub seq: u64,
+}
+
+/// The most arrivals kept unread: past that the oldest go (a reader that
+/// stopped reading shouldn't hold every picture).
+const ARRIVALS_KEPT: usize = 256;
 
 impl Latest {
     /// The newest picture and its number.
@@ -146,10 +162,40 @@ impl Latest {
         self.publish(Frame { width, height, stride: width as usize * 4, order: Order::Bgr, data: Vec::new(), texture: Some(texture) });
     }
 
+    /// Keep every picture as it arrives too, for `drain` (frame blending).
+    pub(crate) fn queue_arrivals(&self) {
+        self.arrivals.lock().unwrap().get_or_insert_with(Default::default);
+    }
+
+    /// The pictures arrived since the last drain, oldest first.
+    pub(crate) fn drain(&self) -> Vec<Arrival> {
+        self.arrivals.lock().unwrap().as_mut().map(|q| q.drain(..).collect()).unwrap_or_default()
+    }
+
+    /// Wait up to `timeout` for a picture newer than number `seen`.
+    pub(crate) fn wait(&self, seen: u64, timeout: Duration) {
+        let q = self.arrivals.lock().unwrap();
+        if self.seq.load(Ordering::Acquire) > seen {
+            return;
+        }
+        let _ = self.arrived.wait_timeout(q, timeout);
+    }
+
     /// Make `frame` the newest; keep the one before for reuse once nobody holds it.
     fn publish(&self, frame: Frame) {
-        let old = self.frame.lock().unwrap().replace(Arc::new(frame));
-        self.seq.fetch_add(1, Ordering::Release);
+        let frame = Arc::new(frame);
+        let old = self.frame.lock().unwrap().replace(frame.clone());
+        let seq = self.seq.fetch_add(1, Ordering::Release) + 1;
+        {
+            let mut q = self.arrivals.lock().unwrap();
+            if let Some(q) = q.as_mut() {
+                if q.len() >= ARRIVALS_KEPT {
+                    q.pop_front();
+                }
+                q.push_back(Arrival { at: super::host_now(), frame, seq });
+            }
+        }
+        self.arrived.notify_all();
         if let Some(Ok(mut old)) = old.map(Arc::try_unwrap) {
             match old.texture.take() {
                 Some(t) => {

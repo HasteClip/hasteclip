@@ -32,6 +32,7 @@
 
 mod apps;
 pub mod audio;
+mod blend;
 mod camera;
 pub mod ffmpeg;
 mod image;
@@ -67,7 +68,7 @@ use crate::sources::{AudioCapture, mix_inputs, track_layout};
 use crate::webcam::{Placement, SharedPlacement};
 use crate::writer::{self, Writer};
 use crate::{AUDIO_BITRATE, Device, EncodeSettings, Mode, Recorder, VideoSource};
-use image::Canvas;
+use image::{CameraPicture, Canvas};
 
 /// CLOCK_MONOTONIC in seconds: PipeWire's clock, and so every timestamp's.
 pub(crate) fn host_now() -> f64 {
@@ -135,6 +136,25 @@ pub fn list_screens() -> Vec<Device> {
         }
     }
     vec![Device { id: SCREEN_ID.into(), name: "Screen (picked when recording first starts)".into() }]
+}
+
+/// The refresh rate of monitor `id` (the fastest's for `None`), where the
+/// desktop says: KDE Plasma, so far.
+pub(crate) fn display_refresh(id: Option<&str>) -> Option<u32> {
+    if x11::session() || !kwin::available() {
+        return None;
+    }
+    let monitors = kwin::monitors();
+    match id {
+        Some(id) => monitors.iter().find(|m| m.id == id).and_then(|m| m.refresh),
+        None => monitors.iter().filter_map(|m| m.refresh).max(),
+    }
+}
+
+/// Whether frames can be blended: on the graphics card, when it takes the
+/// screen's pictures.
+pub(crate) fn frame_blending() -> bool {
+    screen::gpu_frames().is_some()
 }
 
 /// Previews running on their threads, which `shutdown` waits for.
@@ -429,6 +449,31 @@ impl Feed {
         }
     }
 
+    /// Keep every picture as it arrives, for `drain` (frame blending).
+    fn queue_arrivals(&self) {
+        match self {
+            Self::Screen(s) => s.latest.queue_arrivals(),
+            Self::Apps(a) => a.queue_arrivals(),
+        }
+    }
+
+    /// The pictures arrived since the last drain, oldest first.
+    fn drain(&self) -> Vec<screen::Arrival> {
+        match self {
+            Self::Screen(s) => s.latest.drain(),
+            Self::Apps(a) => a.drain(),
+        }
+    }
+
+    /// Wait up to `timeout` for a picture newer than `seen` (a screen; games
+    /// and apps just wait).
+    fn wait(&self, seen: u64, timeout: Duration) {
+        match self {
+            Self::Screen(s) => s.latest.wait(seen, timeout),
+            Self::Apps(_) => thread::sleep(timeout.min(Duration::from_millis(1))),
+        }
+    }
+
     /// Why the pictures stopped, if they did (games and apps don't stop).
     fn ended(&self) -> Option<String> {
         match self {
@@ -521,7 +566,15 @@ impl Session {
 
             let encoder = ffmpeg::H264::start(width, height, s, session.writer_tx.clone())?;
             let picture = Picture::new(feed.clone(), width, height, framing, s.webcam.as_ref());
-            session.pacer = Some(spawn_pacer(s.fps, picture, encoder, clock));
+            // Frame blending is done on the graphics card.
+            session.pacer = Some(if s.blend_samples > 1 && picture.gpu.is_some() {
+                blend::spawn_blend_pacer(s.fps, s.blend_samples, crate::shutter::Shutter::new(s.blend_samples, s.blend_shape), picture, encoder, clock)
+            } else {
+                if s.blend_samples > 1 {
+                    eprintln!("frame blending needs the graphics card to take the screen's pictures: recording without it");
+                }
+                spawn_pacer(s.fps, picture, encoder, clock)
+            });
             Ok(())
         })();
         if let Err(e) = started {
@@ -573,6 +626,8 @@ struct Picture {
     /// What the canvas shows: the screen picture's number, the camera picture
     /// and where it was placed.
     shows: Option<(u64, Option<usize>, Option<Placement>)>,
+    /// The webcam picture and where it was placed, as the card's layer has it.
+    camera_shown: Option<(Option<usize>, Option<Placement>)>,
     /// The canvas as NV12, made when it changes.
     nv12: Vec<u8>,
     /// Counts the canvas's changes, so the preview is only sent new ones.
@@ -585,14 +640,12 @@ impl Picture {
         let gpu = screen::gpu_frames().map(|g| gpu_frame::GpuPicture::new(g, width, height, framing));
         let mut canvas = if gpu.is_some() { Canvas::new(0, 0) } else { Canvas::new(width, height) };
         canvas.clear();
-        Self { feed, width, height, canvas, gpu, framing, camera, shows: None, nv12: Vec::new(), version: 0 }
+        Self { feed, width, height, canvas, gpu, framing, camera, shows: None, camera_shown: None, nv12: Vec::new(), version: 0 }
     }
 
-    /// Bring the canvas up to date. Returns whether there's a picture yet.
-    fn update(&mut self, nv12: bool) -> bool {
-        // A source that reads the screen on request (X11) reads the next one now.
-        self.feed.want();
-        let Some((frame, seq)) = self.feed.get() else { return false };
+    /// On the card: draw the webcam's layer again if its picture or place
+    /// changed. Returns the camera picture and place shown.
+    fn camera_layer(&mut self) -> (Option<Arc<CameraPicture>>, Option<Placement>) {
         let (cam, place) = match &mut self.camera {
             Some((layer, place)) => {
                 let place = *place.lock().unwrap();
@@ -600,14 +653,26 @@ impl Picture {
             }
             None => (None, None),
         };
+        let now = (cam.as_ref().map(|c| Arc::as_ptr(c) as usize), place);
+        if let Some(g) = &mut self.gpu
+            && self.camera_shown != Some(now)
+        {
+            g.set_camera(cam.as_deref().zip(place.as_ref()));
+            self.camera_shown = Some(now);
+        }
+        (cam, place)
+    }
+
+    /// Bring the canvas up to date. Returns whether there's a picture yet.
+    fn update(&mut self, nv12: bool) -> bool {
+        // A source that reads the screen on request (X11) reads the next one now.
+        self.feed.want();
+        let Some((frame, seq)) = self.feed.get() else { return false };
+        let (cam, place) = self.camera_layer();
         let now = (seq, cam.as_ref().map(|c| Arc::as_ptr(c) as usize), place);
         if self.shows.as_ref() != Some(&now) {
             match &mut self.gpu {
                 Some(g) => {
-                    // The webcam's layer is drawn again only when it changed.
-                    if self.shows.as_ref().is_none_or(|s| (s.1, s.2) != (now.1, now.2)) {
-                        g.set_camera(cam.as_deref().zip(place.as_ref()));
-                    }
                     if !g.draw(&frame, seq) {
                         return false;
                     }
@@ -862,8 +927,9 @@ mod tests {
             output_dir: dir.clone(),
             container_ext: "mp4".into(),
             fps: 60,
-            blend_samples: 1,
-            blend_shape: crate::BlendShape::Even,
+            // HASTECLIP_BLEND=<looks a frame>, HASTECLIP_SOFT=1 for the soft shape.
+            blend_samples: std::env::var("HASTECLIP_BLEND").ok().and_then(|s| s.parse().ok()).unwrap_or(1),
+            blend_shape: if std::env::var_os("HASTECLIP_SOFT").is_some() { crate::BlendShape::Soft } else { crate::BlendShape::Even },
             video_bitrate_kbps: 8000,
             target_height: Some(1080),
             shape: None,
@@ -899,6 +965,7 @@ mod tests {
             .arg(&file)
             .output()
             .unwrap();
+        eprintln!("refresh: {:?} Hz (fastest {:?})", display_refresh(Some(&screen.id)), display_refresh(None));
         eprintln!("gpu: {}, {:.0}% of a core, screenshot {}x{}, file: {}", screen::gpu_frames().is_some(), used * 100.0, shot.width, shot.height, String::from_utf8_lossy(&probe.stdout).replace('\n', " "));
         if let Some(out) = std::env::var_os("HASTECLIP_FRAME") {
             let _ = std::process::Command::new("ffmpeg").args(["-v", "error", "-y", "-sseof", "-1", "-i"]).arg(&file).args(["-frames:v", "1"]).arg(out).status();

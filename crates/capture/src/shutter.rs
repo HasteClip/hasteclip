@@ -1,5 +1,5 @@
 //! Which frames a frame-blending look counts toward, and how much: the same
-//! on Windows and macOS.
+//! on Windows, macOS and Linux.
 //!
 //! Look `m` is at `m + 0.5` steps (a step is one over the blend rate), and
 //! frame `k`'s own time is steps `k * looks` to `(k + 1) * looks`.
@@ -28,14 +28,12 @@ pub enum BlendShape {
 }
 
 /// Where the looks go, for `looks` a frame.
-#[cfg_attr(target_os = "linux", allow(dead_code))]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Shutter {
     looks: i64,
     soft: bool,
 }
 
-#[cfg_attr(target_os = "linux", allow(dead_code))]
 impl Shutter {
     pub(crate) fn new(looks: u32, shape: BlendShape) -> Self {
         // One look a frame is no blending: each frame is the picture up at
@@ -65,6 +63,7 @@ impl Shutter {
     }
 
     /// The first look that counts toward frame `k`.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub(crate) fn first_look(&self, k: i64) -> i64 {
         self.start(if self.soft { k - 1 } else { k })
     }

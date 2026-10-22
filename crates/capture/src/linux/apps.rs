@@ -105,6 +105,8 @@ struct Shared {
     /// Counts changes of what's shown, so a new window's (or the away
     /// screen's) pictures read as new.
     generation: AtomicU64,
+    /// Keep every window picture as it arrives (frame blending).
+    queue: AtomicBool,
 }
 
 /// What's shown now.
@@ -126,6 +128,7 @@ impl Apps {
             away: Arc::new(away_screen.map_or_else(black, still_frame)),
             now: Mutex::new(Now::default()),
             generation: AtomicU64::new(1),
+            queue: AtomicBool::new(false),
         });
         let stop = Arc::new(AtomicBool::new(false));
         let (shared2, stop2) = (shared.clone(), stop.clone());
@@ -151,6 +154,27 @@ impl Apps {
                 Some(screen.latest.get().map_or((away.1, away.0), |(f, seq)| (f, generation | seq)))
             }
             _ => Some((away.1, away.0)),
+        }
+    }
+
+    /// Keep every picture of the windows recorded as it arrives, for `drain`.
+    pub(crate) fn queue_arrivals(&self) {
+        self.shared.queue.store(true, Ordering::Relaxed);
+        if let Some((_, _, s)) = &self.shared.now.lock().unwrap().window {
+            s.latest.queue_arrivals();
+        }
+    }
+
+    /// The window's pictures arrived since the last drain, numbered as `get`
+    /// numbers them; none while the away screen shows.
+    pub(crate) fn drain(&self) -> Vec<screen::Arrival> {
+        let now = self.shared.now.lock().unwrap();
+        let generation = self.shared.generation.load(Ordering::Acquire) << 40;
+        match &now.window {
+            Some((_, _, s)) if !(now.minimized && self.shared.away_when_unfocused.load(Ordering::Relaxed)) => {
+                s.latest.drain().into_iter().map(|a| screen::Arrival { seq: generation | a.seq, ..a }).collect()
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -196,6 +220,9 @@ fn follow(shared: &Shared, stop: &AtomicBool) {
                 match screen::open_kwin_window(&w.uuid) {
                     Ok(s) => {
                         failed.remove(&w.uuid);
+                        if shared.queue.load(Ordering::Relaxed) {
+                            s.latest.queue_arrivals();
+                        }
                         let old = std::mem::replace(&mut *shared.now.lock().unwrap(), Now { window: Some((w.uuid.clone(), id, Arc::new(s))), minimized: false });
                         shared.generation.fetch_add(1, Ordering::Release);
                         drop(old);

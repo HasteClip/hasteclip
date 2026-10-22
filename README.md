@@ -162,7 +162,7 @@ HasteClip is in beta (versions 0.x). It works day to day, but not every feature 
 | Voice saving, named clips, per-app sound, webcam | ✅ | ✅ | ✅ |
 | Record a single game or app window | ✅ | ✅ | ✅ (KDE Plasma) |
 | Drag clips out, system share sheet | ✅ | ✅ | — (use Copy clip) |
-| Frame blending | ✅ | ✅ | — |
+| Frame blending | ✅ | ✅ | ✅ |
 | Automatic updates | — | ✅ | ✅ |
 | Screenshots | — | ✅ | ✅ |
 | Game capture for fullscreen games | — | ✅ | — |
