@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
 use rubato::{Fft, FixedSync, Resampler};
@@ -773,7 +773,13 @@ pub(crate) fn spawn_mixer(
         // The meters' own position and limiter, ahead of the mix.
         let mut metered: Option<i64> = None;
         let mut meter_limiter = Limiter::new();
+        // When the meters last moved, and whether that's been said: they
+        // stood still now and then, until clipping was restarted; this says
+        // where they were stuck, in the log.
+        let mut moved = Instant::now();
+        let mut said_stuck = false;
         loop {
+            let tick = Instant::now();
             let stopping = stop.load(Ordering::Relaxed);
             if let Some(t0) = clock.get() {
                 let mut target = ((now() - t0 - METER_LAG) * RATE as f64).floor() as i64;
@@ -807,6 +813,23 @@ pub(crate) fn spawn_mixer(
                     }
                     live.master.record(&mix);
                     *from += n as i64;
+                    moved = Instant::now();
+                }
+                if !stopping && moved.elapsed() > Duration::from_secs(2) {
+                    if !said_stuck {
+                        said_stuck = true;
+                        let arrived: Vec<Option<i64>> = inputs.iter().map(|i| i.feed.arrived()).collect();
+                        eprintln!(
+                            "meters: stuck for {:.1} s at frame {}, aiming at {} ({:.3} s since the start), mixed to {mixed:?}; newest audio per source: {arrived:?}",
+                            moved.elapsed().as_secs_f32(),
+                            metered.unwrap_or(0),
+                            target,
+                            now() - t0
+                        );
+                    }
+                } else if said_stuck && moved.elapsed() < Duration::from_secs(1) {
+                    said_stuck = false;
+                    eprintln!("meters: moving again");
                 }
                 let behind = if stopping { 0.0 } else { latency };
                 let target = ((now() - t0 - behind) * RATE as f64).floor() as i64;
@@ -849,6 +872,9 @@ pub(crate) fn spawn_mixer(
             }
             if stopping {
                 break;
+            }
+            if tick.elapsed() > Duration::from_millis(500) {
+                eprintln!("mixer: one pass took {:.2} s (a source's audio held it up)", tick.elapsed().as_secs_f32());
             }
             thread::sleep(Duration::from_millis(10));
         }
