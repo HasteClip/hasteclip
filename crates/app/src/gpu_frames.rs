@@ -112,6 +112,13 @@ impl Planes {
 }
 
 impl Shown {
+    /// Its size in pixels.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn size(&self) -> (u32, u32) {
+        let s = self.planes.views()[0].texture().size();
+        (s.width, s.height)
+    }
+
     /// Draw it into `rect` (with the high-quality filter), cut to
     /// `painter`'s clip.
     pub fn paint(&self, painter: &egui::Painter, rect: egui::Rect) {

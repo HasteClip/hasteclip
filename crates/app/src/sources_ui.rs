@@ -541,16 +541,14 @@ impl App {
                 let whole = frame.as_ref().is_some_and(|f| (f.recorded.0 as f32 / f.recorded.1.max(1) as f32 - aspect).abs() < 0.01);
                 let to = |px: f32, py: f32| egui::pos2(rect.left() + px / sw as f32 * rect.width(), rect.top() + py / sh as f32 * rect.height());
                 let kept_on_screen = egui::Rect::from_min_max(to(x as f32, y as f32), to((x + w) as f32, (y + h) as f32));
-                match &this.sources_view.preview {
-                    Some((tex, _)) if locked => {
-                        p.image(tex.id(), kept_on_screen, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
-                    }
-                    Some((tex, _)) if whole => {
-                        p.image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
-                    }
-                    _ => {
-                        p.text(rect.center(), egui::Align2::CENTER_CENTER, "Starting preview…", egui::FontId::proportional(13.0), Color32::from_gray(170));
-                    }
+                // Without a frame, what's held is an older capture's picture.
+                let drawn = if locked { frame.is_some() && this.paint_preview(p, kept_on_screen) } else { whole && this.paint_preview(p, rect) };
+                if !drawn {
+                    let text = match this.video_preview.as_ref().and_then(|(_, v)| v.error()) {
+                        Some(e) => format!("No preview: {e}"),
+                        None => "Starting preview…".to_owned(),
+                    };
+                    p.text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(13.0), Color32::from_gray(170));
                 }
                 // Locked: where it is, outlined as when it's set, without grips.
                 if locked {
@@ -723,6 +721,32 @@ impl App {
         }
     }
 
+    /// Draw the preview picture held (macOS: the frame on the GPU; else the
+    /// texture) into `rect`. False if there's none yet.
+    fn paint_preview(&self, p: &egui::Painter, rect: egui::Rect) -> bool {
+        #[cfg(target_os = "macos")]
+        if let Some((shown, _)) = &self.sources_view.preview_gpu {
+            shown.paint(p, rect);
+            return true;
+        }
+        match &self.sources_view.preview {
+            Some((tex, _)) => {
+                p.image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The size of the preview picture held, in pixels.
+    fn preview_size(&self) -> Option<(u32, u32)> {
+        #[cfg(target_os = "macos")]
+        if let Some((shown, _)) = &self.sources_view.preview_gpu {
+            return Some(shown.size());
+        }
+        self.sources_view.preview.as_ref().map(|(t, _)| t.size()).map(|[w, h]| (w as u32, h as u32))
+    }
+
     /// Count a new preview frame, for the rate shown.
     fn count_preview_frame(&mut self) {
         let (count, since, rate) = &mut self.sources_view.preview_rate;
@@ -744,7 +768,7 @@ impl App {
         // The frame's shape; between captures (none has a frame for a moment,
         // starting to clip) the shape of the picture still shown, so it isn't
         // drawn stretched.
-        let shown = self.sources_view.preview.as_ref().map(|(t, _)| t.size()).map(|[w, h]| w as f32 / h.max(1) as f32);
+        let shown = self.preview_size().map(|(w, h)| w as f32 / h.max(1) as f32);
         let aspect = frame.map(|f| f.width as f32 / f.height.max(1) as f32).or(shown).unwrap_or(16.0 / 10.0);
         let max_h = (ui.ctx().content_rect().height() * 0.45).max(140.0);
         let w = ui.available_width().min(max_h * aspect);
@@ -755,22 +779,7 @@ impl App {
             let message = |text: &str| {
                 p.text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(13.0), Color32::from_gray(170));
             };
-            #[cfg(target_os = "macos")]
-            let gpu = self.sources_view.preview_gpu.as_ref().map(|(s, _)| s.clone());
-            #[cfg(not(target_os = "macos"))]
-            let gpu: Option<()> = None;
-            let drawn = match (&gpu, &self.sources_view.preview) {
-                #[cfg(target_os = "macos")]
-                (Some(shown), _) => {
-                    shown.paint(p, rect);
-                    true
-                }
-                (_, Some((tex, _))) => {
-                    p.image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
-                    true
-                }
-                _ => false,
-            };
+            let drawn = self.paint_preview(p, rect);
             // While a new preview starts (another frame rate, size, webcam)
             // the last picture stays up; the message is only for when there's
             // none to show.
