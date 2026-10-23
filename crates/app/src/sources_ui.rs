@@ -552,8 +552,9 @@ impl App {
                         p.text(rect.center(), egui::Align2::CENTER_CENTER, "Starting preview…", egui::FontId::proportional(13.0), Color32::from_gray(170));
                     }
                 }
+                // Locked: where it is, outlined as when it's set, without grips.
                 if locked {
-                    p.rect_stroke(kept_on_screen, 0.0, egui::Stroke::new(1.5, Color32::WHITE), egui::StrokeKind::Outside);
+                    crate::webcam_ui::crop_outline(p, kept_on_screen, false);
                     return;
                 }
                 let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(sw as f32, sh as f32));

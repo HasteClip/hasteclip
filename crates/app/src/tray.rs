@@ -91,7 +91,9 @@ fn tray_image() -> Option<tray_icon::Icon> {
 impl Tray {
     /// The tray icon, or `None` where there's none. `tx`: commands from
     /// elsewhere too (another launch asking to be shown).
-    pub fn new(ctx: &egui::Context, tx: mpsc::Sender<Cmd>, rx: Receiver<Cmd>) -> Option<Self> {
+    /// `quick`: saves a clip from the tray's own thread (Linux: the UI's
+    /// doesn't run while the window's hidden).
+    pub fn new(ctx: &egui::Context, tx: mpsc::Sender<Cmd>, rx: Receiver<Cmd>, quick: crate::service::QuickSave) -> Option<Self> {
         #[cfg(any(windows, target_os = "macos"))]
         {
             use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
@@ -139,12 +141,12 @@ impl Tray {
         }
         #[cfg(target_os = "linux")]
         {
-            let inner = linux::spawn(ctx, tx)?;
+            let inner = linux::spawn(ctx, tx, quick)?;
             Some(Self { rx, inner, buffering: Default::default() })
         }
         #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
         {
-            let _ = (ctx, tx, rx);
+            let _ = (ctx, tx, rx, quick);
             None
         }
     }
@@ -203,11 +205,28 @@ mod linux {
         icon: Vec<ksni::Icon>,
         tx: mpsc::Sender<Cmd>,
         ctx: egui::Context,
+        quick: crate::service::QuickSave,
         pub buffering: bool,
     }
 
     impl Item {
+        /// Do `cmd`. While the window's hidden (KDE under Wayland), the app's
+        /// UI doesn't run: opening it, saving a clip and quitting are done
+        /// from here; starting or stopping clipping brings the window back to
+        /// do it.
         fn send(&self, cmd: Cmd) {
+            if crate::kwin_window::hidden() {
+                match cmd {
+                    Cmd::Open | Cmd::ToggleBuffer => {
+                        crate::kwin_window::bring_back();
+                    }
+                    Cmd::SaveClip => {
+                        self.quick.save();
+                        return;
+                    }
+                    Cmd::Quit => crate::quit_now(),
+                }
+            }
             let _ = self.tx.send(cmd);
             self.ctx.request_repaint();
         }
@@ -252,7 +271,7 @@ mod linux {
     }
 
     /// Put the item in the tray. `None` where nothing shows tray icons.
-    pub fn spawn(ctx: &egui::Context, tx: mpsc::Sender<Cmd>) -> Option<ksni::blocking::Handle<Item>> {
+    pub fn spawn(ctx: &egui::Context, tx: mpsc::Sender<Cmd>, quick: crate::service::QuickSave) -> Option<ksni::blocking::Handle<Item>> {
         if !host_present() {
             eprintln!("no tray icon: this desktop doesn't show tray icons (on GNOME, the AppIndicator extension adds them); closing the window quits");
             return None;
@@ -279,7 +298,7 @@ mod linux {
                 ksni::Icon { width: img.width() as i32, height: img.height() as i32, data }
             })
             .collect();
-        let item = Item { icon: sizes, tx, ctx: ctx.clone(), buffering: false };
+        let item = Item { icon: sizes, tx, ctx: ctx.clone(), quick, buffering: false };
         match item.spawn() {
             Ok(handle) => Some(handle),
             Err(e) => {
@@ -322,6 +341,9 @@ pub fn serve(listener: std::net::TcpListener, ctx: &egui::Context, tx: mpsc::Sen
         for mut stream in listener.incoming().flatten() {
             let mut word = [0u8; 4];
             if stream.read_exact(&mut word).is_ok() && &word == b"show" {
+                // Hidden (KDE under Wayland): the UI doesn't run to hear it.
+                #[cfg(target_os = "linux")]
+                crate::kwin_window::bring_back();
                 let _ = tx.send(Cmd::Open);
                 ctx.request_repaint();
             }

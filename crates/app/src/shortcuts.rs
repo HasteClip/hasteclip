@@ -27,6 +27,9 @@ pub struct Registered {
     mgr: Option<GlobalHotKeyManager>,
     #[cfg(target_os = "linux")]
     portal: Option<crate::portal_shortcuts::Portal>,
+    /// How the portal's presses save a clip or take a screenshot at once.
+    #[cfg(target_os = "linux")]
+    quick: Option<crate::service::QuickSave>,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     ctx: egui::Context,
     /// What's registered now, with the action each id triggers.
@@ -55,8 +58,8 @@ impl Registered {
         #[cfg(target_os = "linux")]
         if crate::portal_shortcuts::wanted() {
             if crate::portal_shortcuts::available() {
-                let _ = (quick, tx);
-                return Ok(Self { mgr: None, portal: None, ctx, active: Vec::new(), ids, presses, from: None, errors: Vec::new() });
+                let _ = tx;
+                return Ok(Self { mgr: None, portal: None, quick: Some(quick), ctx, active: Vec::new(), ids, presses, from: None, errors: Vec::new() });
             }
             eprintln!("the desktop has no GlobalShortcuts portal: shortcuts only work while an X11 app is focused");
         }
@@ -95,6 +98,8 @@ impl Registered {
             mgr: Some(mgr),
             #[cfg(target_os = "linux")]
             portal: None,
+            #[cfg(target_os = "linux")]
+            quick: None,
             ctx,
             active: Vec::new(),
             ids,
@@ -160,7 +165,9 @@ impl Registered {
             let ours = self.from.is_some();
             self.portal = None;
             let list = valid.iter().map(|(_, a)| (*a, wanted.get(*a).to_owned())).collect();
-            self.portal = Some(crate::portal_shortcuts::Portal::bind(list, ours, self.ctx.clone()));
+            if let Some(quick) = self.quick.clone() {
+                self.portal = Some(crate::portal_shortcuts::Portal::bind(list, ours, self.ctx.clone(), quick));
+            }
         }
         let _ = valid;
         if let Ok(mut ids) = self.ids.lock() {
@@ -178,7 +185,7 @@ impl Registered {
         let mut out: Vec<(ShortcutAction, bool)> = self.presses.try_iter().collect();
         #[cfg(target_os = "linux")]
         if let Some(p) = &self.portal {
-            out.extend(p.pressed().into_iter().map(|a| (a, false)));
+            out.extend(p.pressed());
         }
         out
     }

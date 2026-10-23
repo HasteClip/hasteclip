@@ -1399,18 +1399,7 @@ pub(crate) fn crop_editor(ui: &egui::Ui, resp: &egui::Response, area: Rect, boun
     p.rect_filled(Rect::from_min_max(egui::pos2(area.left(), c.bottom()), area.max), 0.0, dim);
     p.rect_filled(Rect::from_min_max(egui::pos2(area.left(), c.top()), egui::pos2(c.left(), c.bottom())), 0.0, dim);
     p.rect_filled(Rect::from_min_max(egui::pos2(c.right(), c.top()), egui::pos2(area.right(), c.bottom())), 0.0, dim);
-    p.rect_stroke(c, 0.0, Stroke::new(1.5, Color32::WHITE), egui::StrokeKind::Inside);
-    // Edge bars, and corner brackets.
-    for (a, b) in [(c.left_center(), vec2(4.0, 24.0)), (c.right_center(), vec2(4.0, 24.0)), (c.center_top(), vec2(24.0, 4.0)), (c.center_bottom(), vec2(24.0, 4.0))] {
-        p.rect_filled(Rect::from_center_size(a, b), 2.0, Color32::WHITE);
-    }
-    let arm = 16.0_f32.min(c.width() / 3.0).min(c.height() / 3.0);
-    for (corner, sx, sy) in [(c.left_top(), 1.0, 1.0), (c.right_top(), -1.0, 1.0), (c.left_bottom(), 1.0, -1.0), (c.right_bottom(), -1.0, -1.0)] {
-        let stroke = Stroke::new(4.0, Color32::WHITE);
-        let inner = corner + vec2(sx * 1.5, sy * 1.5);
-        p.line_segment([inner, inner + vec2(sx * arm, 0.0)], stroke);
-        p.line_segment([inner, inner + vec2(0.0, sy * arm)], stroke);
-    }
+    crop_outline(p, c, true);
     // What's near the pointer: a corner, else an edge, else (inside) all of it.
     let grip_at = |at: Pos2| -> Option<Handle> {
         let near = 12.0;
@@ -1453,6 +1442,27 @@ pub(crate) fn crop_editor(ui: &egui::Ui, resp: &egui::Response, area: Rect, boun
         *drag = None;
     }
     out
+}
+
+/// A crop's outline on the picture, `c`, with its grips (edge bars, corner
+/// brackets) when it can be dragged: all on the one line, its edge.
+pub(crate) fn crop_outline(p: &egui::Painter, c: Rect, grips: bool) {
+    p.rect_stroke(c, 0.0, Stroke::new(1.5, Color32::WHITE), egui::StrokeKind::Middle);
+    if !grips {
+        return;
+    }
+    let thick = Stroke::new(4.0, Color32::WHITE);
+    let bar = 12.0_f32.min(c.width() / 4.0).min(c.height() / 4.0);
+    for (mid, along) in [(c.left_center(), vec2(0.0, bar)), (c.right_center(), vec2(0.0, bar)), (c.center_top(), vec2(bar, 0.0)), (c.center_bottom(), vec2(bar, 0.0))] {
+        p.line_segment([mid - along, mid + along], thick);
+    }
+    // Brackets from each corner along its two edges, squared off where they meet.
+    let arm = 16.0_f32.min(c.width() / 3.0).min(c.height() / 3.0);
+    for (corner, sx, sy) in [(c.left_top(), 1.0, 1.0), (c.right_top(), -1.0, 1.0), (c.left_bottom(), 1.0, -1.0), (c.right_bottom(), -1.0, -1.0)] {
+        let out = vec2(-sx, -sy) * thick.width / 2.0;
+        p.line_segment([corner + vec2(out.x, 0.0), corner + vec2(sx * arm, 0.0)], thick);
+        p.line_segment([corner + vec2(0.0, out.y), corner + vec2(0.0, sy * arm)], thick);
+    }
 }
 
 /// The crop (left, top, right, bottom cut off) as the part of the picture

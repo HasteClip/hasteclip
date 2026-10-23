@@ -33,6 +33,8 @@ mod hover_play;
 #[cfg(target_os = "macos")]
 mod key_tap;
 #[cfg(target_os = "linux")]
+mod kwin_window;
+#[cfg(target_os = "linux")]
 mod linux_desktop;
 mod meter;
 mod moments;
@@ -170,19 +172,7 @@ fn main() -> eframe::Result<()> {
 
     // Killed from outside (Ctrl+C, SIGTERM, logout): stop capture and finish the
     // file before exiting, since destructors don't run on a signal.
-    let _ = ctrlc::set_handler(|| {
-        service::stop_all_and_wait(std::time::Duration::from_secs(10));
-        // Without running the C library's exit handlers: they unload the
-        // graphics driver while the UI thread may still be drawing with it,
-        // which crashed (NVIDIA on Linux). The recording is already written.
-        #[cfg(unix)]
-        // SAFETY: ends the process at once; nothing runs after it.
-        unsafe {
-            libc::_exit(0)
-        };
-        #[cfg(not(unix))]
-        std::process::exit(0);
-    });
+    let _ = ctrlc::set_handler(quit_now);
 
     // Dev aid: `HASTECLIP_WINDOW=WxH` opens at that size, to check layouts.
     let size = std::env::var("HASTECLIP_WINDOW")
@@ -312,6 +302,23 @@ enum RecState {
 /// while running. Release bundles use `assets/hasteclip.icns` instead. On
 /// Windows and Linux, where app icons aren't drawn on a plate, the glyph
 /// without the macOS one (`assets/icon-glyph.svg`): with it, it looked small.
+/// Quit from outside the UI's loop (a signal; the tray while the window's
+/// hidden, when the loop doesn't run): stop capturing, finish the file, and
+/// exit.
+pub(crate) fn quit_now() {
+    service::stop_all_and_wait(std::time::Duration::from_secs(10));
+    // Without running the C library's exit handlers: they unload the
+    // graphics driver while the UI thread may still be drawing with it,
+    // which crashed (NVIDIA on Linux). The recording is already written.
+    #[cfg(unix)]
+    // SAFETY: ends the process at once; nothing runs after it.
+    unsafe {
+        libc::_exit(0)
+    };
+    #[cfg(not(unix))]
+    std::process::exit(0);
+}
+
 pub(crate) fn app_icon() -> egui::IconData {
     #[cfg(not(target_os = "macos"))]
     let png = include_bytes!("../assets/icon-glyph-256.png");
@@ -637,7 +644,7 @@ impl App {
         if let Some(listener) = instance {
             tray::serve(listener, &ctx, tray_tx.clone());
         }
-        let tray = tray::Tray::new(&ctx, tray_tx, tray_rx);
+        let tray = tray::Tray::new(&ctx, tray_tx, tray_rx, quick_save.clone());
         let mut app = Self {
             page: Page::Clips,
             rec_state: RecState::Idle,
@@ -1438,10 +1445,28 @@ impl App {
             self.viewer = None;
             self.page = Page::Clips;
         }
+        // Wayland can't hide a window: KWin is asked to; elsewhere on
+        // Wayland it can only be minimized.
+        #[cfg(target_os = "linux")]
+        if crate::portal_shortcuts::wanted() {
+            if kwin_window::available() {
+                kwin_window::hide();
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
+            return;
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
     }
 
     fn show_window(&mut self, ctx: &egui::Context) {
+        // Nor bring one to the front: KWin is asked to.
+        #[cfg(target_os = "linux")]
+        if kwin_window::available() {
+            kwin_window::raise();
+            ctx.request_repaint();
+            return;
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);

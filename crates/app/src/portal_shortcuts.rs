@@ -80,7 +80,8 @@ pub enum State {
 
 /// One bound set of shortcuts. Dropping it unbinds them.
 pub struct Portal {
-    events: Receiver<ShortcutAction>,
+    /// Presses, and whether it was done already (`QuickSave`).
+    events: Receiver<(ShortcutAction, bool)>,
     stop: Arc<AtomicBool>,
     /// Open the desktop's shortcut editor for ours, on the next tick.
     configure: Arc<AtomicBool>,
@@ -94,11 +95,13 @@ pub struct Portal {
 
 impl Portal {
     /// Bind `wanted` (each action with its keys, as `global_hotkey` text) in
-    /// the background. `ctx` is woken when one is pressed. `ours`: they were
+    /// the background. `ctx` is woken when one is pressed; Save clip and
+    /// Take a screenshot are done through `quick` as they're pressed, as
+    /// the UI may not run then (a hidden window gets no frames). `ours`: they were
     /// just changed in Settings, so where the keys are set here (KDE), ours
     /// win; else (starting up) keys changed in the desktop's settings meanwhile
     /// are taken, and only missing ones set.
-    pub fn bind(wanted: Vec<(ShortcutAction, String)>, ours: bool, ctx: egui::Context) -> Self {
+    pub fn bind(wanted: Vec<(ShortcutAction, String)>, ours: bool, ctx: egui::Context, quick: crate::service::QuickSave) -> Self {
         let (tx, events) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let state = Arc::new(Mutex::new(State::Binding));
@@ -154,7 +157,12 @@ impl Portal {
                     match select(activated.next(), select(changed.next(), tick)).await {
                         Either::Left((Some(press), _)) => {
                             if let Some(a) = action(press.shortcut_id()) {
-                                let _ = tx.send(a);
+                                let done = match a {
+                                    ShortcutAction::SaveClip => quick.save(),
+                                    ShortcutAction::Screenshot => quick.screenshot(),
+                                    _ => false,
+                                };
+                                let _ = tx.send((a, done));
                                 ctx.request_repaint();
                             }
                         }
@@ -226,8 +234,8 @@ impl Portal {
         self.configure.store(true, Ordering::Relaxed);
     }
 
-    /// Shortcuts pressed since last asked.
-    pub fn pressed(&self) -> Vec<ShortcutAction> {
+    /// Shortcuts pressed since last asked, and whether each was done already.
+    pub fn pressed(&self) -> Vec<(ShortcutAction, bool)> {
         self.events.try_iter().collect()
     }
 
