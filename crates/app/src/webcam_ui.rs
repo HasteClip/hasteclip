@@ -1375,7 +1375,7 @@ fn picture_view(ui: &mut egui::Ui, panel: &mut CameraPanel, orient: Orientation,
         }
         // The crop on the whole picture: the rest dimmed, its edges dragged.
         let unit = egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-        if let Some(s) = crop_editor(ui, &resp, rect, unit, shown, vec2(0.1, 0.1), &mut panel.crop_drag) {
+        if let Some(s) = crop_editor(ui, &resp, rect, unit, shown, vec2(0.1, 0.1), false, &mut panel.crop_drag) {
             changed = Some(crop_from_shown(orient, s));
         }
     });
@@ -1385,10 +1385,11 @@ fn picture_view(ui: &mut egui::Ui, panel: &mut CameraPanel, orient: Orientation,
 /// A crop being set on a picture drawn at `area`: `bounds` is all of the
 /// picture and `kept` the part kept, in the same units (fractions of it, or
 /// its pixels). Drawn over it with the rest dimmed; its corners, edges or
-/// middle dragged (Shift keeps its shape), down to `least` across and down.
+/// middle dragged (Shift, or `keep`, keeps its shape), down to `least` across
+/// and down.
 /// `drag`: what's held, kept from frame to frame. The new part kept, when
 /// it's dragged.
-pub(crate) fn crop_editor(ui: &egui::Ui, resp: &egui::Response, area: Rect, bounds: Rect, kept: Rect, least: egui::Vec2, drag: &mut Option<(Handle, Rect, Pos2)>) -> Option<Rect> {
+pub(crate) fn crop_editor(ui: &egui::Ui, resp: &egui::Response, area: Rect, bounds: Rect, kept: Rect, least: egui::Vec2, keep: bool, drag: &mut Option<(Handle, Rect, Pos2)>) -> Option<Rect> {
     let scale = vec2(area.width() / bounds.width().max(1e-6), area.height() / bounds.height().max(1e-6));
     let at = |n: Pos2| area.min + (n - bounds.min) * scale;
     let c = Rect::from_min_max(at(kept.min), at(kept.max));
@@ -1445,7 +1446,7 @@ pub(crate) fn crop_editor(ui: &egui::Ui, resp: &egui::Response, area: Rect, boun
             start.translate(vec2(d.x.clamp(bounds.min.x - start.min.x, bounds.max.x - start.max.x), d.y.clamp(bounds.min.y - start.min.y, bounds.max.y - start.max.y)))
         } else {
             // Shift keeps its shape.
-            resize_within(start, g.sides(), d, ui.input(|i| i.modifiers.shift), bounds, least)
+            resize_within(start, g.sides(), d, keep || ui.input(|i| i.modifiers.shift), bounds, least)
         });
     }
     if resp.drag_stopped() {
