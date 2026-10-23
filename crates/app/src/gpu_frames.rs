@@ -30,6 +30,9 @@
 //! Needs wgpu on the platform's backend (DX12 is asked for at startup on
 //! Windows; macOS only has Metal) and, on Windows, the decoder on the same
 //! graphics card; otherwise frames come back as RGBA as before.
+//!
+//! - **Linux** (and wherever ffmpeg decodes instead): ffmpeg's NV12 frames,
+//!   at the video's own size, uploaded into textures (`upload`).
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -46,6 +49,10 @@ pub use dx12::{Frames, share_luid};
 mod metal;
 #[cfg(target_os = "macos")]
 pub use metal::{Frames, available};
+mod upload;
+#[cfg(target_os = "linux")]
+pub use upload::Frames;
+pub use upload::{Uploads, can_upload};
 
 static RENDER: OnceLock<RenderState> = OnceLock::new();
 
@@ -1156,6 +1163,54 @@ mod tests {
             assert!(mean < 1.5, "mean difference {mean}");
             assert!(bias.iter().all(|b| b.abs() < 0.75), "colour shifted: {bias:?}");
         }
+    }
+
+    /// A frame ffmpeg decoded to NV12, uploaded and drawn by the real filter,
+    /// matches ffmpeg's own conversion of it: at 1:1 and shrunk (Lanczos both).
+    /// `cargo test -p hasteclip uploaded -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs a graphics card"]
+    fn uploaded_nv12_matches_ffmpeg() {
+        let dir = std::env::temp_dir().join(format!("hc-upload-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("clip.mp4");
+        let (w, h) = (1280u32, 720u32);
+        let made = media::ffmpeg()
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", &format!("testsrc2=s={w}x{h}:r=30:d=2")])
+            .args(["-vf", "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"])
+            .args(["-color_range", "tv", "-c:v", "libx264", "-crf", "12"])
+            .arg(&clip)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let info = media::probe(&clip).unwrap();
+        assert!(!info.bt601);
+        let t = 1.0;
+        let nv12 = media::nv12_at(&clip, t, (w, h)).unwrap();
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).expect("adapter");
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).expect("device");
+        let (y, cbcr) = upload::upload_for_test(&device, &queue, w, h, &nv12);
+        let shown = Shown { key: (0, 0), planes: Planes::Nv12 { y, cbcr, bt601: false } };
+        for out_w in [w, 854] {
+            let out_h = ((out_w as f64 * h as f64 / w as f64 / 2.0).round() as u32) * 2;
+            let ours = render(&device, &queue, &shown, (out_w, out_h), wgpu::TextureFormat::Rgba8Unorm);
+            let ff = media::ffmpeg()
+                .args(["-v", "error", "-ss", &format!("{t:.4}"), "-i"])
+                .arg(&clip)
+                .args(["-vf", &format!("scale={out_w}:{out_h}:flags=lanczos+accurate_rnd+full_chroma_int:in_color_matrix=bt709:out_range=full,format=rgba"), "-frames:v", "1", "-f", "rawvideo", "-"])
+                .output()
+                .unwrap()
+                .stdout;
+            assert_eq!(ff.len(), ours.len());
+            let diffs: Vec<u32> = ours.iter().zip(&ff).enumerate().filter(|(i, _)| i % 4 != 3).map(|(_, (a, b))| (*a as i32 - *b as i32).unsigned_abs()).collect();
+            let mean = diffs.iter().sum::<u32>() as f64 / diffs.len() as f64;
+            let bias: Vec<f64> = (0..3).map(|c| ours.iter().skip(c).step_by(4).zip(ff.iter().skip(c).step_by(4)).map(|(a, b)| *a as f64 - *b as f64).sum::<f64>() / (ours.len() / 4) as f64).collect();
+            println!("{out_w}x{out_h}: mean |diff| {mean:.2}, bias r/g/b {:.2} {:.2} {:.2}", bias[0], bias[1], bias[2]);
+            assert!(mean < 1.5, "mean difference {mean}");
+            assert!(bias.iter().all(|b| b.abs() < 0.75), "colour shifted: {bias:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The stage's light, as the app makes it: `frames` taken in one after

@@ -223,7 +223,7 @@ pub fn free_up(target: &EditTarget, how: FreeUp, permanently: bool) -> Result<u6
             // The saved clip becomes the recording: its moments are now
             // counted from its own start.
             if let (Some(edit), Ok(info)) = (load_edit(target), media::probe(&original)) {
-                crate::moments::rebase(&target.clip, &target.clip, info.duration, edit.start, edit.end - edit.start);
+                crate::moments::rebase(&target.clip, &target.clip, info.duration, &edit.kept());
             }
             let dir = assets_dir(lib, id);
             let freed = std::fs::read_dir(&dir).map(|d| d.flatten().map(|e| size(&e.path())).sum()).unwrap_or(0);
@@ -263,7 +263,7 @@ pub fn free_up(target: &EditTarget, how: FreeUp, permanently: bool) -> Result<u6
             };
             let before = size(&original);
             let edit = edit.shifted(from - at);
-            crate::moments::rebase(&target.clip, &target.clip, info.duration, from - at, to - from + at);
+            crate::moments::rebase(&target.clip, &target.clip, info.duration, &[(from - at, to)]);
             // The edit first: should the swap fail, the old edit goes back.
             let old = std::fs::read(edit_path(lib, id)).map_err(|e| e.to_string())?;
             std::fs::write(edit_path(lib, id), serde_json::to_vec_pretty(&edit).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
@@ -464,7 +464,7 @@ mod tests {
     }
 
     fn edit(end: f64) -> Edit {
-        Edit { start: 1.0, end, tracks: Vec::new(), output: Default::default() }
+        Edit { start: 1.0, end, cuts: Vec::new(), tracks: Vec::new(), output: Default::default() }
     }
 
     /// Stand-in for a render: write the staged file the way the app would.
@@ -603,6 +603,7 @@ mod free_up_tests {
         let edit = Edit {
             start: 4.3,
             end: 6.0,
+            cuts: vec![media::Cut { from: 5.2, to: 5.5 }],
             tracks: vec![media::TrackEdit { index: 1, gain: 1.0, muted: false, points: vec![media::VolumePoint { t: 5.0, db: -6.0 }] }],
             output: Default::default(),
         };
@@ -626,6 +627,7 @@ mod free_up_tests {
         let at = media::keyframe_times(&original).unwrap()[0];
         assert!((edit.start - (0.3 + at)).abs() < 0.02, "start {}", edit.start);
         assert!((edit.end - (2.0 + at)).abs() < 0.02, "end {}", edit.end);
+        assert!((edit.cuts[0].from - (1.2 + at)).abs() < 0.02 && (edit.cuts[0].to - (1.5 + at)).abs() < 0.02, "the cut moves along: {:?}", edit.cuts);
         assert!((edit.tracks[0].points[0].t - (1.0 + at)).abs() < 0.02);
         // Again: nothing more to cut.
         assert_eq!(free_up(&target, FreeUp::Trim, true).unwrap(), 0);

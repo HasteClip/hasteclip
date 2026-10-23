@@ -86,9 +86,9 @@ struct Loaded {
     info: ClipInfo,
     /// The mix, filling in as it's decoded (it plays from the start at once).
     pcm: Arc<Pcm>,
-    /// Where this file starts in the recording and how long that was: an
-    /// edited clip is part of its original (moments are kept for that).
-    span: (f64, f64),
+    /// Where this file is in the recording: an edited clip is parts of its
+    /// original (moments are kept for that).
+    span: Span,
 }
 
 enum State {
@@ -141,7 +141,7 @@ struct Ready {
     /// The clip's kills and your markers (see `moments.rs`), and where this
     /// file sits in the recording they're kept for.
     moments: crate::moments::Moments,
-    span: (f64, f64),
+    span: Span,
     clip: PathBuf,
 }
 
@@ -506,12 +506,14 @@ impl Ready {
 
     /// The clip's moments as pins on this file's timeline.
     fn pins(&self) -> Vec<crate::transport::Moment> {
-        let (start, recording) = self.span;
-        let mut pins = self.moments.pins(recording);
-        for m in &mut pins {
-            m.t -= start;
-        }
-        pins.retain(|m| (0.0..=self.info.duration).contains(&m.t));
+        let mut pins = self.moments.pins(self.span.recording);
+        pins.retain_mut(|m| match media::output_time(&self.span.parts, m.t) {
+            Some(t) => {
+                m.t = t;
+                (0.0..=self.info.duration).contains(&t)
+            }
+            None => false,
+        });
         pins
     }
 
@@ -519,7 +521,7 @@ impl Ready {
     /// that's there.
     fn toggle_marker(&mut self) {
         let t = self.info.snap(self.player.time());
-        let at = t + self.span.0;
+        let at = media::source_time(&self.span.parts, t);
         if let Some(&m) = self.moments.markers.iter().find(|m| (*m - at).abs() < self.info.frame_duration().max(0.02)) {
             crate::moments::remove_marker(&self.clip, m);
         } else {
@@ -784,7 +786,7 @@ impl Ready {
         match crate::transport::ruler(ui, ruler, (0.0, dur), self.info.fps, self.show_frames, moments, true) {
             Some(crate::transport::Pinned::Go(t)) => self.seek(t),
             Some(crate::transport::Pinned::Remove(t)) => {
-                crate::moments::remove_marker(&self.clip, t + self.span.0);
+                crate::moments::remove_marker(&self.clip, media::source_time(&self.span.parts, t));
                 self.moments = crate::moments::of(&self.clip);
             }
             None => {}
@@ -820,13 +822,18 @@ impl Ready {
         // Playhead.
         crate::transport::playhead(&painter, xp, ruler.bottom() - 4.0, audio.bottom(), p.text);
 
-        // Click or drag to go there. Playing pauses while you drag and carries on after.
-        if resp.drag_started() {
+        // Click or drag to go there (below the ruler, whose pins are clicked).
+        // A drag follows the pointer wherever it goes until it's let go, over
+        // the picture or out of the window too. Playing pauses while you drag
+        // and carries on after.
+        let below_ruler = |pos: Pos2| pos.y > ruler.bottom() - 6.0;
+        if resp.drag_started() && ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos()).is_some_and(below_ruler) {
             self.dragging = Some(self.player.is_playing());
             self.player.pause();
         }
         if let Some(pos) = resp.interact_pointer_pos() {
-            if (resp.dragged() || resp.drag_started() || resp.clicked()) && pos.y > ruler.bottom() - 6.0 {
+            let scrubbing = self.dragging.is_some() && (resp.dragged() || resp.drag_started());
+            if scrubbing || (resp.clicked() && below_ruler(pos)) {
                 self.seek(t_of(pos.x));
             }
         }
@@ -1104,16 +1111,25 @@ fn volume_id() -> egui::Id {
     egui::Id::new("viewer_volume")
 }
 
-/// Where the clip at `path` starts in its recording, and how long that
-/// recording is: `(0, duration)` unless it's been trimmed.
-fn recording_span(path: &Path, duration: f64) -> (f64, f64) {
+/// Where a clip's file is in its recording: the parts of the recording
+/// it's made of (in order), and how long the recording is.
+#[derive(Clone)]
+struct Span {
+    parts: Vec<(f64, f64)>,
+    recording: f64,
+}
+
+/// Where the clip at `path` is in its recording: all of it, `duration`
+/// long, unless it's been edited.
+fn recording_span(path: &Path, duration: f64) -> Span {
+    let whole = Span { parts: vec![(0.0, duration)], recording: duration };
     let target = crate::store::EditTarget::of(path);
     if target.source == target.clip {
-        return (0.0, duration);
+        return whole;
     }
-    let Some(edit) = crate::store::load_edit(&target) else { return (0.0, duration) };
-    let whole = media::probe(&target.source).map_or(edit.end, |i| i.duration);
-    (edit.start, whole)
+    let Some(edit) = crate::store::load_edit(&target) else { return whole };
+    let recording = media::probe(&target.source).map_or(edit.end, |i| i.duration);
+    Span { parts: edit.kept(), recording }
 }
 
 /// The speeds offered.

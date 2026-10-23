@@ -106,6 +106,9 @@ pub struct ClipInfo {
     pub audio: Vec<AudioStream>,
     /// Permanent id from the clip tag, once the clip has one (see [`clip_tag`]).
     pub id: Option<String>,
+    /// Its colours are stored with BT.601's matrix (standard definition),
+    /// not BT.709's (ours, and HD's).
+    pub bt601: bool,
 }
 
 impl ClipInfo {
@@ -157,7 +160,7 @@ impl AudioStream {
 pub fn probe(source: &Path) -> Result<ClipInfo> {
     let out = ffprobe()
         .args(["-v", "error", "-show_entries"])
-        .arg("format=duration:format_tags=comment:stream=index,codec_type,width,height,avg_frame_rate,r_frame_rate,bit_rate:stream_tags=title,handler_name,name")
+        .arg("format=duration:format_tags=comment:stream=index,codec_type,width,height,avg_frame_rate,r_frame_rate,bit_rate,color_space:stream_tags=title,handler_name,name")
         .args(["-of", "json"])
         .arg(source)
         .stdin(Stdio::null())
@@ -192,6 +195,7 @@ pub fn probe(source: &Path) -> Result<ClipInfo> {
         avg_frame_rate: Option<String>,
         r_frame_rate: Option<String>,
         bit_rate: Option<String>,
+        color_space: Option<String>,
         #[serde(default)]
         tags: Tags,
     }
@@ -240,6 +244,12 @@ pub fn probe(source: &Path) -> Result<ClipInfo> {
         video_kbps: video.bit_rate.as_deref().and_then(|b| b.parse::<u64>().ok()).map(|b| (b / 1000) as u32).filter(|&k| k > 0),
         audio,
         id: tag.id,
+        // Untagged: as players guess, by its size.
+        bt601: match video.color_space.as_deref() {
+            Some("bt470bg" | "smpte170m") => true,
+            Some("unknown") | None => video.height.is_some_and(|h| h < 720),
+            Some(_) => false,
+        },
     })
 }
 
@@ -423,10 +433,34 @@ pub fn fader_db(pos: f32) -> f32 {
 pub struct Edit {
     pub start: f64,
     pub end: f64,
+    /// Stretches cut out between `start` and `end`, in order: what's kept is
+    /// the parts between them (see [`Edit::parts`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cuts: Vec<Cut>,
     pub tracks: Vec<TrackEdit>,
     /// How the saved file is made: size, rate, bitrate, audio.
     #[serde(default)]
     pub output: Output,
+}
+
+/// A stretch cut out of the middle of a clip: `from` to `to` seconds of the
+/// recording. One of no length is a split: the clip in two parts, nothing
+/// cut out (yet).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Cut {
+    pub from: f64,
+    pub to: f64,
+}
+
+/// The sound crossfades over this long each side of a join between parts
+/// kept (seconds), so a cut in the middle of a sound doesn't click.
+pub const JOIN_FADE: f64 = 0.005;
+
+/// Half of each join's crossfade, for `parts` as saved ([`Edit::kept`]):
+/// [`JOIN_FADE`], less where a part beside it is shorter than that takes
+/// from it at both its ends.
+pub fn join_fades(parts: &[(f64, f64)]) -> Vec<f64> {
+    parts.windows(2).map(|w| JOIN_FADE.min((w[0].1 - w[0].0) / 2.0).min((w[1].1 - w[1].0) / 2.0)).collect()
 }
 
 /// How a saved clip is made, when not just like the recording: smaller
@@ -676,6 +710,10 @@ impl Edit {
         let mut e = self.clone();
         e.start = (e.start - by).max(0.0);
         e.end = (e.end - by).max(e.start);
+        for c in &mut e.cuts {
+            c.from = (c.from - by).max(e.start);
+            c.to = (c.to - by).max(c.from);
+        }
         for t in &mut e.tracks {
             for p in &mut t.points {
                 p.t -= by;
@@ -689,6 +727,7 @@ impl Edit {
         Self {
             start: 0.0,
             end: info.duration,
+            cuts: Vec::new(),
             tracks: info
                 .source_tracks()
                 .iter()
@@ -711,14 +750,86 @@ impl Edit {
         };
         self.start <= eps
             && self.end >= info.duration - eps
+            && self.kept().len() == 1
             && self.tracks.iter().all(as_recorded)
             && !self.output.changes_video(info)
             && !(self.output.mix_only && self.tracks.len() > 1)
     }
 
+    /// How long the saved clip is: the parts kept, together.
     pub fn duration(&self) -> f64 {
-        (self.end - self.start).max(0.0)
+        self.parts().iter().map(|(a, b)| (b - a).max(0.0)).sum()
     }
+
+    /// The parts kept, in order, as `(from, to)` seconds of the recording:
+    /// `start` to `end` less the cuts. The two parts at a split touch.
+    pub fn parts(&self) -> Vec<(f64, f64)> {
+        let mut parts = Vec::with_capacity(self.cuts.len() + 1);
+        let mut from = self.start;
+        for c in &self.cuts {
+            parts.push((from, c.from));
+            from = c.to;
+        }
+        parts.push((from, self.end));
+        parts
+    }
+
+    /// Keep `parts` (in order, apart or touching: touching, they stay split).
+    pub fn set_parts(&mut self, parts: &[(f64, f64)]) {
+        let (Some(first), Some(last)) = (parts.first(), parts.last()) else { return };
+        self.start = first.0;
+        self.end = last.1;
+        self.cuts = parts.windows(2).map(|w| Cut { from: w[0].1, to: w[1].0 }).collect();
+    }
+
+    /// The parts as the saved clip has them: split ones with nothing cut out
+    /// between them are one.
+    pub fn kept(&self) -> Vec<(f64, f64)> {
+        let mut kept: Vec<(f64, f64)> = Vec::new();
+        for (a, b) in self.parts() {
+            match kept.last_mut() {
+                Some(last) if a - last.1 < 1e-4 => last.1 = b,
+                _ => kept.push((a, b)),
+            }
+        }
+        kept
+    }
+
+    /// Where `t` seconds of the recording is in the saved clip, if it's kept.
+    pub fn to_output(&self, t: f64) -> Option<f64> {
+        output_time(&self.kept(), t)
+    }
+
+    /// The recording's time at `t` seconds into the saved clip.
+    pub fn to_source(&self, t: f64) -> f64 {
+        source_time(&self.kept(), t)
+    }
+}
+
+/// Where `t` seconds of a recording is in a clip made of `parts` of it (in
+/// order, as [`Edit::kept`] has them), if it's in it (the end of the last
+/// part counts).
+pub fn output_time(parts: &[(f64, f64)], t: f64) -> Option<f64> {
+    let mut at = 0.0;
+    for (i, &(a, b)) in parts.iter().enumerate() {
+        if t >= a - 1e-9 && (t < b || (i + 1 == parts.len() && t <= b + 1e-9)) {
+            return Some(at + (t - a).max(0.0));
+        }
+        at += b - a;
+    }
+    None
+}
+
+/// The recording's time at `t` seconds into a clip made of `parts` of it.
+pub fn source_time(parts: &[(f64, f64)], t: f64) -> f64 {
+    let mut at = 0.0;
+    for &(a, b) in parts {
+        if t < at + (b - a) {
+            return a + (t - at).max(0.0);
+        }
+        at += b - a;
+    }
+    parts.last().map_or(t, |&(_, b)| b)
 }
 
 /// Where `dest` is written until it's whole: `.writing/<name>` next to it,
@@ -758,6 +869,38 @@ pub struct Frame {
 /// Decode the exact frame at `t`, scaled to `width` (aspect kept).
 pub fn frame_at(source: &Path, t: f64, width: u32) -> Result<Frame> {
     frame(source, t, width, true)
+}
+
+/// ffmpeg's output arguments for raw NV12 frames at the video's own size,
+/// studio range (`nv12_len` bytes each).
+pub const NV12_OUT: [&str; 6] = ["-vf", "scale=out_range=tv", "-pix_fmt", "nv12", "-f", "rawvideo"];
+
+/// The bytes in an NV12 frame `width`×`height`: the luma, then Cb, Cr pairs
+/// at half the size each way.
+pub fn nv12_len(width: u32, height: u32) -> usize {
+    (width * height + 2 * width.div_ceil(2) * height.div_ceil(2)) as usize
+}
+
+/// Decode the exact frame at `t` as NV12 at the video's own size
+/// (`width`×`height`).
+pub fn nv12_at(source: &Path, t: f64, (width, height): (u32, u32)) -> Result<Vec<u8>> {
+    let out = ffmpeg()
+        .args(["-hide_banner", "-loglevel", "error", "-ss", &format!("{t:.4}"), "-i"])
+        .arg(source)
+        .args(["-frames:v", "1"])
+        .args(NV12_OUT)
+        .arg("-")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .context("failed to run ffmpeg")?;
+    let len = nv12_len(width, height);
+    if out.stdout.len() < len {
+        bail!("no frame at {t:.2}s");
+    }
+    let mut data = out.stdout;
+    data.truncate(len);
+    Ok(data)
 }
 
 fn frame(source: &Path, t: f64, width: u32, exact: bool) -> Result<Frame> {
@@ -950,10 +1093,11 @@ pub fn render_to(source: &Path, info: &ClipInfo, edit: &Edit, dest: &Path, id: O
 /// Render with progress callbacks (0.0..=1.0).
 ///
 /// "Smart render": only the frames between a cut and the nearest keyframe are
-/// re-encoded; everything between the first and last keyframe inside the trim is
-/// stream-copied untouched. A 20 s trim of a 60 fps 4K-wide recording drops from
-/// ~20 s (full re-encode) to ~3 s, and the copied part is bit-identical to the
-/// original. Falls back to a full re-encode when there's no keyframe to copy from.
+/// re-encoded; everything between the first and last keyframe inside each
+/// part kept is stream-copied untouched. A 20 s trim of a 60 fps 4K-wide
+/// recording drops from ~20 s (full re-encode) to ~3 s, and the copied part
+/// is bit-identical to the original. A part with no keyframes to copy from is
+/// encoded whole.
 pub fn render_with_progress(
     source: &Path,
     info: &ClipInfo,
@@ -973,9 +1117,9 @@ pub fn render_with_progress(
     let result = (|| -> Result<()> {
         progress(0.0);
         let video = work.join(format!("video.{ext}"));
-        let plan = plan(source, info, edit);
-        let weights = Weights::new(&plan, edit.duration());
-        render_video(source, info, edit, &plan, &work, &video, &|f| progress(f * weights.video))?;
+        let pieces = plan(source, info, edit);
+        let weights = Weights::new(&pieces, edit.duration());
+        render_video(source, info, edit, &pieces, &work, &video, &|f| progress(f * weights.video))?;
         // In a hidden folder so the library never shows a half-written clip,
         // under its real name so ffmpeg picks the container from its extension.
         let partial = writing_path(dest)?;
@@ -992,43 +1136,65 @@ pub fn render_with_progress(
     result
 }
 
-/// How the video gets made: one full re-encode, or re-encoded edges around a
-/// stream-copied middle (start/end keyframes).
-enum Plan {
-    Encode,
-    Smart { k1: f64, k2: f64 },
+/// A stretch of the saved video and how it's made: encoded again, or copied
+/// as it is (from a keyframe on). In order, they're the video.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Piece {
+    Encode(f64, f64),
+    Copy(f64, f64),
 }
 
-fn plan(source: &Path, info: &ClipInfo, edit: &Edit) -> Plan {
+impl Piece {
+    /// Rough relative cost, so one progress bar moves at an even pace:
+    /// encoding ~1 unit per second of video, copying far less.
+    fn cost(&self) -> f64 {
+        match *self {
+            Piece::Encode(a, b) => b - a,
+            Piece::Copy(a, b) => (b - a) * 0.03,
+        }
+    }
+}
+
+/// The video's pieces: for each part kept, a full re-encode, or re-encoded
+/// edges around a stream-copied middle (its first to last keyframe).
+fn plan(source: &Path, info: &ClipInfo, edit: &Edit) -> Vec<Piece> {
+    let kept = edit.kept();
     // A new size, rate or bitrate: every frame is encoded again.
     if edit.output.changes_video(info) {
-        return Plan::Encode;
+        return kept.into_iter().map(|(a, b)| Piece::Encode(a, b)).collect();
     }
-    // Keyframes inside the trim, with a frame of margin from the cuts.
     let fd = info.frame_duration();
-    let keys: Vec<f64> = keyframes(source)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|&k| k >= edit.start - fd / 2.0 && k <= edit.end - fd)
-        .collect();
-    match (keys.first(), keys.last()) {
-        (Some(&k1), Some(&k2)) if k2 - k1 >= 1.0 && is_h264(source) => Plan::Smart { k1, k2 },
-        _ => Plan::Encode,
+    let keys = keyframes(source).unwrap_or_default();
+    let h264 = std::sync::OnceLock::new();
+    let mut pieces = Vec::new();
+    for (a, b) in kept {
+        // Keyframes inside the part, with a frame of margin from its ends.
+        let inside: Vec<f64> = keys.iter().copied().filter(|&k| k >= a - fd / 2.0 && k <= b - fd).collect();
+        match (inside.first(), inside.last()) {
+            (Some(&k1), Some(&k2)) if k2 - k1 >= 1.0 && *h264.get_or_init(|| is_h264(source)) => {
+                if k1 - a > 1e-3 {
+                    pieces.push(Piece::Encode(a, k1));
+                }
+                pieces.push(Piece::Copy(k1, k2));
+                if b - k2 > 1e-3 {
+                    pieces.push(Piece::Encode(k2, b));
+                }
+            }
+            _ => pieces.push(Piece::Encode(a, b)),
+        }
     }
+    pieces
 }
 
-/// Rough relative cost of each step, so one progress bar moves at an even pace:
-/// encoding ~1 unit per second of video, copying and the audio mux far less.
+/// Rough relative cost of each step (see [`Piece::cost`]), so one progress
+/// bar moves at an even pace; the audio mux costs far less than encoding.
 struct Weights {
     video: f32,
 }
 
 impl Weights {
-    fn new(plan: &Plan, dur: f64) -> Self {
-        let video = match plan {
-            Plan::Encode => dur,
-            Plan::Smart { k1, k2 } => (dur - (k2 - k1)) + (k2 - k1) * 0.03,
-        };
+    fn new(pieces: &[Piece], dur: f64) -> Self {
+        let video: f64 = pieces.iter().map(Piece::cost).sum();
         let audio = dur * 0.04 + 0.3;
         Self { video: (video / (video + audio)) as f32 }
     }
@@ -1091,8 +1257,9 @@ fn blend_graph(looks: u32, rate: f64, shape: BlendShape) -> String {
     graph
 }
 
-/// Video only, trimmed frame-exactly, into `out`. `progress` gets 0..=1.
-fn render_video(source: &Path, info: &ClipInfo, edit: &Edit, plan: &Plan, work: &Path, out: &Path, progress: &dyn Fn(f32)) -> Result<()> {
+/// Video only, its `pieces` (see [`plan`]) cut frame-exactly and joined,
+/// into `out`. `progress` gets 0..=1.
+fn render_video(source: &Path, info: &ClipInfo, edit: &Edit, pieces: &[Piece], work: &Path, out: &Path, progress: &dyn Fn(f32)) -> Result<()> {
     let output = edit.output.effective(info);
     let kbps = if edit.output.changes_video(info) {
         edit.output.video_kbps_for(info, edit).map(u64::from).unwrap_or(8_000)
@@ -1159,53 +1326,62 @@ fn render_video(source: &Path, info: &ClipInfo, edit: &Edit, plan: &Plan, work: 
     if encoder == "h264_vaapi" {
         filters.push("format=nv12,hwupload".to_owned());
     }
-    let encode = |from: f64, to: f64, dest: &Path, progress: &dyn Fn(f32)| -> Result<()> {
-        run_progress(
-            ffmpeg()
-                .args(["-hide_banner", "-loglevel", "error", "-y"])
-                .args(vaapi_device(encoder))
-                .args(["-ss", &format!("{from:.6}"), "-to", &format!("{to:.6}"), "-i"])
-                .arg(source)
-                .args(["-map", "0:v:0", "-an", "-c:v", encoder, "-b:v", &format!("{kbps}k")])
-                .args(&cap)
-                .args(if filters.is_empty() { Vec::new() } else { vec!["-vf".to_owned(), filters.join(",")] })
-                // Same profile as our recordings so the segments can be joined.
-                .args(["-profile:v", "high"])
-                .args(if encoder == "h264_vaapi" { &[][..] } else { &["-pix_fmt", "yuv420p"][..] })
-                .args(["-video_track_timescale", &timescale])
-                .arg(dest),
-            to - from,
-            progress,
-        )
+    // Each part from its own reading of the source, joined before the
+    // filters: frame rates change over the whole, so parts that don't last a
+    // whole number of the new frames don't each round off (the sound would
+    // drift from the picture a little at every join).
+    let encode = |parts: &[(f64, f64)], dest: &Path, progress: &dyn Fn(f32)| -> Result<()> {
+        let mut cmd = ffmpeg();
+        cmd.args(["-hide_banner", "-loglevel", "error", "-y"]).args(vaapi_device(encoder));
+        for (from, to) in parts {
+            cmd.args(["-ss", &format!("{from:.6}"), "-to", &format!("{to:.6}"), "-i"]).arg(source);
+        }
+        if let [_] = parts {
+            cmd.args(["-map", "0:v:0"]);
+            if !filters.is_empty() {
+                cmd.args(["-vf", &filters.join(",")]);
+            }
+        } else {
+            let inputs: String = (0..parts.len()).map(|i| format!("[{i}:v:0]")).collect();
+            let graph = std::iter::once(format!("{inputs}concat=n={}:v=1:a=0", parts.len())).chain(filters.iter().cloned()).collect::<Vec<_>>().join(",");
+            cmd.args(["-filter_complex", &graph]);
+        }
+        cmd.args(["-an", "-c:v", encoder, "-b:v", &format!("{kbps}k")])
+            .args(&cap)
+            // Same profile as our recordings so the segments can be joined.
+            .args(["-profile:v", "high"])
+            .args(if encoder == "h264_vaapi" { &[][..] } else { &["-pix_fmt", "yuv420p"][..] })
+            .args(["-video_track_timescale", &timescale])
+            .arg(dest);
+        run_progress(&mut cmd, parts.iter().map(|(a, b)| b - a).sum(), progress)
     };
 
-    let Plan::Smart { k1, k2 } = *plan else {
-        return encode(edit.start, edit.end, out, progress);
-    };
-
-    // Share of the video work per part, by the same cost model as `Weights`.
-    let (head, mid, tail) = (k1 - edit.start, (k2 - k1) * 0.03, edit.end - k2);
-    let total = (head + mid + tail).max(1e-6);
-    let (w_head, w_mid) = ((head / total) as f32, (mid / total) as f32);
-    let mut parts = Vec::new();
-    if head > 1e-3 {
-        let path = work.join("head.mp4");
-        encode(edit.start, k1, &path, &|f| progress(f * w_head))?;
-        parts.push(path);
+    // All of it encoded again (a piece for each part): in one go.
+    let encoded: Option<Vec<(f64, f64)>> = pieces.iter().map(|p| if let Piece::Encode(a, b) = *p { Some((a, b)) } else { None }).collect();
+    if let Some(parts) = encoded {
+        return encode(&parts, out, progress);
     }
-    let path = work.join("mid.mp4");
-    run(ffmpeg()
-        .args(["-hide_banner", "-loglevel", "error", "-y"])
-        .args(["-ss", &format!("{k1:.6}"), "-to", &format!("{k2:.6}"), "-i"])
-        .arg(source)
-        .args(["-map", "0:v:0", "-an", "-c", "copy", "-avoid_negative_ts", "make_zero"])
-        .args(["-video_track_timescale", &timescale])
-        .arg(&path))?;
-    parts.push(path);
-    progress(w_head + w_mid);
-    if tail > 1e-3 {
-        let path = work.join("tail.mp4");
-        encode(k2, edit.end, &path, &|f| progress(w_head + w_mid + f * (1.0 - w_head - w_mid)))?;
+
+    // Each piece on its own, encoded or copied, then joined. Its share of the
+    // progress by the same cost model as `Weights`.
+    let total: f64 = pieces.iter().map(Piece::cost).sum::<f64>().max(1e-6);
+    let mut done = 0.0;
+    let mut parts = Vec::new();
+    for (i, piece) in pieces.iter().enumerate() {
+        let path = work.join(format!("piece{i}.mp4"));
+        let (from, share) = ((done / total) as f32, (piece.cost() / total) as f32);
+        match *piece {
+            Piece::Encode(a, b) => encode(&[(a, b)], &path, &|f| progress(from + f * share))?,
+            Piece::Copy(a, b) => run(ffmpeg()
+                .args(["-hide_banner", "-loglevel", "error", "-y"])
+                .args(["-ss", &format!("{a:.6}"), "-to", &format!("{b:.6}"), "-i"])
+                .arg(source)
+                .args(["-map", "0:v:0", "-an", "-c", "copy", "-avoid_negative_ts", "make_zero"])
+                .args(["-video_track_timescale", &timescale])
+                .arg(&path))?,
+        }
+        done += piece.cost();
+        progress((done / total) as f32);
         parts.push(path);
     }
 
@@ -1228,15 +1404,43 @@ fn mux_audio(source: &Path, info: &ClipInfo, edit: &Edit, id: Option<&str>, vide
     let mut mix_inputs: Vec<String> = Vec::new();
     let mut maps: Vec<String> = Vec::new();
     let mut titles: Vec<String> = Vec::new();
+    // The sound is read from a second before the first part: a seek lands on
+    // the sound's own frames, up to one (21 ms) after where it was asked, so
+    // asking early and cutting the parts out by time keeps all of them, in
+    // time with the picture (a part cut from a seek's start came out short,
+    // and the picture lost its last frame to `-shortest`).
+    let from = (edit.start - 1.0).max(0.0);
+    // The parts, in seconds from there, and how far each join's crossfade
+    // reaches either side.
+    let kept: Vec<(f64, f64)> = edit.kept().iter().map(|(a, b)| (a - from, b - from)).collect();
+    let fades = join_fades(&kept);
 
     for (i, t) in edit.tracks.iter().enumerate() {
         // eval=frame re-evaluates per audio frame so keyframed volume ramps; `t`
-        // there counts from the trim start because the input is seeked.
-        graph.push(format!(
-            "[1:a:{}]volume='{}':eval=frame,asplit=2[m{i}][s{i}]",
-            t.index,
-            t.volume_expr(edit.start)
-        ));
+        // there counts from where the input is read from (and the volume is
+        // set before the parts are cut out, on the recording's own time).
+        let level = format!("[1:a:{}]volume='{}':eval=frame", t.index, t.volume_expr(from));
+        if let [(a, b)] = kept[..] {
+            graph.push(format!("{level},atrim=start={a:.6}:end={b:.6},asetpts=PTS-STARTPTS,asplit=2[m{i}][s{i}]"));
+        } else {
+            // Each part, running on into what's cut out either side of a
+            // join by as much as that join crossfades over, then joined: the
+            // crossfades take back what's added, so the length is the parts'.
+            let n = kept.len();
+            graph.push(format!("{level},asplit={n}{}", (0..n).map(|k| format!("[p{i}_{k}]")).collect::<String>()));
+            for (k, &(a, b)) in kept.iter().enumerate() {
+                let before = if k > 0 { fades[k - 1] } else { 0.0 };
+                let after = fades.get(k).copied().unwrap_or(0.0);
+                graph.push(format!("[p{i}_{k}]atrim=start={:.6}:end={:.6},asetpts=PTS-STARTPTS[q{i}_{k}]", a - before, b + after));
+            }
+            let mut joined = format!("[q{i}_0]");
+            for k in 1..n {
+                let to = format!("[j{i}_{k}]");
+                graph.push(format!("{joined}[q{i}_{k}]acrossfade=d={:.6}:c1=tri:c2=tri{to}", 2.0 * fades[k - 1]));
+                joined = to;
+            }
+            graph.push(format!("{joined}asplit=2[m{i}][s{i}]"));
+        }
         if t.muted {
             graph.push(format!("[m{i}]anullsink"));
         } else {
@@ -1267,7 +1471,8 @@ fn mux_audio(source: &Path, info: &ClipInfo, edit: &Edit, id: Option<&str>, vide
 
     let mut cmd = ffmpeg();
     cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-i"]).arg(video);
-    cmd.args(["-ss", &format!("{:.6}", edit.start), "-t", &format!("{:.6}", edit.duration()), "-i"]).arg(source);
+    // To the last part's end (the parts are cut out of that in the graph).
+    cmd.args(["-ss", &format!("{from:.6}"), "-t", &format!("{:.6}", edit.end - from), "-i"]).arg(source);
     cmd.args(["-map", "0:v:0", "-c:v", "copy"]);
     // Only the mix: the file's one track is the mix, and it's in its own mix.
     let tag = if edit.output.mix_only { clip_tag(&[0], id) } else { render_tag(edit, id) };
@@ -1571,13 +1776,13 @@ mod tests {
     }
 
     fn info() -> ClipInfo {
-        ClipInfo { duration: 60.0, fps: 60.0, width: 3600, height: 2338, video_kbps: Some(20_000), audio: Vec::new(), id: None }
+        ClipInfo { duration: 60.0, fps: 60.0, width: 3600, height: 2338, video_kbps: Some(20_000), audio: Vec::new(), id: None, bt601: false }
     }
 
     #[test]
     fn output_settings() {
         let info = info();
-        let edit = |output| Edit { start: 0.0, end: 60.0, tracks: Vec::new(), output };
+        let edit = |output| Edit { start: 0.0, end: 60.0, cuts: Vec::new(), tracks: Vec::new(), output };
         // Nothing chosen, or nothing below the source: the video is copied.
         assert!(!Output::default().changes_video(&info));
         assert!(!Output { height: Some(2338), fps: Some(60), video_kbps: Some(30_000), ..Default::default() }.changes_video(&info));
@@ -1622,7 +1827,7 @@ mod tests {
         assert_eq!(Output { height: Some(1080), ..o }.size(&info), (1920, 1080));
         assert_eq!(Output { height: Some(1440), ..o }.effective(&info).height, None);
         // Fewer pixels, so less bitrate for the same look.
-        let edit = Edit { start: 0.0, end: 60.0, tracks: Vec::new(), output: o };
+        let edit = Edit { start: 0.0, end: 60.0, cuts: Vec::new(), tracks: Vec::new(), output: o };
         assert!(o.video_kbps_for(&info, &edit).unwrap() < 20_000);
         assert!(!edit.is_identity(&info));
         // A crop of all of it is none.
@@ -1638,6 +1843,55 @@ mod tests {
         e.output = Output { height: Some(720), max_mb: Some(10), mix_only: true, ..Default::default() };
         let back: Edit = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
         assert_eq!(back.output, e.output);
+    }
+
+    /// The parts kept are the trim less its cuts; a split (a cut of no
+    /// length) shows as two parts but saves as one.
+    #[test]
+    fn parts_and_cuts() {
+        let mut e = Edit { start: 2.0, end: 20.0, cuts: Vec::new(), tracks: Vec::new(), output: Default::default() };
+        assert_eq!(e.parts(), [(2.0, 20.0)]);
+        e.set_parts(&[(2.0, 5.0), (5.0, 9.0), (12.0, 20.0)]);
+        assert_eq!(e.cuts, [Cut { from: 5.0, to: 5.0 }, Cut { from: 9.0, to: 12.0 }]);
+        assert_eq!(e.parts(), [(2.0, 5.0), (5.0, 9.0), (12.0, 20.0)]);
+        assert_eq!(e.kept(), [(2.0, 9.0), (12.0, 20.0)], "the split joins up");
+        assert_eq!(e.duration(), 15.0);
+        // The recording's time in the saved clip, and back.
+        assert_eq!(e.to_output(1.0), None, "trimmed off");
+        assert_eq!(e.to_output(2.0), Some(0.0));
+        assert_eq!(e.to_output(8.0), Some(6.0));
+        assert_eq!(e.to_output(10.0), None, "cut out");
+        assert_eq!(e.to_output(12.5), Some(7.5));
+        assert_eq!(e.to_output(20.0), Some(15.0), "the very end counts");
+        assert_eq!(e.to_source(6.0), 8.0);
+        assert_eq!(e.to_source(7.0), 12.0, "the first frame after the cut");
+        assert_eq!(e.to_source(15.0), 20.0);
+        // Trimming the recording's start moves the cuts along.
+        let s = e.shifted(1.5);
+        assert_eq!((s.start, s.end), (0.5, 18.5));
+        assert_eq!(s.cuts, [Cut { from: 3.5, to: 3.5 }, Cut { from: 7.5, to: 10.5 }]);
+        // Joins crossfade, less where a part is too short for all of it.
+        assert_eq!(join_fades(&[(0.0, 1.0), (2.0, 3.0)]), [JOIN_FADE]);
+        let short = join_fades(&[(0.0, 1.0), (2.0, 2.004), (3.0, 4.0)]);
+        assert!(short.len() == 2 && short.iter().all(|f| (f - 0.002).abs() < 1e-9), "{short:?}");
+    }
+
+    /// A cut makes an edit, and a split alone doesn't; edits saved before
+    /// cuts open with none, and an edit without cuts saves as it did.
+    #[test]
+    fn cuts_change_the_clip() {
+        let mut info = info();
+        info.audio.clear();
+        let mut e = Edit::new(&info);
+        e.set_parts(&[(0.0, 30.0), (30.0, 60.0)]);
+        assert!(e.is_identity(&info), "a split alone changes nothing");
+        e.set_parts(&[(0.0, 30.0), (31.0, 60.0)]);
+        assert!(!e.is_identity(&info));
+        let old: Edit = serde_json::from_str(r#"{"start":1.0,"end":5.0,"tracks":[]}"#).unwrap();
+        assert!(old.cuts.is_empty());
+        assert!(!serde_json::to_string(&old).unwrap().contains("cuts"));
+        let back: Edit = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+        assert_eq!(back.cuts, e.cuts);
     }
 
     /// Soft blending weighs as much in all as even, centred on the slot's
@@ -1681,6 +1935,85 @@ mod tests {
         assert_eq!(parse_clip_tag("hasteclip:mix=1 id=ab12"), ClipTag { mix: Some(vec![1]), id: Some("ab12".into()) });
         assert_eq!(parse_clip_tag("hasteclip:mix="), ClipTag { mix: Some(vec![]), id: None });
         assert_eq!(parse_clip_tag("made with something else"), ClipTag::default());
+    }
+}
+
+#[cfg(test)]
+mod cut_render_tests {
+    use super::*;
+
+    /// A 6 s clip made by ffmpeg: a picture that changes every frame, 30 fps
+    /// with a keyframe each second (as recordings have), and a tone that's a
+    /// quarter of a cycle on each second, so a cut from one whole second to
+    /// another jumps from its middle to its trough.
+    fn clip(path: &Path) {
+        let ok = ffmpeg()
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=30:duration=6"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440.25:duration=6:sample_rate=48000"])
+            .args(["-map", "0", "-map", "1", "-c:v", "libx264", "-g", "30", "-bf", "0", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k"])
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+    }
+
+    /// How far apart two frames are: the mean difference of their pixels.
+    fn apart(a: &Frame, b: &Frame) -> f64 {
+        a.rgba.iter().zip(&b.rgba).map(|(x, y)| x.abs_diff(*y) as f64).sum::<f64>() / a.rgba.len() as f64
+    }
+
+    /// A clip with a stretch cut out of its middle saves as the parts kept,
+    /// joined: as long as they are together, the frame after the cut the one
+    /// after it in the recording, and the sound joined without a click.
+    #[test]
+    fn cut_out_of_the_middle() {
+        let dir = std::env::temp_dir().join(format!("hc-media-cut-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, out) = (dir.join("clip.mp4"), dir.join("cut.mp4"));
+        clip(&src);
+        let info = probe(&src).unwrap();
+        let mut edit = Edit::new(&info);
+        // 0.5–2.0 (no two keyframes in it: encoded) and 3.0–4.6 (copied from
+        // its keyframes at 3 and 4, its end encoded).
+        edit.set_parts(&[(0.5, 2.0), (3.0, 4.6)]);
+        assert_eq!(plan(&src, &info, &edit), [Piece::Encode(0.5, 2.0), Piece::Copy(3.0, 4.0), Piece::Encode(4.0, 4.6)]);
+        render_to(&src, &info, &edit, &out, None).unwrap();
+
+        let made = probe(&out).unwrap();
+        assert!((made.duration - 3.1).abs() < 0.04, "lasts {} s, not 3.1", made.duration);
+        // Every frame kept, none more: 45 + 48.
+        let frames = ffprobe().args(["-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0"]).arg(&out).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&frames.stdout).trim(), "93");
+        // Either side of the join: the last frame before the cut, the first after.
+        let at = |p: &Path, t: f64| frame_at(p, t, 64).unwrap();
+        let (before, after) = (at(&out, 1.49), at(&out, 1.51));
+        assert!(apart(&before, &at(&src, 1.98)) < apart(&before, &at(&src, 1.95)), "the frame before the cut is the recording's last before it");
+        assert!(apart(&after, &at(&src, 3.01)) < apart(&after, &at(&src, 3.05)), "the frame after the cut is the recording's first after it");
+        assert!(apart(&after, &at(&src, 3.01)) < apart(&after, &at(&src, 2.01)), "and not one cut out");
+
+        // The sound: no step bigger than the tone itself makes (a hard cut
+        // here jumps by its whole height, 0.125), and no gap at the join.
+        let sound = decode_audio(&out, 1).unwrap();
+        let left: Vec<f32> = sound.chunks(2).map(|s| s[0]).collect();
+        let join = (1.5 * PREVIEW_RATE as f64) as usize;
+        let step = left[join - 2400..join + 2400].windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+        assert!(step < 0.03, "a click at the join: a step of {step}");
+        let rms = |s: &[f32]| (s.iter().map(|x| x * x).sum::<f32>() / s.len() as f32).sqrt();
+        assert!(rms(&left[join - 240..join + 240]) > 0.5 * rms(&left[join - 4800..join - 2400]), "the sound dips at the join");
+        // As long as the picture, to a few samples: a part short of sound
+        // (cut from where a seek landed) leaves the picture a frame short.
+        assert!((left.len() as f64 / PREVIEW_RATE as f64 - 3.1).abs() < 0.002, "the sound lasts {} s", left.len() as f64 / PREVIEW_RATE as f64);
+
+        // From 2 s in, where a seek in the sound lands 5 ms late: still every
+        // sample and every frame.
+        edit.set_parts(&[(2.0, 2.5), (3.0, 3.5)]);
+        render_to(&src, &info, &edit, &out, None).unwrap();
+        let frames = ffprobe().args(["-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0"]).arg(&out).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&frames.stdout).trim(), "30");
+        let sound = decode_audio(&out, 1).unwrap();
+        assert!((sound.len() as f64 / 2.0 / PREVIEW_RATE as f64 - 1.0).abs() < 0.002, "the sound lasts {} s", sound.len() as f64 / 2.0 / PREVIEW_RATE as f64);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
 

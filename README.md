@@ -101,6 +101,7 @@ Clips are saved in a `hasteclip` folder in your Videos folder (Movies on macOS),
 </p>
 
 - **Frame-accurate trimming.** Drag the ends, or press <kbd>I</kbd> and <kbd>O</kbd>.
+- **Cut out the slow parts.** Press <kbd>S</kbd> to split at the playhead, then click a part and press <kbd>Delete</kbd>, or drag a split open. Playing skips what's cut out, and it stays on the timeline, dimmed, to drag back.
 - **Fast saving.** Only the frames around each cut are re-encoded, and the rest is copied as it is. A trim saves in seconds and looks exactly like the original.
 - **Every track on its own lane.** Turn your mic down after the fact, and draw volume changes along the timeline.
 - **Crop** to 16:9, 4:3, 1:1, 9:16 for phones, or any shape.
@@ -183,7 +184,7 @@ You need:
 
 - [Rust](https://rustup.rs) (stable).
 - [ffmpeg](https://ffmpeg.org) on your `PATH`, or next to the app. The editor, thumbnails and playback use it, and so does encoding on Linux. On macOS, run `brew install ffmpeg`; on Windows, `winget install Gyan.FFmpeg`. On Linux, your distribution's ffmpeg must encode and decode H.264. Debian, Ubuntu and Arch's packages do. Fedora's own `ffmpeg-free` doesn't, so use RPM Fusion's: `sudo dnf swap ffmpeg-free ffmpeg --allowerasing`.
-- On Linux: a C compiler, clang, and the PipeWire, D-Bus and ALSA headers. On Fedora, run `sudo dnf install gcc clang-devel pipewire-devel dbus-devel alsa-lib-devel`. On Debian or Ubuntu, run `sudo apt install build-essential libclang-dev libpipewire-0.3-dev libdbus-1-dev libasound2-dev`. You also need an xdg-desktop-portal for your desktop (GNOME, KDE Plasma, wlroots, Hyprland).
+- On Linux: a C compiler, clang, and the PipeWire, D-Bus, ALSA and FFmpeg (libavcodec) headers. On Fedora, run `sudo dnf install gcc clang-devel pipewire-devel dbus-devel alsa-lib-devel ffmpeg-free-devel`. On Debian or Ubuntu, run `sudo apt install build-essential libclang-dev libpipewire-0.3-dev libdbus-1-dev libasound2-dev libavcodec-dev libswresample-dev`. You also need an xdg-desktop-portal for your desktop (GNOME, KDE Plasma, wlroots, Hyprland). Without the FFmpeg headers it still builds, but playback decodes through ffmpeg processes: no instant play or full-quality scrubbing.
 
 Then build and run:
 

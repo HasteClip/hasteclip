@@ -131,7 +131,7 @@ impl Tracker {
     pub fn focused(&self) -> Option<(String, Game)> {
         let (id, path) = capture::foreground_app_path()?;
         let apps = self.state.lock().unwrap().apps.clone();
-        let game = identify(&id, self.installed(&path), &apps)?;
+        let game = identify(&id, &path, self.installed(&path), &apps)?;
         Some((id, game))
     }
 
@@ -186,8 +186,8 @@ fn sample(tracker: &Tracker) {
 
 /// The game an app is, if it's one: Discord's name for it, else its store
 /// folder's (`by_place`), else its name on the games and apps list.
-fn identify(id: &str, by_place: Option<String>, apps: &[(String, String)]) -> Option<Game> {
-    crate::discord::known_game(id)
+fn identify(id: &str, path: &Path, by_place: Option<String>, apps: &[(String, String)]) -> Option<Game> {
+    crate::discord::known_game(id, path)
         .or_else(|| by_place.map(|name| Game { name, icon: None }))
         .or_else(|| apps.iter().find(|(a, _)| a.eq_ignore_ascii_case(id)).map(|(_, name)| Game { name: name.clone(), icon: None }))
 }

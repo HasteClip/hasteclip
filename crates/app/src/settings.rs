@@ -241,28 +241,36 @@ pub struct PlacementCfg {
 
 impl PlacementCfg {
     /// Keep the box right for a frame of shape `frame_aspect`: rescaled to
-    /// keep its shape in pixels, around the same centre, as wide a share of
-    /// the frame (narrower if that won't fit). Laid out before the frame's
-    /// shape was kept: given the camera's shape (`camera_aspect`, when
-    /// known), as every box was meant to have. Returns whether it changed.
+    /// keep its shape in pixels, as wide a share of the frame (narrower if
+    /// that won't fit), at the same place in the room it has to move in (so
+    /// a box in a corner stays in it). Its shape is what's left of the
+    /// camera's picture once cropped, as every box is made: given the
+    /// camera's shape (`camera_aspect`, as turned, when known), a box of
+    /// another shape gets it back, one laid out before the frame's shape was
+    /// kept or squashed by a frame that changed under it. Returns whether it
+    /// changed.
     pub fn refit(&mut self, frame_aspect: f32, camera_aspect: Option<f32>) -> bool {
         if frame_aspect <= 0.0 || self.w <= 0.0 || self.h <= 0.0 {
             return false;
         }
-        let box_aspect = match self.frame_aspect {
-            Some(was) if (was - frame_aspect).abs() < 1e-3 => return false,
-            // Its shape in pixels, in the frame it was made for.
-            Some(was) => self.w * was / self.h,
-            None => match camera_aspect {
-                Some(cam) => {
-                    let visible = (1.0 - self.crop[0] - self.crop[2]).max(0.05) / (1.0 - self.crop[1] - self.crop[3]).max(0.05);
-                    cam * visible
-                }
-                None => return false, // wait for the camera's shape
-            },
+        let wanted = camera_aspect.filter(|&cam| cam > 0.0).map(|cam| {
+            cam * (1.0 - self.crop[0] - self.crop[2]).max(0.05) / (1.0 - self.crop[1] - self.crop[3]).max(0.05)
+        });
+        // Its shape in pixels, in the frame it was made for.
+        let had = self.frame_aspect.map(|was| self.w * was / self.h);
+        let same_frame = self.frame_aspect.is_some_and(|was| (was - frame_aspect).abs() < 1e-3);
+        let box_aspect = match (had, wanted) {
+            // Off by more than the preview's rounding.
+            (Some(had), Some(wanted)) if (had / wanted - 1.0).abs() > 0.02 => wanted,
+            (Some(_), _) if same_frame => return false,
+            (Some(had), _) => had,
+            (None, Some(wanted)) => wanted,
+            (None, None) => return false, // wait for the camera's shape
         };
-        let (cx, cy) = (self.x + self.w / 2.0, self.y + self.h / 2.0);
-        let mut w = self.w;
+        // From 0 against the left or top edge to 1 against the other.
+        let along = |at: f32, size: f32| if size < 1.0 - 1e-4 { (at / (1.0 - size)).clamp(0.0, 1.0) } else { 0.5 };
+        let (ax, ay) = (along(self.x, self.w), along(self.y, self.h));
+        let mut w = self.w.min(1.0);
         let mut h = w * frame_aspect / box_aspect;
         if h > 1.0 {
             w *= 1.0 / h;
@@ -270,8 +278,8 @@ impl PlacementCfg {
         }
         self.w = w;
         self.h = h;
-        self.x = cx - w / 2.0;
-        self.y = cy - h / 2.0;
+        self.x = ax * (1.0 - w);
+        self.y = ay * (1.0 - h);
         self.frame_aspect = Some(frame_aspect);
         true
     }
@@ -1156,16 +1164,64 @@ mod placement_tests {
         assert!(!p.refit(16.0 / 9.0, Some(16.0 / 9.0)));
     }
 
+    /// Where it is in the room it has to move in, across and down.
+    fn along(p: &PlacementCfg) -> (f32, f32) {
+        (p.x / (1.0 - p.w), p.y / (1.0 - p.h))
+    }
+
+    fn inside(p: &PlacementCfg) -> bool {
+        p.x >= -1e-6 && p.y >= -1e-6 && p.x + p.w <= 1.0 + 1e-6 && p.y + p.h <= 1.0 + 1e-6
+    }
+
     #[test]
     fn moving_to_an_ultrawide_keeps_its_shape() {
         // A 16:9 box on a 16:9 display, then a 6720x2836 ultrawide.
         let mut p = cfg(0.7, 0.7, 0.25, 0.25, Some(16.0 / 9.0));
-        let (cx, cy) = (p.x + p.w / 2.0, p.y + p.h / 2.0);
+        let (ax, ay) = along(&p);
         let uw = 6720.0 / 2836.0;
         assert!(p.refit(uw, None));
         assert!((pixel_aspect(&p, uw) - 16.0 / 9.0).abs() < 1e-4);
-        assert!((p.x + p.w / 2.0 - cx).abs() < 1e-5 && (p.y + p.h / 2.0 - cy).abs() < 1e-5);
+        let (bx, by) = along(&p);
+        assert!((bx - ax).abs() < 1e-5 && (by - ay).abs() < 1e-5);
+        assert!(inside(&p));
         assert_eq!(p.frame_aspect, Some(uw));
+    }
+
+    #[test]
+    fn a_box_in_a_corner_stays_there_on_a_turned_display() {
+        // Bottom right on a 16:9 display, then a portrait one, then back.
+        let start = cfg(0.75, 0.75, 0.25, 0.25, Some(16.0 / 9.0));
+        let mut p = start;
+        assert!(p.refit(9.0 / 16.0, Some(16.0 / 9.0)));
+        assert!((p.x + p.w - 1.0).abs() < 1e-5 && (p.y + p.h - 1.0).abs() < 1e-5);
+        assert!((pixel_aspect(&p, 9.0 / 16.0) - 16.0 / 9.0).abs() < 1e-4);
+        assert!(p.refit(16.0 / 9.0, Some(16.0 / 9.0)));
+        for (a, b) in [(p.x, start.x), (p.y, start.y), (p.w, start.w), (p.h, start.h)] {
+            assert!((a - b).abs() < 1e-5, "{p:?}");
+        }
+    }
+
+    #[test]
+    fn a_squashed_box_gets_the_cameras_shape_back() {
+        // The saved box from the bug report: a thin strip of a cropped 16:9
+        // camera, squashed by a frame that changed shape under it. On the
+        // display it was laid out for, and on another.
+        let squashed = PlacementCfg { crop: [0.137, 0.180, 0.105, 0.051], ..cfg(0.4073, 0.4962, 0.2372, 0.00762, Some(0.5625)) };
+        let visible = 16.0 / 9.0 * (1.0 - 0.137 - 0.105) / (1.0 - 0.180 - 0.051);
+        for frame in [0.5625, 16.0 / 9.0] {
+            let mut p = squashed;
+            assert!(p.refit(frame, Some(16.0 / 9.0)));
+            assert!((pixel_aspect(&p, frame) - visible).abs() < 1e-3, "{frame}: {p:?}");
+            assert!((p.w - squashed.w).abs() < 1e-6 && inside(&p), "{frame}: {p:?}");
+            assert!(!p.refit(frame, Some(16.0 / 9.0)), "then it's left alone");
+        }
+    }
+
+    #[test]
+    fn rounding_isnt_squashing() {
+        // A 16:9 box laid out on a preview a pixel off the frame's shape.
+        let mut p = cfg(0.7, 0.7, 0.25, 0.25 * 1.005, Some(16.0 / 9.0));
+        assert!(!p.refit(16.0 / 9.0, Some(16.0 / 9.0)));
     }
 
     #[test]

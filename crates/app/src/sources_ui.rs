@@ -375,8 +375,9 @@ impl App {
         });
 
         // What to record: changes right away, while capturing too (the clip
-        // switches mid-way; nothing restarts), the display included. (Where
-        // the desktop's dialog picks the screen, that waits: see below.)
+        // switches mid-way; nothing restarts), except the display, which
+        // sets the recording's size (see below; where the desktop's dialog
+        // picks the screen, that waits too).
         if capture::app_capture() {
             let opts = [
                 crate::ui_kit::Seg { icon: Some(egui_phosphor::regular::MONITOR), label: "Whole screen", tip: Some("Everything on one display") },
@@ -421,22 +422,34 @@ impl App {
             _ => {
                 let names: Vec<String> = self.screens.iter().map(|d| d.name.clone()).collect();
                 let at = self.display_at();
+                let stop_first = self.stop_first();
+                let mut locked_click = false;
                 group_rows(ui, "display", |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     ui.horizontal(|ui| {
                         ui.set_min_height(GROUP_ROW_H);
-                        ui.label(crate::theme::text("Display", 13.5, crate::theme::W::Regular).color(pal.text));
+                        ui.spacing_mut().item_spacing.x = 5.0;
+                        ui.label(crate::theme::text("Display", 13.5, crate::theme::W::Regular).color(if idle { pal.text } else { pal.text2 }));
+                        // Set before capturing: the recording is its size, so
+                        // another display mid-way came out boxed in black at
+                        // the first one's. Locked, as the crop is.
+                        if !idle {
+                            ui.label(crate::theme::ic(egui_phosphor::regular::LOCK_SIMPLE, 12.5).color(pal.text3)).on_hover_text(stop_first);
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let current = names.get(at).cloned().unwrap_or_else(|| "Main display".to_owned());
-                            let r = crate::ui_kit::select(ui, &current, 180.0);
-                            crate::ui_kit::menu_popup(&r, false, 240.0, |ui| {
-                                for (i, name) in names.iter().enumerate() {
-                                    if crate::ui_kit::Item::new(name.clone()).check(at == i).show(ui).clicked() {
-                                        self.settings.display_id = Some(self.screens[i].id.clone());
-                                        self.settings.display_index = i;
+                            let r = ui.add_enabled_ui(idle, |ui| crate::ui_kit::select(ui, &current, 180.0)).inner;
+                            locked_click = !idle && ui.input(|i| i.pointer.primary_clicked()) && r.contains_pointer();
+                            if idle {
+                                crate::ui_kit::menu_popup(&r, false, 240.0, |ui| {
+                                    for (i, name) in names.iter().enumerate() {
+                                        if crate::ui_kit::Item::new(name.clone()).check(at == i).show(ui).clicked() {
+                                            self.settings.display_id = Some(self.screens[i].id.clone());
+                                            self.settings.display_index = i;
+                                        }
                                     }
-                                }
-                            });
+                                });
+                            }
                         });
                     });
                     if capture::SCREEN_CROP {
@@ -444,6 +457,9 @@ impl App {
                         self.crop_row(ui, idle);
                     }
                 });
+                if locked_click {
+                    self.toast_icon(egui_phosphor::regular::LOCK_SIMPLE, stop_first.trim_end_matches('.'));
+                }
             }
         }
     }
@@ -1004,9 +1020,17 @@ impl App {
             source => (source, (self.settings.resolution.height(), self.settings.capture_shape()), self.settings.fps, webcam.clone()),
         };
         let webcam = wanted.3.clone();
-        // A changed app list reaches the running preview without a restart.
+        // A changed app list reaches the running preview without a restart,
+        // as does anything else its size. Another size (another display)
+        // starts it again at that size: switched in place, it kept the old
+        // display's size, the new one in black borders and the webcam drawn
+        // in a frame of the wrong shape (until clipping started a new capture).
         if let Some((have, preview)) = &mut self.video_preview {
-            if *have != wanted && (&have.1, have.2, &have.3) == (&wanted.1, wanted.2, &wanted.3) && preview.update(&wanted.0) {
+            if *have != wanted
+                && (&have.1, have.2, &have.3) == (&wanted.1, wanted.2, &wanted.3)
+                && capture::frame_size(&have.0, have.1.0, have.1.1) == capture::frame_size(&wanted.0, wanted.1.0, wanted.1.1)
+                && preview.update(&wanted.0)
+            {
                 have.0 = wanted.0.clone();
             }
         }

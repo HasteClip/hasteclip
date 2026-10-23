@@ -21,7 +21,7 @@
 //!   { "shortcut": "save" },                  // the save shortcut, as from a game
 //!   { "wait": 0.8 },                         // hold still
 //!   { "move": "clip:1", "secs": 0.9 },       // glide onto the first card
-//!   { "click": true },                       // (or "double": true)
+//!   { "click": true },                       // (or "double": true, "right": true)
 //!   { "play": true },                        // play, if it isn't
 //!   { "trim": "in", "to": "marker:1", "before": 3 },  // a trim handle to a moment
 //!   { "seek": "marker:1", "before": 1 },     // the playhead to a moment
@@ -33,8 +33,10 @@
 //!
 //! Targets: `clip:<title>` or `clip:N` (the Nth card on screen),
 //! `filter:<name>` (the library's games and collections), `button:<label>`
-//! (buttons and menu items, by label or tooltip), `play`, `trim:in`,
-//! `trim:out`, or a point `[x, y]` in the window's points. Moments:
+//! (buttons and menu items, by label or tooltip), `select:<value>` (a
+//! dropdown, by what it shows), `play`, `trim:in`,
+//! `trim:out`, the editor's `part:N` and `split:N` (the Nth part kept, the
+//! Nth split), or a point `[x, y]` in the window's points. Moments:
 //! `marker:N` (the open clip's Nth marker, put in with B) or seconds.
 
 use std::collections::HashMap;
@@ -183,12 +185,15 @@ enum Step {
         #[serde(default = "default_move")]
         secs: f64,
     },
-    /// Click where the pointer is (twice for a double click).
+    /// Click where the pointer is (twice for a double click; with the right
+    /// button for a menu).
     Click {
         #[allow(dead_code)]
         click: bool,
         #[serde(default)]
         double: bool,
+        #[serde(default)]
+        right: bool,
         /// Keys held, like `"cmd"` (select a clip) or `"shift"`.
         #[serde(default)]
         mods: Option<String>,
@@ -564,7 +569,7 @@ impl Demo {
                     next(self);
                 }
             }
-            Step::Click { double, mods, .. } => {
+            Step::Click { double, right, mods, .. } => {
                 let modifiers = mods.as_deref().map_or(Modifiers::NONE, |m| parse_key(&format!("{m}+a")).1);
                 // Press and release on frames of their own, like a hand: a
                 // press, a frame held, a release (twice for a double click).
@@ -575,8 +580,9 @@ impl Demo {
                 }
                 if n < frames {
                     let pressed = n.is_multiple_of(2);
-                    raw.events.push(Event::PointerButton { pos: self.pointer, button: PointerButton::Primary, pressed, modifiers });
-                    self.down = pressed;
+                    let button = if right { PointerButton::Secondary } else { PointerButton::Primary };
+                    raw.events.push(Event::PointerButton { pos: self.pointer, button, pressed, modifiers });
+                    self.down = pressed && !right;
                     self.click_frame += 1;
                 } else {
                     self.click_frame = 0;
@@ -585,7 +591,9 @@ impl Demo {
                 }
             }
             Step::Drag { drag, by, to, secs } => {
-                let Some(grab) = resolve(self, &drag) else {
+                // Found until it's grabbed: what it is may change once pulled
+                // (a split pulled open is two handles).
+                let Some(grab) = self.grabbed.or_else(|| resolve(self, &drag)) else {
                     self.started = None;
                     return;
                 };

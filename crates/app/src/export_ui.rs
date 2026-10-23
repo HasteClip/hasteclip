@@ -53,7 +53,7 @@ pub fn ui(ui: &mut egui::Ui, info: &ClipInfo, edit: &mut Edit, crop_on_picture: 
     let pal = theme::pal(ui);
     let before = edit.output;
     // Trim and tracks, for sizes worked out while the settings change.
-    let mut dims = Edit { start: edit.start, end: edit.end, tracks: edit.tracks.clone(), output: edit.output };
+    let mut dims = edit.clone();
     let tracks = edit.tracks.len();
     let o = &mut edit.output;
     ui.set_width(330.0);

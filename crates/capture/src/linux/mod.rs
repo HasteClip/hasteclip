@@ -34,6 +34,7 @@ mod apps;
 pub mod audio;
 mod blend;
 mod camera;
+pub mod decode;
 mod ext_windows;
 pub mod ffmpeg;
 mod image;
@@ -62,6 +63,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 pub use camera::{keep_open as keep_camera_open, list_cameras};
+pub use kwin::helper as kde_stream_helper;
 
 use crate::mixer::{self, Clock, LiveAudio};
 use crate::mp4file::Layout;

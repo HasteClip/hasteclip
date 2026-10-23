@@ -118,6 +118,12 @@ struct Ready {
     redo: Vec<Edit>,
     /// The edit when a drag began, to put on the undo stack once it ends.
     before_drag: Option<Edit>,
+    /// A volume drag: how far it's gone (Shift's fine steps counted small),
+    /// where along the clip its line was taken hold of (seconds), and the
+    /// level it's snapped to (lane, dB), which a guide marks.
+    vol_moved: Vec2,
+    vol_grab: f64,
+    vol_guide: Option<(usize, f32)>,
     /// Trim edges and the playhead snap to each other and the clip's ends.
     snap: bool,
     /// Playing loops the kept part.
@@ -138,7 +144,42 @@ struct Ready {
     moments: Vec<crate::transport::Moment>,
     /// Cropping the picture (C): the whole of it shows, to choose the part kept.
     crop_tool: Option<crate::crop_ui::CropTool>,
+    /// What the timeline's right-click menu is for, and the time clicked,
+    /// while it's open (a part right-clicked is lit meanwhile).
+    menu_at: Option<(Spot, f64)>,
+    /// A stretch just cut out (or put back): its dimming fades in (or out).
+    fading: Option<Fading>,
 }
+
+/// A place on the timeline, for its right-click menu.
+#[derive(Clone, Copy, PartialEq)]
+enum Spot {
+    /// Part `k` of what's kept.
+    Part(usize),
+    /// What's cut out between part `k` and the next.
+    Gap(usize),
+    /// The split between part `k` and the next (nothing cut out).
+    Split(usize),
+    /// What's trimmed off the start, or the end.
+    Before,
+    After,
+    /// Track `i`'s volume line, and its point `k`.
+    Volume(usize),
+    Point(usize, usize),
+}
+
+/// A stretch whose dimming changes: `from` to `to` seconds, cut out (`cut`)
+/// or put back, at `since` (the UI's clock).
+#[derive(Clone, Copy)]
+struct Fading {
+    from: f64,
+    to: f64,
+    cut: bool,
+    since: f64,
+}
+
+/// How long a stretch's dimming takes to fade in or out (seconds).
+const FADE_S: f64 = 0.18;
 
 #[derive(Default, Clone, Copy)]
 struct Meter {
@@ -336,6 +377,9 @@ impl Ready {
             undo: Vec::new(),
             redo: Vec::new(),
             before_drag: None,
+            vol_moved: Vec2::ZERO,
+            vol_grab: 0.0,
+            vol_guide: None,
             snap,
             looping: false,
             solo: None,
@@ -346,6 +390,8 @@ impl Ready {
             save_as_focused: false,
             moments: crate::moments::of(&target.clip).pins(full),
             crop_tool: None,
+            menu_at: None,
+            fading: None,
         }
     }
 
@@ -362,6 +408,8 @@ impl Ready {
             }
         }
         self.player.set_mix(mix);
+        // What's cut out, skipped while playing.
+        self.player.set_cuts(&self.edit.kept());
         // As loud as you listen, in the player too (they share it): the
         // edit's own levels stay as they are.
         self.player.set_listening(crate::transport::listening_gain(&ctx));
@@ -767,6 +815,10 @@ impl Ready {
         let prev = self.moments.iter().rev().find(|m| m.t < t - 0.05).cloned();
         let next = self.moments.iter().find(|m| m.t > t + 0.05).cloned();
         let (mut undo, mut redo, mut set_in, mut set_out, mut play, mut jump, mut crop) = (false, false, false, false, false, None, false);
+        let mut split = false;
+        let can_split = self.split_at(t).is_some();
+        // With the clip in parts, Start and End are the part's at the playhead.
+        let whose = if self.edit.parts().len() > 1 { "this part" } else { "the clip" };
         let cropping = self.crop_tool.is_some();
         let (mut zoom_by, mut zoom_to) = (None, None);
         let mut frames = self.show_frames;
@@ -775,33 +827,45 @@ impl Ready {
         let full = self.info.duration.max(1e-6);
         let zoom_frac = (1.0 - ((self.view.1 / full).ln() / (self.min_span() / full).ln()).clamp(0.0, 1.0)) as f32;
         let zoom_frac = 1.0 - zoom_frac;
-        // Narrower windows: Start and End become their brackets, the zoom
-        // slider goes (its buttons stay), then the time moves out of the
-        // middle to make room.
-        let medium = bar.width() < 860.0;
-        let narrow = bar.width() < 660.0;
+        // Narrower windows: Start, End and Split become their brackets and
+        // icons and the sliders go (the zoom's buttons stay), then the time
+        // moves out of the middle to make room. (Where each side's buttons
+        // still fit beside the middle's.)
+        let medium = bar.width() < 1040.0;
+        let narrow = bar.width() < 740.0;
         let centre_w = if narrow { 44.0 } else { 250.0 };
         crate::transport::bar(ui, bar, centre_w, |ui, part| match part {
             crate::transport::Part::Left => {
-                undo = Btn::icon(Kind::Ghost, icon::ARROW_U_UP_LEFT).enabled(can_undo).tip("Undo  (Cmd Z)").show(ui).clicked();
-                redo = Btn::icon(Kind::Ghost, icon::ARROW_U_UP_RIGHT).enabled(can_redo).tip("Redo  (Shift Cmd Z)").show(ui).clicked();
-                crate::transport::vrule(ui);
-                if medium {
-                    set_in = Btn::ghost("[").small().tip("Start the clip here  (I)").show(ui).clicked();
-                    set_out = Btn::ghost("]").small().tip("End the clip here  (O)").show(ui).clicked();
-                    // No room in the middle: the time here, without the length.
-                    if narrow {
-                        crate::transport::vrule(ui);
-                        crate::transport::timecode(ui, t, 0.0, self.info.fps, &mut frames);
-                    }
-                } else {
-                    set_in = Btn::ghost("Start").with_icon("[").small().tip("Start the clip here  (I)").show(ui).clicked();
-                    set_out = Btn::ghost("End").trail("]").small().tip("End the clip here  (O)").show(ui).clicked();
+                // Narrow: the time joins these (there's no room in the
+                // middle), so they're smaller, with no rules between them,
+                // and narrower still, Redo goes (Shift Cmd Z stays).
+                let icon_btn = |kind, glyph| if narrow { Btn::icon(kind, glyph).small() } else { Btn::icon(kind, glyph) };
+                let rule = |ui: &mut egui::Ui| if !narrow { crate::transport::vrule(ui) };
+                undo = icon_btn(Kind::Ghost, icon::ARROW_U_UP_LEFT).enabled(can_undo).tip(format!("Undo  ({} Z)", crate::shortcuts::cmd_name())).show(ui).clicked();
+                if bar.width() >= 600.0 {
+                    redo = icon_btn(Kind::Ghost, icon::ARROW_U_UP_RIGHT).enabled(can_redo).tip(format!("Redo  (Shift {} Z)", crate::shortcuts::cmd_name())).show(ui).clicked();
                 }
-                crate::transport::vrule(ui);
+                rule(ui);
+                let (start_tip, end_tip) = (format!("Start {whose} here  (I)"), format!("End {whose} here  (O)"));
+                let split_tip = if can_split { "Split at the playhead, to cut a part out  (S)" } else { "Move the playhead to where you want to split  (S)" };
+                if medium {
+                    set_in = Btn::ghost("[").small().tip(start_tip).show(ui).clicked();
+                    set_out = Btn::ghost("]").small().tip(end_tip).show(ui).clicked();
+                    split = icon_btn(Kind::Ghost, icon::SCISSORS).enabled(can_split).tip(split_tip).show(ui).clicked();
+                } else {
+                    set_in = Btn::ghost("Start").with_icon("[").small().tip(start_tip).show(ui).clicked();
+                    set_out = Btn::ghost("End").trail("]").small().tip(end_tip).show(ui).clicked();
+                    split = Btn::ghost("Split").with_icon(icon::SCISSORS).small().enabled(can_split).tip(split_tip).show(ui).clicked();
+                }
+                rule(ui);
                 let kind = if cropping { Kind::On } else { Kind::Ghost };
-                let btn = if medium { Btn::icon(kind, icon::CROP) } else { Btn::new(kind, "Crop").with_icon(icon::CROP).small() };
+                let btn = if medium { icon_btn(kind, icon::CROP) } else { Btn::new(kind, "Crop").with_icon(icon::CROP).small() };
                 crop = btn.tip("Crop the picture: keep a part of it, like 16:9 out of an ultrawide screen  (C)").show(ui).clicked();
+                // No room in the middle: the time here, without the length.
+                if narrow {
+                    ui.add_space(4.0);
+                    crate::transport::timecode(ui, t, 0.0, self.info.fps, &mut frames);
+                }
             }
             crate::transport::Part::Centre => {
                 // Narrow: play alone (the pins and [ ] still go to moments).
@@ -831,10 +895,10 @@ impl Ready {
                 }
                 crate::transport::vrule(ui);
                 let kind = |on: bool| if on { Kind::On } else { Kind::Ghost };
-                if Btn::icon(kind(self.looping), icon::REPEAT).tip("Loop the kept part").show(ui).clicked() {
+                if Btn::icon(kind(self.looping), icon::REPEAT).tip("Loop what's kept").show(ui).clicked() {
                     self.looping = !self.looping;
                 }
-                if Btn::icon(kind(self.snap), icon::MAGNET).tip("Snapping  (N): edges snap to the playhead, the clip's ends and its moments").show(ui).clicked() {
+                if Btn::icon(kind(self.snap), icon::MAGNET).tip("Snapping  (N): edges snap to the playhead, each other, the clip's ends and its moments").show(ui).clicked() {
                     self.snap = !self.snap;
                 }
                 // How loud you listen (not the edit's levels, which are on
@@ -858,6 +922,9 @@ impl Ready {
         }
         if set_out {
             self.set_out();
+        }
+        if split {
+            self.split(t);
         }
         if play {
             self.toggle_play();
@@ -1018,9 +1085,9 @@ impl Ready {
         }
     }
 
-    /// Snap `t` to the playhead, the trim edges or the clip's ends when it's
-    /// within a few points of one (and snapping is on). `except`: what's being
-    /// moved, which mustn't snap to itself.
+    /// Snap `t` to the playhead, the parts' edges or the clip's ends when
+    /// it's within a few points of one (and snapping is on). `except`: what's
+    /// being moved, which mustn't snap to itself.
     fn snapped(&self, t: f64, px_per_s: f64, except: Option<Drag>) -> f64 {
         if !self.snap {
             return t;
@@ -1031,14 +1098,16 @@ impl Ready {
         // Not while a trim edge moves: the playhead follows the edge, and
         // snapping to it made the edge chase its own shadow (back and forth
         // while held still).
-        if !matches!(except, Some(Drag::Playhead | Drag::In | Drag::Out)) {
+        if !matches!(except, Some(Drag::Playhead | Drag::Start(_) | Drag::End(_))) {
             targets.push(self.info.snap(self.player.time()));
         }
-        if except != Some(Drag::In) {
-            targets.push(self.edit.start);
-        }
-        if except != Some(Drag::Out) {
-            targets.push(self.edit.end);
+        for (k, (a, b)) in self.edit.parts().into_iter().enumerate() {
+            if except != Some(Drag::Start(k)) {
+                targets.push(a);
+            }
+            if except != Some(Drag::End(k)) {
+                targets.push(b);
+            }
         }
         targets.into_iter().filter(|x| (x - t).abs() < reach).min_by(|a, b| (a - t).abs().total_cmp(&(b - t).abs())).unwrap_or(t)
     }
@@ -1122,6 +1191,33 @@ impl Ready {
         }
         if fit {
             self.view_target = Some((0.0, self.info.duration.max(1e-6)));
+        }
+        // Splitting and cutting out, at the playhead: S (or Cmd B, as other
+        // editors have it) splits there, Delete cuts out the part it's in.
+        let at_playhead = (self.edit.parts().len() > 1).then(|| self.part_at(self.player.time())).flatten();
+        let (split, cut, up, down) = ctx.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::NONE, Key::S) || i.consume_key(egui::Modifiers::COMMAND, Key::B),
+                at_playhead.is_some() && (i.consume_key(egui::Modifiers::NONE, Key::Delete) || i.consume_key(egui::Modifiers::NONE, Key::Backspace)),
+                i.consume_key(egui::Modifiers::NONE, Key::ArrowUp),
+                i.consume_key(egui::Modifiers::NONE, Key::ArrowDown),
+            )
+        });
+        if split {
+            self.split(self.player.time());
+        }
+        if let (true, Some(k)) = (cut, at_playhead) {
+            self.cut_out(k, ctx.input(|i| i.time));
+        }
+        // ↑ ↓: the previous or next cut (a part's first or last frame).
+        if up || down {
+            let t = self.info.snap(self.player.time());
+            let points = self.cut_points();
+            let to = if up { points.iter().rev().find(|&&p| p < t - 1e-6) } else { points.iter().find(|&&p| p > t + 1e-6) };
+            if let Some(&to) = to {
+                self.player.pause();
+                self.player.seek(to + 1e-6);
+            }
         }
         let (space, left, right, i, o, home, end, shift) = ctx.input_mut(|inp| {
             (
@@ -1216,6 +1312,11 @@ impl Ready {
         let t = self.player.time();
         if t < self.edit.start || t >= self.edit.end - self.info.frame_duration() * 1.5 {
             self.player.seek(self.edit.start);
+        } else if self.part_at(t).is_none()
+            && let Some(&(a, _)) = self.edit.parts().iter().find(|&&(a, _)| a > t)
+        {
+            // In what's cut out: on from the part after it.
+            self.player.seek(a);
         }
         self.player.play(self.edit.end);
     }
@@ -1227,21 +1328,114 @@ impl Ready {
         self.player.seek(f.clamp(0, max.max(0)) as f64 / self.info.fps + 1e-6);
     }
 
+    /// Start here (I): see [`start_at`].
     fn set_in(&mut self) {
         let t = self.info.snap(self.player.time());
-        if t < self.edit.end - self.info.frame_duration() && t != self.edit.start {
+        if let Some(parts) = start_at(&self.edit.parts(), t, self.info.frame_duration()) {
             self.push_undo(self.edit.clone());
-            self.edit.start = t;
+            self.edit.set_parts(&parts);
         }
     }
 
+    /// End here (O): see [`end_at`].
     fn set_out(&mut self) {
+        let fd = self.info.frame_duration();
         // Out is exclusive: include the frame under the playhead.
-        let t = (self.info.snap(self.player.time()) + self.info.frame_duration()).min(self.info.duration);
-        if t > self.edit.start + self.info.frame_duration() && t != self.edit.end {
+        let t = (self.info.snap(self.player.time()) + fd).min(self.info.duration);
+        if let Some(parts) = end_at(&self.edit.parts(), t, fd) {
             self.push_undo(self.edit.clone());
-            self.edit.end = t;
+            self.edit.set_parts(&parts);
         }
+    }
+
+    /// The part `t` is in, if it's kept.
+    fn part_at(&self, t: f64) -> Option<usize> {
+        self.edit.parts().iter().position(|&(a, b)| t >= a - 1e-9 && t < b - 1e-9)
+    }
+
+    /// The part a split at `t` would split, if one would be.
+    fn split_at(&self, t: f64) -> Option<usize> {
+        splits(&self.edit.parts(), self.info.snap(t), self.info.frame_duration())
+    }
+
+    /// Split the part at `t` in two there: the frame at `t` starts the second.
+    fn split(&mut self, t: f64) {
+        let t = self.info.snap(t);
+        let mut parts = self.edit.parts();
+        let Some(k) = splits(&parts, t, self.info.frame_duration()) else { return };
+        self.push_undo(self.edit.clone());
+        let (a, b) = parts[k];
+        parts.splice(k..=k, [(a, t), (t, b)]);
+        self.edit.set_parts(&parts);
+    }
+
+    /// A volume point on track `i` at `t`, at the level the line has there
+    /// (the first one takes the track's flat level).
+    fn add_point(&mut self, i: usize, t: f64) {
+        let fd = self.info.frame_duration();
+        let Some(track) = self.edit.tracks.get(i) else { return };
+        if track.points.iter().any(|pt| (pt.t - t).abs() < fd / 2.0) {
+            return;
+        }
+        self.push_undo(self.edit.clone());
+        let track = &mut self.edit.tracks[i];
+        let db = track.db_at(t);
+        if track.points.is_empty() {
+            track.gain = 1.0;
+        }
+        let at = track.points.partition_point(|pt| pt.t < t);
+        track.points.insert(at, media::VolumePoint { t, db });
+    }
+
+    /// Take point `k` of track `i` away; the last one leaves its level as the
+    /// flat level.
+    fn remove_point(&mut self, i: usize, k: usize) {
+        if self.edit.tracks.get(i).is_none_or(|t| k >= t.points.len()) {
+            return;
+        }
+        self.push_undo(self.edit.clone());
+        let track = &mut self.edit.tracks[i];
+        let removed = track.points.remove(k);
+        if track.points.is_empty() {
+            track.gain = media::from_db(removed.db);
+        }
+    }
+
+    /// Cut part `k` out (it stays on the timeline, dimmed, to put back). The
+    /// clip keeps one part at least. A playhead in it moves on to the next.
+    fn cut_out(&mut self, k: usize, now: f64) {
+        let mut parts = self.edit.parts();
+        if parts.len() < 2 || k >= parts.len() {
+            return;
+        }
+        self.push_undo(self.edit.clone());
+        let (a, b) = parts.remove(k);
+        self.edit.set_parts(&parts);
+        self.fading = Some(Fading { from: a, to: b, cut: true, since: now });
+        let t = self.player.time();
+        if t >= a && t < b {
+            let fd = self.info.frame_duration();
+            let to = parts.get(k).map_or_else(|| parts[k - 1].1 - fd, |p| p.0);
+            self.player.seek(to + 1e-6);
+        }
+    }
+
+    /// Keep what's cut out or trimmed off at `spot` again: the parts either
+    /// side of it are one again.
+    fn put_back(&mut self, spot: Spot, now: f64) {
+        let Some((parts, back)) = put_back(&self.edit.parts(), spot, self.info.duration) else { return };
+        self.push_undo(self.edit.clone());
+        self.edit.set_parts(&parts);
+        if back.1 - back.0 > 1e-6 {
+            self.fading = Some(Fading { from: back.0, to: back.1, cut: false, since: now });
+        }
+    }
+
+    /// Where the playhead goes with ↑ and ↓: the first and last frame of
+    /// each part, in order.
+    fn cut_points(&self) -> Vec<f64> {
+        let fd = self.info.frame_duration();
+        self.edit.parts().iter().flat_map(|&(a, b)| [a, (b - fd).max(a)]).collect()
     }
 
     /// One shared time axis for everything, like Premiere / Resolve: the
@@ -1339,7 +1533,6 @@ impl Ready {
         }
 
         // --- The mix's meter, on the right ---
-        p.vline(meter_col.left() - 0.5, meter_col.y_range(), Stroke::new(1.0, pal.line));
         let mix = Rect::from_min_max(meter_col.min + Vec2::new(6.0, 4.0), meter_col.max);
         crate::meter::stereo_vertical(ui, mix, ui.id().with("mix_meter"), &self.mix_meter);
         ui.interact(mix.with_max_y(mix.top() + 16.0), ui.id().with("mix_tip"), Sense::hover()).on_hover_text("The clip's mix: every track together. The number is its loudest peak in the last few seconds.");
@@ -1402,60 +1595,215 @@ impl Ready {
             p.rect_filled(Rect::from_x_y_ranges(track.x_range(), thumb_y..=thumb_y + thumb_h), 2, if hv { pal.text3 } else { pal.control_h });
         }
 
-        // --- Trim: the cut parts dimmed, the kept part outlined, handles ---
+        // --- What's kept: each part outlined, with handles at its ends; what's
+        // cut away (trimmed off the ends, cut out between parts) dimmed ---
         let body = Rect::from_x_y_ranges(lanes_x, video.top()..=(y - 4.0).min(audio_view.bottom()));
-        let (xi, xo) = (x_of(self.edit.start), x_of(self.edit.end));
-        lp.rect_filled(Rect::from_min_max(body.min, Pos2::new(xi, body.bottom())), 0, pal.dim);
-        lp.rect_filled(Rect::from_min_max(Pos2::new(xo, body.top()), body.max), 0, pal.dim);
-        // The outline shows once something's cut: before that the whole clip
-        // is kept and a white frame round everything only adds noise.
-        let trimmed = self.edit.start > fd * 0.5 || self.edit.end < dur - fd * 0.5;
-        let outline = theme_fade(&ctx, "ed_trimmed", trimmed || self.dragging.is_some_and(|d| matches!(d, Drag::In | Drag::Out)));
-        let keep = Rect::from_min_max(Pos2::new(xi, body.top()), Pos2::new(xo, body.bottom()));
-        let edge = crate::theme::mix(pal.text3, pal.text, outline);
-        if outline > 0.0 {
-            lp.hline(keep.x_range(), keep.top() + 1.0, Stroke::new(2.0, crate::theme::fade(pal.text, outline)));
-            lp.hline(keep.x_range(), keep.bottom() - 1.0, Stroke::new(2.0, crate::theme::fade(pal.text, outline)));
+        let parts = self.edit.parts();
+        let n = parts.len();
+        let xs: Vec<(f32, f32)> = parts.iter().map(|&(a, b)| (x_of(a), x_of(b))).collect();
+        // Part k and the next touch: split, nothing cut out between them.
+        let split = |k: usize| k + 1 < n && parts[k + 1].0 - parts[k].1 < 1e-6;
+        // A stretch just cut out fades to dim; one put back, from it.
+        let now = ctx.input(|i| i.time);
+        let fading = self.fading.filter(|f| now - f.since < FADE_S);
+        let faded = fading.map_or(1.0, |f| crate::theme::ease_out(((now - f.since) / FADE_S) as f32));
+        if fading.is_some() {
+            ctx.request_repaint();
         }
-        let handle_w = 9.0;
-        let in_handle = Rect::from_min_max(Pos2::new(xi - handle_w, body.top()), Pos2::new(xi, body.bottom()));
-        let out_handle = Rect::from_min_max(Pos2::new(xo, body.top()), Pos2::new(xo + handle_w, body.bottom()));
-        crate::demo::mark(&ctx, || "trim:in".into(), in_handle);
-        crate::demo::mark(&ctx, || "trim:out".into(), out_handle);
-        let hover_pos = ui.input(|i| i.pointer.hover_pos());
-        for (h, left, drag) in [(in_handle, true, Drag::In), (out_handle, false, Drag::Out)] {
-            let active = self.dragging == Some(drag) || (self.dragging.is_none() && hover_pos.is_some_and(|p| h.expand(5.0).contains(p)));
-            let grow = theme_fade(&ctx, if left { "ed_hin" } else { "ed_hout" }, active);
-            let h = if left { h.with_min_x(h.min.x - 2.0 * grow) } else { h.with_max_x(h.max.x + 2.0 * grow) };
-            let corners = if left { egui::CornerRadius { nw: 4, sw: 4, ne: 0, se: 0 } } else { egui::CornerRadius { nw: 0, sw: 0, ne: 4, se: 4 } };
-            p.rect_filled(h, corners, crate::theme::mix(edge, pal.text, grow));
-            p.vline(h.center().x, h.center().y - 8.0..=h.center().y + 8.0, Stroke::new(2.0, crate::theme::fade(pal.base, 0.7)));
-        }
-        // The volume lines over the handles: their points stay where you can
-        // see and grab them.
-        for (i, lane) in lane_rects.iter().enumerate() {
-            if lane.intersects(audio_view) {
-                draw_envelope(&alp, pal, *lane, &self.edit.tracks[i], dur, x_of);
+        let gaps = std::iter::once((0.0, parts[0].0)).chain(parts.windows(2).map(|w| (w[0].1, w[1].0))).chain(std::iter::once((parts[n - 1].1, dur)));
+        let dim = |a: f64, b: f64, k: f32| {
+            let (xa, xb) = (x_of(a), x_of(b));
+            if xb > xa {
+                lp.rect_filled(Rect::from_x_y_ranges(xa..=xb, body.y_range()), 0, crate::theme::fade(pal.dim, k));
+            }
+        };
+        for (a, b) in gaps {
+            // (What's just been cut out of it, fading in: it may have joined
+            // what was cut out either side.)
+            match fading.filter(|f| f.cut && f.from >= a - 1e-6 && f.to <= b + 1e-6) {
+                Some(f) => {
+                    dim(a, f.from, 1.0);
+                    dim(f.from, f.to, faded);
+                    dim(f.to, b, 1.0);
+                }
+                None => dim(a, b, 1.0),
             }
         }
-        // The kept part's length, as a dimension line under the lanes; drag it
-        // to slide the kept part along the clip, its length kept.
+        if let Some(f) = fading.filter(|f| !f.cut) {
+            lp.rect_filled(Rect::from_x_y_ranges(x_of(f.from)..=x_of(f.to), body.y_range()), 0, crate::theme::fade(pal.dim, 1.0 - faded));
+        }
+        // The outline shows once something's cut: before that the whole clip
+        // is kept and a white frame round everything only adds noise.
+        let trimmed = self.edit.start > fd * 0.5 || self.edit.end < dur - fd * 0.5 || n > 1;
+        let outline = theme_fade(&ctx, "ed_trimmed", trimmed || self.dragging.is_some_and(|d| matches!(d, Drag::Start(_) | Drag::End(_))));
+        let edge = crate::theme::mix(pal.text3, pal.text, outline);
+        let hover_pos = ui.input(|i| i.pointer.hover_pos());
+        // At a split the two parts' outlines stop short of each other: the
+        // film is cut there.
+        const SPLIT_GAP: f32 = 2.0;
+        let shown_x = |k: usize| {
+            let (xa, xb) = xs[k];
+            (if k > 0 && split(k - 1) { xa + SPLIT_GAP } else { xa }, if split(k) { xb - SPLIT_GAP } else { xb })
+        };
+        for k in 0..n {
+            let (xa, xb) = shown_x(k);
+            let part = Rect::from_x_y_ranges(xa..=xb, body.y_range());
+            crate::demo::mark(&ctx, || format!("part:{}", k + 1), part);
+            // The part right-clicked: lit and framed while its menu is open,
+            // so it's clear what the menu acts on.
+            let chosen = theme_fade(&ctx, &format!("ed_sel{k}"), self.menu_at.is_some_and(|(s, _)| s == Spot::Part(k)));
+            if chosen > 0.0 {
+                // (In the light look, more would read as greyed out.)
+                lp.rect_filled(part, 0, crate::theme::fade(pal.text, if pal.dark { 0.14 } else { 0.06 } * chosen));
+                lp.rect_stroke(part.shrink(1.0), 3, Stroke::new(2.0, crate::theme::fade(pal.text, chosen)), egui::StrokeKind::Middle);
+            }
+            if outline > 0.0 {
+                let line = Stroke::new(2.0, crate::theme::fade(pal.text, outline));
+                lp.hline(part.x_range(), part.top() + 1.0, line);
+                lp.hline(part.x_range(), part.bottom() - 1.0, line);
+            }
+        }
+        // A split: the film cut through, a hair of the page between its
+        // parts, and a grip on the picture's lane to pull it open with.
+        let mut splits: Vec<(Rect, Drag)> = Vec::new();
+        // Handles and grips stand out past the lanes a little, never over
+        // the lanes' names (zoomed in, an edge just out of view).
+        let handle_w = 6.0;
+        let hp = ui.painter_at(lanes.expand2(Vec2::new(handle_w + 3.0, 0.0)).intersect(outer));
+        for k in (0..n).filter(|&k| split(k)) {
+            let x = xs[k].1;
+            let r = Rect::from_center_size(Pos2::new(x, body.center().y), Vec2::new(12.0, body.height()));
+            let hv = theme_fade(&ctx, &format!("ed_split{k}"), self.dragging.is_none() && hover_pos.is_some_and(|p| r.contains(p)));
+            lp.rect_filled(Rect::from_x_y_ranges(x - SPLIT_GAP..=x + SPLIT_GAP, body.y_range()), 0, pal.base);
+            let grip = Rect::from_center_size(Pos2::new(x, video.center().y), Vec2::new(6.0 + 2.0 * hv, 26.0 + 6.0 * hv));
+            hp.rect_filled(grip.expand(1.5), 4, pal.base);
+            hp.rect_filled(grip, 3, crate::theme::mix(edge, pal.text, hv));
+            crate::demo::mark(&ctx, || format!("split:{}", k + 1), r);
+            splits.push((r, Drag::Split(k)));
+        }
+        // Handles at each part's ends, outside it; between parts, as wide as
+        // half of what's cut out lets them be.
+        let mut grips: Vec<(Rect, Drag)> = Vec::new();
+        for k in 0..n {
+            let (xa, xb) = xs[k];
+            if k == 0 || !split(k - 1) {
+                let w = if k == 0 { handle_w } else { ((xa - xs[k - 1].1) / 2.0).clamp(3.0, handle_w) };
+                grips.push((Rect::from_x_y_ranges(xa - w..=xa, body.y_range()), Drag::Start(k)));
+            }
+            if !split(k) {
+                let w = if k + 1 == n { handle_w } else { ((xs[k + 1].0 - xb) / 2.0).clamp(3.0, handle_w) };
+                grips.push((Rect::from_x_y_ranges(xb..=xb + w, body.y_range()), Drag::End(k)));
+            }
+        }
+        if let Some((r, _)) = grips.first() {
+            crate::demo::mark(&ctx, || "trim:in".into(), *r);
+        }
+        if let Some((r, _)) = grips.last() {
+            crate::demo::mark(&ctx, || "trim:out".into(), *r);
+        }
+        let near_grip = |pos: Pos2| grips.iter().filter(|(r, _)| r.expand(5.0).contains(pos)).min_by(|a, b| (a.0.center().x - pos.x).abs().total_cmp(&(b.0.center().x - pos.x).abs())).map(|g| g.1);
+        let hovered_grip = hover_pos.filter(|_| self.dragging.is_none()).and_then(near_grip);
+        // A volume point under the pointer, else its lane's line (unless a
+        // handle is nearer): what a drag there takes hold of.
+        let vol_at = |pos: Pos2, this: &Self| -> Option<Drag> {
+            let (i, lane) = lane_rects.iter().enumerate().find(|(_, l)| l.contains(pos) && audio_view.contains(pos))?;
+            let track = &this.edit.tracks[i];
+            if let Some(k) = track.points.iter().position(|pt| Pos2::new(x_of(pt.t), y_of_db(*lane, pt.db)).distance(pos) < 8.0) {
+                return Some(Drag::Point(i, k));
+            }
+            let on_line = (pos.y - y_of_db(*lane, track.db_at(t_of(pos.x)))).abs() < 6.0;
+            (on_line && near_grip(pos).is_none()).then_some(Drag::Line(i))
+        };
+        // The volume line or point pointed at, or taken hold of.
+        let vol_hot = match self.dragging {
+            Some(d @ (Drag::Line(_) | Drag::Point(..))) => Some(d),
+            Some(_) => None,
+            None => hover_pos.and_then(|p| vol_at(p, self)),
+        };
+        // The volume lines, under the handles (a line is grabbed beside one).
+        for (i, lane) in lane_rects.iter().enumerate() {
+            if lane.intersects(audio_view) {
+                let look = Look {
+                    line: theme_fade(&ctx, &format!("ed_vline{i}"), vol_hot == Some(Drag::Line(i))),
+                    point: match vol_hot {
+                        Some(Drag::Point(j, k)) if j == i => Some(k),
+                        _ => None,
+                    },
+                    held: matches!(self.dragging, Some(Drag::Point(j, _)) if j == i),
+                    guide: self.vol_guide.filter(|(j, _)| *j == i).map(|(_, db)| db),
+                };
+                draw_envelope(&alp, pal, *lane, &self.edit.tracks[i], dur, x_of, look);
+            }
+        }
+        for (h, drag) in &grips {
+            let (left, k) = match *drag {
+                Drag::Start(k) => (true, k),
+                Drag::End(k) => (false, k),
+                _ => continue,
+            };
+            let active = self.dragging == Some(*drag) || hovered_grip == Some(*drag);
+            let grow = theme_fade(&ctx, &format!("ed_h{k}{}", if left { "in" } else { "out" }), active);
+            // Slim, so it never covers much; a pixel wider each side (its
+            // notch stays in the middle) and brighter while it's pointed at
+            // or pulled.
+            let h = h.expand2(Vec2::new(grow, 0.0));
+            let corners = if left { egui::CornerRadius { nw: 3, sw: 3, ne: 0, se: 0 } } else { egui::CornerRadius { nw: 0, sw: 0, ne: 3, se: 3 } };
+            hp.rect_filled(h, corners, crate::theme::mix(edge, pal.text, grow));
+            if h.width() >= 5.0 {
+                hp.vline(h.center().x, h.center().y - 6.0..=h.center().y + 6.0, Stroke::new(1.5, crate::theme::fade(pal.base, 0.75)));
+            }
+        }
+        // Each part's length, as a dimension line under the lanes; drag one
+        // to slide its part along the clip, its length kept.
         let dim_y = body_bottom + LENGTH_H / 2.0;
-        let range = Rect::from_x_y_ranges(xi.max(lanes.left())..=xo.min(lanes.right()), dim_y - 9.0..=dim_y + 9.0);
+        // What the timeline says where the pointer rests: on the picture's
+        // lane, what a stretch cut out, or the part chosen, is for.
+        let mut tip: Option<String> = None;
+        match vol_hot.filter(|_| self.dragging.is_none()) {
+            Some(Drag::Line(_)) => tip = Some("Drag to set the volume (Shift: finer). Double-click to add a point".into()),
+            Some(Drag::Point(..)) => tip = Some("Drag to move it (Shift: finer). Double-click to take it away".into()),
+            _ => {}
+        }
+        if let Some(pos) = hover_pos.filter(|p| n > 1 && self.dragging.is_none() && video.contains(*p) && lanes.contains(*p)) {
+            let t = t_of(pos.x);
+            if parts.windows(2).any(|w| t >= w[0].1 && t < w[1].0) {
+                tip = Some("Cut out: playing skips it. Drag its edges, or right-click to put it back".into());
+            }
+        }
+        let ranges: Vec<Rect> = (0..n)
+            .map(|k| {
+                let (xa, xb) = shown_x(k);
+                Rect::from_x_y_ranges(xa.max(lanes.left())..=xb.min(lanes.right()), dim_y - 9.0..=dim_y + 9.0)
+            })
+            .collect();
+        for (k, range) in ranges.iter().enumerate().filter(|(_, r)| r.width() > 0.0) {
+            let hovered = self.dragging.is_none() && hover_pos.is_some_and(|p| range.contains(p));
+            let lit = self.dragging == Some(Drag::Range(k)) || self.menu_at.is_some_and(|(s, _)| s == Spot::Part(k)) || hovered;
+            // A slim rounded bar under the part: brighter, a little thicker,
+            // when pointed at or pulled.
+            let hv = theme_fade(&ctx, &format!("ed_range{k}"), lit);
+            let h = 3.0 + 2.0 * hv;
+            let bar = Rect::from_x_y_ranges(range.left() + 1.0..=(range.right() - 1.0).max(range.left() + 1.0), dim_y - h / 2.0..=dim_y + h / 2.0);
+            p.rect_filled(bar, h / 2.0, crate::theme::mix(pal.line2, pal.text2, hv));
+            // In parts, each says how long it is.
+            if hovered && n > 1 {
+                let (a, b) = parts[k];
+                let long = if self.show_frames { format!("{} frames", ((b - a) * self.info.fps).round() as u64) } else { crate::transport::clock(b - a) };
+                tip = Some(format!("This part: {long}. Drag to slide it along the clip"));
+            }
+        }
+        // How long it all is: the parts together. With one part, click it
+        // to type another length (drawn last, after the timeline takes its
+        // clicks, so it gets its own).
         let len = self.edit.duration();
         let len_text = if self.show_frames { format!("{} frames", (len * self.info.fps).round() as u64) } else { crate::transport::clock(len) };
-        let range_hv = self.dragging == Some(Drag::Range) || (self.dragging.is_none() && hover_pos.is_some_and(|p| range.contains(p)));
-        let rc = if range_hv { pal.text2 } else { pal.line2 };
-        p.hline(range.x_range(), dim_y, Stroke::new(1.0, rc));
-        p.vline(range.left(), dim_y - 5.0..=dim_y + 5.0, Stroke::new(1.0, if range_hv { pal.text2 } else { pal.text3 }));
-        p.vline(range.right(), dim_y - 5.0..=dim_y + 5.0, Stroke::new(1.0, if range_hv { pal.text2 } else { pal.text3 }));
-        // The length itself: click it to type another (drawn last, after
-        // the timeline takes its clicks, so it gets its own).
+        let span = Rect::from_x_y_ranges(ranges[0].left()..=ranges[n - 1].right().max(ranges[0].left()), dim_y - 9.0..=dim_y + 9.0);
         let len_label = {
             let g = p.layout_no_wrap(len_text.clone(), crate::theme::font(12.0, crate::theme::W::Semibold), pal.text);
+            let more = if n > 1 { p.layout_no_wrap(format!("in {n} parts"), crate::theme::font(12.0, crate::theme::W::Regular), pal.text3).size().x + 5.0 } else { 0.0 };
             // (A little wider than the time: room for the caret as it's typed.)
-            let w = if self.typing_length.is_some() { 90.0 } else { g.size().x + 22.0 };
-            (w < range.width().max(110.0)).then(|| Rect::from_center_size(Pos2::new(range.center().x, dim_y), Vec2::new(w, 20.0)))
+            let w = if self.typing_length.is_some() { 90.0 } else { g.size().x + more + 22.0 };
+            (w < span.width().max(110.0)).then(|| Rect::from_center_size(Pos2::new(span.center().x, dim_y), Vec2::new(w, 20.0)))
         };
 
         // The playhead, on the start of the frame showing, with that frame's
@@ -1495,9 +1843,11 @@ impl Ready {
             let glyph = lane_icon(&name);
             let tc = if heard { pal.text } else { pal.text3 };
             ap.text(Pos2::new(head.left() + 24.0, head.center().y), Align2::CENTER_CENTER, glyph, FontId::proportional(15.0), pal.text3);
-            let name_g = ap.layout_job(crate::ui_kit::single_line_job(&name, crate::theme::font(13.0, crate::theme::W::Medium), tc, head.width() - 40.0 - 10.0 - 56.0 * shown_ms(&ctx, i)));
+            let name_g = ap.layout_job(crate::ui_kit::single_line_job(&name, crate::theme::font(13.0, crate::theme::W::Medium), tc, head.width() - 40.0 - 10.0));
             ap.galley(Pos2::new(head.left() + 40.0, head.center().y - 16.0), name_g, tc);
-            ap.text(Pos2::new(head.left() + 40.0, head.center().y + 2.0), Align2::LEFT_TOP, sub, crate::theme::font(11.5, crate::theme::W::Regular), pal.text3);
+            // M and S take the second row's place while they show (the
+            // name keeps all its room).
+            ap.text(Pos2::new(head.left() + 40.0, head.center().y + 2.0), Align2::LEFT_TOP, sub, crate::theme::font(11.5, crate::theme::W::Regular), crate::theme::fade(pal.text3, 1.0 - shown_ms(&ctx, i)));
             // Its level: a thin bar on the header's right edge.
             let m = self.meters.get(i).copied().unwrap_or_default();
             let bar = Rect::from_min_max(Pos2::new(head.right() - 3.0, head.top() + 8.0), Pos2::new(head.right(), head.bottom() - 8.0));
@@ -1510,8 +1860,8 @@ impl Ready {
             let shown = theme_fade(&ctx, &format!("ed_ms{i}"), hresp.hovered() || track.muted || solo_before == Some(i) || hover_pos.is_some_and(|p| head.contains(p)));
             ctx.data_mut(|d| d.insert_temp(egui::Id::new(("ed_ms_shown", i)), shown));
             if shown > 0.0 {
-                let s_rect = Rect::from_min_size(Pos2::new(head.right() - 12.0 - 22.0, head.center().y - 10.0), Vec2::new(22.0, 20.0));
-                let m_rect = s_rect.translate(Vec2::new(-25.0, 0.0));
+                let s_rect = Rect::from_min_size(Pos2::new(head.left() + 40.0 + 25.0, head.center().y + 1.0), Vec2::new(22.0, 18.0));
+                let m_rect = Rect::from_min_size(Pos2::new(head.left() + 40.0, head.center().y + 1.0), Vec2::new(22.0, 18.0));
                 let put = |rect: Rect, label: &str, on: bool, solo: bool, tip: &str| -> bool {
                     let r = ui.interact(rect, ui.id().with((label, i)), Sense::click());
                     if !rect.intersects(audio_view) {
@@ -1580,10 +1930,26 @@ impl Ready {
 
         // --- Interaction ---
         let hit_area = Rect::from_x_y_ranges(lanes.left() - handle_w - 4.0..=lanes.right() + handle_w + 4.0, ruler.top()..=body_bottom + LENGTH_H);
-        let resp = ui.interact(hit_area, ui.id().with("timeline"), Sense::click_and_drag());
+        let mut resp = ui.interact(hit_area, ui.id().with("timeline"), Sense::click_and_drag());
         let pointer = resp.hover_pos();
         if let Some(label) = len_label {
-            self.length_field(ui, label, &len_text);
+            if n == 1 {
+                self.length_field(ui, label, &len_text);
+            } else {
+                // In parts, it's what they come to together.
+                let g = p.layout_no_wrap(len_text.clone(), crate::theme::font(12.0, crate::theme::W::Semibold), pal.text);
+                let more = p.layout_no_wrap(format!("in {n} parts"), crate::theme::font(12.0, crate::theme::W::Regular), pal.text3);
+                p.rect_filled(label, 5, pal.base);
+                let x = label.center().x - (g.size().x + 5.0 + more.size().x) / 2.0;
+                p.galley(Pos2::new(x, label.center().y - g.size().y / 2.0), g.clone(), pal.text);
+                p.galley(Pos2::new(x + g.size().x + 5.0, label.center().y - more.size().y / 2.0), more, pal.text3);
+                if pointer.is_some_and(|p| label.contains(p)) {
+                    tip = Some("How long the saved clip is: the parts kept, together".into());
+                }
+            }
+        }
+        if let Some(tip) = tip.filter(|_| self.dragging.is_none()) {
+            resp = resp.on_hover_text(tip);
         }
         // (A click on the length is its own; a drag that starts on it is
         // the timeline's, sliding the kept part: egui gives each its widget.)
@@ -1591,57 +1957,56 @@ impl Ready {
         // What's under the pointer, in priority order.
         let hit = |pos: Pos2, this: &Self| -> Option<Drag> {
             // A volume point over a handle is the point's.
-            for (i, lane) in lane_rects.iter().enumerate() {
-                if lane.contains(pos) && audio_view.contains(pos) {
-                    let track = &this.edit.tracks[i];
-                    if let Some(k) = track.points.iter().position(|pt| Pos2::new(x_of(pt.t), y_of_db(*lane, pt.db)).distance(pos) < 7.0) {
-                        return Some(Drag::Point(i, k));
-                    }
-                }
+            let vol = vol_at(pos, this);
+            if let Some(d @ Drag::Point(..)) = vol {
+                return Some(d);
             }
-            if in_handle.expand(5.0).contains(pos) {
-                return Some(Drag::In);
+            // The nearest handle, then a split, then a part's length, then a
+            // volume line.
+            if let Some(d) = near_grip(pos) {
+                return Some(d);
             }
-            if out_handle.expand(5.0).contains(pos) {
-                return Some(Drag::Out);
+            if let Some(&(_, d)) = splits.iter().find(|(r, _)| r.contains(pos)) {
+                return Some(d);
             }
-            if range.expand2(Vec2::new(0.0, 4.0)).contains(pos) {
-                return Some(Drag::Range);
+            if let Some(k) = ranges.iter().position(|r| r.width() > 0.0 && r.expand2(Vec2::new(0.0, 4.0)).contains(pos)) {
+                return Some(Drag::Range(k));
             }
-            for (i, lane) in lane_rects.iter().enumerate() {
-                if !lane.contains(pos) || !audio_view.contains(pos) {
-                    continue;
-                }
-                let track = &this.edit.tracks[i];
-                if let Some(k) = track.points.iter().position(|pt| Pos2::new(x_of(pt.t), y_of_db(*lane, pt.db)).distance(pos) < 7.0) {
-                    return Some(Drag::Point(i, k));
-                }
-                let line_y = y_of_db(*lane, track.db_at(t_of(pos.x)));
-                if (pos.y - line_y).abs() < 6.0 {
-                    return Some(Drag::Line(i));
-                }
-            }
-            None
+            vol
         };
 
-        if let Some(pos) = pointer {
-            match hit(pos, self) {
-                Some(Drag::In | Drag::Out) => ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal),
-                Some(Drag::Range) => ui.ctx().set_cursor_icon(if self.dragging.is_some() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab }),
-                Some(Drag::Point(..)) => ui.ctx().set_cursor_icon(egui::CursorIcon::Grab),
-                Some(Drag::Line(_)) => ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical),
-                _ => {}
+        // The cursor says what a drag takes hold of; while dragging, what's
+        // held (wherever the pointer has gone).
+        let held = self.dragging.filter(|_| resp.dragged());
+        if let Some(d) = held.or_else(|| pointer.and_then(|pos| hit(pos, self))) {
+            let icon = match d {
+                Drag::Start(_) | Drag::End(_) | Drag::Split(_) => Some(egui::CursorIcon::ResizeHorizontal),
+                Drag::Range(_) | Drag::Point(..) => Some(if held.is_some() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab }),
+                Drag::Line(_) => Some(egui::CursorIcon::ResizeVertical),
+                _ => None,
+            };
+            if let Some(icon) = icon {
+                ui.ctx().set_cursor_icon(icon);
             }
+        }
+        if let Some(pos) = pointer {
             // Hover: a line through the lanes, and the volume on a lane.
-            if self.dragging.is_none() && lanes.contains(pos) && pos.y > ruler.bottom() {
+            if self.dragging.is_none() && self.menu_at.is_none() && lanes.contains(pos) && pos.y > ruler.bottom() {
                 if let Some(i) = lane_rects.iter().position(|l| l.contains(pos) && audio_view.contains(pos)) {
                     let t = self.info.snap(t_of(pos.x));
-                    let text = db_label(self.edit.tracks[i].db_at(t));
-                    let g = p.layout_no_wrap(text, crate::theme::font(11.0, crate::theme::W::Semibold), Color32::WHITE);
-                    let r = Rect::from_min_size(Pos2::new(pos.x + 8.0, pos.y - 22.0), g.size() + Vec2::new(10.0, 4.0));
-                    p.rect_filled(r, 4, Color32::from_black_alpha(184));
-                    p.galley(r.min + Vec2::new(5.0, 2.0), g, Color32::WHITE);
+                    readout(&p, pos, db_label(self.edit.tracks[i].db_at(t)));
                 }
+            }
+        }
+        // Dragging the volume: the level as it goes (a point's time too).
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let text = match self.dragging {
+                Some(Drag::Line(i)) => self.edit.tracks.get(i).map(|t| db_label(t.db_at(self.vol_grab))),
+                Some(Drag::Point(i, k)) => self.edit.tracks.get(i).and_then(|t| t.points.get(k)).map(|pt| format!("{}  ·  {}", db_label(pt.db), crate::transport::clock(pt.t))),
+                _ => None,
+            };
+            if let Some(text) = text {
+                readout(&p, pos, text);
             }
         }
 
@@ -1650,22 +2015,35 @@ impl Ready {
             // drag only starts after a few pixels of movement, by which time a
             // vertical drag has already left the thin volume line or point.
             if let Some(pos) = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos()) {
-                let d = hit(pos, self).unwrap_or(Drag::Playhead);
+                let d = match hit(pos, self) {
+                    // A split opens the way it's pulled: the part after it
+                    // starts later, or the one before ends sooner.
+                    Some(Drag::Split(k)) => {
+                        if resp.interact_pointer_pos().unwrap_or(pos).x >= pos.x {
+                            Drag::Start(k + 1)
+                        } else {
+                            Drag::End(k)
+                        }
+                    }
+                    d => d.unwrap_or(Drag::Playhead),
+                };
                 self.dragging = Some(d);
                 if d != Drag::Playhead {
                     self.before_drag = Some(self.edit.clone());
                 }
-                // Where it was grabbed (in the selection, or beside an edge),
-                // so it moves with the pointer instead of jumping to it.
+                (self.vol_moved, self.vol_grab, self.vol_guide) = (Vec2::ZERO, t_of(pos.x), None);
+                // Where it was grabbed (in a part, or beside an edge), so it
+                // moves with the pointer instead of jumping to it.
                 let at = t_of(pos.x);
                 self.grab_offset = match d {
-                    Drag::In => at - self.edit.start,
-                    Drag::Out => at - self.edit.end,
+                    Drag::Start(k) => at - parts[k].0,
+                    Drag::End(k) => at - parts[k].1,
+                    Drag::Range(k) => self.info.snap(at) - parts[k].0,
                     _ => self.info.snap(at) - self.edit.start,
                 };
                 // Moving the playhead or a trim pauses while you drag and carries on
                 // after; shaping the volume never interrupts playback.
-                if matches!(d, Drag::In | Drag::Out | Drag::Range | Drag::Playhead) {
+                if matches!(d, Drag::Start(_) | Drag::End(_) | Drag::Range(_) | Drag::Playhead) {
                     self.resume = self.player.is_playing();
                     self.player.pause();
                 }
@@ -1673,7 +2051,7 @@ impl Ready {
         }
         if let (Some(pos), Some(d)) = (resp.interact_pointer_pos(), self.dragging) {
             // Dragging the playhead or a trim past either end scrolls a zoomed timeline.
-            if matches!(d, Drag::In | Drag::Out | Drag::Range | Drag::Playhead) && resp.dragged() {
+            if matches!(d, Drag::Start(_) | Drag::End(_) | Drag::Range(_) | Drag::Playhead) && resp.dragged() {
                 let over = if pos.x > lanes.right() { pos.x - lanes.right() } else if pos.x < lanes.left() { pos.x - lanes.left() } else { 0.0 };
                 if over != 0.0 {
                     self.view.0 = (self.view.0 + (over / lanes.width()) as f64 * self.view.1 * 0.1).clamp(0.0, (dur - self.view.1).max(0.0));
@@ -1681,73 +2059,119 @@ impl Ready {
                 }
             }
             if resp.dragged() || resp.drag_started() {
+                // A volume drag goes a fifth as far with Shift held, for fine
+                // steps (the first frame takes in the movement before the drag
+                // registered); Ctrl keeps it from snapping.
+                let (fine, no_snap) = ui.input(|i| (if i.modifiers.shift { 0.2 } else { 1.0 }, i.modifiers.ctrl));
+                if matches!(d, Drag::Line(_) | Drag::Point(..)) {
+                    let moved = match ui.input(|i| i.pointer.press_origin()) {
+                        Some(origin) if resp.drag_started() => pos - origin,
+                        _ => resp.drag_delta(),
+                    };
+                    self.vol_moved += moved * fine;
+                }
                 let t = self.info.snap(t_of(pos.x));
+                let mut parts = self.edit.parts();
+                // A part's edges go no further than the parts beside it (or
+                // the clip's ends), and keep it a frame long.
+                let lo = |k: usize, parts: &[(f64, f64)]| if k > 0 { parts[k - 1].1 } else { 0.0 };
+                let hi = |k: usize, parts: &[(f64, f64)]| parts.get(k + 1).map_or(self.info.duration, |p| p.0);
                 match d {
-                    Drag::In => {
-                        let t = self.info.snap(self.snapped(t_of(pos.x) - self.grab_offset, px_per_s, Some(Drag::In)));
-                        self.edit.start = t.min(self.edit.end - fd);
-                        self.player.seek(self.edit.start);
+                    Drag::Start(k) if k < parts.len() => {
+                        let t = self.info.snap(self.snapped(t_of(pos.x) - self.grab_offset, px_per_s, Some(d)));
+                        parts[k].0 = t.min(parts[k].1 - fd).max(lo(k, &parts));
+                        self.edit.set_parts(&parts);
+                        self.player.seek(parts[k].0);
                     }
-                    Drag::Out => {
-                        let t = self.snapped(t_of(pos.x) - self.grab_offset, px_per_s, Some(Drag::Out));
-                        self.edit.end = self.info.snap(t).clamp(self.edit.start + fd, self.info.duration);
-                        self.player.seek(self.edit.end - fd);
+                    Drag::End(k) if k < parts.len() => {
+                        let t = self.snapped(t_of(pos.x) - self.grab_offset, px_per_s, Some(d));
+                        parts[k].1 = self.info.snap(t).clamp(parts[k].0 + fd, hi(k, &parts).max(parts[k].0 + fd));
+                        self.edit.set_parts(&parts);
+                        self.player.seek(parts[k].1 - fd);
                     }
-                    Drag::Range => {
-                        // Same length, slid along the clip, stopping at its ends.
-                        let len = self.edit.end - self.edit.start;
-                        let start = self.info.snap((t - self.grab_offset).clamp(0.0, (self.info.duration - len).max(0.0)));
-                        self.edit.start = start;
-                        self.edit.end = (start + len).min(self.info.duration);
-                        self.player.seek(self.edit.start);
+                    Drag::Range(k) if k < parts.len() => {
+                        // Same length, slid along the clip, stopping at the
+                        // parts beside it (or the clip's ends).
+                        let len = parts[k].1 - parts[k].0;
+                        let (lo, hi) = (lo(k, &parts), hi(k, &parts));
+                        let start = self.info.snap((t - self.grab_offset).clamp(lo, (hi - len).max(lo)));
+                        parts[k] = (start, (start + len).min(hi));
+                        self.edit.set_parts(&parts);
+                        self.player.seek(start);
                     }
+                    Drag::Start(_) | Drag::End(_) | Drag::Range(_) | Drag::Split(_) => {}
                     Drag::Playhead => {
                         let t = self.snapped(t, px_per_s, Some(Drag::Playhead));
                         self.player.seek(self.info.snap(t) + 1e-6);
                     }
                     Drag::Line(i) => {
-                        // Move the whole curve up or down by the drag distance.
+                        // The whole curve, up or down by how far it's been
+                        // dragged (along the fader, so it follows the pointer).
+                        // Level, it snaps to 0 dB as it passes (Ctrl: it doesn't).
                         let lane = lane_rects[i];
-                        // On the first frame, include the movement before the drag registered.
-                        let dy = match ui.input(|i| i.pointer.press_origin()) {
-                            Some(origin) if resp.drag_started() => pos.y - origin.y,
-                            _ => resp.drag_delta().y,
-                        };
-                        // Moves along the fader, so it follows the pointer exactly.
-                        let delta = -dy / (lane.height() - 8.0);
-                        let shift = |db: f32| media::fader_db(media::fader_pos(db) + delta);
-                        let track = &mut self.edit.tracks[i];
-                        if track.points.is_empty() {
-                            track.gain = media::from_db(shift(media::to_db(track.gain)));
-                        } else {
-                            for pt in &mut track.points {
-                                pt.db = shift(pt.db);
+                        let travel = lane.height() - 8.0;
+                        let was = self.before_drag.as_ref().and_then(|e| e.tracks.get(i)).cloned();
+                        let mut guide = None;
+                        if let Some(was) = was {
+                            let d = -self.vol_moved.y / travel;
+                            let track = &mut self.edit.tracks[i];
+                            if was.points.is_empty() {
+                                let mut db = media::fader_db(media::fader_pos(media::to_db(was.gain)) + d);
+                                // Unchanged, or silent at the bottom.
+                                if let Some(to) = [0.0, media::SILENT_DB].into_iter().find(|&to| !no_snap && (y_of_db(lane, db) - y_of_db(lane, to)).abs() < SNAP_PX) {
+                                    db = to;
+                                    guide = Some((i, to));
+                                }
+                                track.gain = media::from_db(db);
+                            } else {
+                                for (pt, from) in track.points.iter_mut().zip(&was.points) {
+                                    pt.db = media::fader_db(media::fader_pos(from.db) + d);
+                                }
                             }
                         }
+                        self.vol_guide = guide;
                     }
                     Drag::Point(i, k) => {
+                        // From where it was by how far it's been dragged (taken
+                        // hold of off its middle, it doesn't jump to the
+                        // pointer), between its neighbours. Its level snaps to
+                        // 0 dB and to theirs as it passes (Ctrl: it doesn't).
                         let lane = lane_rects[i];
-                        let track = &mut self.edit.tracks[i];
-                        // Keep points in time order: clamp between neighbours.
-                        let lo = if k > 0 { track.points[k - 1].t + fd } else { 0.0 };
-                        let hi = track.points.get(k + 1).map_or(self.info.duration, |n| n.t - fd);
-                        track.points[k].t = t.clamp(lo, hi.max(lo));
-                        track.points[k].db = db_of_y(lane, pos.y);
-                        if !self.player.is_playing() {
-                            self.player.seek(track.points[k].t + 1e-6);
+                        let from = self.before_drag.as_ref().and_then(|e| e.tracks.get(i)).and_then(|t| t.points.get(k)).map(|p| (p.t, p.db));
+                        let mut guide = None;
+                        if let Some((t0, db0)) = from.filter(|_| k < self.edit.tracks[i].points.len()) {
+                            let track = &mut self.edit.tracks[i];
+                            // Keep points in time order: clamp between neighbours.
+                            let lo = if k > 0 { track.points[k - 1].t + fd } else { 0.0 };
+                            let hi = track.points.get(k + 1).map_or(self.info.duration, |n| n.t - fd);
+                            let t = self.info.snap(t0 + self.vol_moved.x as f64 / px_per_s).clamp(lo, hi.max(lo));
+                            let mut db = media::fader_db(media::fader_pos(db0) - self.vol_moved.y / (lane.height() - 8.0));
+                            if !no_snap {
+                                let levels = [Some(0.0), Some(media::SILENT_DB), k.checked_sub(1).map(|j| track.points[j].db), track.points.get(k + 1).map(|n| n.db)];
+                                let nearest = levels
+                                    .into_iter()
+                                    .flatten()
+                                    .map(|to| (to, (y_of_db(lane, db) - y_of_db(lane, to)).abs()))
+                                    .filter(|(_, off)| *off < SNAP_PX)
+                                    .min_by(|a, b| a.1.total_cmp(&b.1));
+                                if let Some((to, _)) = nearest {
+                                    db = to;
+                                    guide = Some((i, to));
+                                }
+                            }
+                            track.points[k].t = t;
+                            track.points[k].db = db;
+                            if !self.player.is_playing() {
+                                self.player.seek(t + 1e-6);
+                            }
                         }
+                        self.vol_guide = guide;
                     }
                 }
             }
         }
         if resp.drag_stopped() {
-            // Snap a whole-track level to 0 dB when it lands close, so "unchanged" is easy.
-            if let Some(Drag::Line(i)) = self.dragging {
-                let track = &mut self.edit.tracks[i];
-                if track.points.is_empty() && media::to_db(track.gain).abs() < 2.0 {
-                    track.gain = 1.0;
-                }
-            }
+            self.vol_guide = None;
             if let Some(was) = self.before_drag.take()
                 && !same_edit(&was, &self.edit)
             {
@@ -1761,7 +2185,10 @@ impl Ready {
 
         if resp.double_clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
-                if let Some(i) = lane_rects.iter().position(|l| l.contains(pos) && audio_view.contains(pos)) {
+                if let Some(Drag::Point(i, k)) = vol_at(pos, self) {
+                    // On a point: it goes.
+                    self.remove_point(i, k);
+                } else if let Some(i) = lane_rects.iter().position(|l| l.contains(pos) && audio_view.contains(pos)) {
                     // Add a point on the curve at this time (keeps the sound unchanged
                     // until it's dragged). The first one adopts the track's flat level.
                     let t = self.info.snap(t_of(pos.x));
@@ -1781,23 +2208,138 @@ impl Ready {
         } else if resp.clicked() {
             // Jump there; playing carries on from the new spot.
             if let Some(pos) = resp.interact_pointer_pos() {
-                if pos.y < body_bottom {
-                    let t = self.snapped(t_of(pos.x), px_per_s, Some(Drag::Playhead));
-                    self.player.seek(self.info.snap(t) + 1e-6);
+                let t = self.snapped(t_of(pos.x), px_per_s, Some(Drag::Playhead));
+                self.player.seek(self.info.snap(t) + 1e-6);
+            }
+        }
+        // Right-click: a menu for what's there (a part's handle is the part's).
+        if resp.secondary_clicked() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                {
+                    let t = t_of(pos.x);
+                    let spot = if let Some(Drag::Point(i, k)) = vol_at(pos, self) {
+                        Spot::Point(i, k)
+                    } else if let Some(Drag::Start(k) | Drag::End(k)) = near_grip(pos) {
+                        Spot::Part(k)
+                    } else if let Some(Drag::Line(i)) = vol_at(pos, self) {
+                        Spot::Volume(i)
+                    } else if let Some(&(_, Drag::Split(k))) = splits.iter().find(|(r, _)| r.contains(pos)) {
+                        Spot::Split(k)
+                    } else if let Some(k) = parts.iter().position(|&(a, b)| t >= a && t < b) {
+                        Spot::Part(k)
+                    } else if t < parts[0].0 {
+                        Spot::Before
+                    } else if t >= parts[n - 1].1 {
+                        Spot::After
+                    } else {
+                        Spot::Gap(parts.iter().rposition(|&(_, b)| b <= t).unwrap_or(0))
+                    };
+                    self.menu_at = Some((spot, t));
                 }
             }
         }
-        if resp.secondary_clicked() {
-            if let Some(pos) = resp.interact_pointer_pos() {
-                if let Some(Drag::Point(i, k)) = hit(pos, self) {
-                    self.push_undo(self.edit.clone());
-                    let track = &mut self.edit.tracks[i];
-                    let removed = track.points.remove(k);
-                    // Removing the last point leaves its level as the flat level.
-                    if track.points.is_empty() {
-                        track.gain = media::from_db(removed.db);
+        if let Some((spot, t)) = self.menu_at {
+            enum Act {
+                Split,
+                CutOut(usize),
+                PutBack,
+                AddPoint(usize),
+                Level(usize, f32),
+                Flatten(usize),
+                Mute(usize),
+                RemovePoint(usize, usize),
+                PointLevel(usize, usize, f32),
+            }
+            let can_split = self.split_at(t).is_some();
+            let at_playhead = self.part_at(self.player.time());
+            let mut act = None;
+            let open = crate::ui_kit::context_menu(&resp, 220.0, |ui| {
+                use crate::ui_kit::Item;
+                use egui_phosphor::regular as icon;
+                match spot {
+                    Spot::Part(k) => {
+                        if Item::new("Split here").icon(icon::SCISSORS).enabled(can_split).show(ui).clicked() {
+                            act = Some(Act::Split);
+                        }
+                        // Delete does it too, to the part the playhead's in.
+                        let item = Item::new("Cut out this part").icon(icon::TRASH).keys((at_playhead == Some(k)).then(|| vec!["Delete".into()])).enabled(n > 1);
+                        let item = if n > 1 { item } else { item.tip("Split the clip first, then cut out the part you don't want") };
+                        if item.show(ui).clicked() {
+                            act = Some(Act::CutOut(k));
+                        }
+                    }
+                    Spot::Split(_) => {
+                        if Item::new("Join the parts").icon(icon::ARROWS_IN_LINE_HORIZONTAL).tip("Take the split away").show(ui).clicked() {
+                            act = Some(Act::PutBack);
+                        }
+                    }
+                    Spot::Gap(_) | Spot::Before | Spot::After => {
+                        if Item::new("Put back").icon(icon::ARROW_COUNTER_CLOCKWISE).tip("Keep this part of the clip again").show(ui).clicked() {
+                            act = Some(Act::PutBack);
+                        }
+                    }
+                    Spot::Volume(i) => {
+                        let Some(track) = self.edit.tracks.get(i) else { return };
+                        let flat = track.points.is_empty() && (track.gain - 1.0).abs() < 0.005;
+                        if Item::new("Add a point here").icon(icon::PLUS).keys(Some(vec!["Double-click".into()])).show(ui).clicked() {
+                            act = Some(Act::AddPoint(i));
+                        }
+                        if Item::new("Reset to 0 dB").icon(icon::ARROW_COUNTER_CLOCKWISE).enabled(!flat).show(ui).clicked() {
+                            act = Some(Act::Level(i, 0.0));
+                        }
+                        if !track.points.is_empty() && Item::new("Remove all points").icon(icon::X_CIRCLE).tip("Keeps the level the playhead is at").show(ui).clicked() {
+                            act = Some(Act::Flatten(i));
+                        }
+                        crate::ui_kit::menu_sep(ui);
+                        if Item::new(if track.muted { "Unmute" } else { "Mute" }).icon(icon::SPEAKER_X).show(ui).clicked() {
+                            act = Some(Act::Mute(i));
+                        }
+                    }
+                    Spot::Point(i, k) => {
+                        if Item::new("Set to 0 dB").icon(icon::ARROW_COUNTER_CLOCKWISE).show(ui).clicked() {
+                            act = Some(Act::PointLevel(i, k, 0.0));
+                        }
+                        if Item::new("Remove this point").icon(icon::TRASH).keys(Some(vec!["Double-click".into()])).show(ui).clicked() {
+                            act = Some(Act::RemovePoint(i, k));
+                        }
                     }
                 }
+            });
+            // Closed (picked from, or clicked away): its part isn't lit anymore.
+            if open.is_none() {
+                self.menu_at = None;
+            }
+            let now = ctx.input(|i| i.time);
+            match act {
+                Some(Act::Split) => self.split(t),
+                Some(Act::CutOut(k)) => self.cut_out(k, now),
+                Some(Act::PutBack) => self.put_back(spot, now),
+                Some(Act::AddPoint(i)) => self.add_point(i, self.info.snap(t)),
+                Some(Act::Level(i, db)) => {
+                    self.push_undo(self.edit.clone());
+                    let track = &mut self.edit.tracks[i];
+                    track.points.clear();
+                    track.gain = media::from_db(db);
+                }
+                Some(Act::Flatten(i)) => {
+                    self.push_undo(self.edit.clone());
+                    let db = self.edit.tracks[i].db_at(self.player.time());
+                    let track = &mut self.edit.tracks[i];
+                    track.points.clear();
+                    track.gain = media::from_db(db);
+                }
+                Some(Act::Mute(i)) => {
+                    self.push_undo(self.edit.clone());
+                    self.edit.tracks[i].muted = !self.edit.tracks[i].muted;
+                }
+                Some(Act::RemovePoint(i, k)) => self.remove_point(i, k),
+                Some(Act::PointLevel(i, k, db)) => {
+                    if let Some(pt) = self.edit.tracks.get(i).and_then(|t| t.points.get(k)).copied() {
+                        self.push_undo(self.edit.clone());
+                        self.edit.tracks[i].points[k] = media::VolumePoint { t: pt.t, db };
+                    }
+                }
+                None => {}
             }
         }
     }
@@ -1832,10 +2374,14 @@ fn lane_icon(name: &str) -> &'static str {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Drag {
-    In,
-    Out,
-    /// The whole selection, its length kept.
-    Range,
+    /// The start or the end of part k.
+    Start(usize),
+    End(usize),
+    /// The split after part k, grabbed: pulled open which ever way it's
+    /// dragged (moving the start of the part after it, or the end of k).
+    Split(usize),
+    /// Part k, slid along, its length kept.
+    Range(usize),
     Playhead,
     /// Whole volume line of track i.
     Line(usize),
@@ -1875,19 +2421,12 @@ fn db_label(db: f32) -> String {
     }
 }
 
-fn db_of_y(lane: Rect, y: f32) -> f32 {
-    // Detents a few pixels wide at 0 dB (unchanged) and at the bottom (silent).
-    if (y - y_of_db(lane, 0.0)).abs() <= 3.0 {
-        return 0.0;
-    }
-    let f = (lane.bottom() - 4.0 - y) / (lane.height() - 8.0);
-    if f <= 0.02 { media::SILENT_DB } else { media::fader_db(f) }
-}
-
 fn same_edit(a: &Edit, b: &Edit) -> bool {
     a.output == b.output
         && (a.start - b.start).abs() < 1e-6
         && (a.end - b.end).abs() < 1e-6
+        && a.cuts.len() == b.cuts.len()
+        && a.cuts.iter().zip(&b.cuts).all(|(x, y)| (x.from - y.from).abs() < 1e-6 && (x.to - y.to).abs() < 1e-6)
         && a.tracks.len() == b.tracks.len()
         && a.tracks.iter().zip(&b.tracks).all(|(x, y)| {
             x.muted == y.muted && (x.gain - y.gain).abs() < 1e-4 && x.points == y.points
@@ -1912,30 +2451,123 @@ fn trim_to_length(info: &media::ClipInfo, start: f64, end: f64, secs: f64) -> (f
     (a, (info.snap(a + secs)).min(info.duration).max(a + fd))
 }
 
+/// The part of `parts` a split at `t` (a frame's start) splits: one with a
+/// frame or more either side of it.
+fn splits(parts: &[(f64, f64)], t: f64, fd: f64) -> Option<usize> {
+    parts.iter().position(|&(a, b)| t >= a + fd - 1e-9 && t <= b - fd + 1e-9)
+}
+
+/// Start here (I) at `t` (a frame's start): the part `t` is in starts there;
+/// in what's cut out or trimmed off before a part, that part starts there
+/// (taking some of it back). A part keeps a frame at least. `None`: nothing
+/// changes.
+fn start_at(parts: &[(f64, f64)], t: f64, fd: f64) -> Option<Vec<(f64, f64)>> {
+    let k = parts.iter().position(|&(_, b)| t < b)?;
+    let mut parts = parts.to_vec();
+    (t < parts[k].1 - fd + 1e-9 && (t - parts[k].0).abs() > 1e-9).then(|| {
+        parts[k].0 = t;
+        parts
+    })
+}
+
+/// End here (O) at `t` (the end of the frame at the playhead): the part
+/// that frame is in ends there; in what's cut out or trimmed off after a
+/// part, that part ends there. A part keeps a frame at least.
+fn end_at(parts: &[(f64, f64)], t: f64, fd: f64) -> Option<Vec<(f64, f64)>> {
+    let k = parts.iter().rposition(|&(a, _)| t > a)?;
+    let mut parts = parts.to_vec();
+    (t > parts[k].0 + fd - 1e-9 && (t - parts[k].1).abs() > 1e-9).then(|| {
+        parts[k].1 = t;
+        parts
+    })
+}
+
+/// `parts` with what's at `spot` kept again, and the stretch put back: what
+/// was cut out between two parts (or the split between them, nothing) makes
+/// them one; what was trimmed off the start or the end of a clip
+/// `duration` long comes back.
+fn put_back(parts: &[(f64, f64)], spot: Spot, duration: f64) -> Option<(Vec<(f64, f64)>, (f64, f64))> {
+    let mut parts = parts.to_vec();
+    let n = parts.len();
+    let back = match spot {
+        Spot::Gap(k) | Spot::Split(k) if k + 1 < n => {
+            let gap = (parts[k].1, parts[k + 1].0);
+            parts[k].1 = parts[k + 1].1;
+            parts.remove(k + 1);
+            gap
+        }
+        Spot::Before if parts[0].0 > 0.0 => {
+            let gap = (0.0, parts[0].0);
+            parts[0].0 = 0.0;
+            gap
+        }
+        Spot::After if parts[n - 1].1 < duration => {
+            let gap = (parts[n - 1].1, duration);
+            parts[n - 1].1 = duration;
+            gap
+        }
+        _ => return None,
+    };
+    Some((parts, back))
+}
+
 /// The volume line, striped (so it reads as a control over the waveform, not
 /// part of it): faint where it's unchanged, bright with its points as
 /// diamonds where it's been changed.
-fn draw_envelope(p: &egui::Painter, pal: &crate::theme::Pal, lane: Rect, track: &media::TrackEdit, dur: f64, x_of: impl Fn(f64) -> f32) {
+/// How a volume drag that comes this close (points) to a level it snaps to
+/// lands on it.
+const SNAP_PX: f32 = 5.0;
+
+/// How a lane's volume line looks this frame: how much it's pointed at (0 to
+/// 1), the point pointed at or held, whether that point is held, and a level
+/// it's snapped to (a guide marks it).
+#[derive(Clone, Copy, Default)]
+struct Look {
+    line: f32,
+    point: Option<usize>,
+    held: bool,
+    guide: Option<f32>,
+}
+
+fn draw_envelope(p: &egui::Painter, pal: &crate::theme::Pal, lane: Rect, track: &media::TrackEdit, dur: f64, x_of: impl Fn(f64) -> f32, look: Look) {
     let flat = track.points.is_empty() && (track.gain - 1.0).abs() < 0.005;
-    let color = if track.muted { pal.text3 } else { pal.text };
-    if flat {
-        // Unchanged: just a faint line at 0 dB to grab.
-        let y = y_of_db(lane, 0.0);
-        p.extend(egui::Shape::dashed_line(&[Pos2::new(lane.left(), y), Pos2::new(lane.right(), y)], Stroke::new(1.0, crate::theme::fade(pal.text, 0.22)), 5.0, 4.0));
-        return;
+    // Amber: apart from the waveform's blue-grey and the edit's white.
+    let amber = if pal.dark { Color32::from_rgb(255, 196, 72) } else { Color32::from_rgb(200, 118, 0) };
+    let color = if track.muted { pal.text3 } else { amber };
+    if let Some(db) = look.guide {
+        p.hline(lane.x_range(), y_of_db(lane, db), Stroke::new(1.0, crate::theme::fade(color, 0.45)));
     }
     let mut pts = vec![Pos2::new(x_of(0.0), y_of_db(lane, track.db_at(0.0)))];
-    for pt in &track.points {
-        pts.push(Pos2::new(x_of(pt.t), y_of_db(lane, pt.db)));
-    }
+    pts.extend(track.points.iter().map(|pt| Pos2::new(x_of(pt.t), y_of_db(lane, pt.db))));
     pts.push(Pos2::new(x_of(dur), y_of_db(lane, track.db_at(dur))));
-    p.extend(egui::Shape::dashed_line(&pts, Stroke::new(1.5, crate::theme::fade(color, 0.85)), 6.0, 4.0));
-    for pt in &track.points {
+    // Unchanged, it's faint: something to take hold of, not to read. Set,
+    // it's clear, on a dark edge that keeps it readable over the waveform.
+    // Pointed at, it's brighter, a little thicker.
+    let strength = if flat { 0.3 + 0.6 * look.line } else { 0.9 + 0.1 * look.line };
+    let width = 1.5 + 0.5 * look.line;
+    let edge = if flat { look.line } else { 1.0 };
+    if edge > 0.0 {
+        p.add(egui::Shape::line(pts.clone(), Stroke::new(width + 3.0, crate::theme::fade(pal.base, 0.7 * edge))));
+    }
+    p.add(egui::Shape::line(pts, Stroke::new(width, crate::theme::fade(color, strength))));
+    for (k, pt) in track.points.iter().enumerate() {
         let c = Pos2::new(x_of(pt.t), y_of_db(lane, pt.db));
-        let d = 5.5;
+        let hot = look.point == Some(k);
+        let d = if hot { 6.0 } else { 4.5 };
         let diamond = vec![c + Vec2::new(0.0, -d), c + Vec2::new(d, 0.0), c + Vec2::new(0.0, d), c + Vec2::new(-d, 0.0)];
         p.add(egui::Shape::convex_polygon(diamond, color, Stroke::new(1.5, pal.base)));
+        if hot && look.held {
+            p.circle_stroke(c, d + 4.0, Stroke::new(1.5, crate::theme::fade(color, 0.45)));
+        }
     }
+}
+
+/// A small dark label just above and right of `at`: a level, a time.
+fn readout(p: &egui::Painter, at: Pos2, text: String) {
+    let g = p.layout_no_wrap(text, crate::theme::font(11.0, crate::theme::W::Semibold), Color32::WHITE);
+    let r = Rect::from_min_size(Pos2::new(at.x + 8.0, at.y - 22.0), g.size() + Vec2::new(10.0, 4.0));
+    p.rect_filled(r, 4, Color32::from_black_alpha(184));
+    p.galley(r.min + Vec2::new(5.0, 2.0), g, Color32::WHITE);
 }
 
 /// Meter colour zones: green to −12 dB, yellow to −3 dB, red above.
@@ -1955,7 +2587,7 @@ mod length_tests {
     use super::*;
 
     fn info() -> media::ClipInfo {
-        media::ClipInfo { duration: 60.0, fps: 60.0, width: 1920, height: 1080, video_kbps: None, audio: Vec::new(), id: None }
+        media::ClipInfo { duration: 60.0, fps: 60.0, width: 1920, height: 1080, video_kbps: None, audio: Vec::new(), id: None, bt601: false }
     }
 
     #[test]
@@ -1970,5 +2602,62 @@ mod length_tests {
         assert_eq!(trim_to_length(&info(), 0.0, 4.0, 10.0), (0.0, 10.0));
         // Longer than the whole clip: all of it.
         assert_eq!(trim_to_length(&info(), 5.0, 10.0, 90.0), (0.0, 60.0));
+    }
+}
+
+#[cfg(test)]
+mod part_tests {
+    use super::*;
+
+    /// A frame at 10 fps, so times read plainly.
+    const FD: f64 = 0.1;
+    /// Kept: 1–4 s and 6–9 s of a 10 s clip.
+    const PARTS: [(f64, f64); 2] = [(1.0, 4.0), (6.0, 9.0)];
+
+    #[test]
+    fn splitting_keeps_a_frame_either_side() {
+        assert_eq!(splits(&PARTS, 2.5, FD), Some(0));
+        assert_eq!(splits(&PARTS, 7.0, FD), Some(1));
+        // At a part's first frame there's nothing before it to split off; a
+        // frame later there is. Its last frame can start the second part.
+        assert_eq!(splits(&PARTS, 6.0, FD), None);
+        assert_eq!(splits(&PARTS, 6.1, FD), Some(1));
+        assert_eq!(splits(&PARTS, 8.9, FD), Some(1));
+        // Not in what's cut out or trimmed off.
+        assert_eq!(splits(&PARTS, 5.0, FD), None);
+        assert_eq!(splits(&PARTS, 0.5, FD), None);
+    }
+
+    #[test]
+    fn start_and_end_here_act_on_the_part_at_the_playhead() {
+        // In a part: that part starts (ends) there.
+        assert_eq!(start_at(&PARTS, 7.0, FD), Some(vec![(1.0, 4.0), (7.0, 9.0)]));
+        assert_eq!(end_at(&PARTS, 2.0, FD), Some(vec![(1.0, 2.0), (6.0, 9.0)]));
+        // In what's cut out: the part after it starts sooner, the one before
+        // ends later, taking some of it back.
+        assert_eq!(start_at(&PARTS, 5.0, FD), Some(vec![(1.0, 4.0), (5.0, 9.0)]));
+        assert_eq!(end_at(&PARTS, 5.0, FD), Some(vec![(1.0, 5.0), (6.0, 9.0)]));
+        // Trimmed off: the clip starts sooner or ends later, as ever.
+        assert_eq!(start_at(&PARTS, 0.5, FD), Some(vec![(0.5, 4.0), (6.0, 9.0)]));
+        assert_eq!(end_at(&PARTS, 9.5, FD), Some(vec![(1.0, 4.0), (6.0, 9.5)]));
+        // Nothing to start after the end, or to end before the start.
+        assert_eq!(start_at(&PARTS, 9.5, FD), None);
+        assert_eq!(end_at(&PARTS, 0.5, FD), None);
+        // A part keeps a frame: its last frame can start it, no later.
+        assert_eq!(start_at(&PARTS, 3.9, FD), Some(vec![(3.9, 4.0), (6.0, 9.0)]));
+        // Where it already starts or ends: nothing to do.
+        assert_eq!(start_at(&PARTS, 6.0, FD), None);
+        assert_eq!(end_at(&PARTS, 4.0, FD), None);
+    }
+
+    #[test]
+    fn putting_back() {
+        assert_eq!(put_back(&PARTS, Spot::Gap(0), 10.0), Some((vec![(1.0, 9.0)], (4.0, 6.0))));
+        assert_eq!(put_back(&PARTS, Spot::Before, 10.0), Some((vec![(0.0, 4.0), (6.0, 9.0)], (0.0, 1.0))));
+        assert_eq!(put_back(&PARTS, Spot::After, 10.0), Some((vec![(1.0, 4.0), (6.0, 10.0)], (9.0, 10.0))));
+        // A split taken away joins its parts.
+        assert_eq!(put_back(&[(0.0, 5.0), (5.0, 10.0)], Spot::Split(0), 10.0), Some((vec![(0.0, 10.0)], (5.0, 5.0))));
+        // Nothing trimmed off: nothing to put back.
+        assert_eq!(put_back(&[(0.0, 10.0)], Spot::Before, 10.0), None);
     }
 }

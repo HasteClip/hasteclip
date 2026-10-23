@@ -624,13 +624,16 @@ impl App {
                 ("← →", "One frame back or ahead"),
                 ("Shift ← →", "One second back or ahead"),
                 ("I  O", "Start or end here"),
+                ("S", "Split at the playhead"),
+                ("Delete", "Cut out the part at the playhead"),
+                ("↑ ↓", "Previous or next cut"),
                 ("C", "Crop the picture  (Enter when done)"),
                 ("Home  End", "Go to the start or end"),
                 ("Cmd Z", "Undo  (Shift for redo)"),
                 ("N", "Snapping on or off"),
                 ("M", "Mute (as in the player)"),
                 ("+  −  \\", "Zoom in, out, or to fit"),
-                ("Ctrl scroll", "Zoom the timeline"),
+                ("Cmd scroll", "Zoom the timeline"),
                 ("Shift scroll", "Move along the timeline"),
                 ("Drag the volume line", "Change a track's volume"),
                 ("Double-click it", "Add a volume point"),
@@ -645,7 +648,8 @@ impl App {
             let p = theme::pal(ui);
             egui::Grid::new("keys_grid").num_columns(2).spacing(vec2(18.0, 8.0)).show(ui, |ui| {
                 for (k, what) in rows {
-                    ui.label(theme::text(*k, 13.5, W::Semibold).color(p.text));
+                    // "Cmd" is the command key: Ctrl off a Mac.
+                    ui.label(theme::text(k.replace("Cmd", crate::shortcuts::cmd_name()), 13.5, W::Semibold).color(p.text));
                     ui.label(theme::text(*what, 13.5, W::Regular).color(p.text2));
                     ui.end_row();
                 }

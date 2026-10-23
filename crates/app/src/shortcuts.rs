@@ -303,7 +303,23 @@ pub fn label(text: &str) -> String {
 /// The platform's command key plus `key`, for in-app shortcuts: "Cmd + A" on a
 /// Mac, "Ctrl + A" elsewhere.
 pub fn command(key: &str) -> Vec<String> {
-    vec![if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" }.to_owned(), key.to_owned()]
+    vec![cmd_name().to_owned(), key.to_owned()]
+}
+
+/// The keys as the platform names them, for hints in words. The command key
+/// (egui's `command`): Cmd on a Mac, Ctrl elsewhere.
+pub fn cmd_name() -> &'static str {
+    if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" }
+}
+
+/// Alt (egui's `alt`): Option on a Mac.
+pub fn alt_name() -> &'static str {
+    if cfg!(target_os = "macos") { "Option" } else { "Alt" }
+}
+
+/// Ctrl (egui's `ctrl`): Control on a Mac, where Cmd is the command key.
+pub fn ctrl_name() -> &'static str {
+    if cfg!(target_os = "macos") { "Control" } else { "Ctrl" }
 }
 
 fn key_name(code: Code) -> String {
