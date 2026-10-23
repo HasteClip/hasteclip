@@ -477,7 +477,7 @@ impl PictureSource {
     /// display's — so it can't change mid-file, whatever the windows do.
     fn plan(source: &VideoSource) -> Result<(Self, (u32, u32))> {
         Ok(match source {
-            VideoSource::Screen { id, hook, method } => {
+            VideoSource::Screen { id, hook, method, .. } => {
                 let monitor = system::find_monitor(id);
                 let item = d3d::monitor_item(monitor)?;
                 let size = item.Size()?;
@@ -1780,7 +1780,7 @@ mod tests {
     #[ignore = "captures the screen: cargo test -p capture screenshot_of_the_screen -- --ignored"]
     fn screenshot_of_the_screen() {
         let screen = system::list_screens().into_iter().next().expect("a screen");
-        let video = VideoSource::Screen { id: screen.id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() }, method: Default::default() };
+        let video = VideoSource::Screen { id: screen.id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() }, method: Default::default(), crop: None };
         let mut rec = WinRecorder::new(Arc::new(LiveAudio::default()));
         let t = Instant::now();
         let img = rec.screenshot(&video).unwrap().finish().unwrap();
@@ -1803,7 +1803,7 @@ mod tests {
     #[ignore = "captures the screen: cargo test -p capture screenshot_while_clipping -- --ignored"]
     fn screenshot_while_clipping() {
         let screen = system::list_screens().into_iter().next().expect("a screen");
-        let video = VideoSource::Screen { id: screen.id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() }, method: Default::default() };
+        let video = VideoSource::Screen { id: screen.id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() }, method: Default::default(), crop: None };
         let settings = EncodeSettings {
             output_dir: std::env::temp_dir().join("hc-shot-test"),
             container_ext: "mp4".into(),

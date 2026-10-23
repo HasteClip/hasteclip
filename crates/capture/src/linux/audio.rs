@@ -159,22 +159,39 @@ fn route(channel: &str, index: usize) -> &'static [usize] {
 
 /// Desktop, app and mic capture for a set of sources.
 pub(crate) struct SystemAudio {
-    stop: pw::channel::Sender<()>,
+    tx: pw::channel::Sender<Cmd>,
+    /// The mic sources, by id.
+    mics: Vec<String>,
     thread: Option<JoinHandle<()>>,
+}
+
+/// What the PipeWire thread is told.
+enum Cmd {
+    /// Point the mic source `id`'s stream at another device.
+    SetMic { id: String, device: String },
+    Stop,
 }
 
 impl SystemAudio {
     pub(crate) fn start(sources: Vec<(AudioSource, Arc<SourceFeed>, Arc<Channel>)>) -> Result<Self> {
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<pw::channel::Sender<()>>>();
+        let mics = sources.iter().filter(|(s, ..)| matches!(s.kind, SourceKind::Microphone { .. })).map(|(s, ..)| s.id.clone()).collect();
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<pw::channel::Sender<Cmd>>>();
         let thread = thread::Builder::new().name("pipewire-audio".into()).spawn(move || {
             if let Err(e) = run(sources, &ready_tx) {
                 let _ = ready_tx.send(Err(e));
             }
         })?;
-        let stop = ready_rx
+        let tx = ready_rx
             .recv_timeout(Duration::from_secs(5))
             .map_err(|_| anyhow!("PipeWire didn't answer — is it running?"))??;
-        Ok(Self { stop, thread: Some(thread) })
+        Ok(Self { tx, mics, thread: Some(thread) })
+    }
+
+    /// Switch the mic source `id` to `device` while capturing: its stream
+    /// is made again, aimed at the new device, into the same feed (so the
+    /// same track). False if `id` isn't a mic source.
+    pub(crate) fn set_mic(&mut self, id: &str, device: &str) -> bool {
+        self.mics.iter().any(|m| m == id) && self.tx.send(Cmd::SetMic { id: id.to_owned(), device: device.to_owned() }).is_ok()
     }
 
     pub(crate) fn stop(self) {
@@ -184,7 +201,7 @@ impl SystemAudio {
 
 impl Drop for SystemAudio {
     fn drop(&mut self) {
-        let _ = self.stop.send(());
+        let _ = self.tx.send(Cmd::Stop);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -194,6 +211,7 @@ impl Drop for SystemAudio {
 /// One source's stream and the links into it.
 struct Capture {
     source: AudioSource,
+    feed: Arc<SourceFeed>,
     channel: Arc<Channel>,
     stream: pw::stream::StreamRc,
     _listener: pw::stream::StreamListener<()>,
@@ -201,7 +219,7 @@ struct Capture {
     links: HashMap<(u32, u32), pw::link::Link>,
 }
 
-fn run(sources: Vec<(AudioSource, Arc<SourceFeed>, Arc<Channel>)>, ready: &mpsc::Sender<Result<pw::channel::Sender<()>>>) -> Result<()> {
+fn run(sources: Vec<(AudioSource, Arc<SourceFeed>, Arc<Channel>)>, ready: &mpsc::Sender<Result<pw::channel::Sender<Cmd>>>) -> Result<()> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
@@ -229,13 +247,13 @@ fn run(sources: Vec<(AudioSource, Arc<SourceFeed>, Arc<Channel>)>, ready: &mpsc:
 
     let mut captures = Vec::new();
     for (source, feed, channel) in sources {
-        match open_stream(&core, &source, feed) {
+        match open_stream(&core, &source, feed.clone()) {
             Ok((stream, listener)) => {
                 channel.set_status(match source.kind {
                     SourceKind::App { .. } => SourceStatus::WaitingForApp,
                     _ => SourceStatus::Live,
                 });
-                captures.push(Capture { source, channel, stream, _listener: listener, links: HashMap::new() });
+                captures.push(Capture { source, feed, channel, stream, _listener: listener, links: HashMap::new() });
             }
             Err(e) => {
                 eprintln!("audio source \"{}\": {e:#}", source.name);
@@ -264,14 +282,39 @@ fn run(sources: Vec<(AudioSource, Arc<SourceFeed>, Arc<Channel>)>, ready: &mpsc:
     };
     timer.update_timer(Some(Duration::from_millis(50)), Some(Duration::from_millis(250))).into_result()?;
 
-    let (stop_tx, stop_rx) = pw::channel::channel::<()>();
+    let (cmd_tx, cmd_rx) = pw::channel::channel::<Cmd>();
     let quit = mainloop.downgrade();
-    let _stop = stop_rx.attach(mainloop.loop_(), move |()| {
-        if let Some(l) = quit.upgrade() {
-            l.quit();
-        }
-    });
-    let _ = ready.send(Ok(stop_tx));
+    let _commands = {
+        let (captures, core, graph) = (captures.clone(), core.clone(), graph.clone());
+        cmd_rx.attach(mainloop.loop_(), move |cmd| match cmd {
+            Cmd::Stop => {
+                if let Some(l) = quit.upgrade() {
+                    l.quit();
+                }
+            }
+            Cmd::SetMic { id, device } => {
+                for c in captures.borrow_mut().iter_mut().filter(|c| c.source.id == id) {
+                    if matches!(&c.source.kind, SourceKind::Microphone { device: d } if *d == device) {
+                        continue;
+                    }
+                    c.source.kind = SourceKind::Microphone { device: device.clone() };
+                    let _ = c.stream.disconnect();
+                    match open_stream(&core, &c.source, c.feed.clone()) {
+                        Ok((stream, listener)) => {
+                            c.stream = stream;
+                            c._listener = listener;
+                            relink(&core, &graph.borrow(), c, &[]);
+                        }
+                        Err(e) => {
+                            eprintln!("audio source \"{}\": {e:#}", c.source.name);
+                            c.channel.set_status(SourceStatus::Unavailable);
+                        }
+                    }
+                }
+            }
+        })
+    };
+    let _ = ready.send(Ok(cmd_tx));
     mainloop.run();
 
     for c in captures.borrow_mut().iter_mut() {
@@ -335,6 +378,20 @@ fn open_stream(core: &pw::core::CoreRc, source: &AudioSource, feed: Arc<SourceFe
         })
         .register()?;
 
+    let pod = stereo_format()?;
+    let mut params = [spa::pod::Pod::from_bytes(&pod).ok_or_else(|| anyhow!("bad audio format"))?];
+    // Mics are connected by the session manager; desktop and apps by us.
+    let mut flags = pw::stream::StreamFlags::MAP_BUFFERS;
+    if device.is_some() {
+        flags |= pw::stream::StreamFlags::AUTOCONNECT;
+    }
+    stream.connect(spa::utils::Direction::Input, None, flags, &mut params)?;
+    Ok((stream, listener))
+}
+
+/// The format our streams ask for: 32-bit float stereo at [`RATE`]
+/// (PipeWire converts), as a serialized pod.
+pub(super) fn stereo_format() -> Result<Vec<u8>> {
     let mut info = spa::param::audio::AudioInfoRaw::new();
     info.set_format(spa::param::audio::AudioFormat::F32LE);
     info.set_rate(RATE);
@@ -343,7 +400,7 @@ fn open_stream(core: &pw::core::CoreRc, source: &AudioSource, feed: Arc<SourceFe
     position[0] = spa::sys::SPA_AUDIO_CHANNEL_FL;
     position[1] = spa::sys::SPA_AUDIO_CHANNEL_FR;
     info.set_position(position);
-    let pod = spa::pod::serialize::PodSerializer::serialize(
+    Ok(spa::pod::serialize::PodSerializer::serialize(
         std::io::Cursor::new(Vec::new()),
         &spa::pod::Value::Object(spa::pod::Object {
             type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
@@ -353,15 +410,7 @@ fn open_stream(core: &pw::core::CoreRc, source: &AudioSource, feed: Arc<SourceFe
     )
     .map_err(|_| anyhow!("bad audio format"))?
     .0
-    .into_inner();
-    let mut params = [spa::pod::Pod::from_bytes(&pod).ok_or_else(|| anyhow!("bad audio format"))?];
-    // Mics are connected by the session manager; desktop and apps by us.
-    let mut flags = pw::stream::StreamFlags::MAP_BUFFERS;
-    if device.is_some() {
-        flags |= pw::stream::StreamFlags::AUTOCONNECT;
-    }
-    stream.connect(spa::utils::Direction::Input, None, flags, &mut params)?;
-    Ok((stream, listener))
+    .into_inner())
 }
 
 /// Make `c`'s links match what it should hear now, and update its status.
@@ -581,6 +630,47 @@ pub(crate) fn list_apps() -> Vec<Device> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A mic switched while capturing: our stream is linked to the new
+    /// device, and its sound keeps coming into the same feed.
+    #[test]
+    #[ignore = "needs two mics: HASTECLIP_MIC_A=<node name> HASTECLIP_MIC_B=<node name> cargo test -p capture switches_mic -- --ignored"]
+    fn switches_mic_while_capturing() {
+        let (a, b) = (std::env::var("HASTECLIP_MIC_A").unwrap(), std::env::var("HASTECLIP_MIC_B").unwrap());
+        let clock = Arc::new(crate::mixer::Clock::default());
+        clock.set(crate::linux::host_now());
+        let feed = SourceFeed::new(RATE, clock);
+        let live = crate::mixer::LiveAudio::default();
+        let source = AudioSource { id: "mictest".into(), name: "Mic".into(), kind: SourceKind::Microphone { device: a.clone() }, in_mix: true, own_track: false };
+        let mut audio = SystemAudio::start(vec![(source, feed.clone(), live.channel("mictest"))]).unwrap();
+        let linked_to = || {
+            let out = std::process::Command::new("pw-link").arg("-l").output().unwrap();
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            // `device:port` lines, each followed by `  |-> ours:port` when linked to us.
+            let mut from = None;
+            let mut found = Vec::new();
+            for line in text.lines() {
+                if !line.starts_with(' ') {
+                    from = line.split(':').next().map(str::to_owned);
+                } else if line.contains("|-> hasteclip.mictest:") {
+                    found.extend(from.clone());
+                }
+            }
+            found.sort();
+            found.dedup();
+            found
+        };
+        thread::sleep(Duration::from_millis(1500));
+        let (first, at_a) = (linked_to(), feed.arrived().unwrap_or(0));
+        assert!(audio.set_mic("mictest", &b));
+        thread::sleep(Duration::from_millis(1500));
+        let (second, at_b) = (linked_to(), feed.arrived().unwrap_or(0));
+        eprintln!("before: {first:?}, {at_a} samples; after: {second:?}, {at_b} samples");
+        assert_eq!(first, vec![a]);
+        assert_eq!(second, vec![b]);
+        assert!(at_b - at_a > RATE as i64, "the switched mic's sound didn't arrive");
+        audio.stop();
+    }
 
     #[test]
     fn surround_folds_into_stereo() {

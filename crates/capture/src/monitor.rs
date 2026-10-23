@@ -1,5 +1,5 @@
 //! Hear a microphone live ("Listen" on the Sources page), to check it works
-//! and how it sounds.
+//! and how it sounds. (Linux: `linux::monitor`.)
 //!
 //! The mic goes straight to the default output, not through the mixer (which
 //! runs deliberately behind, for the meters and the recording): its own input
@@ -24,14 +24,8 @@ const BUFFER_SECS: f32 = 0.005;
 const MAX_QUEUE: f32 = 0.02;
 
 /// The input's error handler.
-#[cfg(not(target_os = "linux"))]
 fn input_errors(device: &str) -> impl FnMut(cpal::Error) + Send + 'static {
     crate::sources::quiet_xruns(format!("{device} (Listen)"))
-}
-
-#[cfg(target_os = "linux")]
-fn input_errors(_: &str) -> impl FnMut(cpal::Error) + Send + 'static {
-    |e| eprintln!("mic monitor (input): {e}")
 }
 
 /// A microphone being played live; stops when dropped.

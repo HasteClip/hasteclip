@@ -419,7 +419,7 @@ impl Viewer {
                         out = ViewerOutcome::Delete;
                     }
                 });
-                let share_tip = match (image, crate::share::CAN_DRAG_OUT) {
+                let share_tip = match (image, crate::share::can_drag_out()) {
                     (true, true) => "Copy it or send it, or drag the picture into any app",
                     (true, false) => "Copy it or send it",
                     (false, true) => "Copy it, send it or upload it, or drag the picture into any app",
@@ -642,7 +642,7 @@ impl Ready {
         }
 
         let preview_resp = preview_resp.on_hover_cursor(if full { egui::CursorIcon::Default } else { egui::CursorIcon::PointingHand });
-        if crate::share::CAN_DRAG_OUT && preview_resp.drag_started() {
+        if crate::share::can_drag_out() && preview_resp.drag_started() {
             self.drag_out = true;
         }
         if preview_resp.double_clicked() {

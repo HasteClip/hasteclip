@@ -198,8 +198,8 @@ impl AudioCapture {
     }
 
     /// Switch the microphone of the source `id` to `device`, without stopping
-    /// anything. False if that source isn't a mic here (on Linux mics are
-    /// PipeWire streams, set at the start).
+    /// anything. False if that source isn't a mic. On Linux a mic is a
+    /// PipeWire stream, made again aimed at the new device.
     pub(crate) fn set_mic(&mut self, id: &str, device: &str) -> bool {
         #[cfg(not(target_os = "linux"))]
         if let Some(mic) = self.mics.iter_mut().find(|m| m.id == id) {
@@ -208,6 +208,10 @@ impl AudioCapture {
                 mic.open();
             }
             return true;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(system) = self.system.as_mut() {
+            return system.set_mic(id, device);
         }
         let _ = (id, device);
         false

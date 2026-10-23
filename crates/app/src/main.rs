@@ -33,6 +33,8 @@ mod hover_play;
 #[cfg(target_os = "macos")]
 mod key_tap;
 #[cfg(target_os = "linux")]
+mod kwin_window;
+#[cfg(target_os = "linux")]
 mod linux_desktop;
 mod meter;
 mod moments;
@@ -50,6 +52,8 @@ mod settings_ui;
 mod setup;
 mod share;
 mod transport;
+#[cfg(target_os = "linux")]
+mod wayland_drag;
 mod shell;
 mod shortcuts;
 mod sound;
@@ -168,10 +172,7 @@ fn main() -> eframe::Result<()> {
 
     // Killed from outside (Ctrl+C, SIGTERM, logout): stop capture and finish the
     // file before exiting, since destructors don't run on a signal.
-    let _ = ctrlc::set_handler(|| {
-        service::stop_all_and_wait(std::time::Duration::from_secs(10));
-        std::process::exit(0);
-    });
+    let _ = ctrlc::set_handler(quit_now);
 
     // Dev aid: `HASTECLIP_WINDOW=WxH` opens at that size, to check layouts.
     let size = std::env::var("HASTECLIP_WINDOW")
@@ -223,8 +224,9 @@ fn main() -> eframe::Result<()> {
             );
         }
     }
-    // The app is gone by now (capture stopped, files finished): an update
-    // can go in.
+    // The app is gone by now (capture stopped, files finished): end what
+    // capture keeps running in the background, then an update can go in.
+    capture::shutdown();
     update::apply_queued();
     result
 }
@@ -296,14 +298,31 @@ enum RecState {
     Recording,
 }
 
-/// The app icon (`assets/icon.svg` rendered to PNG), shown in the Dock and taskbar
+/// The app icon (`assets/icon-mac.svg` rendered to PNG), shown in the Dock and taskbar
 /// while running. Release bundles use `assets/hasteclip.icns` instead. On
-/// Windows, where icons are small, the glyph without the macOS plate
-/// (`assets/icon-windows.svg`).
+/// Windows and Linux, where app icons aren't drawn on a plate, the glyph
+/// without the macOS one (`assets/icon-glyph.svg`): with it, it looked small.
+/// Quit from outside the UI's loop (a signal; the tray while the window's
+/// hidden, when the loop doesn't run): stop capturing, finish the file, and
+/// exit.
+pub(crate) fn quit_now() {
+    service::stop_all_and_wait(std::time::Duration::from_secs(10));
+    // Without running the C library's exit handlers: they unload the
+    // graphics driver while the UI thread may still be drawing with it,
+    // which crashed (NVIDIA on Linux). The recording is already written.
+    #[cfg(unix)]
+    // SAFETY: ends the process at once; nothing runs after it.
+    unsafe {
+        libc::_exit(0)
+    };
+    #[cfg(not(unix))]
+    std::process::exit(0);
+}
+
 pub(crate) fn app_icon() -> egui::IconData {
-    #[cfg(windows)]
-    let png = include_bytes!("../assets/icon-windows-256.png");
-    #[cfg(not(windows))]
+    #[cfg(not(target_os = "macos"))]
+    let png = include_bytes!("../assets/icon-glyph-256.png");
+    #[cfg(target_os = "macos")]
     let png = include_bytes!("../assets/icon-1024.png");
     let img = image::load_from_memory_with_format(png, image::ImageFormat::Png)
         .expect("bundled icon is a valid PNG")
@@ -397,6 +416,8 @@ struct App {
     pub(crate) recording_shortcut: Option<(settings::ShortcutAction, Option<&'static str>)>,
     /// The "Reset all settings?" confirmation is open.
     pub(crate) confirm_reset: bool,
+    /// The camera panel (Linux), in place of the Sound column while it's open.
+    pub(crate) camera_panel: Option<crate::webcam_ui::CameraPanel>,
     /// Scroll the library to this clip next time it's shown.
     pub(crate) reveal_clip: Option<PathBuf>,
     /// Days folded away in the library.
@@ -623,7 +644,7 @@ impl App {
         if let Some(listener) = instance {
             tray::serve(listener, &ctx, tray_tx.clone());
         }
-        let tray = tray::Tray::new(&ctx, &app_icon(), tray_tx, tray_rx);
+        let tray = tray::Tray::new(&ctx, tray_tx, tray_rx, quick_save.clone());
         let mut app = Self {
             page: Page::Clips,
             rec_state: RecState::Idle,
@@ -644,6 +665,7 @@ impl App {
             hotkeys,
             recording_shortcut: None,
             confirm_reset: false,
+            camera_panel: None,
             reveal_clip: None,
             folded,
             permission: capture::screen_permission(),
@@ -947,17 +969,29 @@ impl App {
         Some(capture::webcam::Webcam { device: w.id.clone(), format: w.format.map(Into::into), placement: self.webcam_placement.clone() })
     }
 
+    /// Where the chosen display is in `screens`: found by its id, by its
+    /// place for settings from before ids were kept, else the main display
+    /// (listed first).
+    pub(crate) fn display_at(&self) -> usize {
+        match &self.settings.display_id {
+            Some(id) => self.screens.iter().position(|d| &d.id == id).unwrap_or(0),
+            None if self.settings.display_index < self.screens.len() => self.settings.display_index,
+            None => 0,
+        }
+    }
+
     pub(crate) fn video_source(&self) -> capture::VideoSource {
         match &self.settings.capture {
-            settings::CaptureTarget::Apps { apps, away_screen } if capture::APP_CAPTURE => capture::VideoSource::Apps {
+            settings::CaptureTarget::Apps { apps, away_screen } if capture::app_capture() => capture::VideoSource::Apps {
                 ids: apps.iter().map(|a| a.id.clone()).collect(),
                 away_when_unfocused: *away_screen,
                 hook: self.game_hook(),
             },
             _ => capture::VideoSource::Screen {
-                id: self.screens.get(self.settings.display_index).map(|d| d.id.clone()).unwrap_or_else(|| "0".to_owned()),
+                id: self.screens.get(self.display_at()).map(|d| d.id.clone()).unwrap_or_else(|| "0".to_owned()),
                 hook: self.game_hook(),
                 method: self.settings.screen_capture.into(),
+                crop: self.settings.screen_crop.filter(|c| capture::SCREEN_CROP && !c.is_none()).map(Into::into),
             },
         }
     }
@@ -1195,6 +1229,9 @@ impl eframe::App for App {
     /// What runs every frame whether the window shows or not (it's hidden
     /// in the tray): shortcuts, voice, capture events, saves and uploads.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // From the first frame, so the press that starts a drag out is heard.
+        #[cfg(target_os = "linux")]
+        crate::wayland_drag::prepare(_frame);
         static LAUNCHED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
         let launched = *LAUNCHED.get_or_init(Instant::now);
         if let Some(secs) = std::env::var("HASTECLIP_DEV_BUFFER_QUIT").ok().and_then(|s| s.parse::<f64>().ok())
@@ -1203,6 +1240,21 @@ impl eframe::App for App {
         {
             eprintln!("dev: quitting");
             self.quit(ctx);
+        }
+        // `HASTECLIP_DEV_CAMERA_PANEL`: open on Sources with the camera panel
+        // (to look at it without clicking there).
+        static CAMERA_PANEL: std::sync::Once = std::sync::Once::new();
+        if std::env::var_os("HASTECLIP_DEV_CAMERA_PANEL").is_some()
+            && let Some(w) = &self.settings.webcam
+        {
+            let id = w.id.clone();
+            CAMERA_PANEL.call_once(|| {
+                self.page = Page::Sources;
+                let mut panel = crate::webcam_ui::CameraPanel::open(&id);
+                // `=crop`: cropping already.
+                panel.set_cropping(std::env::var("HASTECLIP_DEV_CAMERA_PANEL").is_ok_and(|v| v == "crop"));
+                self.camera_panel = Some(panel);
+            });
         }
         // `HASTECLIP_DEV_PAGES=<secs>`: go round Clips, Sources and Settings,
         // one every so many seconds (with `HASTECLIP_DEV_LAPS` to time it).
@@ -1270,6 +1322,10 @@ impl App {
         let pressed = match &mut self.hotkeys {
             Ok(h) => {
                 h.sync(&self.settings.shortcuts);
+                // Changed in the desktop's own settings: ours follow.
+                for (action, keys) in h.adopted() {
+                    self.settings.shortcuts.set(action, keys);
+                }
                 h.pressed()
             }
             Err(_) => Vec::new(),
@@ -1341,6 +1397,10 @@ impl App {
         let on = self.settings.webcam.as_ref().is_some_and(|w| w.enabled);
         let camera = self.webcam_source().filter(|_| on).map(|w| (w.device, w.format));
         if camera != self.kept_camera {
+            // Its settings go back on as it opens.
+            if let Some((device, _)) = &camera {
+                capture::webcam::remember_controls(device, self.settings.camera_controls.get(device).map(|m| m.iter().map(|(k, v)| (*k, *v)).collect()).unwrap_or_default());
+            }
             capture::webcam::keep_open(camera.clone());
             self.kept_camera = camera;
         }
@@ -1385,10 +1445,28 @@ impl App {
             self.viewer = None;
             self.page = Page::Clips;
         }
+        // Wayland can't hide a window: KWin is asked to; elsewhere on
+        // Wayland it can only be minimized.
+        #[cfg(target_os = "linux")]
+        if crate::portal_shortcuts::wanted() {
+            if kwin_window::available() {
+                kwin_window::hide();
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
+            return;
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
     }
 
     fn show_window(&mut self, ctx: &egui::Context) {
+        // Nor bring one to the front: KWin is asked to.
+        #[cfg(target_os = "linux")]
+        if kwin_window::available() {
+            kwin_window::raise();
+            ctx.request_repaint();
+            return;
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);

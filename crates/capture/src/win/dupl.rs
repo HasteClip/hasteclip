@@ -555,7 +555,7 @@ mod tests {
         let screen = super::super::system::list_screens().into_iter().next().expect("a screen");
         let gpu = Gpu::new().unwrap();
         let held = Duplication::open(&gpu, super::super::system::find_monitor(&screen.id)).unwrap();
-        let video = crate::VideoSource::Screen { id: screen.id, hook: crate::GameHook { auto: false, allowed: Vec::new() }, method: crate::ScreenCapture::Duplication };
+        let video = crate::VideoSource::Screen { id: screen.id, hook: crate::GameHook { auto: false, allowed: Vec::new() }, method: crate::ScreenCapture::Duplication, crop: None };
         let preview = crate::preview::VideoPreview::start(&video, Some(360), None, 30, None, None);
         let becomes = |want: crate::ScreenCaptureInUse, within: Duration| {
             let t = Instant::now();

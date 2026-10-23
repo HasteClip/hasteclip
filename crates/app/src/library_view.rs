@@ -621,7 +621,7 @@ impl App {
             return None;
         }
         let outside = pos.is_none_or(|p| !ctx.content_rect().shrink(2.0).contains(p));
-        if down && outside && share::CAN_DRAG_OUT {
+        if down && outside && share::can_drag_out() {
             let drag = self.card_drag.take()?;
             let preview = self.clips.iter().find(|c| c.path == drag.clip).and_then(thumbs::cached_jpeg);
             return Some(Action::DragOut(drag.files, preview));
@@ -1573,7 +1573,7 @@ pub(crate) fn share_items(ui: &mut egui::Ui, anchor: Pos2, full: bool, linked: b
         if Item::new(crate::reveal_label()).icon(icon::FOLDER_OPEN).show(ui).clicked() {
             choice = Some(ShareChoice::Reveal);
         }
-        if !full && share::CAN_DRAG_OUT {
+        if !full && share::can_drag_out() {
             ui_kit::menu_sep(ui);
             ui_kit::menu_head(ui, "Or drag the screenshot into any app");
         }
@@ -1611,7 +1611,7 @@ pub(crate) fn share_items(ui: &mut egui::Ui, anchor: Pos2, full: bool, linked: b
     if Item::new(crate::reveal_label()).icon(icon::FOLDER_OPEN).show(ui).clicked() {
         choice = Some(ShareChoice::Reveal);
     }
-    if !full && share::CAN_DRAG_OUT {
+    if !full && share::can_drag_out() {
         ui_kit::menu_sep(ui);
         ui_kit::menu_head(ui, "Or drag the clip into any app");
     }

@@ -27,8 +27,8 @@ impl Canvas {
     /// Fill with a picture, put in as `framing` says (see `crate::placement`):
     /// its middle filling the canvas, all of it with black bars, or all of
     /// it stretched.
-    pub(crate) fn fill_from(&mut self, src: &Frame, framing: crate::Framing) {
-        let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = crate::placement((src.width, src.height), (self.width, self.height), framing);
+    pub(crate) fn fill_from(&mut self, src: &Frame, framing: crate::Framing, crop: Option<crate::Crop>) {
+        let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = crate::placement_cropped(crop, (src.width, src.height), (self.width, self.height), framing);
         let data = &src.data[sy as usize * src.stride + sx as usize * 4..];
         let (size, to) = ((sw as usize, sh as usize), (dw as usize, dh as usize));
         let swap = src.order == Order::Rgb;
@@ -207,7 +207,7 @@ fn bands(buf: &mut [u8], row: usize, f: impl Fn(usize, &mut [u8]) + Sync) {
 /// Scale a picture of 4-byte pixels (`size`, rows `stride` bytes apart) into
 /// `out` (`to`, rows packed), averaging the area each output pixel covers;
 /// swapping the first and third bytes (red and blue) if asked. Alpha opaque.
-fn resample(src: &[u8], size: (usize, usize), stride: usize, swap: bool, out: &mut [u8], to: (usize, usize)) {
+pub(crate) fn resample(src: &[u8], size: (usize, usize), stride: usize, swap: bool, out: &mut [u8], to: (usize, usize)) {
     let ((sw, sh), (dw, dh)) = (size, to);
     if size == to {
         bands(out, dw * 4, |y0, rows| {
@@ -221,19 +221,27 @@ fn resample(src: &[u8], size: (usize, usize), stride: usize, swap: bool, out: &m
     let xs = Taps::new(sw, dw);
     let ys = Taps::new(sh, dh);
     bands(out, dw * 4, |y0, rows| {
-        // One horizontally scaled source row at a time, weighted into the
-        // output row: each source row is scaled once per output row it
-        // touches (once or twice when shrinking).
+        let n = rows.len() / (dw * 4);
+        if n == 0 {
+            return;
+        }
+        // Each source row this band covers, scaled across once (×256, which
+        // still fits 16 bits), then the output rows weighted from those.
+        let top = ys.first[y0];
+        let bottom = ys.first[y0 + n - 1] + ys.n;
+        let mut scaled = vec![0u16; (bottom - top) * dw * 3];
+        for (k, line) in scaled.chunks_exact_mut(dw * 3).enumerate() {
+            let at = (top + k) * stride;
+            scale_row(&src[at..at + sw * 4], &xs, line);
+        }
         let mut acc = vec![0u32; dw * 3];
-        let mut line = vec![0u32; dw * 3];
         for (i, row) in rows.chunks_exact_mut(dw * 4).enumerate() {
             acc.iter_mut().for_each(|a| *a = 0);
             let (first, weights) = ys.of(y0 + i);
-            for (k, &wy) in weights.iter().enumerate() {
-                let at = (first + k) * stride;
-                scale_row(&src[at..at + sw * 4], &xs, &mut line);
-                for (a, l) in acc.iter_mut().zip(&line) {
-                    *a += l * wy;
+            for (k, &wy) in weights.iter().enumerate().filter(|&(_, &w)| w > 0) {
+                let line = &scaled[(first + k - top) * dw * 3..][..dw * 3];
+                for (a, &l) in acc.iter_mut().zip(line) {
+                    *a += l as u32 * wy;
                 }
             }
             // Each pass's weights add up to 256: two passes, 65536.
@@ -259,20 +267,19 @@ fn copy_row(src: &[u8], out: &mut [u8], swap: bool) {
 
 /// Area-average resampling weights, from `src` samples to `dst`: for each
 /// output sample, the first source sample it covers and how much of each
-/// (out of 256).
+/// (out of 256). Every output sample has the same number of weights (`n`,
+/// the unused ones 0), so the loops over them are plain.
 struct Taps {
     first: Vec<usize>,
-    /// Concatenated weights; `span[i]` is where output `i`'s start.
+    /// `n` weights for each output sample.
     weights: Vec<u32>,
-    span: Vec<(usize, usize)>,
+    n: usize,
 }
 
 impl Taps {
     fn new(src: usize, dst: usize) -> Self {
         let scale = src as f64 / dst.max(1) as f64;
-        let mut first = Vec::with_capacity(dst);
-        let mut weights = Vec::new();
-        let mut span = Vec::with_capacity(dst);
+        let mut each = Vec::with_capacity(dst);
         for i in 0..dst {
             // The source interval this output sample covers (at least one
             // sample wide, so enlarging picks the nearest).
@@ -292,31 +299,65 @@ impl Taps {
             let sum: u32 = w.iter().sum();
             let biggest = (0..w.len()).max_by_key(|&k| w[k]).unwrap_or(0);
             w[biggest] = (w[biggest] + 256).saturating_sub(sum);
-            first.push(lo);
-            span.push((weights.len(), w.len()));
-            weights.extend(w);
+            each.push((lo, w));
         }
-        Self { first, weights, span }
+        let n = each.iter().map(|(_, w)| w.len()).max().unwrap_or(1).min(src.max(1));
+        let mut first = Vec::with_capacity(dst);
+        let mut weights = Vec::with_capacity(dst * n);
+        for (lo, w) in each {
+            // Padded to `n` with zeros, after it, or before it where that
+            // would run past the last source sample.
+            let start = lo.min(src - n);
+            first.push(start);
+            weights.extend(std::iter::repeat_n(0, lo - start));
+            weights.extend(&w);
+            weights.extend(std::iter::repeat_n(0, n - w.len() - (lo - start)));
+        }
+        Self { first, weights, n }
     }
 
     fn of(&self, i: usize) -> (usize, &[u32]) {
-        let (at, n) = self.span[i];
-        (self.first[i], &self.weights[at..at + n])
+        (self.first[i], &self.weights[i * self.n..(i + 1) * self.n])
     }
 }
 
 /// One source row scaled to the output width: 3 channels a pixel, ×256.
-fn scale_row(src: &[u8], xs: &Taps, out: &mut [u32]) {
-    for (i, o) in out.chunks_exact_mut(3).enumerate() {
-        let (first, weights) = xs.of(i);
+fn scale_row(src: &[u8], xs: &Taps, out: &mut [u16]) {
+    // The common tap counts get their own copy of the loop, unrolled.
+    match xs.n {
+        1 => scale_row_n::<1>(src, xs, out),
+        2 => scale_row_n::<2>(src, xs, out),
+        3 => scale_row_n::<3>(src, xs, out),
+        4 => scale_row_n::<4>(src, xs, out),
+        _ => scale_row_any(src, xs, out),
+    }
+}
+
+fn scale_row_n<const N: usize>(src: &[u8], xs: &Taps, out: &mut [u16]) {
+    for ((o, &first), weights) in out.chunks_exact_mut(3).zip(&xs.first).zip(xs.weights.chunks_exact(N)) {
+        let px = &src[first * 4..][..N * 4];
         let (mut c0, mut c1, mut c2) = (0u32, 0u32, 0u32);
-        for (k, &w) in weights.iter().enumerate() {
-            let p = &src[(first + k) * 4..];
+        for k in 0..N {
+            let w = weights[k];
+            c0 += px[k * 4] as u32 * w;
+            c1 += px[k * 4 + 1] as u32 * w;
+            c2 += px[k * 4 + 2] as u32 * w;
+        }
+        o.copy_from_slice(&[c0 as u16, c1 as u16, c2 as u16]);
+    }
+}
+
+fn scale_row_any(src: &[u8], xs: &Taps, out: &mut [u16]) {
+    let n = xs.n;
+    for ((o, &first), weights) in out.chunks_exact_mut(3).zip(&xs.first).zip(xs.weights.chunks_exact(n)) {
+        let px = &src[first * 4..(first + n) * 4];
+        let (mut c0, mut c1, mut c2) = (0u32, 0u32, 0u32);
+        for (p, &w) in px.chunks_exact(4).zip(weights) {
             c0 += p[0] as u32 * w;
             c1 += p[1] as u32 * w;
             c2 += p[2] as u32 * w;
         }
-        o.copy_from_slice(&[c0, c1, c2]);
+        o.copy_from_slice(&[c0 as u16, c1 as u16, c2 as u16]);
     }
 }
 
@@ -353,16 +394,16 @@ mod tests {
     use super::*;
 
     fn frame(w: u32, h: u32, px: [u8; 4], order: Order) -> Frame {
-        Frame { width: w, height: h, stride: w as usize * 4, order, data: px.repeat((w * h) as usize) }
+        Frame { width: w, height: h, stride: w as usize * 4, order, data: px.repeat((w * h) as usize), texture: None }
     }
 
     #[test]
     fn flat_colours_survive_scaling() {
         for (sw, sh, dw, dh) in [(64, 36, 64, 36), (64, 36, 32, 18), (96, 54, 64, 36), (40, 30, 64, 48)] {
             let mut c = Canvas::new(dw, dh);
-            c.fill_from(&frame(sw, sh, [10, 120, 250, 0], Order::Bgr), crate::Framing::Fit);
+            c.fill_from(&frame(sw, sh, [10, 120, 250, 0], Order::Bgr), crate::Framing::Fit, None);
             assert!(c.bgra.chunks_exact(4).all(|p| p == [10, 120, 250, 255]), "{sw}x{sh} -> {dw}x{dh}");
-            c.fill_from(&frame(sw, sh, [250, 120, 10, 0], Order::Rgb), crate::Framing::Fit);
+            c.fill_from(&frame(sw, sh, [250, 120, 10, 0], Order::Rgb), crate::Framing::Fit, None);
             assert!(c.bgra.chunks_exact(4).all(|p| p == [10, 120, 250, 255]), "rgb {sw}x{sh} -> {dw}x{dh}");
         }
     }
@@ -377,7 +418,7 @@ mod tests {
             }
         }
         let mut c = Canvas::new(2, 1);
-        c.fill_from(&f, crate::Framing::Stretch);
+        c.fill_from(&f, crate::Framing::Stretch, None);
         assert!(c.bgra.chunks_exact(4).all(|p| (127..=128).contains(&p[0])), "{:?}", c.bgra);
     }
 
@@ -398,12 +439,12 @@ mod tests {
             c.bgra[at..at + 3].to_vec()
         };
         let mut c = Canvas::new(4, 4);
-        c.fill_from(&f, crate::Framing::Fill);
+        c.fill_from(&f, crate::Framing::Fill, None);
         assert!((0..4).all(|x| px(&c, x, 0) == [0, 255, 0]), "the green middle: {:?}", c.bgra);
-        c.fill_from(&f, crate::Framing::Stretch);
+        c.fill_from(&f, crate::Framing::Stretch, None);
         assert_eq!((px(&c, 0, 2), px(&c, 3, 2)), (vec![0, 0, 255], vec![255, 0, 0]));
         let mut c = Canvas::new(12, 12);
-        c.fill_from(&f, crate::Framing::Fit);
+        c.fill_from(&f, crate::Framing::Fit, None);
         assert_eq!((px(&c, 0, 0), px(&c, 0, 6), px(&c, 11, 6)), (vec![0, 0, 0], vec![0, 0, 255], vec![255, 0, 0]));
     }
 

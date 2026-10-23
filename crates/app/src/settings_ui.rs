@@ -265,8 +265,8 @@ impl App {
                 let (_, c) = l.row(Row::new("Quality").tip("Quality", "How much detail each second gets. Fast motion needs more, and files grow with it. Balanced looks good in fast motion at this size and frame rate.").note(quality_note.clone()).locked(lock.clone()), |ui| self.quality_field(ui, rec, preset));
                 locked_click |= c;
             }
-            if cfg!(any(windows, target_os = "macos")) && f.shows(&["frame blending", "motion blur"]) {
-                let (_, c) = l.row(Row::new("Frame blending").tip("Frame blending", "Captures faster than the frame rate and averages the pictures into each frame, for smooth motion like motion blur. On macOS, up to your display's refresh rate.").note(blend_note.clone()).locked(lock.clone()), |ui| self.blend_field(ui, &blends));
+            if capture::frame_blending() && f.shows(&["frame blending", "motion blur"]) {
+                let (_, c) = l.row(Row::new("Frame blending").tip("Frame blending", "Captures faster than the frame rate and averages the pictures into each frame, for smooth motion like motion blur. On macOS and Linux, up to your display's refresh rate.").note(blend_note.clone()).locked(lock.clone()), |ui| self.blend_field(ui, &blends));
                 locked_click |= c;
                 let on = samples > 1;
                 l.well("blend_well", on, |l| {
@@ -393,7 +393,8 @@ impl App {
             if f.shows(&["screenshots", "shortcut", "hotkey", "keyboard"]) {
                 let action = ShortcutAction::Screenshot;
                 let keys = self.shortcut_keys(action);
-                let note = if keys.is_none() { "Off. Choose a key to take screenshots" } else { "Set under Shortcuts" };
+                // Off says itself (its button reads Choose a key).
+                let note = if keys.is_none() { "" } else { "Set under Shortcuts" };
                 l.row(Row::new("Shortcut").note(note), |ui| {
                     if Btn::normal(if keys.is_none() { "Choose a key" } else { "Change" }).small().show(ui).clicked() {
                         self.recording_shortcut = Some((action, None));
@@ -518,7 +519,9 @@ impl App {
             ui.label(theme::text(format!("Shortcuts are unavailable: {e}"), 12.5, W::Regular).color(p.warn));
             ui.add_space(6.0);
         }
-        let desktop = self.hotkeys.as_ref().is_ok_and(|h| h.via_desktop());
+        // The desktop keeps the keys (Wayland, but KDE Plasma, where they're
+        // set from here): it may ask to confirm them, and has the last word.
+        let desktop = self.hotkeys.as_ref().is_ok_and(|h| h.via_desktop() && !h.keys_set_here());
         ui_kit::list(ui, "shortcuts", |l| {
             for action in ShortcutAction::ALL.into_iter().filter(|a| a.available()) {
                 if !f.shows(&[action.label(), "shortcut", "hotkey", "keyboard"]) {
@@ -528,13 +531,25 @@ impl App {
                 let note = match action {
                     ShortcutAction::SaveClip if desktop => "Works everywhere. Your desktop looks after it, and may ask you to confirm.",
                     ShortcutAction::SaveClip => "Works everywhere, even in a game",
-                    ShortcutAction::Screenshot if off => "Off. Choose a key to take screenshots",
+                    // Off says itself: its keys read Off.
+                    ShortcutAction::Screenshot if off => "",
                     ShortcutAction::Screenshot => "Works everywhere, even in a game",
                     _ => "",
                 };
                 let problem = self.shortcut_problem(action);
                 let note = problem.clone().unwrap_or_else(|| note.to_owned());
                 l.row(Row::new(action.label()).note(note).warn(problem.is_some()), |ui| self.shortcut_editor(ui, action));
+            }
+            // On Wayland the desktop keeps the keys (the user's, once set):
+            // they're changed in its own editor.
+            if desktop && self.hotkeys.as_ref().is_ok_and(|h| h.desktop_configurable()) && f.shows(&["shortcut", "hotkey", "keyboard", "system settings"]) {
+                let mut open = false;
+                l.row(Row::new("Keys").note("Your desktop decides these shortcuts' keys. Set or change them in its window, opened from here."), |ui| {
+                    open = Btn::normal("Set up keys").small().show(ui).clicked();
+                });
+                if open && let Ok(h) = &self.hotkeys {
+                    h.configure_desktop();
+                }
             }
             #[cfg(target_os = "macos")]
             if f.shows(&["fullscreen games", "input monitoring", "shortcut", "hotkey", "keyboard", "permission"]) {
@@ -976,7 +991,11 @@ impl App {
                 if let Some(e) = self.hotkeys.as_ref().ok().and_then(|h| h.error_for(action)) {
                     return Some(format!("Not working: {e}."));
                 }
-                // The desktop has the last word on Wayland: say if it chose differently.
+                // The desktop has the last word on Wayland: say if it chose
+                // differently (where it isn't told from here).
+                if self.hotkeys.as_ref().is_ok_and(|h| h.keys_set_here()) {
+                    return None;
+                }
                 let current = self.settings.shortcuts.get(action).to_owned();
                 let keys = self.hotkeys.as_ref().ok().and_then(|h| h.assigned(action))?;
                 let asked = shortcuts::label(&current);
@@ -1024,7 +1043,7 @@ impl App {
                 }
             });
         }
-        let keys = shortcuts::keys(&current).unwrap_or_else(|| vec!["Off".to_owned()]);
+        let keys = shortcuts::keys(&current).unwrap_or_default();
         let tip = if listening { "Press the new shortcut. Esc cancels." } else { "Click, then press the new shortcut" };
         let r = ui_kit::keycaps(ui, &keys, listening).on_hover_text(tip);
         if r.clicked() {
@@ -1095,6 +1114,8 @@ impl App {
                     fresh.capture = std::mem::take(&mut self.settings.capture);
                     fresh.idle_apps = self.settings.idle_apps.take();
                     fresh.webcam = self.settings.webcam.take();
+                    fresh.camera_controls = std::mem::take(&mut self.settings.camera_controls);
+                    fresh.display_id = self.settings.display_id.take();
                     fresh.display_index = self.settings.display_index;
                     fresh.limiter = self.settings.limiter;
                     fresh.save_sound.custom = std::mem::take(&mut self.settings.save_sound.custom);

@@ -27,6 +27,9 @@ pub struct Registered {
     mgr: Option<GlobalHotKeyManager>,
     #[cfg(target_os = "linux")]
     portal: Option<crate::portal_shortcuts::Portal>,
+    /// How the portal's presses save a clip or take a screenshot at once.
+    #[cfg(target_os = "linux")]
+    quick: Option<crate::service::QuickSave>,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     ctx: egui::Context,
     /// What's registered now, with the action each id triggers.
@@ -55,8 +58,8 @@ impl Registered {
         #[cfg(target_os = "linux")]
         if crate::portal_shortcuts::wanted() {
             if crate::portal_shortcuts::available() {
-                let _ = (quick, tx);
-                return Ok(Self { mgr: None, portal: None, ctx, active: Vec::new(), ids, presses, from: None, errors: Vec::new() });
+                let _ = tx;
+                return Ok(Self { mgr: None, portal: None, quick: Some(quick), ctx, active: Vec::new(), ids, presses, from: None, errors: Vec::new() });
             }
             eprintln!("the desktop has no GlobalShortcuts portal: shortcuts only work while an X11 app is focused");
         }
@@ -95,6 +98,8 @@ impl Registered {
             mgr: Some(mgr),
             #[cfg(target_os = "linux")]
             portal: None,
+            #[cfg(target_os = "linux")]
+            quick: None,
             ctx,
             active: Vec::new(),
             ids,
@@ -156,9 +161,13 @@ impl Registered {
         #[cfg(target_os = "linux")]
         if self.mgr.is_none() {
             // The old set goes (dropping it unbinds them), the new one is bound.
+            // Changed in Settings (not starting up): ours win in the desktop.
+            let ours = self.from.is_some();
             self.portal = None;
             let list = valid.iter().map(|(_, a)| (*a, wanted.get(*a).to_owned())).collect();
-            self.portal = Some(crate::portal_shortcuts::Portal::bind(list, self.ctx.clone()));
+            if let Some(quick) = self.quick.clone() {
+                self.portal = Some(crate::portal_shortcuts::Portal::bind(list, ours, self.ctx.clone(), quick));
+            }
         }
         let _ = valid;
         if let Ok(mut ids) = self.ids.lock() {
@@ -176,9 +185,58 @@ impl Registered {
         let mut out: Vec<(ShortcutAction, bool)> = self.presses.try_iter().collect();
         #[cfg(target_os = "linux")]
         if let Some(p) = &self.portal {
-            out.extend(p.pressed().into_iter().map(|a| (a, false)));
+            out.extend(p.pressed());
         }
         out
+    }
+
+    /// Keys changed in the desktop's own settings (KDE Plasma), for Settings
+    /// to take: already in place, so they aren't bound again.
+    pub fn adopted(&mut self) -> Vec<(ShortcutAction, String)> {
+        #[cfg(target_os = "linux")]
+        if let Some(p) = &self.portal {
+            let list = p.adopted();
+            if let Some(from) = &mut self.from {
+                for (a, keys) in &list {
+                    from.set(*a, keys.clone());
+                }
+            }
+            return list;
+        }
+        Vec::new()
+    }
+
+    /// Whether the keys set in Settings are the ones that work: always, but
+    /// on a Wayland desktop that keeps its own (not KDE Plasma, where they're
+    /// set from here).
+    pub fn keys_set_here(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(p) = &self.portal {
+            return p.managed();
+        }
+        self.mgr.is_some()
+    }
+
+    /// Open the desktop's editor for its shortcuts, where it keeps theirs
+    /// (Wayland, through the portal). False where it can't.
+    pub fn configure_desktop(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(p) = &self.portal
+            && crate::portal_shortcuts::can_configure()
+        {
+            p.configure();
+            return true;
+        }
+        false
+    }
+
+    /// Whether the desktop's own shortcut editor can be opened for them.
+    pub fn desktop_configurable(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(p) = &self.portal {
+            return !p.managed() && crate::portal_shortcuts::can_configure();
+        }
+        false
     }
 
     pub fn error_for(&self, action: ShortcutAction) -> Option<String> {
@@ -190,8 +248,12 @@ impl Registered {
             use crate::portal_shortcuts::State;
             return match p.state() {
                 State::Failed(e) => Some(format!("the desktop didn't take it ({e})")),
-                State::Bound(list) if list.iter().any(|(a, keys)| *a == action && keys.trim().is_empty()) => {
-                    Some("the desktop gave it no keys — set them in its keyboard settings".into())
+                State::Bound(list) if !p.managed() && list.iter().any(|(a, keys)| *a == action && keys.trim().is_empty()) => {
+                    Some(if crate::portal_shortcuts::can_configure() {
+                        "no key yet. Your desktop gives the keys: use Set up keys below".into()
+                    } else {
+                        "no key yet. Your desktop gives the keys: add one in its keyboard settings".into()
+                    })
                 }
                 _ => None,
             };

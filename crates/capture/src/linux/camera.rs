@@ -29,10 +29,30 @@ pub(crate) struct CameraFeed {
     pub device: String,
     pub format: Option<Format>,
     frame: Mutex<Option<Arc<CameraPicture>>>,
+    /// The newest picture's number (`PICTURES`), so a reader can tell a new one.
+    seq: std::sync::atomic::AtomicU64,
     stop: AtomicBool,
 }
 
 static CURRENT: Mutex<Option<Arc<CameraFeed>>> = Mutex::new(None);
+
+/// Numbers every camera picture, whichever camera or format it's from: a
+/// new format's pictures carry on from the last ones, not from 0 (a reader
+/// waiting for one newer than the last it had would wait for as many again).
+static PICTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Counts the camera's pictures that differ from the one before. With a long
+/// exposure a camera keeps sending frames at its rate but repeats pictures in
+/// them (the very same bytes): this counts what's new, its real rate.
+static NEW_PICTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A quick fingerprint of a picture: a few thousand of its bytes, spread
+/// over it. A repeated picture has the same; a new one (sensor noise alone)
+/// a different one.
+fn fingerprint(bytes: &[u8]) -> u64 {
+    let step = (bytes.len() / 4096).max(1);
+    bytes.iter().step_by(step).fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100_0000_01b3))
+}
 
 impl CameraFeed {
     fn latest(&self) -> Option<Arc<CameraPicture>> {
@@ -92,10 +112,22 @@ pub fn keep_open(want: Option<(String, Option<Format>)>) {
         set_status(Status::Off);
         return;
     };
-    let feed = Arc::new(CameraFeed { device, format, frame: Mutex::new(None), stop: AtomicBool::new(false) });
+    let feed = Arc::new(CameraFeed { device, format, frame: Mutex::new(None), seq: Default::default(), stop: AtomicBool::new(false) });
     *current = Some(feed.clone());
-    thread::spawn(move || run(feed));
+    // The camera before is let go of first (its ffmpeg ends after its next
+    // picture): opened while that still holds it, a camera is busy.
+    let mut running = RUNNING.lock().unwrap();
+    let before = running.take();
+    *running = Some(thread::spawn(move || {
+        if let Some(t) = before {
+            let _ = t.join();
+        }
+        run(feed)
+    }));
 }
+
+/// The thread of the camera opened last, to wait for before opening another.
+static RUNNING: Mutex<Option<thread::JoinHandle<()>>> = Mutex::new(None);
 
 /// Open the camera and keep it open until told to stop, reopening it when it
 /// goes away (unplugged, taken by another app) and comes back.
@@ -147,6 +179,7 @@ fn stream(feed: &CameraFeed) -> Result<()> {
     let mut live = false;
     // The picture before last's memory, once nobody holds it, for the next one.
     let mut spare: Option<Vec<u8>> = None;
+    let mut last_print = None;
     let result = loop {
         if feed.stop.load(Ordering::Relaxed) {
             break Ok(());
@@ -156,9 +189,18 @@ fn stream(feed: &CameraFeed) -> Result<()> {
         if out.read_exact(&mut buf).is_err() {
             break Err(anyhow!("the camera stopped"));
         }
+        let print = fingerprint(&buf);
+        if last_print != Some(print) {
+            NEW_PICTURES.fetch_add(1, Ordering::Relaxed);
+            last_print = Some(print);
+        }
         let old = feed.frame.lock().unwrap().replace(Arc::new(CameraPicture { width: w, height: h, bgra: buf }));
+        feed.seq.store(PICTURES.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Release);
         spare = old.and_then(|a| Arc::try_unwrap(a).ok()).map(|p| p.bgra);
         if !live {
+            // Open: what was set for this camera before goes back on (it
+            // forgets when it's unplugged).
+            apply_remembered(&feed.device);
             set_status(Status::Live { width: w, height: h });
             live = true;
         }
@@ -267,6 +309,168 @@ const V4L2_CAP_DEVICE_CAPS: u32 = 0x8000_0000;
 const V4L2_BUF_TYPE_VIDEO_CAPTURE: u32 = 1;
 const V4L2_FRMSIZE_TYPE_DISCRETE: u32 = 1;
 const V4L2_FRMIVAL_TYPE_DISCRETE: u32 = 1;
+
+/// `struct v4l2_queryctrl`.
+#[repr(C)]
+struct QueryCtrl {
+    id: u32,
+    kind: u32,
+    name: [u8; 32],
+    minimum: i32,
+    maximum: i32,
+    step: i32,
+    default_value: i32,
+    flags: u32,
+    reserved: [u32; 2],
+}
+
+/// `struct v4l2_querymenu` (packed): a menu item's name, or for an integer
+/// menu its value.
+#[repr(C, packed)]
+struct QueryMenu {
+    id: u32,
+    index: u32,
+    name: [u8; 32],
+    reserved: u32,
+}
+
+/// `struct v4l2_control`.
+#[repr(C)]
+struct Control {
+    id: u32,
+    value: i32,
+}
+
+const VIDIOC_G_CTRL: u64 = iorw(27, std::mem::size_of::<Control>(), false);
+const VIDIOC_S_CTRL: u64 = iorw(28, std::mem::size_of::<Control>(), false);
+const VIDIOC_QUERYCTRL: u64 = iorw(36, std::mem::size_of::<QueryCtrl>(), false);
+const VIDIOC_QUERYMENU: u64 = iorw(37, std::mem::size_of::<QueryMenu>(), false);
+const V4L2_CTRL_FLAG_NEXT_CTRL: u32 = 0x8000_0000;
+const V4L2_CTRL_FLAG_DISABLED: u32 = 0x1;
+const V4L2_CTRL_FLAG_READ_ONLY: u32 = 0x4;
+const V4L2_CTRL_FLAG_INACTIVE: u32 = 0x10;
+const V4L2_CTRL_TYPE_INTEGER: u32 = 1;
+const V4L2_CTRL_TYPE_BOOLEAN: u32 = 2;
+const V4L2_CTRL_TYPE_MENU: u32 = 3;
+const V4L2_CTRL_TYPE_INTEGER_MENU: u32 = 9;
+
+/// The controls a camera offers that can be set (exposure, focus, white
+/// balance…), in its order, with their values now.
+pub(crate) fn controls(device: &str) -> Vec<crate::webcam::CameraControl> {
+    use crate::webcam::{CameraControl, ControlKind};
+    let Some(fd) = open(Path::new(device)) else { return Vec::new() };
+    let mut out = Vec::new();
+    let mut id = V4L2_CTRL_FLAG_NEXT_CTRL;
+    loop {
+        // SAFETY: plain integers and byte arrays; all-zero is valid.
+        let mut q: QueryCtrl = unsafe { std::mem::zeroed() };
+        q.id = id;
+        if !ioctl(&fd, VIDIOC_QUERYCTRL, &mut q) {
+            break;
+        }
+        id = q.id | V4L2_CTRL_FLAG_NEXT_CTRL;
+        if q.flags & (V4L2_CTRL_FLAG_DISABLED | V4L2_CTRL_FLAG_READ_ONLY) != 0 {
+            continue;
+        }
+        let kind = match q.kind {
+            V4L2_CTRL_TYPE_INTEGER => ControlKind::Int { min: q.minimum as i64, max: q.maximum as i64, step: q.step.max(1) as i64 },
+            V4L2_CTRL_TYPE_BOOLEAN => ControlKind::Bool,
+            V4L2_CTRL_TYPE_MENU | V4L2_CTRL_TYPE_INTEGER_MENU => {
+                let items: Vec<(i64, String)> = (q.minimum..=q.maximum)
+                    .filter_map(|index| {
+                        // SAFETY: as above.
+                        let mut m: QueryMenu = unsafe { std::mem::zeroed() };
+                        m.id = q.id;
+                        m.index = index as u32;
+                        if !ioctl(&fd, VIDIOC_QUERYMENU, &mut m) {
+                            return None;
+                        }
+                        let name = { m.name };
+                        let label = if q.kind == V4L2_CTRL_TYPE_INTEGER_MENU {
+                            i64::from_le_bytes(name[..8].try_into().unwrap()).to_string()
+                        } else {
+                            String::from_utf8_lossy(&name).trim_end_matches('\0').trim().to_owned()
+                        };
+                        Some((index as i64, label))
+                    })
+                    .collect();
+                if items.is_empty() {
+                    continue;
+                }
+                ControlKind::Menu(items)
+            }
+            // Buttons, strings, classes (headings): not offered.
+            _ => continue,
+        };
+        let mut c = Control { id: q.id, value: 0 };
+        let value = if ioctl(&fd, VIDIOC_G_CTRL, &mut c) { c.value as i64 } else { q.default_value as i64 };
+        out.push(CameraControl {
+            id: q.id,
+            name: String::from_utf8_lossy(&q.name).trim_end_matches('\0').trim().to_owned(),
+            kind,
+            value,
+            default: q.default_value as i64,
+            inactive: q.flags & V4L2_CTRL_FLAG_INACTIVE != 0,
+        });
+    }
+    out
+}
+
+/// Put back the settings remembered for camera `device`: switches and menus
+/// first (a manual exposure time is only taken once automatic exposure is
+/// off), then the rest.
+fn apply_remembered(device: &str) {
+    let saved = crate::webcam::remembered_controls(device);
+    if saved.is_empty() {
+        return;
+    }
+    let all = controls(device);
+    let kind_first = |id: u32| all.iter().find(|c| c.id == id).is_some_and(|c| !matches!(c.kind, crate::webcam::ControlKind::Int { .. }));
+    let (first, rest): (Vec<_>, Vec<_>) = saved.into_iter().partition(|(id, _)| kind_first(*id));
+    for (id, value) in first {
+        if let Err(e) = set_control(device, id, value) {
+            eprintln!("camera setting {id:#x}: {e:#}");
+        }
+    }
+    // The rest, unless the switches just set leave them doing nothing (a
+    // white balance temperature while white balance is automatic): the camera
+    // refuses those.
+    let now = controls(device);
+    for (id, value) in rest {
+        if now.iter().any(|c| c.id == id && c.inactive) {
+            continue;
+        }
+        if let Err(e) = set_control(device, id, value) {
+            eprintln!("camera setting {id:#x}: {e:#}");
+        }
+    }
+}
+
+/// The open camera's newest picture, shrunk to at most `max_width` wide, as
+/// R, G, B, A; `None` if there's none newer than picture `newer_than`.
+pub(crate) fn picture(max_width: u32, newer_than: u64) -> Option<crate::webcam::CameraPreview> {
+    let feed = CURRENT.lock().unwrap().clone().filter(|f| !f.stop.load(Ordering::Relaxed))?;
+    let seq = feed.seq.load(Ordering::Acquire);
+    if seq <= newer_than {
+        return None;
+    }
+    let p = feed.latest()?;
+    let scale = (max_width as f64 / p.width as f64).min(1.0);
+    let (w, h) = (((p.width as f64 * scale).round() as u32).max(1), ((p.height as f64 * scale).round() as u32).max(1));
+    let mut rgba = vec![0u8; w as usize * h as usize * 4];
+    super::image::resample(&p.bgra, (p.width as usize, p.height as usize), p.width as usize * 4, true, &mut rgba, (w as usize, h as usize));
+    Some(crate::webcam::CameraPreview { width: w, height: h, rgba, seq, new_pictures: NEW_PICTURES.load(Ordering::Relaxed) })
+}
+
+/// Set a camera's control `id` to `value`; it applies at once, in every app.
+pub(crate) fn set_control(device: &str, id: u32, value: i64) -> Result<()> {
+    let fd = open(Path::new(device)).context("can't open the camera")?;
+    let mut c = Control { id, value: value as i32 };
+    if !ioctl(&fd, VIDIOC_S_CTRL, &mut c) {
+        bail!("the camera didn't take it: {}", std::io::Error::last_os_error());
+    }
+    Ok(())
+}
 
 fn ioctl<T>(fd: &std::fs::File, request: u64, arg: &mut T) -> bool {
     // SAFETY: `arg` is the request's own struct, laid out as the kernel's.
@@ -393,6 +597,107 @@ fn intervals(fd: &std::fs::File, pixel: u32, width: u32, height: u32) -> Vec<(u3
 mod tests {
     use super::*;
 
+
+    /// Switching a camera's format reopens it without it being busy (the
+    /// one before let go of first).
+    #[test]
+    #[ignore = "uses a camera nothing else has open: HASTECLIP_WEBCAM=<device> cargo test -p capture switches_format -- --ignored"]
+    fn switches_format() {
+        let device = std::env::var("HASTECLIP_WEBCAM").unwrap();
+        let formats = formats_of(&std::fs::canonicalize(&device).unwrap()).unwrap();
+        let (a, b) = (formats[0].0, formats[formats.len() / 2].0);
+        let live = |want: (u32, u32)| {
+            let t = std::time::Instant::now();
+            let mut seen = Vec::new();
+            loop {
+                let s = crate::webcam::status();
+                if seen.last() != Some(&s) {
+                    seen.push(s.clone());
+                }
+                if s == (crate::webcam::Status::Live { width: want.0, height: want.1 }) || t.elapsed() > Duration::from_secs(8) {
+                    return seen;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        keep_open(Some((device.clone(), Some(a))));
+        let first = live((a.width, a.height));
+        keep_open(Some((device.clone(), Some(b))));
+        let t = std::time::Instant::now();
+        let second = live((b.width, b.height));
+        eprintln!("{} then {} in {} ms: {first:?} → {second:?}", a.label(), b.label(), t.elapsed().as_millis());
+        keep_open(None);
+        thread::sleep(Duration::from_millis(300));
+        assert!(!second.iter().any(|s| matches!(s, crate::webcam::Status::Unavailable(_))), "busy on the way");
+        assert_eq!(second.last(), Some(&crate::webcam::Status::Live { width: b.width, height: b.height }));
+    }
+
+    /// With a long exposure the camera repeats pictures: frames keep coming
+    /// at its rate, new pictures far fewer.
+    #[test]
+    #[ignore = "changes a camera's exposure for a moment: HASTECLIP_WEBCAM=<device> cargo test -p capture repeats_pictures -- --ignored"]
+    fn repeats_pictures_with_a_long_exposure() {
+        let device = std::env::var("HASTECLIP_WEBCAM").unwrap();
+        let all = controls(&device);
+        let auto = all.iter().find(|c| c.id == 0x9a0901).expect("auto exposure").clone();
+        let time = all.iter().find(|c| c.id == 0x9a0902).expect("exposure time").clone();
+        keep_open(Some((device.clone(), None)));
+        thread::sleep(Duration::from_secs(2));
+        let rate = |secs: u64| {
+            let (f0, n0) = (PICTURES.load(Ordering::Relaxed), NEW_PICTURES.load(Ordering::Relaxed));
+            thread::sleep(Duration::from_secs(secs));
+            ((PICTURES.load(Ordering::Relaxed) - f0) / secs, (NEW_PICTURES.load(Ordering::Relaxed) - n0) / secs)
+        };
+        set_control(&device, auto.id, 1).unwrap();
+        set_control(&device, time.id, 50).unwrap();
+        thread::sleep(Duration::from_millis(500));
+        let short = rate(2);
+        set_control(&device, time.id, 1000).unwrap();
+        thread::sleep(Duration::from_millis(500));
+        let long = rate(2);
+        set_control(&device, time.id, time.value).unwrap();
+        set_control(&device, auto.id, auto.value).unwrap();
+        keep_open(None);
+        eprintln!("frames, new pictures a second: 5 ms {short:?}, 100 ms {long:?}");
+        assert!(long.1 < long.0, "no repeats at 100 ms");
+    }
+
+    /// Settings remembered for a camera go back on when it's opened.
+    #[test]
+    #[ignore = "uses a camera nothing else has open: HASTECLIP_WEBCAM=<device> cargo test -p capture remembered_settings -- --ignored"]
+    fn remembered_settings_go_back_on() {
+        let device = std::env::var("HASTECLIP_WEBCAM").unwrap();
+        let b = controls(&device).into_iter().find(|c| c.name.to_lowercase().contains("brightness")).expect("brightness");
+        crate::webcam::remember_controls(&device, vec![(b.id, b.default + 7)]);
+        keep_open(Some((device.clone(), None)));
+        let t = std::time::Instant::now();
+        while !matches!(crate::webcam::status(), crate::webcam::Status::Live { .. }) && t.elapsed() < Duration::from_secs(10) {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let now = controls(&device).into_iter().find(|c| c.id == b.id).unwrap().value;
+        let picture = picture(320, 0).map(|p| (p.width, p.height));
+        keep_open(None);
+        set_control(&device, b.id, b.default).unwrap();
+        eprintln!("brightness after opening: {now} (default {}), picture {picture:?}", b.default);
+        assert_eq!(now, b.default + 7);
+        assert!(picture.is_some_and(|(w, _)| w == 320));
+    }
+
+    /// A camera's settings are listed with their values, and one set reads back.
+    #[test]
+    #[ignore = "uses a camera: HASTECLIP_WEBCAM=<device> cargo test -p capture camera_settings -- --ignored"]
+    fn camera_settings() {
+        let device = std::env::var("HASTECLIP_WEBCAM").unwrap();
+        let all = controls(&device);
+        for c in &all {
+            eprintln!("{:>10x} {:32} {:?} = {} (default {}){}", c.id, c.name, c.kind, c.value, c.default, if c.inactive { " inactive" } else { "" });
+        }
+        let b = all.iter().find(|c| c.name.to_lowercase().contains("brightness")).expect("brightness");
+        set_control(&device, b.id, b.default + 1).unwrap();
+        let now = controls(&device).into_iter().find(|c| c.id == b.id).unwrap().value;
+        set_control(&device, b.id, b.value).unwrap();
+        assert_eq!(now, b.default + 1);
+    }
     #[test]
     fn ioctl_numbers_match_the_kernel() {
         assert_eq!(VIDIOC_QUERYCAP, 0x8068_5600);

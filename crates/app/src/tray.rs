@@ -70,14 +70,14 @@ fn tray_image() -> Option<tray_icon::Icon> {
         // SAFETY: no arguments to get wrong.
         let want = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16);
         const SIZES: [(i32, &[u8]); 8] = [
-            (16, include_bytes!("../assets/tray/windows-16.png")),
-            (20, include_bytes!("../assets/tray/windows-20.png")),
-            (24, include_bytes!("../assets/tray/windows-24.png")),
-            (28, include_bytes!("../assets/tray/windows-28.png")),
-            (32, include_bytes!("../assets/tray/windows-32.png")),
-            (40, include_bytes!("../assets/tray/windows-40.png")),
-            (48, include_bytes!("../assets/tray/windows-48.png")),
-            (64, include_bytes!("../assets/tray/windows-64.png")),
+            (16, include_bytes!("../assets/tray/glyph-16.png")),
+            (20, include_bytes!("../assets/tray/glyph-20.png")),
+            (24, include_bytes!("../assets/tray/glyph-24.png")),
+            (28, include_bytes!("../assets/tray/glyph-28.png")),
+            (32, include_bytes!("../assets/tray/glyph-32.png")),
+            (40, include_bytes!("../assets/tray/glyph-40.png")),
+            (48, include_bytes!("../assets/tray/glyph-48.png")),
+            (64, include_bytes!("../assets/tray/glyph-64.png")),
         ];
         // The size asked for, else the next bigger one (scaled down a little,
         // which stays smooth), else the biggest.
@@ -91,7 +91,9 @@ fn tray_image() -> Option<tray_icon::Icon> {
 impl Tray {
     /// The tray icon, or `None` where there's none. `tx`: commands from
     /// elsewhere too (another launch asking to be shown).
-    pub fn new(ctx: &egui::Context, icon: &egui::IconData, tx: mpsc::Sender<Cmd>, rx: Receiver<Cmd>) -> Option<Self> {
+    /// `quick`: saves a clip from the tray's own thread (Linux: the UI's
+    /// doesn't run while the window's hidden).
+    pub fn new(ctx: &egui::Context, tx: mpsc::Sender<Cmd>, rx: Receiver<Cmd>, quick: crate::service::QuickSave) -> Option<Self> {
         #[cfg(any(windows, target_os = "macos"))]
         {
             use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
@@ -103,7 +105,6 @@ impl Tray {
             let quit = MenuItem::new("Quit HasteClip", true, None);
             let menu = Menu::new();
             menu.append_items(&[&open, &PredefinedMenuItem::separator(), &save, &buffer, &PredefinedMenuItem::separator(), &quit]).ok()?;
-            let _ = icon;
             let image = tray_image()?;
             // macOS: a template image, tinted by macOS to suit the menu bar
             // (white on a dark one, black on a light one), as its own icons.
@@ -140,12 +141,12 @@ impl Tray {
         }
         #[cfg(target_os = "linux")]
         {
-            let inner = linux::spawn(ctx, icon, tx)?;
+            let inner = linux::spawn(ctx, tx, quick)?;
             Some(Self { rx, inner, buffering: Default::default() })
         }
         #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
         {
-            let _ = (ctx, icon, tx, rx);
+            let _ = (ctx, tx, rx, quick);
             None
         }
     }
@@ -204,11 +205,28 @@ mod linux {
         icon: Vec<ksni::Icon>,
         tx: mpsc::Sender<Cmd>,
         ctx: egui::Context,
+        quick: crate::service::QuickSave,
         pub buffering: bool,
     }
 
     impl Item {
+        /// Do `cmd`. While the window's hidden (KDE under Wayland), the app's
+        /// UI doesn't run: opening it, saving a clip and quitting are done
+        /// from here; starting or stopping clipping brings the window back to
+        /// do it.
         fn send(&self, cmd: Cmd) {
+            if crate::kwin_window::hidden() {
+                match cmd {
+                    Cmd::Open | Cmd::ToggleBuffer => {
+                        crate::kwin_window::bring_back();
+                    }
+                    Cmd::SaveClip => {
+                        self.quick.save();
+                        return;
+                    }
+                    Cmd::Quit => crate::quit_now(),
+                }
+            }
             let _ = self.tx.send(cmd);
             self.ctx.request_repaint();
         }
@@ -253,21 +271,34 @@ mod linux {
     }
 
     /// Put the item in the tray. `None` where nothing shows tray icons.
-    pub fn spawn(ctx: &egui::Context, icon: &egui::IconData, tx: mpsc::Sender<Cmd>) -> Option<ksni::blocking::Handle<Item>> {
+    pub fn spawn(ctx: &egui::Context, tx: mpsc::Sender<Cmd>, quick: crate::service::QuickSave) -> Option<ksni::blocking::Handle<Item>> {
         if !host_present() {
             eprintln!("no tray icon: this desktop doesn't show tray icons (on GNOME, the AppIndicator extension adds them); closing the window quits");
             return None;
         }
-        // Trays show 16–48 px: a few sizes (sent again with every change, so
-        // not the 1024 px original), ARGB32 in network byte order as
-        // StatusNotifierItem wants it.
-        let full = image::RgbaImage::from_raw(icon.width, icon.height, icon.rgba.clone())?;
-        let sizes = [22, 32, 48, 64].map(|size| {
-            let small = image::imageops::resize(&full, size, size, image::imageops::FilterType::Lanczos3);
-            let data = small.pixels().flat_map(|p| [p[3], p[0], p[1], p[2]]).collect();
-            ksni::Icon { width: size as i32, height: size as i32, data }
-        });
-        let item = Item { icon: sizes.to_vec(), tx, ctx: ctx.clone(), buffering: false };
+        // The glyph alone, as the tray's other icons are (and as on Windows),
+        // drawn at the sizes trays show (16–64 px), for the tray to pick
+        // from; ARGB32 in network byte order as StatusNotifierItem wants it.
+        const SIZES: [&[u8]; 8] = [
+            include_bytes!("../assets/tray/glyph-16.png"),
+            include_bytes!("../assets/tray/glyph-20.png"),
+            include_bytes!("../assets/tray/glyph-24.png"),
+            include_bytes!("../assets/tray/glyph-28.png"),
+            include_bytes!("../assets/tray/glyph-32.png"),
+            include_bytes!("../assets/tray/glyph-40.png"),
+            include_bytes!("../assets/tray/glyph-48.png"),
+            include_bytes!("../assets/tray/glyph-64.png"),
+        ];
+        let sizes: Vec<ksni::Icon> = SIZES
+            .iter()
+            .filter_map(|png| image::load_from_memory_with_format(png, image::ImageFormat::Png).ok())
+            .map(|img| {
+                let img = img.to_rgba8();
+                let data = img.pixels().flat_map(|p| [p[3], p[0], p[1], p[2]]).collect();
+                ksni::Icon { width: img.width() as i32, height: img.height() as i32, data }
+            })
+            .collect();
+        let item = Item { icon: sizes, tx, ctx: ctx.clone(), quick, buffering: false };
         match item.spawn() {
             Ok(handle) => Some(handle),
             Err(e) => {
@@ -310,6 +341,9 @@ pub fn serve(listener: std::net::TcpListener, ctx: &egui::Context, tx: mpsc::Sen
         for mut stream in listener.incoming().flatten() {
             let mut word = [0u8; 4];
             if stream.read_exact(&mut word).is_ok() && &word == b"show" {
+                // Hidden (KDE under Wayland): the UI doesn't run to hear it.
+                #[cfg(target_os = "linux")]
+                crate::kwin_window::bring_back();
                 let _ = tx.send(Cmd::Open);
                 ctx.request_repaint();
             }

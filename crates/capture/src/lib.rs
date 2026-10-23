@@ -15,7 +15,11 @@ pub mod audio;
 #[cfg(target_os = "macos")]
 mod avwriter;
 pub mod mixer;
+/// Hearing a microphone live: through PipeWire on Linux (`linux::monitor`).
+#[cfg(not(target_os = "linux"))]
 pub mod monitor;
+#[cfg(target_os = "linux")]
+pub use linux::monitor;
 pub mod mp4meta;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(crate) mod mp4read;
@@ -213,13 +217,22 @@ pub fn frame_size(source: &VideoSource, target_height: Option<u32>, shape: Optio
         let _ = id;
         None
     };
+    // Cropped: what's kept, as a display that size.
+    let native = match source {
+        VideoSource::Screen { crop: Some(c), .. } => native.map(|(w, h)| {
+            let [_, _, w, h] = c.rect(w, h);
+            (w, h)
+        }),
+        _ => native,
+    };
     native.map(|(w, h)| recorded_size(w, h, target_height, shape))
 }
 
 /// The fastest a recording of `source` can look at the screen for frame
-/// blending, if there's a limit: on macOS the display's refresh rate (games
-/// and apps: the main display's), as ScreenCaptureKit only sees what the
-/// display shows. Windows takes the game's own pictures: no limit.
+/// blending, if there's a limit: on macOS and Linux the display's refresh
+/// rate (games and apps: the main display's on macOS, the fastest's on
+/// Linux), as ScreenCaptureKit and the compositor only see what the display
+/// shows. Windows takes the game's own pictures: no limit.
 pub fn max_blend_rate(source: &VideoSource) -> Option<u32> {
     #[cfg(target_os = "macos")]
     {
@@ -229,10 +242,28 @@ pub fn max_blend_rate(source: &VideoSource) -> Option<u32> {
         };
         mac::display_refresh(id)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        display_refresh(source)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = source;
         None
+    }
+}
+
+/// Whether frame blending can be done here: Windows and macOS, and Linux
+/// where the graphics card takes the screen's pictures (Vulkan that imports
+/// DMA-BUFs). Quick after the first time.
+pub fn frame_blending() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux::frame_blending()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        cfg!(any(target_os = "windows", target_os = "macos"))
     }
 }
 
@@ -252,11 +283,47 @@ pub fn display_refresh(source: &VideoSource) -> Option<u32> {
     {
         win::system::display_refresh(id)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::display_refresh(id)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         let _ = id;
         None
     }
+}
+
+/// The part of a display kept, in its pixels: `w`×`h`, its top-left corner
+/// at `at`, or in the middle. Kept inside the display, and even, for the
+/// encoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Crop {
+    pub w: u32,
+    pub h: u32,
+    pub at: Option<(u32, u32)>,
+}
+
+impl Crop {
+    /// Where it is on a `cw`×`ch` display: (left, top, width, height).
+    pub fn rect(&self, cw: u32, ch: u32) -> [u32; 4] {
+        let w = self.w.clamp(2, cw.max(2)) & !1;
+        let h = self.h.clamp(2, ch.max(2)) & !1;
+        let (x, y) = self.at.unwrap_or((cw.saturating_sub(w) / 2, ch.saturating_sub(h) / 2));
+        [x.min(cw.saturating_sub(w)), y.min(ch.saturating_sub(h)), w, h]
+    }
+}
+
+/// Whether a screen can be cropped ([`VideoSource::Screen`]'s `crop`) here.
+pub const SCREEN_CROP: bool = cfg!(target_os = "linux");
+
+/// [`placement`] of part of a picture: `crop` of it, if any.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn placement_cropped(crop: Option<Crop>, (cw, ch): (u32, u32), frame: (u32, u32), framing: Framing) -> ([u32; 4], [u32; 4]) {
+    let Some(c) = crop else { return placement((cw, ch), frame, framing) };
+    let [x, y, w, h] = c.rect(cw, ch);
+    let ([sx, sy, sw, sh], dest) = placement((w, h), frame, framing);
+    ([x + sx, y + sy, sw, sh], dest)
 }
 
 /// What a recording's video shows. This is the bottom layer of the picture;
@@ -266,7 +333,10 @@ pub enum VideoSource {
     /// A whole display, by backend id (see [`list_screens`]), captured the
     /// way `method` says (Windows). A game that needs the game capture hook,
     /// fullscreen and in focus on it, is recorded through the hook while it is.
-    Screen { id: String, hook: GameHook, method: ScreenCapture },
+    /// `crop`: its sides cut off, the rest recorded as a display that size
+    /// would be (a game running at a lower resolution than the display,
+    /// black around it).
+    Screen { id: String, hook: GameHook, method: ScreenCapture, crop: Option<Crop> },
     /// Games and apps, by executable name (see [`list_windowed_apps`]): records
     /// whichever of them was last in focus, for as long as it's showing, even
     /// while you click into something else. When it stops showing (minimized,
@@ -422,8 +492,28 @@ pub struct StillImage {
     pub bgra: Vec<u8>,
 }
 
-/// Whether this platform can record games and apps ([`VideoSource::Apps`]).
-pub const APP_CAPTURE: bool = cfg!(any(target_os = "windows", target_os = "macos"));
+/// Before the app exits, once capture has stopped: end what still runs in
+/// the background (on Linux a screen cast kept a moment for reuse), so none
+/// of it is using the graphics card while the process exits.
+pub fn shutdown() {
+    #[cfg(target_os = "linux")]
+    linux::shutdown();
+}
+
+/// Whether games and apps can be recorded here ([`VideoSource::Apps`]):
+/// on Windows and macOS, and on Linux on KDE Plasma's Wayland session so far.
+/// Asked once; quick after that.
+pub fn app_capture() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *AVAILABLE.get_or_init(linux::app_capture)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        cfg!(any(target_os = "windows", target_os = "macos"))
+    }
+}
 
 /// Running apps with a window, for [`VideoSource::Apps`], sorted by name.
 pub fn list_windowed_apps() -> Vec<Device> {
@@ -435,16 +525,21 @@ pub fn list_windowed_apps() -> Vec<Device> {
     {
         mac::windows::list_windowed_apps()
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::list_windowed_apps()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         Vec::new()
     }
 }
 
 /// The icon of an app source's app ([`sources::SourceKind::App`]'s id: a
-/// bundle id on macOS, an executable on Windows), as `size`×`size` RGBA with
-/// straight alpha. `None` where there isn't one to show: Linux, a program
-/// without an app bundle, or on Windows an app that isn't running. Slow-ish
+/// bundle id on macOS, an executable on Windows, a program's file name on
+/// Linux), as `size`×`size` RGBA with straight alpha. `None` where there
+/// isn't one to show: a program without an app bundle, on Windows an app
+/// that isn't running, on Linux one the icon theme doesn't have. Slow-ish
 /// (it reads files): call it off the UI thread.
 pub fn app_icon(id: &str, size: u32) -> Option<Vec<u8>> {
     #[cfg(target_os = "windows")]
@@ -455,7 +550,11 @@ pub fn app_icon(id: &str, size: u32) -> Option<Vec<u8>> {
     {
         mac::windows::app_icon(id, size)
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::app_icon(id, size)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         let _ = (id, size);
         None
@@ -726,8 +825,8 @@ impl PendingClip {
     }
 }
 
-/// Whether [`Recorder::screenshot`] can take one here (Windows, so far).
-pub const SCREENSHOTS: bool = cfg!(target_os = "windows");
+/// Whether [`Recorder::screenshot`] can take one here (Windows and Linux, so far).
+pub const SCREENSHOTS: bool = cfg!(any(target_os = "windows", target_os = "linux"));
 
 /// A screenshot being taken: its picture is the one up when it was asked
 /// for, copied aside on the graphics card; [`PendingShot::finish`] reads it
@@ -735,7 +834,7 @@ pub const SCREENSHOTS: bool = cfg!(target_os = "windows");
 pub struct PendingShot(Box<dyn FnOnce() -> anyhow::Result<StillImage> + Send>);
 
 impl PendingShot {
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
     pub(crate) fn new(finish: impl FnOnce() -> anyhow::Result<StillImage> + Send + 'static) -> Self {
         Self(Box::new(finish))
     }
@@ -794,7 +893,7 @@ pub trait Recorder {
 
 #[cfg(test)]
 mod size_tests {
-    use super::{Framing, Shape, output_size, placement, recorded_size};
+    use super::{Crop, Framing, Shape, output_size, placement, placement_cropped, recorded_size};
 
     #[test]
     fn output_size_keeps_aspect_and_even() {
@@ -829,6 +928,11 @@ mod size_tests {
 
     #[test]
     fn where_the_picture_goes() {
+        // Cropped: the middle 1600×900 of 2560×1440, then as usual.
+        let crop = Some(Crop { w: 1600, h: 900, at: None });
+        assert_eq!(placement_cropped(crop, (2560, 1440), (1600, 900), Framing::Fit), ([480, 270, 1600, 900], [0, 0, 1600, 900]));
+        // Placed past the edge: moved back in; odd sizes made even.
+        assert_eq!(Crop { w: 1601, h: 901, at: Some((2000, 1000)) }.rect(2560, 1440), [960, 540, 1600, 900]);
         // Fill: the middle 2560 of 3440, over all of the frame.
         assert_eq!(placement((3440, 1440), (2560, 1440), Framing::Fill), ([440, 0, 2560, 1440], [0, 0, 2560, 1440]));
         // Fit: all of it, bars above and below.

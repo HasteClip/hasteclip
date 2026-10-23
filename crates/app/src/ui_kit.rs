@@ -729,7 +729,16 @@ pub fn key_hint(painter: &egui::Painter, left: Pos2, keys: &[String], size: f32,
 pub fn keycaps(ui: &mut egui::Ui, keys: &[String], listening: bool) -> Response {
     let p = theme::pal(ui);
     let font = theme::font(12.5, W::Semibold);
-    let caps: Vec<String> = if listening { vec!["Press keys…".into()] } else { keys.iter().map(|k| key_text(std::slice::from_ref(k))).collect() };
+    // No keys: "Off", as words, not on a key (it isn't one).
+    let off = !listening && keys.is_empty();
+    let plain = listening || off;
+    let caps: Vec<String> = if listening {
+        vec!["Press keys…".into()]
+    } else if off {
+        vec!["Off".into()]
+    } else {
+        keys.iter().map(|k| key_text(std::slice::from_ref(k))).collect()
+    };
     let galleys: Vec<_> = caps.iter().map(|k| ui.painter().layout_no_wrap(k.clone(), font.clone(), p.text)).collect();
     let cap_w = |g: &std::sync::Arc<egui::Galley>| (g.size().x + 10.0).max(22.0);
     let inner: f32 = galleys.iter().map(cap_w).sum::<f32>() + 4.0 * galleys.len().saturating_sub(1) as f32;
@@ -747,11 +756,11 @@ pub fn keycaps(ui: &mut egui::Ui, keys: &[String], listening: bool) -> Response 
     for g in galleys {
         let cw = cap_w(&g);
         let cap = Rect::from_min_size(Pos2::new(x, rect.center().y - 10.0), vec2(cw, 20.0));
-        if !listening {
+        if !plain {
             painter.rect_filled(cap.translate(vec2(0.0, 1.0)), 4, p.line2);
             painter.rect_filled(cap, 4, if p.dark { p.raise } else { Color32::WHITE });
         }
-        painter.galley(cap.center() - g.size() / 2.0, g, if listening { p.text2 } else { p.text });
+        painter.galley(cap.center() - g.size() / 2.0, g, if plain { p.text2 } else { p.text });
         x += cw + 4.0;
     }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -882,8 +891,11 @@ pub fn segmented_opts(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::De
 pub fn select(ui: &mut egui::Ui, value: &str, min_w: f32) -> Response {
     let p = theme::pal(ui);
     let font = theme::font(13.0, W::Medium);
-    let g = ui.painter().layout_no_wrap(value.to_owned(), font, p.text);
-    let target = (g.size().x + 11.0 + 10.0 + 14.0 + 8.0).max(min_w);
+    // Never wider than there's room for: a long value is cut short (…).
+    let chrome = 11.0 + 10.0 + 14.0 + 8.0;
+    let room = ui.available_width().max(min_w.min(ui.available_width()));
+    let g = ui.painter().layout_job(single_line_job(value, font, p.text, (room - chrome).max(20.0)));
+    let target = (g.size().x + chrome).max(min_w).min(room);
     let id = ui.next_auto_id();
     let w = theme::value(ui.ctx(), id.with("w"), target, theme::NORMAL);
     let (rect, resp) = ui.allocate_exact_size(vec2(w, CONTROL_H), Sense::click());
@@ -893,7 +905,9 @@ pub fn select(ui: &mut egui::Ui, value: &str, min_w: f32) -> Response {
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, RADIUS, theme::mix(p.control, p.control_h, hv));
     let tc = if enabled { p.text } else { theme::fade(p.text, 0.55) };
+    let elided = g.elided;
     painter.galley(Pos2::new(rect.left() + 11.0, rect.center().y - g.size().y / 2.0), g, tc);
+    let resp = if elided { resp.on_hover_text(value) } else { resp };
     let rot = theme::toggle(ui.ctx(), resp.id.with("open"), open, theme::NORMAL);
     chevron(&painter, Pos2::new(rect.right() - 15.0, rect.center().y), 4.0, rot, p.text3);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -1295,7 +1309,14 @@ impl<'a> Row<'a> {
         // How wide the control was last frame: beside the label when both
         // fit, else under it (narrow windows), never over it.
         let key = ui.id().with(("row_control_w", self.label));
-        let control_w = ui.data(|d| d.get_temp::<f32>(key)).unwrap_or(0.0);
+        let known_w = ui.data(|d| d.get_temp::<f32>(key));
+        let control_w = known_w.unwrap_or(0.0);
+        // The label's height as last drawn, to centre it on the control (its
+        // line is as tall as a control can be, not just its text).
+        let label_key = ui.id().with(("row_label_h", self.label));
+        let known_h = ui.data(|d| d.get_temp::<f32>(label_key));
+        let label_h = known_h.unwrap_or(20.0);
+        let mut drawn_label_h = 0.0;
         let inner_w = width - pad_x * 2.0;
         let stacked = control_w > 0.0 && control_w + 16.0 + 140.0 > inner_w;
         let label_w = if stacked { inner_w } else { (inner_w - control_w - 16.0).max(120.0) };
@@ -1364,9 +1385,9 @@ impl<'a> Row<'a> {
                     if self.note.is_some() {
                         ui.add_space(9.0);
                     } else {
-                        ui.add_space(((min_h - 20.0) / 2.0).max(0.0));
+                        ui.add_space(((min_h - label_h) / 2.0).max(0.0));
                     }
-                    label(ui);
+                    drawn_label_h = ui.scope(label).response.rect.height();
                     if self.note.is_some() {
                         ui.add_space(8.0);
                     }
@@ -1379,9 +1400,21 @@ impl<'a> Row<'a> {
             })
             .inner
         };
+        // Laid out by last frame's sizes. The first time, the frame is drawn
+        // again with the real ones; after that a change (a control growing as
+        // it animates) is just used next frame: discarding every frame of an
+        // animation made egui warn, and a frame's lag doesn't show.
         if control_rect.is_positive() && (control_rect.width() - control_w).abs() > 0.5 {
             ui.data_mut(|d| d.insert_temp(key, control_rect.width()));
-            ui.ctx().request_discard("a settings row's control changed width");
+            if known_w.is_none() {
+                ui.ctx().request_discard("a settings row's control was measured");
+            }
+        }
+        if self.note.is_none() && drawn_label_h > 0.0 && (drawn_label_h - label_h).abs() > 0.5 {
+            ui.data_mut(|d| d.insert_temp(label_key, drawn_label_h));
+            if known_h.is_none() {
+                ui.ctx().request_discard("a settings row's label was measured");
+            }
         }
         (r, clicked_locked)
     }

@@ -44,8 +44,18 @@ pub fn save_mp3(clip: &Path, out: &Path) -> Result<(), String> {
     Err(why.lines().last().unwrap_or("ffmpeg failed").to_owned())
 }
 
-/// Whether clips can be dragged out of the window into other apps.
-pub const CAN_DRAG_OUT: bool = cfg!(any(target_os = "macos", target_os = "windows"));
+/// Whether clips can be dragged out of the window into other apps: on
+/// Windows and macOS, and on Linux under Wayland (`wayland_drag`).
+pub fn can_drag_out() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        crate::wayland_drag::available()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        cfg!(any(target_os = "macos", target_os = "windows"))
+    }
+}
 
 /// Start a native drag of `files` out of the window. The drag image is the
 /// first clip's thumbnail (a JPEG on disk) when we have one, as a little stack
@@ -63,7 +73,12 @@ pub fn start_drag(frame: &eframe::Frame, files: Vec<PathBuf>, preview: Option<Pa
     .map_err(|e| e.to_string())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(target_os = "linux")]
+pub fn start_drag(frame: &eframe::Frame, files: Vec<PathBuf>, _preview: Option<PathBuf>) -> Result<(), String> {
+    crate::wayland_drag::start(frame, &files)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 pub fn start_drag(_frame: &eframe::Frame, _files: Vec<PathBuf>, _preview: Option<PathBuf>) -> Result<(), String> {
     Err("dragging clips out isn't available here — use Copy clip".into())
 }

@@ -9,7 +9,7 @@ build() {
   CARGO_TARGET_DIR=/target cargo build -q -p hasteclip 2>&1 | grep -E "^error" -A5 || true
   cp /tmp/Cargo.toml.orig Cargo.toml; cp /tmp/Cargo.lock.orig Cargo.lock
   cp /target/debug/hasteclip $out/
-  cp crates/app/assets/io.github.kaillr.HasteClip.desktop crates/app/assets/icon.svg $out/
+  cp crates/app/assets/io.github.kaillr.HasteClip.desktop crates/app/assets/icon-glyph.svg $out/
   printf "HasteClip $v for Linux (x86-64)\n" > $out/README.txt
   echo "only-in-$v" > $out/marker-$v.txt
 }

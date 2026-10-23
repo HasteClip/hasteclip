@@ -161,7 +161,7 @@ impl OutputResolution {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CaptureTarget {
-    /// The display chosen by `display_index`.
+    /// The display chosen by `display_id`.
     #[default]
     Screen,
     /// Games and apps: whichever is in focus is recorded (see
@@ -593,6 +593,29 @@ impl Default for GameTitles {
     }
 }
 
+/// The part of the screen kept, in its pixels: `w`×`h`, its top-left
+/// corner at `at`, or in the middle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScreenCrop {
+    pub w: u32,
+    pub h: u32,
+    pub at: Option<[u32; 2]>,
+}
+
+impl ScreenCrop {
+    /// No size: none of it cut off.
+    pub fn is_none(&self) -> bool {
+        self.w == 0 || self.h == 0
+    }
+}
+
+impl From<ScreenCrop> for capture::Crop {
+    fn from(c: ScreenCrop) -> Self {
+        capture::Crop { w: c.w, h: c.h, at: c.at.map(|[x, y]| (x, y)) }
+    }
+}
+
 /// A part of an osu! clip's name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -669,7 +692,16 @@ pub struct RecordSettings {
     pub idle_apps: Option<CaptureTarget>,
     /// A webcam over the picture, if any.
     pub webcam: Option<WebcamCfg>,
-    /// Index into the runtime-detected display list.
+    /// Each camera's settings changed from its defaults (Linux: V4L2 control
+    /// id to value), by camera id: put back each time it's opened, as
+    /// cameras forget them when unplugged.
+    pub camera_controls: std::collections::BTreeMap<String, std::collections::BTreeMap<u32, i64>>,
+    /// The chosen display's id (`capture::Device::id`), so the choice stays
+    /// with that display when others are plugged in or listed in another
+    /// order. The main display when it isn't connected.
+    pub display_id: Option<String>,
+    /// Where the chosen display was in the list: what settings from before
+    /// `display_id` have, and still written for them.
     pub display_index: usize,
     pub fps: u32,
     /// Live frame blending: look at the screen this many times a second and
@@ -684,6 +716,10 @@ pub struct RecordSettings {
     pub shape: Option<[u32; 2]>,
     /// How the screen goes into that shape.
     pub framing: Framing,
+    /// The part of the screen kept (a game at a lower resolution than the
+    /// display, black around it): set on Sources. It's recorded as a display
+    /// that size would be.
+    pub screen_crop: Option<ScreenCrop>,
     pub video_bitrate_mbps: u32,
 
     pub replay_seconds: u32,
@@ -778,6 +814,8 @@ impl Default for RecordSettings {
             capture: CaptureTarget::Screen,
             idle_apps: None,
             webcam: None,
+            camera_controls: Default::default(),
+            display_id: None,
             display_index: 0,
             fps: 60,
             blend_fps: 0,
@@ -785,6 +823,7 @@ impl Default for RecordSettings {
             resolution: OutputResolution::Native,
             shape: None,
             framing: Framing::Fill,
+            screen_crop: None,
             video_bitrate_mbps: 40,
 
             replay_seconds: 60,

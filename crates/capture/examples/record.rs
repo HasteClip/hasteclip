@@ -86,6 +86,7 @@ default: {:?}", d.inputs.iter().map(|i| &i.name).collect::<Vec<_>>(), d.default_
                         Some("wgc") => capture::ScreenCapture::Wgc,
                         _ => capture::ScreenCapture::Auto,
                     },
+                    crop: None,
                 },
             }
         },

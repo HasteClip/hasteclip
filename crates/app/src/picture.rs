@@ -132,7 +132,7 @@ impl Picture {
         if zoomed && resp.dragged() {
             self.pan_to += resp.drag_delta();
             self.pan = self.pan_to;
-        } else if !zoomed && crate::share::CAN_DRAG_OUT && resp.drag_started() {
+        } else if !zoomed && crate::share::can_drag_out() && resp.drag_started() {
             self.drag_out = true;
         }
         self.clamp(stage, fit);

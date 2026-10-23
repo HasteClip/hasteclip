@@ -14,7 +14,8 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use std::thread::{self, JoinHandle};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -135,18 +136,29 @@ fn render_node() -> Option<String> {
 /// ffmpeg can list NVENC without an NVIDIA card, or VA-API without a driver
 /// that encodes H.264). Found once per run.
 pub fn encoder(hardware: bool) -> Result<Codec> {
-    static HW: OnceLock<Option<Codec>> = OnceLock::new();
-    static SW: OnceLock<Option<Codec>> = OnceLock::new();
+    // What was found, kept: unless the graphics card's encoder was wanted
+    // and only the CPU's worked, which may have been a moment's hiccup (the
+    // card still letting go of an app that just quit): looked for again on
+    // the next start.
+    static FOUND: Mutex<[Option<Codec>; 2]> = Mutex::new([None, None]);
+    if let Some(c) = FOUND.lock().unwrap()[usize::from(hardware)] {
+        return Ok(c);
+    }
     let candidates: &[Codec] =
         if hardware { &[Codec::Nvenc, Codec::Vaapi, Codec::X264, Codec::OpenH264] } else { &[Codec::X264, Codec::OpenH264] };
-    let found = (if hardware { &HW } else { &SW }).get_or_init(|| {
-        let listed = ffmpeg().arg("-encoders").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
-        candidates
-            .iter()
-            .copied()
-            .filter(|c| listed.split_whitespace().any(|w| w == c.ffmpeg_name()))
-            .find(|c| works(*c))
+    let listed = ffmpeg().arg("-encoders").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    let gpu = |c: &Codec| matches!(c, Codec::Nvenc | Codec::Vaapi);
+    let found = candidates.iter().copied().filter(|c| listed.split_whitespace().any(|w| w == c.ffmpeg_name())).find(|c| {
+        // A card's encoder gets a second try a moment later.
+        works(*c) || (gpu(c) && {
+            thread::sleep(Duration::from_millis(300));
+            works(*c)
+        })
     });
+    let has_gpu_encoder = candidates.iter().any(|c| gpu(c) && listed.split_whitespace().any(|w| w == c.ffmpeg_name()));
+    if found.is_some_and(|c| !hardware || gpu(&c) || !has_gpu_encoder) {
+        FOUND.lock().unwrap()[usize::from(hardware)] = found;
+    }
     found.ok_or_else(|| {
         anyhow!(
             "ffmpeg can't encode H.264 here: install an ffmpeg with libx264 (on Fedora, RPM Fusion's `ffmpeg`), \
@@ -162,12 +174,13 @@ fn works(codec: Codec) -> bool {
         .args(codec.args(w, h, 30, 1000, 30))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
     {
         Ok(c) => c,
         Err(_) => return false,
     };
+    let errors = spawn_stderr(child.stderr.take().unwrap());
     let frame = vec![128u8; (w * h * 3 / 2) as usize];
     let mut stdin = child.stdin.take().unwrap();
     let writer = thread::spawn(move || {
@@ -180,16 +193,23 @@ fn works(codec: Codec) -> bool {
     let mut out = Vec::new();
     let _ = child.stdout.take().unwrap().read_to_end(&mut out);
     let _ = writer.join();
-    let ok = child.wait().is_ok_and(|s| s.success());
-    ok && split_access_units(&mut out, true).len() == 5
+    let ok = child.wait().is_ok_and(|s| s.success()) && split_access_units(&mut out, true).len() == 5;
+    if !ok && let Some(why) = errors.join().ok().flatten() {
+        eprintln!("video encoder {} didn't work: {}", codec.ffmpeg_name(), why.lines().last().unwrap_or_default());
+    }
+    ok
 }
 
 // ---------------------------------------------------------------------------
 // H.264
 // ---------------------------------------------------------------------------
 
-/// Frames waiting for ffmpeg before the pacer starts dropping them.
-const QUEUE: usize = 4;
+/// Frames waiting for ffmpeg before the pacer starts dropping them: a
+/// quarter of a second's, so a busy moment (a compile on every core) is
+/// waited out instead of dropped. Only taken while ffmpeg is behind.
+fn queue_len(fps: u32) -> usize {
+    (fps as usize / 4).clamp(4, 60)
+}
 
 /// A running H.264 encoder.
 pub(crate) struct H264 {
@@ -219,7 +239,7 @@ impl H264 {
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
         let errors = spawn_stderr(stderr);
-        let (tx, rx) = mpsc::sync_channel::<(Vec<u8>, i64)>(QUEUE);
+        let (tx, rx) = mpsc::sync_channel::<(Vec<u8>, i64)>(queue_len(s.fps));
         let (spare_tx, spare) = mpsc::channel();
         // The frame numbers sent, in order: the Nth packet back is the Nth sent.
         let sent = Arc::new(Mutex::new(VecDeque::<i64>::new()));

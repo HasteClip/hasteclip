@@ -15,7 +15,8 @@
 //! copies them out for us): 4 bytes a pixel, BGRx or RGBx.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::os::fd::OwnedFd;
+use std::collections::HashMap;
+use std::os::fd::{BorrowedFd, OwnedFd};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread::{self, JoinHandle};
@@ -26,7 +27,7 @@ use pipewire as pw;
 use pw::spa;
 
 use super::portal::{self, Cast};
-use super::{kwin, mutter, wlr, x11};
+use super::{gpu, kwin, mutter, wlr, x11};
 
 /// Which way round a frame's colour bytes are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,14 +38,17 @@ pub(crate) enum Order {
     Rgb,
 }
 
-/// One picture of the screen.
+/// One picture of the screen: in our memory, or on the graphics card.
 pub(crate) struct Frame {
     pub width: u32,
     pub height: u32,
     /// Bytes from one row to the next.
     pub stride: usize,
     pub order: Order,
+    /// The pixels, unless the picture is on the graphics card.
     pub data: Vec<u8>,
+    /// The picture on the graphics card (`super::gpu`), which `data` then isn't.
+    pub texture: Option<wgpu::Texture>,
 }
 
 /// The newest picture, shared with whoever reads it.
@@ -58,11 +62,29 @@ pub(crate) struct Latest {
     /// The picture before the newest, once nobody holds it: the next one is
     /// made in its memory.
     spare: Mutex<Option<Frame>>,
+    /// Textures of pictures nobody holds anymore, for the next ones on the card.
+    spare_textures: Mutex<Vec<wgpu::Texture>>,
     /// Whether a new picture is wanted, for a source that makes them on
     /// request (X11), and the signal to it.
     wanted: Mutex<bool>,
     wake: Condvar,
+    /// For frame blending: every picture as it arrives, not just the newest
+    /// (`queue_arrivals`), and the signal that one has.
+    arrivals: Mutex<Option<std::collections::VecDeque<Arrival>>>,
+    arrived: Condvar,
 }
+
+/// A picture as it arrived, for frame blending.
+pub(crate) struct Arrival {
+    /// When (CLOCK_MONOTONIC seconds).
+    pub at: f64,
+    pub frame: Arc<Frame>,
+    pub seq: u64,
+}
+
+/// The most arrivals kept unread: past that the oldest go (a reader that
+/// stopped reading shouldn't hold every picture).
+const ARRIVALS_KEPT: usize = 256;
 
 impl Latest {
     /// The newest picture and its number.
@@ -116,17 +138,76 @@ impl Latest {
     pub(crate) fn fill(&self, width: u32, height: u32, order: Order, draw: impl FnOnce(&mut [u8])) {
         let row = width as usize * 4;
         let spare = self.spare.lock().unwrap().take();
-        let mut frame = spare.unwrap_or(Frame { width, height, stride: row, order, data: Vec::new() });
+        let mut frame = spare.unwrap_or(Frame { width, height, stride: row, order, data: Vec::new(), texture: None });
         frame.width = width;
         frame.height = height;
         frame.stride = row;
         frame.order = order;
         frame.data.resize(row * height as usize, 0);
         draw(&mut frame.data);
-        let old = self.frame.lock().unwrap().replace(Arc::new(frame));
-        self.seq.fetch_add(1, Ordering::Release);
-        if let Some(Ok(old)) = old.map(Arc::try_unwrap) {
-            *self.spare.lock().unwrap() = Some(old);
+        self.publish(frame);
+    }
+
+    /// A texture to copy the next picture on the card into: one nobody holds
+    /// anymore of this size and format, if there is one.
+    pub(crate) fn spare_texture(&self, width: u32, height: u32, format: wgpu::TextureFormat) -> Option<wgpu::Texture> {
+        let mut spare = self.spare_textures.lock().unwrap();
+        let at = spare.iter().position(|t| t.width() == width && t.height() == height && t.format() == format)?;
+        Some(spare.swap_remove(at))
+    }
+
+    /// The newest picture is this texture, on the card.
+    pub(crate) fn store_texture(&self, texture: wgpu::Texture) {
+        let (width, height) = (texture.width(), texture.height());
+        self.publish(Frame { width, height, stride: width as usize * 4, order: Order::Bgr, data: Vec::new(), texture: Some(texture) });
+    }
+
+    /// Keep every picture as it arrives too, for `drain` (frame blending).
+    pub(crate) fn queue_arrivals(&self) {
+        self.arrivals.lock().unwrap().get_or_insert_with(Default::default);
+    }
+
+    /// The pictures arrived since the last drain, oldest first.
+    pub(crate) fn drain(&self) -> Vec<Arrival> {
+        self.arrivals.lock().unwrap().as_mut().map(|q| q.drain(..).collect()).unwrap_or_default()
+    }
+
+    /// Wait up to `timeout` for a picture newer than number `seen`.
+    pub(crate) fn wait(&self, seen: u64, timeout: Duration) {
+        let q = self.arrivals.lock().unwrap();
+        if self.seq.load(Ordering::Acquire) > seen {
+            return;
+        }
+        let _ = self.arrived.wait_timeout(q, timeout);
+    }
+
+    /// Make `frame` the newest; keep the one before for reuse once nobody holds it.
+    fn publish(&self, frame: Frame) {
+        let frame = Arc::new(frame);
+        let old = self.frame.lock().unwrap().replace(frame.clone());
+        let seq = self.seq.fetch_add(1, Ordering::Release) + 1;
+        {
+            let mut q = self.arrivals.lock().unwrap();
+            if let Some(q) = q.as_mut() {
+                if q.len() >= ARRIVALS_KEPT {
+                    q.pop_front();
+                }
+                q.push_back(Arrival { at: super::host_now(), frame, seq });
+            }
+        }
+        self.arrived.notify_all();
+        if let Some(Ok(mut old)) = old.map(Arc::try_unwrap) {
+            match old.texture.take() {
+                Some(t) => {
+                    let mut spare = self.spare_textures.lock().unwrap();
+                    // A few are plenty: older ones (another size, say) go.
+                    if spare.len() >= 4 {
+                        spare.remove(0);
+                    }
+                    spare.push(t);
+                }
+                None => *self.spare.lock().unwrap() = Some(old),
+            }
         }
     }
 }
@@ -191,6 +272,48 @@ pub(crate) fn acquire(id: &str) -> Result<Arc<Screen>> {
     Ok(screen)
 }
 
+/// A stream of one window on KDE Plasma (by its uuid in KWin's window list),
+/// at its own size; not shared. Blocks until its first picture (for up to 2
+/// seconds: a window that isn't drawing yet still opens).
+pub(crate) fn open_kwin_window(uuid: &str) -> Result<Screen> {
+    let latest = Arc::new(Latest::default());
+    let ended = Arc::downgrade(&latest);
+    let cast = kwin::Cast::open_window(uuid, move |why| {
+        if let Some(l) = ended.upgrade() {
+            l.end(why);
+        }
+    })?;
+    let node = cast.node;
+    let screen = Screen::start_pipewire(uuid, None, node, latest, move || drop(cast))?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !screen.latest.has_frame() && screen.latest.ended().is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(screen)
+}
+
+/// A window on the X server (`x11win:<id>`, see `super::x11_windows`), read
+/// through XComposite at its own size; not shared.
+pub(crate) fn open_x11_window(id: &str) -> Result<Screen> {
+    let screen = Screen::start_direct(id, super::x11_windows::Grab::open, super::x11_windows::run)?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !screen.latest.has_frame() && screen.latest.ended().is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(screen)
+}
+
+/// A window on Sway and its kin (`ext:<identifier>`, see
+/// `super::ext_windows`), captured at its own size; not shared.
+pub(crate) fn open_ext_window(id: &str) -> Result<Screen> {
+    let screen = Screen::start_direct(id, super::ext_windows::Grab::open, super::ext_windows::run)?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !screen.latest.has_frame() && screen.latest.ended().is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(screen)
+}
+
 /// Don't hand out the running cast anymore: the next [`acquire`] starts a new
 /// one (it ends once its holders let go).
 pub(crate) fn forget() {
@@ -201,10 +324,32 @@ pub(crate) fn forget() {
 /// takes it up again right away (the preview after a recording, or the other
 /// way round).
 pub(crate) fn release(screen: Arc<Screen>) {
-    thread::spawn(move || {
-        thread::sleep(Duration::from_secs(3));
-        drop(screen);
+    static REAPER: std::sync::Once = std::sync::Once::new();
+    RELEASED.lock().unwrap().push((Instant::now() + Duration::from_secs(3), screen));
+    REAPER.call_once(|| {
+        let _ = thread::Builder::new().name("screen-release".into()).spawn(|| loop {
+            thread::sleep(Duration::from_millis(250));
+            let now = Instant::now();
+            let expired: Vec<_> = {
+                let mut released = RELEASED.lock().unwrap();
+                let (gone, kept) = std::mem::take(&mut *released).into_iter().partition(|(at, _)| *at <= now);
+                *released = kept;
+                gone
+            };
+            drop(expired);
+        });
     });
+}
+
+/// Casts let go of, still running a moment in case they're taken up again.
+static RELEASED: Mutex<Vec<(Instant, Arc<Screen>)>> = Mutex::new(Vec::new());
+
+/// Stop the casts let go of now (the app is quitting): one left running
+/// would still be drawing on the graphics card while the process exits and
+/// its driver is unloaded.
+pub(crate) fn shutdown() {
+    let released = std::mem::take(&mut *RELEASED.lock().unwrap());
+    drop(released);
 }
 
 impl Screen {
@@ -298,6 +443,18 @@ struct StreamState {
     width: u32,
     height: u32,
     order: Option<Order>,
+    /// On the graphics card: the picture's DRM format and layout.
+    dmabuf: Option<(u32, u64)>,
+    /// The compositor's buffers, imported, by file descriptor.
+    imported: HashMap<i64, wgpu::Texture>,
+    /// An import failed (said once).
+    failed: bool,
+}
+
+/// The graphics card, when pictures are taken and worked on it (whenever
+/// Vulkan can import DMA-BUFs; `HASTECLIP_NO_GPU_CAPTURE` turns it off).
+pub(crate) fn gpu_frames() -> Option<Arc<gpu::Gpu>> {
+    gpu::gpu()
 }
 
 /// Read the cast until told to stop (or it ends). Sends the stopper once the
@@ -320,6 +477,8 @@ fn run(fd: Option<OwnedFd>, node: u32, latest: &Arc<Latest>, ready: &mpsc::Sende
         },
     )?;
 
+    let card = gpu_frames();
+    let modifiers = card.as_ref().map(|g| g.modifiers.clone()).unwrap_or_default();
     let (latest_p, latest_s) = (latest.clone(), latest.clone());
     let quit = mainloop.downgrade();
     let _listener = stream
@@ -335,7 +494,7 @@ fn run(fd: Option<OwnedFd>, node: u32, latest: &Arc<Latest>, ready: &mpsc::Sende
                 l.quit();
             }
         })
-        .param_changed(|_, st, id, param| {
+        .param_changed(|stream, st, id, param| {
             let Some(param) = param else { return };
             if id != spa::param::ParamType::Format.as_raw() {
                 return;
@@ -355,12 +514,47 @@ fn run(fd: Option<OwnedFd>, node: u32, latest: &Arc<Latest>, ready: &mpsc::Sende
             if st.width > 0 && st.height > 0 {
                 portal::remember_size((st.width, st.height));
             }
+            st.imported.clear();
+            st.dmabuf = None;
+            // On the card: the compositor may leave the layout to us (any of
+            // the ones offered); then pick one and agree again on just it.
+            if let Some((modifier, choose)) = modifier_of(param) {
+                if choose {
+                    let pod = format_pod(Modifiers::Fixed(modifier));
+                    if let Some(p) = spa::pod::Pod::from_bytes(&pod) {
+                        let _ = stream.update_params(&mut [p]);
+                    }
+                    return;
+                }
+                let fourcc = match info.format() {
+                    F::BGRx => gpu::DRM_XRGB8888,
+                    F::BGRA => gpu::DRM_ARGB8888,
+                    F::RGBx => gpu::DRM_XBGR8888,
+                    F::RGBA => gpu::DRM_ABGR8888,
+                    _ => return,
+                };
+                st.dmabuf = Some((fourcc, modifier));
+            }
+            let pod = buffers_pod(st.dmabuf.is_some());
+            if let Some(p) = spa::pod::Pod::from_bytes(&pod) {
+                let _ = stream.update_params(&mut [p]);
+            }
         })
         .process(move |stream, st| {
             let Some(mut buffer) = stream.dequeue_buffer() else { return };
             let Some(order) = st.order else { return };
             let Some(data) = buffer.datas_mut().first_mut() else { return };
             let (size, offset, stride) = (data.chunk().size() as usize, data.chunk().offset() as usize, data.chunk().stride());
+            if data.type_() == spa::buffer::DataType::DmaBuf {
+                if let (Some(card), Some((fourcc, modifier))) = (&card, st.dmabuf) {
+                    let fd = data.as_raw().fd;
+                    let corrupted = data.chunk().flags().contains(spa::buffer::ChunkFlags::CORRUPTED);
+                    if !corrupted && st.width > 0 && st.height > 0 {
+                        take_dmabuf(card, st, &latest_p, fd, fourcc, modifier, offset as u64, stride.max(0) as u64);
+                    }
+                }
+                return;
+            }
             // No new picture: only the pointer moved (or nothing at all).
             if size == 0 || data.chunk().flags().contains(spa::buffer::ChunkFlags::CORRUPTED) {
                 return;
@@ -376,13 +570,18 @@ fn run(fd: Option<OwnedFd>, node: u32, latest: &Arc<Latest>, ready: &mpsc::Sende
         })
         .register()?;
 
-    let format = video_format_pod();
-    let mut params = [spa::pod::Pod::from_bytes(&format).ok_or_else(|| anyhow!("bad video format"))?];
+    // On the card if it can, else in our memory.
+    let mut pods = Vec::new();
+    if !modifiers.is_empty() {
+        pods.push(format_pod(Modifiers::Any(&modifiers)));
+    }
+    pods.push(format_pod(Modifiers::None));
+    let mut params: Vec<&spa::pod::Pod> = pods.iter().map(|p| spa::pod::Pod::from_bytes(p).ok_or_else(|| anyhow!("bad video format"))).collect::<Result<_>>()?;
     stream.connect(
         spa::utils::Direction::Input,
         Some(node),
         pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
-        &mut params,
+        &mut params[..],
     )?;
 
     let (stop_tx, stop_rx) = pw::channel::channel::<()>();
@@ -400,45 +599,160 @@ fn run(fd: Option<OwnedFd>, node: u32, latest: &Arc<Latest>, ready: &mpsc::Sende
 
 /// What we take: 4-byte RGB in either order, any size, up to 360 fps (the
 /// compositor sends at most one per screen refresh, and only on changes).
-fn video_format_pod() -> Vec<u8> {
+/// `SPA_POD_PROP_FLAG_DONT_FIXATE`: a choice left open for the other side
+/// (libspa only names it behind a feature).
+const DONT_FIXATE: spa::pod::PropertyFlags = spa::pod::PropertyFlags::from_bits_retain(1 << 4);
+
+/// What a format offers about the picture's layout on the card.
+enum Modifiers<'a> {
+    /// In our memory.
+    None,
+    /// On the card, in any of these layouts (the compositor or we pick).
+    Any(&'a [u64]),
+    /// On the card, in this one.
+    Fixed(u64),
+}
+
+/// A video format we take: 4 bytes a pixel, any size, up to 1000 a second.
+fn format_pod(modifiers: Modifiers) -> Vec<u8> {
     use spa::param::format::{FormatProperties, MediaSubtype, MediaType};
     use spa::param::video::VideoFormat;
-    use spa::pod::{Value, property, serialize::PodSerializer};
-    use spa::utils::{Fraction, Rectangle, SpaTypes};
-    let obj = spa::pod::object!(
-        SpaTypes::ObjectParamFormat,
-        spa::param::ParamType::EnumFormat,
-        property!(FormatProperties::MediaType, Id, MediaType::Video),
-        property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
-        property!(
-            FormatProperties::VideoFormat,
-            Choice,
-            Enum,
-            Id,
-            VideoFormat::BGRx,
-            VideoFormat::BGRx,
-            VideoFormat::BGRA,
-            VideoFormat::RGBx,
-            VideoFormat::RGBA
-        ),
-        property!(
-            FormatProperties::VideoSize,
-            Choice,
-            Range,
-            Rectangle,
-            Rectangle { width: 1920, height: 1080 },
-            Rectangle { width: 1, height: 1 },
-            Rectangle { width: 16384, height: 16384 }
-        ),
-        property!(
-            FormatProperties::VideoFramerate,
-            Choice,
-            Range,
-            Fraction,
-            Fraction { num: 60, denom: 1 },
-            Fraction { num: 0, denom: 1 },
-            Fraction { num: 360, denom: 1 }
-        ),
-    );
+    use spa::pod::{ChoiceValue, Object, Property, PropertyFlags, Value, serialize::PodSerializer};
+    use spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Fraction, Id, Rectangle, SpaTypes};
+    let id_enum = |ids: &[VideoFormat]| Value::Choice(ChoiceValue::Id(Choice(ChoiceFlags::empty(), ChoiceEnum::Enum { default: Id(ids[0].as_raw()), alternatives: ids.iter().map(|f| Id(f.as_raw())).collect() })));
+    let prop = |key: FormatProperties, value: Value| Property { key: key.as_raw(), flags: PropertyFlags::empty(), value };
+    let formats: &[VideoFormat] = match modifiers {
+        // What the card imports.
+        Modifiers::Any(_) | Modifiers::Fixed(_) => &[VideoFormat::BGRx, VideoFormat::BGRA],
+        Modifiers::None => &[VideoFormat::BGRx, VideoFormat::BGRA, VideoFormat::RGBx, VideoFormat::RGBA],
+    };
+    let mut properties = vec![
+        prop(FormatProperties::MediaType, Value::Id(Id(MediaType::Video.as_raw()))),
+        prop(FormatProperties::MediaSubtype, Value::Id(Id(MediaSubtype::Raw.as_raw()))),
+        prop(FormatProperties::VideoFormat, id_enum(formats)),
+    ];
+    match modifiers {
+        Modifiers::None => {}
+        Modifiers::Any(list) => properties.push(Property {
+            key: FormatProperties::VideoModifier.as_raw(),
+            flags: PropertyFlags::MANDATORY | DONT_FIXATE,
+            value: Value::Choice(ChoiceValue::Long(Choice(ChoiceFlags::empty(), ChoiceEnum::Enum { default: list[0] as i64, alternatives: list.iter().map(|m| *m as i64).collect() }))),
+        }),
+        Modifiers::Fixed(m) => properties.push(Property { key: FormatProperties::VideoModifier.as_raw(), flags: PropertyFlags::MANDATORY, value: Value::Long(m as i64) }),
+    }
+    properties.push(prop(
+        FormatProperties::VideoSize,
+        Value::Choice(ChoiceValue::Rectangle(Choice(ChoiceFlags::empty(), ChoiceEnum::Range { default: Rectangle { width: 1920, height: 1080 }, min: Rectangle { width: 1, height: 1 }, max: Rectangle { width: 16384, height: 16384 } }))),
+    ));
+    properties.push(prop(
+        FormatProperties::VideoFramerate,
+        Value::Choice(ChoiceValue::Fraction(Choice(ChoiceFlags::empty(), ChoiceEnum::Range { default: Fraction { num: 60, denom: 1 }, min: Fraction { num: 0, denom: 1 }, max: Fraction { num: 1000, denom: 1 } }))),
+    ));
+    let obj = Object { type_: SpaTypes::ObjectParamFormat.as_raw(), id: spa::param::ParamType::EnumFormat.as_raw(), properties };
     PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj)).map(|(c, _)| c.into_inner()).unwrap_or_default()
+}
+
+/// The layout of a picture on the card that a format says, and whether
+/// it's left to us to pick (then the first offered). `None` for a picture
+/// in our memory.
+fn modifier_of(param: &spa::pod::Pod) -> Option<(u64, bool)> {
+    use spa::pod::{ChoiceValue, Value, deserialize::PodDeserializer};
+    use spa::utils::ChoiceEnum;
+    let (_, Value::Object(obj)) = PodDeserializer::deserialize_any_from(param.as_bytes()).ok()? else { return None };
+    let p = obj.properties.iter().find(|p| p.key == spa::param::format::FormatProperties::VideoModifier.as_raw())?;
+    let open = p.flags.contains(DONT_FIXATE);
+    match &p.value {
+        Value::Long(m) => Some((*m as u64, false)),
+        Value::Choice(ChoiceValue::Long(c)) => match &c.1 {
+            ChoiceEnum::Enum { default, alternatives } => Some((alternatives.first().copied().unwrap_or(*default) as u64, true)),
+            ChoiceEnum::None(m) => Some((*m as u64, open)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The buffers we take: on the card, or in memory we can map.
+fn buffers_pod(dmabuf: bool) -> Vec<u8> {
+    use spa::pod::{Object, Property, PropertyFlags, Value, serialize::PodSerializer};
+    let types = if dmabuf { 1 << spa::sys::SPA_DATA_DmaBuf } else { (1 << spa::sys::SPA_DATA_MemFd) | (1 << spa::sys::SPA_DATA_MemPtr) };
+    let obj = Object {
+        type_: spa::utils::SpaTypes::ObjectParamBuffers.as_raw(),
+        id: spa::param::ParamType::Buffers.as_raw(),
+        properties: vec![Property { key: spa::sys::SPA_PARAM_BUFFERS_dataType, flags: PropertyFlags::empty(), value: Value::Int(types as i32) }],
+    };
+    PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj)).map(|(c, _)| c.into_inner()).unwrap_or_default()
+}
+
+/// A picture on the card: imported (once per buffer), copied into a texture
+/// of ours on the card, which becomes the newest picture; waited for, so the
+/// compositor can draw into its buffer again once it's handed back.
+#[allow(clippy::too_many_arguments)]
+fn take_dmabuf(card: &gpu::Gpu, st: &mut StreamState, latest: &Latest, fd: i64, fourcc: u32, modifier: u64, offset: u64, stride: u64) {
+    let (w, h) = (st.width, st.height);
+    if !st.imported.contains_key(&fd) {
+        // SAFETY: the buffer's fd, valid while PipeWire holds the buffer (it's dup'ed to import).
+        let borrowed = unsafe { BorrowedFd::borrow_raw(fd as i32) };
+        match card.import(borrowed, w, h, fourcc, modifier, offset, stride) {
+            Ok(t) => {
+                st.imported.insert(fd, t);
+            }
+            Err(e) => {
+                if !std::mem::replace(&mut st.failed, true) {
+                    eprintln!("can't take the picture on the graphics card: {e:#}");
+                }
+                return;
+            }
+        }
+    }
+    let input = &st.imported[&fd];
+    let format = input.format();
+    let out = latest.spare_texture(w, h, format).unwrap_or_else(|| {
+        card.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("screen picture"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+    });
+    let mut enc = card.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("take picture") });
+    enc.copy_texture_to_texture(input.as_image_copy(), out.as_image_copy(), wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 });
+    let done = card.queue.submit([enc.finish()]);
+    let _ = card.device.poll(wgpu::PollType::Wait { submission_index: Some(done), timeout: Some(Duration::from_secs(1)) });
+    latest.store_texture(out);
+}
+
+#[cfg(test)]
+mod gpu_tests {
+    use super::*;
+
+    /// With the graphics card taking pictures, they arrive as textures, as
+    /// fast as the screen changes, and read back as the screen.
+    #[test]
+    #[ignore = "captures the screen on the graphics card: cargo test -p capture pictures_on_the_card -- --ignored"]
+    fn pictures_on_the_card() {
+        let card = gpu_frames().expect("a graphics card that imports DMA-BUFs");
+        let id = super::super::list_screens().into_iter().next().unwrap().id;
+        let scr = acquire(&id).unwrap();
+        thread::sleep(Duration::from_millis(500));
+        let (f, s0) = scr.latest.get().unwrap();
+        let texture = f.texture.clone().expect("a picture on the card");
+        let t = Instant::now();
+        thread::sleep(Duration::from_secs(3));
+        let (_, s1) = scr.latest.get().unwrap();
+        let rate = (s1 - s0) as f64 / t.elapsed().as_secs_f64();
+        let px = card.read(&texture);
+        let lit = px.chunks_exact(4).filter(|p| p[0] > 16 || p[1] > 16 || p[2] > 16).count();
+        eprintln!("{}x{} {:?}: {rate:.1} pictures/s, {lit} lit pixels", texture.width(), texture.height(), texture.format());
+        if let Some(out) = std::env::var_os("HASTECLIP_SHOT") {
+            let (w, h) = (texture.width(), texture.height());
+            let rgb: Vec<u8> = px.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
+            std::fs::write(out, [format!("P6\n{w} {h}\n255\n").as_bytes(), &rgb].concat()).unwrap();
+        }
+        assert!(lit > 0, "all black");
+    }
 }

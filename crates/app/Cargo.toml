@@ -53,13 +53,17 @@ tray-icon = "0.21"
 # Linux: global shortcuts through the desktop portal (Wayland has no other
 # way), showing a clip in the file manager, the log file (libc), and checking
 # downloaded updates (sha2), and the tray icon (ksni: StatusNotifierItem over
-# D-Bus, no GTK).
+# D-Bus, no GTK), and setting the shortcuts' keys in KDE Plasma (zbus).
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { version = "0.13", default-features = false, features = ["async-io", "global_shortcuts"] }
 async-io = "2"
 futures-util = { version = "0.3", default-features = false }
 ksni = { version = "0.3", default-features = false, features = ["async-io", "blocking"] }
 libc = "0.2"
+zbus = { version = "5", default-features = false, features = ["async-io"] }
+# Dragging clips out under Wayland, on the window's own connection (winit's).
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
 pollster = "1"
 sha2 = "0.11"
 
