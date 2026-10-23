@@ -551,26 +551,6 @@ impl App {
                     h.configure_desktop();
                 }
             }
-            #[cfg(target_os = "macos")]
-            if f.shows(&["fullscreen games", "input monitoring", "shortcut", "hotkey", "keyboard", "permission"]) {
-                let allowed = crate::key_tap::allowed();
-                let note = if allowed {
-                    "They work even in games that take over the whole screen."
-                } else {
-                    "Some games take over the whole screen in fullscreen, and macOS doesn't let shortcuts through while they do. Allow Input Monitoring under Permissions so they keep working."
-                };
-                let mut open = false;
-                l.row(Row::new("In fullscreen games").note(note), |ui| {
-                    if allowed {
-                        ui.label(theme::text(format!("{}  Allowed", icon::CHECK), 13.0, W::Medium).color(p.text2));
-                    } else {
-                        open = Btn::normal("Permissions").small().show(ui).clicked();
-                    }
-                });
-                if open {
-                    self.settings_jump = Some("Permissions");
-                }
-            }
         });
     }
 
