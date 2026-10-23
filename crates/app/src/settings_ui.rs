@@ -217,13 +217,7 @@ impl App {
         let size = self.recorded_size();
         let native = capture::frame_size(&self.video_source(), None, self.settings.capture_shape());
         let screen = capture::frame_size(&self.video_source(), None, None);
-        // Cropped on Sources: clips are the crop's size, whatever these say.
-        let cropped = matches!(self.video_source(), capture::VideoSource::Screen { crop: Some(_), .. });
-        let size_lock = if cropped { Some("Cropped on Sources: clips are the crop's size. Turn the crop off there to set this.".to_owned()) } else { lock.clone() };
-        // What a click on a locked row says: why that one is.
-        let mut why = lock.clone();
         let res_note = match (size, native) {
-            (Some((w, h)), _) if cropped => format!("Cropped on Sources: records at {w}×{h}"),
             (Some((w, h)), Some((_, nh))) if self.settings.resolution.height().is_some_and(|t| t > nh) => format!("Records at {w}×{h}: your display's size, it isn't made bigger"),
             (Some((w, h)), _) => format!("Records at {w}×{h}"),
             _ => String::new(),
@@ -246,18 +240,12 @@ impl App {
         let mut locked_click = false;
         ui_kit::list(ui, "video", |l| {
             if f.shows(&["resolution", "height", "size", "native"]) {
-                let (_, c) = l.row(Row::new("Resolution").tip("Resolution", "Lower makes smaller files that are quicker to share. Native keeps every pixel of your display.").note(res_note.clone()).locked(size_lock.clone()), |ui| self.resolution_field(ui));
+                let (_, c) = l.row(Row::new("Resolution").tip("Resolution", "Lower makes smaller files that are quicker to share. Native keeps every pixel of your display.").note(res_note.clone()).locked(lock.clone()), |ui| self.resolution_field(ui));
                 locked_click |= c;
-                if c {
-                    why = size_lock.clone();
-                }
             }
             if f.shows(&["aspect ratio", "shape", "same as screen", "16:9", "21:9", "ultrawide", "black bars", "crop", "fill", "fit", "stretch"]) {
-                let (_, c) = l.row(Row::new("Aspect ratio").tip("Aspect ratio", SHAPE_TIP).locked(size_lock.clone()), |ui| self.shape_field(ui, screen));
+                let (_, c) = l.row(Row::new("Aspect ratio").tip("Aspect ratio", SHAPE_TIP).locked(lock.clone()), |ui| self.shape_field(ui, screen));
                 locked_click |= c;
-                if c {
-                    why = size_lock.clone();
-                }
                 let shape = self.settings.capture_shape();
                 l.well("shape_well", shape.is_some(), |l| {
                     let note = shape.zip(screen).map_or(String::new(), |(shape, screen)| shape_note(shape, screen));
@@ -339,7 +327,7 @@ impl App {
         });
         if locked_click && !said {
             said = true;
-            self.toast_icon(icon::LOCK_SIMPLE, why.unwrap_or_default());
+            self.toast_icon(icon::LOCK_SIMPLE, lock.clone().unwrap_or_default());
         }
         let _ = said;
     }

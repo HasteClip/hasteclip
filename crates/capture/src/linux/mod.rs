@@ -500,17 +500,15 @@ impl Feed {
         self.0.crop
     }
 
-    /// The size it's recorded at: the crop's, else the screen's (or the
-    /// main display's) as `target_height` and `shape` make it.
+    /// The size it's recorded at: the screen's (or the main display's), or
+    /// what's kept of it when it's cropped, as `target_height` and `shape`
+    /// make it.
     fn recorded_size(&self, target_height: Option<u32>, shape: Option<crate::Shape>) -> (u32, u32) {
-        let (w, h) = self.size();
-        match self.crop() {
-            Some(c) => {
-                let [_, _, w, h] = c.rect(w, h);
-                (w, h)
-            }
-            None => crate::recorded_size(w, h, target_height, shape),
+        let (mut w, mut h) = self.size();
+        if let Some(c) = self.crop() {
+            [_, _, w, h] = c.rect(w, h);
         }
+        crate::recorded_size(w, h, target_height, shape)
     }
 
     fn source(&self) -> std::sync::RwLockReadGuard<'_, Source> {

@@ -62,6 +62,10 @@ pub(crate) struct SourcesView {
     /// webcam): shown again at once when the page opens on the same, while
     /// the preview's capture starts (that takes a moment).
     last_preview: Option<(PreviewSetup, std::sync::Arc<capture::preview::PreviewFrame>)>,
+    /// The crop's page is open (in Sources' place), and what of the crop is
+    /// held there.
+    pub(crate) crop_open: bool,
+    crop_drag: Option<(crate::webcam_ui::Handle, egui::Rect, egui::Pos2)>,
 }
 
 /// What a preview shows: the picture, its height and shape, the frame rate
@@ -95,9 +99,13 @@ impl App {
         let every = if capture::preview::AVAILABLE { Duration::from_secs_f64(0.5 / self.settings.fps.max(1) as f64) } else { Duration::from_millis(16) };
         crate::ui_kit::repaint_after(ui.ctx(), every);
 
-        // Adjusting the camera: its own page, in Sources' place.
+        // Adjusting the camera, or the crop: its own page, in Sources' place.
         if self.camera_panel.is_some() {
             self.camera_page(ui);
+            return;
+        }
+        if self.sources_view.crop_open {
+            self.screen_crop_page(ui);
             return;
         }
         self.page_head(ui, "Sources", |_, _| {});
@@ -436,86 +444,188 @@ impl App {
         }
     }
 
-    /// The part of the screen recorded: off (all of it), or a size, in the
-    /// middle or where it's put. For a game at a lower resolution than the
-    /// display (black around it): typed in as the game's resolution. Set
-    /// before capturing, as it's the recording's size.
+    /// The Crop row: what's kept of the screen, and a way to its page.
     fn crop_row(&mut self, ui: &mut egui::Ui, idle: bool) {
-        use crate::settings::ScreenCrop;
-        use crate::ui_kit::{Typed, ValueField};
+        use crate::ui_kit::Btn;
         let pal = crate::theme::pal(ui);
-        let crop = self.settings.screen_crop;
-        // The display's own size, uncropped.
-        let whole = match self.video_source() {
-            capture::VideoSource::Screen { id, hook, method, .. } => capture::frame_size(&capture::VideoSource::Screen { id, hook, method, crop: None }, None, None),
-            capture::VideoSource::Apps { .. } => None,
-        };
+        let kept = self.crop_whole().zip(self.settings.screen_crop.filter(|c| !c.is_none())).map(|((w, h), c)| capture::Crop::from(c).rect(w, h));
         let stop_first = self.stop_first();
         ui.horizontal(|ui| {
             ui.set_min_height(GROUP_ROW_H);
-            ui.spacing_mut().item_spacing.x = 6.0;
             ui.label(crate::theme::text("Crop", 13.5, crate::theme::W::Regular).color(pal.text));
-            let tip = "Record only part of the screen, at its own size: for a game running at a lower resolution than your display, with black around it. Type the game's resolution. Your clips come out at that size; Resolution and Shape in Settings don't apply.";
-            crate::ui_kit::info(ui, "Crop", tip);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_enabled_ui(idle, |ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    // Where it is: in the middle, or typed.
-                    if let Some(c) = crop {
-                        let text = c.at.map_or("Centred".to_owned(), |[x, y]| format!("{x}, {y}"));
-                        let presets = vec![("Centred".to_owned(), "Centred".to_owned(), String::new()), ("Top left".to_owned(), "0, 0".to_owned(), String::new())];
-                        let current = match c.at {
-                            None => Some(0),
-                            Some([0, 0]) => Some(1),
-                            _ => None,
-                        };
-                        let field = ValueField { id: egui::Id::new("vf_crop_at"), text, unit: "", width: 104.0, hint: "Its top-left corner on the screen, like 320, 180", presets, current, range: "x, y" };
-                        match field.show(ui) {
-                            Typed::Preset(0) => self.settings.screen_crop = Some(ScreenCrop { at: None, ..c }),
-                            Typed::Preset(_) => self.settings.screen_crop = Some(ScreenCrop { at: Some([0, 0]), ..c }),
-                            Typed::Text(t) => match parse_at(&t) {
-                                Some(at) => self.settings.screen_crop = Some(ScreenCrop { at, ..c }),
-                                None => self.toast_error(format!("“{}” isn't a place: type its left and top, like 320, 180", t.trim())),
-                            },
-                            _ => {}
-                        }
-                        ui.label(crate::theme::text("at", 12.5, crate::theme::W::Regular).color(pal.text3));
+                ui.spacing_mut().item_spacing.x = 10.0;
+                let b = Btn::normal("Adjust").trail(egui_phosphor::regular::CARET_RIGHT).small().tip(if idle { "Cut off the screen's sides: a game at a lower resolution than your display, with black around it" } else { stop_first });
+                if b.show(ui).clicked() {
+                    if idle {
+                        self.sources_view.crop_open = true;
+                    } else {
+                        self.toast_icon(egui_phosphor::regular::LOCK_SIMPLE, stop_first.trim_end_matches('.'));
                     }
-                    // Its size: the game's resolution.
-                    let sizes: Vec<(u32, u32)> = CROP_SIZES.iter().copied().filter(|&(w, h)| whole.is_none_or(|(sw, sh)| w <= sw && h <= sh && (w, h) != (sw, sh))).collect();
-                    let mut presets = vec![("Off".to_owned(), "Off".to_owned(), "All of the screen".to_owned())];
-                    presets.extend(sizes.iter().map(|(w, h)| (format!("{w}×{h}"), format!("{w}×{h}"), String::new())));
-                    let current = match crop {
-                        None => Some(0),
-                        Some(c) => sizes.iter().position(|&s| s == (c.w, c.h)).map(|i| i + 1),
-                    };
-                    let text = crop.map_or("Off".to_owned(), |c| format!("{}×{}", c.w, c.h));
-                    let field = ValueField { id: egui::Id::new("vf_crop"), text, unit: "", width: 116.0, hint: "The game's resolution, like 1600×900, or Off", presets, current, range: "width × height" };
-                    let typed = field.show(ui);
-                    let r = ui.response();
-                    if !idle {
-                        r.on_hover_text(stop_first);
+                }
+                let text = kept.map_or("Off".to_owned(), |[_, _, w, h]| format!("{w}×{h}"));
+                ui.label(crate::theme::text(text, 12.5, crate::theme::W::Regular).color(pal.text3));
+            });
+        });
+    }
+
+    /// The display's own size, uncropped, when it's known.
+    fn crop_whole(&self) -> Option<(u32, u32)> {
+        match self.video_source() {
+            capture::VideoSource::Screen { id, hook, method, .. } => capture::frame_size(&capture::VideoSource::Screen { id, hook, method, crop: None }, None, None),
+            capture::VideoSource::Apps { .. } => None,
+        }
+    }
+
+    /// The crop's page, in Sources' place: all of the screen with what's
+    /// kept drawn on it to drag, and its size and place as numbers. It starts
+    /// centred, and stays so as its size changes, until it's put somewhere.
+    fn screen_crop_page(&mut self, ui: &mut egui::Ui) {
+        use crate::settings::ScreenCrop;
+        use crate::theme::{self, W};
+        use crate::ui_kit::{Btn, Row};
+        let pal = theme::pal(ui);
+        // Back to Sources: the arrow, or Esc. Only before capturing: it sets
+        // the recording's size.
+        let back_key = !crate::ui_kit::overlay_open(ui.ctx()) && !ui.ctx().egui_wants_keyboard_input() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        if back_key || self.rec_state != crate::RecState::Idle {
+            self.sources_view.crop_open = false;
+            return;
+        }
+        let mut back = false;
+        self.page_head(ui, "", |_, ui| {
+            back = Btn::icon(crate::ui_kit::Kind::Ghost, egui_phosphor::regular::CARET_LEFT).tip("Back to Sources  (Esc)").show(ui).clicked();
+            ui.label(theme::text("Crop", 20.0, W::Semibold).color(pal.text));
+        });
+        if back {
+            self.sources_view.crop_open = false;
+            return;
+        }
+        capture::preview::request();
+        let frame = capture::preview::latest();
+        self.update_preview_texture(ui.ctx(), frame.as_deref());
+        crate::ui_kit::repaint_after(ui.ctx(), Duration::from_millis(33));
+        let Some((sw, sh)) = self.crop_whole() else {
+            ui.label(theme::text("The display's size isn't known yet.", 13.0, W::Regular).color(pal.text3));
+            return;
+        };
+        // None set: all of the screen, centred.
+        let crop = self.settings.screen_crop.filter(|c| !c.is_none()).unwrap_or(ScreenCrop { w: sw, h: sh, at: None });
+        let [x, y, w, h] = capture::Crop::from(crop).rect(sw, sh);
+        let centred = crop.at.is_none();
+        let mut set: Option<ScreenCrop> = None;
+        // The least kept each way.
+        let least = 64u32;
+
+        let picture = |ui: &mut egui::Ui, this: &mut Self, max_h: f32, set: &mut Option<ScreenCrop>| {
+            let aspect = sw as f32 / sh.max(1) as f32;
+            let pw = ui.available_width().min(max_h * aspect);
+            ui.vertical_centered(|ui| {
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(pw, pw / aspect), Sense::click_and_drag());
+                let p = ui.painter();
+                p.rect_filled(rect, 6.0, pal.stage);
+                // Only a picture of the whole screen is cropped on (one of
+                // the cropped picture shows for a moment as the preview
+                // starts over).
+                let whole = frame.as_ref().is_some_and(|f| (f.recorded.0 as f32 / f.recorded.1.max(1) as f32 - aspect).abs() < 0.01);
+                match &this.sources_view.preview {
+                    Some((tex, _)) if whole => {
+                        p.image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
                     }
-                    let at = crop.and_then(|c| c.at);
-                    match typed {
-                        Typed::Preset(0) => self.settings.screen_crop = None,
-                        Typed::Preset(i) => self.settings.screen_crop = Some(ScreenCrop { w: sizes[i - 1].0, h: sizes[i - 1].1, at }),
-                        Typed::Text(t) => match parse_size(&t) {
-                            Some(None) => self.settings.screen_crop = None,
-                            Some(Some((w, h))) if w >= 64 && h >= 64 && whole.is_none_or(|(sw, sh)| w <= sw && h <= sh) => {
-                                self.settings.screen_crop = Some(ScreenCrop { w, h, at });
-                            }
-                            Some(Some(_)) => {
-                                let most = whole.map_or(String::new(), |(w, h)| format!(", at most {w}×{h}"));
-                                self.toast_error(format!("“{}” doesn't fit on your display{most}", t.trim()));
-                            }
-                            None => self.toast_error(format!("“{}” isn't a size: type it like 1600×900, or Off", t.trim())),
-                        },
-                        _ => {}
+                    _ => {
+                        p.text(rect.center(), egui::Align2::CENTER_CENTER, "Starting preview…", egui::FontId::proportional(13.0), Color32::from_gray(170));
+                    }
+                }
+                let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(sw as f32, sh as f32));
+                let kept = egui::Rect::from_min_size(egui::pos2(x as f32, y as f32), egui::vec2(w as f32, h as f32));
+                // Dragged: where it's put (no longer centred).
+                if let Some(k) = crate::webcam_ui::crop_editor(ui, &resp, rect, bounds, kept, egui::vec2(least as f32, least as f32), &mut this.sources_view.crop_drag) {
+                    let r = |v: f32| v.round().max(0.0) as u32;
+                    *set = Some(ScreenCrop { w: r(k.width()), h: r(k.height()), at: Some([r(k.min.x), r(k.min.y)]) });
+                }
+            });
+            ui.add_space(8.0);
+            ui.vertical_centered(|ui| {
+                ui.label(theme::text("Drag the edges or corners (Shift keeps the shape), or the middle to move it.", 12.5, W::Regular).color(pal.text3));
+            });
+        };
+        let numbers = |ui: &mut egui::Ui, set: &mut Option<ScreenCrop>| {
+            let px = |ui: &mut egui::Ui| ui.label(theme::text("px", 12.5, W::Regular).color(pal.text3));
+            let between = |ui: &mut egui::Ui, t: &str| ui.label(theme::text(t, 13.0, W::Regular).color(pal.text3));
+            crate::ui_kit::list(ui, "screen_crop", |l| {
+                // Its size: the game's resolution. Centred, it stays in the
+                // middle; else its top-left corner stays put.
+                l.row(Row::new("Size").note("The game's resolution, like 1600 × 900"), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    px(ui);
+                    if let Some(v) = crate::ui_kit::number_box(ui, egui::Id::new("screen_crop_h"), h, least..=sh, 64.0) {
+                        *set = Some(ScreenCrop { h: v, ..crop });
+                    }
+                    between(ui, "×");
+                    if let Some(v) = crate::ui_kit::number_box(ui, egui::Id::new("screen_crop_w"), w, least..=sw, 64.0) {
+                        *set = Some(ScreenCrop { w: v, ..crop });
+                    }
+                });
+                // Where it is: its top-left corner, or the middle.
+                let note = if centred { "Centred on the screen".to_owned() } else { "Its top-left corner, from the screen's".to_owned() };
+                l.row(Row::new("Position").note(note), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let b = Btn::normal("Centre").small().enabled(!centred).tip("Put it in the middle of the screen, and keep it there");
+                    if b.show(ui).clicked() {
+                        *set = Some(ScreenCrop { at: None, ..crop });
+                    }
+                    ui.add_space(4.0);
+                    px(ui);
+                    if let Some(v) = crate::ui_kit::number_box(ui, egui::Id::new("screen_crop_y"), y, 0..=sh - h, 64.0) {
+                        *set = Some(ScreenCrop { w, h, at: Some([x, v]) });
+                    }
+                    between(ui, ",");
+                    if let Some(v) = crate::ui_kit::number_box(ui, egui::Id::new("screen_crop_x"), x, 0..=sw - w, 64.0) {
+                        *set = Some(ScreenCrop { w, h, at: Some([v, y]) });
                     }
                 });
             });
-        });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add_space(2.0);
+                let what = if (w, h) == (sw, sh) { format!("All of the screen, {sw}×{sh}") } else { format!("{w}×{h} of {sw}×{sh}, recorded like a display that size") };
+                ui.label(theme::text(what, 12.5, W::Regular).color(pal.text3));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if (w, h) != (sw, sh) && Btn::ghost("Reset").small().tip("All of the screen again").show(ui).clicked() {
+                        *set = Some(ScreenCrop::default());
+                    }
+                });
+            });
+        };
+
+        ui.add_space(4.0);
+        let avail_w = ui.available_width();
+        let avail_h = ui.available_height();
+        if avail_w >= TWO_COLUMNS {
+            let col = (avail_w - 28.0) / 2.0;
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 28.0;
+                ui.allocate_ui_with_layout(egui::vec2(col, avail_h), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.set_width(col);
+                    ui.add_space(4.0);
+                    picture(ui, self, avail_h * 0.7, &mut set);
+                });
+                ui.allocate_ui_with_layout(egui::vec2(col, avail_h), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.set_width(col);
+                    numbers(ui, &mut set);
+                });
+            });
+        } else {
+            crate::ui_kit::scroll(ui, "screen_crop_page", |ui| {
+                picture(ui, self, avail_h * 0.4, &mut set);
+                ui.add_space(16.0);
+                numbers(ui, &mut set);
+            });
+        }
+        if let Some(c) = set {
+            let all = c.is_none() || capture::Crop::from(c).rect(sw, sh) == [0, 0, sw & !1, sh & !1];
+            self.settings.screen_crop = (!all).then_some(c);
+        }
     }
 
     fn update_preview_texture(&mut self, ctx: &egui::Context, frame: Option<&capture::preview::PreviewFrame>) {
@@ -815,9 +925,14 @@ impl App {
         if self.video_preview.is_none() && self.level_monitor.as_ref().is_some_and(|(_, m)| !m.ready()) {
             return;
         }
-        // What a recording would be: same picture, size and frame rate.
+        // What a recording would be: same picture, size and frame rate. While
+        // the crop's set: all of the screen as it is, to crop on.
         let webcam = self.webcam_source();
-        let wanted = (self.video_source(), (self.settings.resolution.height(), self.settings.capture_shape()), self.settings.fps, webcam.clone());
+        let wanted = match self.video_source() {
+            capture::VideoSource::Screen { id, hook, method, .. } if self.sources_view.crop_open => (capture::VideoSource::Screen { id, hook, method, crop: None }, (None, None), self.settings.fps, None),
+            source => (source, (self.settings.resolution.height(), self.settings.capture_shape()), self.settings.fps, webcam.clone()),
+        };
+        let webcam = wanted.3.clone();
         // A changed app list reaches the running preview without a restart.
         if let Some((have, preview)) = &mut self.video_preview {
             if *have != wanted && (&have.1, have.2, &have.3) == (&wanted.1, wanted.2, &wanted.3) && preview.update(&wanted.0) {
@@ -855,35 +970,6 @@ impl App {
     /// by the time it shows.
     pub(crate) fn wants_sources_capture(&self) -> bool {
         self.page == crate::Page::Sources || self.sources_warm.is_some_and(|t| t.elapsed() < Duration::from_secs(2))
-    }
-}
-
-/// Game resolutions offered for the crop (those that fit the display).
-const CROP_SIZES: [(u32, u32); 9] = [(2560, 1440), (1920, 1080), (1680, 1050), (1600, 900), (1440, 900), (1366, 768), (1280, 1024), (1280, 720), (1024, 768)];
-
-/// A size typed as "1600×900" (or 1600x900, 1600 900): `Some(None)` for Off.
-fn parse_size(t: &str) -> Option<Option<(u32, u32)>> {
-    let t = t.trim().to_lowercase();
-    if t.is_empty() || t.starts_with("off") || t.starts_with("all") || t.starts_with("whole") {
-        return Some(None);
-    }
-    let mut n = t.split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty()).map(|s| s.parse::<u32>().ok());
-    match (n.next().flatten(), n.next().flatten(), n.next()) {
-        (Some(w), Some(h), None) => Some(Some((w, h))),
-        _ => None,
-    }
-}
-
-/// A place typed as "320, 180": `Some(None)` for the middle.
-fn parse_at(t: &str) -> Option<Option<[u32; 2]>> {
-    let t = t.trim().to_lowercase();
-    if t.is_empty() || t.starts_with("cent") || t.starts_with("middle") {
-        return Some(None);
-    }
-    let mut n = t.split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty()).map(|s| s.parse::<u32>().ok());
-    match (n.next().flatten(), n.next().flatten(), n.next()) {
-        (Some(x), Some(y), None) => Some(Some([x, y])),
-        _ => None,
     }
 }
 

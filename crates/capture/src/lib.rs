@@ -217,13 +217,14 @@ pub fn frame_size(source: &VideoSource, target_height: Option<u32>, shape: Optio
         let _ = id;
         None
     };
-    // Cropped: that part, at its own size.
-    if let VideoSource::Screen { crop: Some(c), .. } = source {
-        return native.map(|(w, h)| {
+    // Cropped: what's kept, as a display that size.
+    let native = match source {
+        VideoSource::Screen { crop: Some(c), .. } => native.map(|(w, h)| {
             let [_, _, w, h] = c.rect(w, h);
             (w, h)
-        });
-    }
+        }),
+        _ => native,
+    };
     native.map(|(w, h)| recorded_size(w, h, target_height, shape))
 }
 
@@ -293,8 +294,9 @@ pub fn display_refresh(source: &VideoSource) -> Option<u32> {
     }
 }
 
-/// Part of a display, in its pixels: `w`×`h`, at `at` (its top-left corner)
-/// or in the middle. Kept inside the display, and even, for the encoder.
+/// The part of a display kept, in its pixels: `w`×`h`, its top-left corner
+/// at `at`, or in the middle. Kept inside the display, and even, for the
+/// encoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Crop {
     pub w: u32,
@@ -307,7 +309,7 @@ impl Crop {
     pub fn rect(&self, cw: u32, ch: u32) -> [u32; 4] {
         let w = self.w.clamp(2, cw.max(2)) & !1;
         let h = self.h.clamp(2, ch.max(2)) & !1;
-        let (x, y) = self.at.unwrap_or(((cw.saturating_sub(w)) / 2, (ch.saturating_sub(h)) / 2));
+        let (x, y) = self.at.unwrap_or((cw.saturating_sub(w) / 2, ch.saturating_sub(h) / 2));
         [x.min(cw.saturating_sub(w)), y.min(ch.saturating_sub(h)), w, h]
     }
 }
@@ -331,8 +333,9 @@ pub enum VideoSource {
     /// A whole display, by backend id (see [`list_screens`]), captured the
     /// way `method` says (Windows). A game that needs the game capture hook,
     /// fullscreen and in focus on it, is recorded through the hook while it is.
-    /// `crop`: only that part of it, recorded at its own size (a game
-    /// running at a lower resolution than the display, black around it).
+    /// `crop`: its sides cut off, the rest recorded as a display that size
+    /// would be (a game running at a lower resolution than the display,
+    /// black around it).
     Screen { id: String, hook: GameHook, method: ScreenCapture, crop: Option<Crop> },
     /// Games and apps, by executable name (see [`list_windowed_apps`]): records
     /// whichever of them was last in focus, for as long as it's showing, even

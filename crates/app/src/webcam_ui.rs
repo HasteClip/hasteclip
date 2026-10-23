@@ -1374,70 +1374,84 @@ fn picture_view(ui: &mut egui::Ui, panel: &mut CameraPanel, orient: Orientation,
             return;
         }
         // The crop on the whole picture: the rest dimmed, its edges dragged.
-        let at = |n: egui::Pos2| egui::pos2(rect.left() + n.x * rect.width(), rect.top() + n.y * rect.height());
-        let c = egui::Rect::from_min_max(at(shown.min), at(shown.max));
-        let dim = Color32::from_black_alpha(150);
-        let p = ui.painter();
-        p.rect_filled(egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), c.top())), 0.0, dim);
-        p.rect_filled(egui::Rect::from_min_max(egui::pos2(rect.left(), c.bottom()), rect.max), 0.0, dim);
-        p.rect_filled(egui::Rect::from_min_max(egui::pos2(rect.left(), c.top()), egui::pos2(c.left(), c.bottom())), 0.0, dim);
-        p.rect_filled(egui::Rect::from_min_max(egui::pos2(c.right(), c.top()), egui::pos2(rect.right(), c.bottom())), 0.0, dim);
-        p.rect_stroke(c, 0.0, Stroke::new(1.5, Color32::WHITE), egui::StrokeKind::Inside);
-        // Edge bars, and corner brackets.
-        for (a, b) in [(c.left_center(), vec2(4.0, 24.0)), (c.right_center(), vec2(4.0, 24.0)), (c.center_top(), vec2(24.0, 4.0)), (c.center_bottom(), vec2(24.0, 4.0))] {
-            p.rect_filled(egui::Rect::from_center_size(a, b), 2.0, Color32::WHITE);
-        }
-        let arm = 16.0_f32.min(c.width() / 3.0).min(c.height() / 3.0);
-        for (corner, sx, sy) in [(c.left_top(), 1.0, 1.0), (c.right_top(), -1.0, 1.0), (c.left_bottom(), 1.0, -1.0), (c.right_bottom(), -1.0, -1.0)] {
-            let stroke = Stroke::new(4.0, Color32::WHITE);
-            let inner = corner + vec2(sx * 1.5, sy * 1.5);
-            p.line_segment([inner, inner + vec2(sx * arm, 0.0)], stroke);
-            p.line_segment([inner, inner + vec2(0.0, sy * arm)], stroke);
-        }
-        // What's near the pointer: a corner, else an edge, else (inside) all of it.
-        let grip_at = |at: Pos2| -> Option<Handle> {
-            let near = 12.0;
-            let corner = [Handle::NW, Handle::NE, Handle::SW, Handle::SE].into_iter().find(|h| h.pos(c).distance(at) < near);
-            corner.or_else(|| {
-                let between_y = at.y > c.top() && at.y < c.bottom();
-                let between_x = at.x > c.left() && at.x < c.right();
-                if between_y && (at.x - c.left()).abs() < near {
-                    Some(Handle::W)
-                } else if between_y && (at.x - c.right()).abs() < near {
-                    Some(Handle::E)
-                } else if between_x && (at.y - c.top()).abs() < near {
-                    Some(Handle::N)
-                } else if between_x && (at.y - c.bottom()).abs() < near {
-                    Some(Handle::S)
-                } else {
-                    c.contains(at).then_some(Handle::Move)
-                }
-            })
-        };
-        let hover = resp.hover_pos().and_then(grip_at);
-        if resp.drag_started() {
-            let origin = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos());
-            panel.crop_drag = origin.and_then(|at| grip_at(at).map(|g| (g, shown, at)));
-        }
-        if let Some(g) = panel.crop_drag.map(|(g, _, _)| g).or(hover) {
-            ui.ctx().set_cursor_icon(if g == Handle::Move && panel.crop_drag.is_some() { egui::CursorIcon::Grabbing } else { g.cursor() });
-        }
-        if let (Some((g, start, from)), true, Some(now)) = (panel.crop_drag, resp.dragged(), resp.interact_pointer_pos()) {
-            let d = vec2((now.x - from.x) / rect.width(), (now.y - from.y) / rect.height());
-            let unit = egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-            let s = if g == Handle::Move {
-                start.translate(vec2(d.x.clamp(-start.min.x, 1.0 - start.max.x), d.y.clamp(-start.min.y, 1.0 - start.max.y)))
-            } else {
-                // Shift keeps its shape.
-                resize_within(start, g.sides(), d, ui.input(|i| i.modifiers.shift), unit, vec2(0.1, 0.1))
-            };
+        let unit = egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+        if let Some(s) = crop_editor(ui, &resp, rect, unit, shown, vec2(0.1, 0.1), &mut panel.crop_drag) {
             changed = Some(crop_from_shown(orient, s));
-        }
-        if resp.drag_stopped() {
-            panel.crop_drag = None;
         }
     });
     changed
+}
+
+/// A crop being set on a picture drawn at `area`: `bounds` is all of the
+/// picture and `kept` the part kept, in the same units (fractions of it, or
+/// its pixels). Drawn over it with the rest dimmed; its corners, edges or
+/// middle dragged (Shift keeps its shape), down to `least` across and down.
+/// `drag`: what's held, kept from frame to frame. The new part kept, when
+/// it's dragged.
+pub(crate) fn crop_editor(ui: &egui::Ui, resp: &egui::Response, area: Rect, bounds: Rect, kept: Rect, least: egui::Vec2, drag: &mut Option<(Handle, Rect, Pos2)>) -> Option<Rect> {
+    let scale = vec2(area.width() / bounds.width().max(1e-6), area.height() / bounds.height().max(1e-6));
+    let at = |n: Pos2| area.min + (n - bounds.min) * scale;
+    let c = Rect::from_min_max(at(kept.min), at(kept.max));
+    let dim = Color32::from_black_alpha(150);
+    let p = ui.painter();
+    p.rect_filled(Rect::from_min_max(area.min, egui::pos2(area.right(), c.top())), 0.0, dim);
+    p.rect_filled(Rect::from_min_max(egui::pos2(area.left(), c.bottom()), area.max), 0.0, dim);
+    p.rect_filled(Rect::from_min_max(egui::pos2(area.left(), c.top()), egui::pos2(c.left(), c.bottom())), 0.0, dim);
+    p.rect_filled(Rect::from_min_max(egui::pos2(c.right(), c.top()), egui::pos2(area.right(), c.bottom())), 0.0, dim);
+    p.rect_stroke(c, 0.0, Stroke::new(1.5, Color32::WHITE), egui::StrokeKind::Inside);
+    // Edge bars, and corner brackets.
+    for (a, b) in [(c.left_center(), vec2(4.0, 24.0)), (c.right_center(), vec2(4.0, 24.0)), (c.center_top(), vec2(24.0, 4.0)), (c.center_bottom(), vec2(24.0, 4.0))] {
+        p.rect_filled(Rect::from_center_size(a, b), 2.0, Color32::WHITE);
+    }
+    let arm = 16.0_f32.min(c.width() / 3.0).min(c.height() / 3.0);
+    for (corner, sx, sy) in [(c.left_top(), 1.0, 1.0), (c.right_top(), -1.0, 1.0), (c.left_bottom(), 1.0, -1.0), (c.right_bottom(), -1.0, -1.0)] {
+        let stroke = Stroke::new(4.0, Color32::WHITE);
+        let inner = corner + vec2(sx * 1.5, sy * 1.5);
+        p.line_segment([inner, inner + vec2(sx * arm, 0.0)], stroke);
+        p.line_segment([inner, inner + vec2(0.0, sy * arm)], stroke);
+    }
+    // What's near the pointer: a corner, else an edge, else (inside) all of it.
+    let grip_at = |at: Pos2| -> Option<Handle> {
+        let near = 12.0;
+        let corner = [Handle::NW, Handle::NE, Handle::SW, Handle::SE].into_iter().find(|h| h.pos(c).distance(at) < near);
+        corner.or_else(|| {
+            let between_y = at.y > c.top() && at.y < c.bottom();
+            let between_x = at.x > c.left() && at.x < c.right();
+            if between_y && (at.x - c.left()).abs() < near {
+                Some(Handle::W)
+            } else if between_y && (at.x - c.right()).abs() < near {
+                Some(Handle::E)
+            } else if between_x && (at.y - c.top()).abs() < near {
+                Some(Handle::N)
+            } else if between_x && (at.y - c.bottom()).abs() < near {
+                Some(Handle::S)
+            } else {
+                c.contains(at).then_some(Handle::Move)
+            }
+        })
+    };
+    let hover = resp.hover_pos().and_then(grip_at);
+    if resp.drag_started() {
+        let origin = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos());
+        *drag = origin.and_then(|at| grip_at(at).map(|g| (g, kept, at)));
+    }
+    if let Some(g) = drag.map(|(g, _, _)| g).or(hover) {
+        ui.ctx().set_cursor_icon(if g == Handle::Move && drag.is_some() { CursorIcon::Grabbing } else { g.cursor() });
+    }
+    let mut out = None;
+    if let (Some((g, start, from)), true, Some(now)) = (*drag, resp.dragged(), resp.interact_pointer_pos()) {
+        let d = vec2((now.x - from.x) / scale.x, (now.y - from.y) / scale.y);
+        out = Some(if g == Handle::Move {
+            start.translate(vec2(d.x.clamp(bounds.min.x - start.min.x, bounds.max.x - start.max.x), d.y.clamp(bounds.min.y - start.min.y, bounds.max.y - start.max.y)))
+        } else {
+            // Shift keeps its shape.
+            resize_within(start, g.sides(), d, ui.input(|i| i.modifiers.shift), bounds, least)
+        });
+    }
+    if resp.drag_stopped() {
+        *drag = None;
+    }
+    out
 }
 
 /// The crop (left, top, right, bottom cut off) as the part of the picture

@@ -593,14 +593,21 @@ impl Default for GameTitles {
     }
 }
 
-/// The part of the screen recorded: `w`×`h` pixels, at `at` (its top-left
-/// corner), else in the middle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// The part of the screen kept, in its pixels: `w`×`h`, its top-left
+/// corner at `at`, or in the middle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ScreenCrop {
     pub w: u32,
     pub h: u32,
-    #[serde(default)]
     pub at: Option<[u32; 2]>,
+}
+
+impl ScreenCrop {
+    /// No size: none of it cut off.
+    pub fn is_none(&self) -> bool {
+        self.w == 0 || self.h == 0
+    }
 }
 
 impl From<ScreenCrop> for capture::Crop {
@@ -709,9 +716,9 @@ pub struct RecordSettings {
     pub shape: Option<[u32; 2]>,
     /// How the screen goes into that shape.
     pub framing: Framing,
-    /// Only part of the screen, at its own size (a game at a lower
-    /// resolution than the display, black around it): set on Sources.
-    /// Shape and resolution don't apply while it's set.
+    /// The part of the screen kept (a game at a lower resolution than the
+    /// display, black around it): set on Sources. It's recorded as a display
+    /// that size would be.
     pub screen_crop: Option<ScreenCrop>,
     pub video_bitrate_mbps: u32,
 
