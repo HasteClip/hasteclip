@@ -96,6 +96,8 @@ impl Tray {
     pub fn new(ctx: &egui::Context, tx: mpsc::Sender<Cmd>, rx: Receiver<Cmd>, quick: crate::service::QuickSave) -> Option<Self> {
         #[cfg(any(windows, target_os = "macos"))]
         {
+            // Their UI runs while the window's hidden: the tray's commands wait for it.
+            let _ = quick;
             use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
             use tray_icon::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 

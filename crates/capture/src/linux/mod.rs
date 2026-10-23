@@ -454,14 +454,6 @@ enum Source {
     Apps(Arc<apps::Apps>),
 }
 
-/// The part of a screen `video` records, if it's cropped.
-fn crop_of(video: &VideoSource) -> Option<crate::Crop> {
-    match video {
-        VideoSource::Screen { crop, .. } => *crop,
-        VideoSource::Apps { .. } => None,
-    }
-}
-
 impl Source {
     /// Start `source`'s pictures. Games and apps show the away screen (else
     /// black) until one of them is found.
@@ -492,7 +484,7 @@ impl Feed {
             base: Default::default(),
             last: Default::default(),
             queuing: AtomicBool::new(false),
-            crop: crop_of(video),
+            crop: crate::crop_of(video),
         })))
     }
 
@@ -504,10 +496,7 @@ impl Feed {
     /// what's kept of it when it's cropped, as `target_height` and `shape`
     /// make it.
     fn recorded_size(&self, target_height: Option<u32>, shape: Option<crate::Shape>) -> (u32, u32) {
-        let (mut w, mut h) = self.size();
-        if let Some(c) = self.crop() {
-            [_, _, w, h] = c.rect(w, h);
-        }
+        let (w, h) = crate::cropped_size(self.crop(), self.size());
         crate::recorded_size(w, h, target_height, shape)
     }
 
@@ -530,7 +519,7 @@ impl Feed {
             a.set(ids, *away_when_unfocused);
             return Ok(());
         }
-        if crop_of(video) != self.crop() {
+        if crate::crop_of(video) != self.crop() {
             bail!("another crop makes the recording another size");
         }
         let new = Source::open(video, away_screen)?;

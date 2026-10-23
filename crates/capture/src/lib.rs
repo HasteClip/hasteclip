@@ -175,7 +175,7 @@ pub fn recorded_size(w: u32, h: u32, target_height: Option<u32>, shape: Option<S
 /// without a shape does with a window that isn't the screen's shape); Fill
 /// cuts off what's past the frame's shape; Stretch draws all of it over all
 /// of the frame. Where it's drawn is even, for the encoder's 4:2:0 colour.
-#[cfg_attr(not(any(target_os = "windows", target_os = "linux", target_os = "macos")), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
 pub(crate) fn placement((cw, ch): (u32, u32), (fw, fh): (u32, u32), framing: Framing) -> ([u32; 4], [u32; 4]) {
     let (all, whole) = ([0, 0, cw, ch], [0, 0, fw, fh]);
     if cw == 0 || ch == 0 || fw == 0 || fh == 0 {
@@ -218,14 +218,7 @@ pub fn frame_size(source: &VideoSource, target_height: Option<u32>, shape: Optio
         None
     };
     // Cropped: what's kept, as a display that size.
-    let native = match source {
-        VideoSource::Screen { crop: Some(c), .. } => native.map(|(w, h)| {
-            let [_, _, w, h] = c.rect(w, h);
-            (w, h)
-        }),
-        _ => native,
-    };
-    native.map(|(w, h)| recorded_size(w, h, target_height, shape))
+    native.map(|size| cropped_size(crop_of(source), size)).map(|(w, h)| recorded_size(w, h, target_height, shape))
 }
 
 /// The fastest a recording of `source` can look at the screen for frame
@@ -315,10 +308,32 @@ impl Crop {
 }
 
 /// Whether a screen can be cropped ([`VideoSource::Screen`]'s `crop`) here.
-pub const SCREEN_CROP: bool = cfg!(target_os = "linux");
+pub const SCREEN_CROP: bool = cfg!(any(target_os = "linux", target_os = "windows", target_os = "macos"));
+
+/// The part of a screen `video` records, if it's cropped.
+#[cfg_attr(not(any(target_os = "windows", target_os = "linux", target_os = "macos")), allow(dead_code))]
+pub(crate) fn crop_of(video: &VideoSource) -> Option<Crop> {
+    match video {
+        VideoSource::Screen { crop, .. } => *crop,
+        VideoSource::Apps { .. } => None,
+    }
+}
+
+/// A `w`×`h` picture's size once `crop` is cut out of it.
+#[cfg_attr(not(any(target_os = "windows", target_os = "linux", target_os = "macos")), allow(dead_code))]
+pub(crate) fn cropped_size(crop: Option<Crop>, (w, h): (u32, u32)) -> (u32, u32) {
+    match crop {
+        Some(c) => {
+            let [_, _, w, h] = c.rect(w, h);
+            (w, h)
+        }
+        None => (w, h),
+    }
+}
 
 /// [`placement`] of part of a picture: `crop` of it, if any.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+// macOS has ScreenCaptureKit cut and place it (`mac::video::stream_config`).
+#[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
 pub(crate) fn placement_cropped(crop: Option<Crop>, (cw, ch): (u32, u32), frame: (u32, u32), framing: Framing) -> ([u32; 4], [u32; 4]) {
     let Some(c) = crop else { return placement((cw, ch), frame, framing) };
     let [x, y, w, h] = c.rect(cw, ch);

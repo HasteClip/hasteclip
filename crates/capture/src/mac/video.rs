@@ -233,7 +233,9 @@ pub(crate) fn plan(source: &VideoSource, target_height: Option<u32>, shape: Opti
     };
     let display = pick_display(&content, id).context("no display to capture")?;
     let (w, h) = display_pixels(&display);
-    let (w, h) = crate::recorded_size(w as u32, h as u32, target_height, shape);
+    // Cropped: what's kept, recorded as a display that size.
+    let (w, h) = crate::cropped_size(crate::crop_of(source), (w as u32, h as u32));
+    let (w, h) = crate::recorded_size(w, h, target_height, shape);
     Ok((content, display, (w as usize, h as usize)))
 }
 
@@ -254,6 +256,8 @@ pub(crate) struct Picture {
     /// each to the frame's shape).
     fps: u32,
     framing: crate::Framing,
+    /// The part of the display recorded, if not all of it (in its pixels).
+    crop: Option<crate::Crop>,
     away: Option<Arc<Buffer>>,
 }
 
@@ -291,7 +295,8 @@ impl Picture {
         let latest = Arc::new(Latest::default());
         let out = Arc::new(Output { latest: latest.clone(), paused: AtomicBool::new(false), frames: AtomicU64::new(0) });
         let output = ScreenOutput::new(out.clone());
-        let config = stream_config(width, height, fps, framing, Some(points(display)));
+        let crop = crate::crop_of(source);
+        let config = stream_config(width, height, fps, framing, Some(points(display)), crop_points(display, crop));
         // Games and apps start on the away screen (the stream shows the
         // display until a window is picked, but nothing of it is used).
         let apps = AppsConfig::of(source);
@@ -314,7 +319,7 @@ impl Picture {
             VideoSource::Apps { .. } => String::new(),
         };
         let _ = content;
-        let mut picture = Self { latest, stream, _output: output, out, follow: None, display: display_id, size: (width, height), fps, framing, away };
+        let mut picture = Self { latest, stream, _output: output, out, follow: None, display: display_id, size: (width, height), fps, framing, crop, away };
         match apps {
             None => {
                 let deadline = Instant::now() + Duration::from_secs(3);
@@ -352,6 +357,10 @@ impl Picture {
     /// apps, another display, or the whole screen instead of games and apps
     /// (or the other way round). False if it couldn't.
     pub(crate) fn update(&mut self, source: &VideoSource) -> bool {
+        // Another crop is another size: that's a new recording.
+        if crate::crop_of(source) != self.crop {
+            return false;
+        }
         match (AppsConfig::of(source), &self.follow) {
             (Some(config), Some((_, _, list))) => {
                 *list.lock().unwrap() = config;
@@ -370,7 +379,7 @@ impl Picture {
                     return true;
                 }
                 self.stop_following();
-                match show_display(&self.stream, id, self.size, self.fps, self.framing) {
+                match show_display(&self.stream, id, self.size, self.fps, self.framing, self.crop) {
                     Ok(()) => {
                         self.display = id.clone();
                         *self.latest.app.lock().unwrap() = None;
@@ -394,13 +403,13 @@ impl Picture {
 }
 
 /// Point the stream at a whole display (by id; the main one if it's gone),
-/// at a `size` frame, `fps`, put in as `framing` says.
-fn show_display(stream: &SCStream, id: &str, size: (usize, usize), fps: u32, framing: crate::Framing) -> Result<()> {
+/// at a `size` frame, `fps`, put in as `framing` says (`crop` of it).
+fn show_display(stream: &SCStream, id: &str, size: (usize, usize), fps: u32, framing: crate::Framing, crop: Option<crate::Crop>) -> Result<()> {
     let content = shareable_content()?;
     let display = pick_display(&content, id).context("no display to capture")?;
     let filter = unsafe { SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), &display, &NSArray::new()) };
     await_completion(|h| unsafe { stream.updateContentFilter_completionHandler(&filter, Some(h)) }).map_err(|e| anyhow::anyhow!("{e}"))?;
-    reconfigure(stream, size, fps, framing, points(&display))
+    reconfigure(stream, size, fps, framing, points(&display), crop_points(&display, crop))
 }
 
 /// A display's size in points, what the stream's source rect is in.
@@ -408,10 +417,21 @@ fn points(display: &SCDisplay) -> (f64, f64) {
     unsafe { (display.width() as f64, display.height() as f64) }
 }
 
-/// Set the stream up again for what it now shows, `content` points big:
-/// filling, the middle of it, cut to the frame's shape.
-fn reconfigure(stream: &SCStream, (width, height): (usize, usize), fps: u32, framing: crate::Framing, content: (f64, f64)) -> Result<()> {
-    let config = stream_config(width, height, fps, framing, Some(content));
+/// A crop (in the display's pixels) in its points, as (left, top, width,
+/// height).
+fn crop_points(display: &SCDisplay, crop: Option<crate::Crop>) -> Option<[f64; 4]> {
+    let c = crop?;
+    let (pw, ph) = display_pixels(display);
+    let (w, h) = points(display);
+    let [x, y, cw, ch] = c.rect(pw as u32, ph as u32);
+    let (sx, sy) = (w / pw.max(1) as f64, h / ph.max(1) as f64);
+    Some([x as f64 * sx, y as f64 * sy, cw as f64 * sx, ch as f64 * sy])
+}
+
+/// Set the stream up again for what it now shows, `content` points big
+/// (`crop` of it): filling, the middle of it, cut to the frame's shape.
+fn reconfigure(stream: &SCStream, (width, height): (usize, usize), fps: u32, framing: crate::Framing, content: (f64, f64), crop: Option<[f64; 4]>) -> Result<()> {
+    let config = stream_config(width, height, fps, framing, Some(content), crop);
     await_completion(|h| unsafe { stream.updateConfiguration_completionHandler(&config, Some(h)) }).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
@@ -421,8 +441,9 @@ unsafe impl Send for SendStream {}
 /// The stream's settings for a `width`×`height` frame at `fps`. What's
 /// recorded (`content` points big: a display, or a window) goes in as
 /// `framing` says: its middle, cut to the frame's shape (Fill); all of it,
-/// with black around (Fit); or all of it, stretched.
-fn stream_config(width: usize, height: usize, fps: u32, framing: crate::Framing, content: Option<(f64, f64)>) -> Retained<SCStreamConfiguration> {
+/// with black around (Fit); or all of it, stretched. `crop`: only that part
+/// of it (in points), put in the same way.
+fn stream_config(width: usize, height: usize, fps: u32, framing: crate::Framing, content: Option<(f64, f64)>, crop: Option<[f64; 4]>) -> Retained<SCStreamConfiguration> {
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
     unsafe {
         let config = SCStreamConfiguration::new();
@@ -436,13 +457,19 @@ fn stream_config(width: usize, height: usize, fps: u32, framing: crate::Framing,
         // centred, with black around it; stretched, all of the frame.
         config.setScalesToFit(true);
         config.setPreservesAspectRatio(framing != crate::Framing::Stretch);
-        if let (crate::Framing::Fill, Some((cw, ch))) = (framing, content)
+        // What's used of it: the crop, or all of it.
+        let area = crop.or(content.map(|(cw, ch)| [0.0, 0.0, cw, ch]));
+        if let Some([x, y, cw, ch]) = area
             && cw > 0.0
             && ch > 0.0
         {
-            let shape = width as f64 / height.max(1) as f64;
-            let (w, h) = if cw / ch > shape { (ch * shape, ch) } else { (cw, cw / shape) };
-            config.setSourceRect(CGRect::new(CGPoint::new((cw - w) / 2.0, (ch - h) / 2.0), CGSize::new(w, h)));
+            if framing == crate::Framing::Fill {
+                let shape = width as f64 / height.max(1) as f64;
+                let (w, h) = if cw / ch > shape { (ch * shape, ch) } else { (cw, cw / shape) };
+                config.setSourceRect(CGRect::new(CGPoint::new(x + (cw - w) / 2.0, y + (ch - h) / 2.0), CGSize::new(w, h)));
+            } else if crop.is_some() {
+                config.setSourceRect(CGRect::new(CGPoint::new(x, y), CGSize::new(cw, ch)));
+            }
         }
         if let Some(black) = CGColor::constant_color(Some(objc2_core_graphics::kCGColorBlack)) {
             config.setBackgroundColor(&black);
@@ -583,7 +610,7 @@ fn follow_apps(
         {
             // Not tried again until it changes size.
             cut_to = Some((win.width, win.height));
-            if let Err(e) = reconfigure(&stream, (width, height), fps, framing, (win.width, win.height)) {
+            if let Err(e) = reconfigure(&stream, (width, height), fps, framing, (win.width, win.height), None) {
                 eprintln!("can't cut the window to the recording's shape: {e:#}");
             }
         }

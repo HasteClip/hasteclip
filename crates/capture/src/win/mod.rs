@@ -250,7 +250,10 @@ impl Session {
         system::com_init();
         system::mf_startup()?;
         let gpu = d3d::Gpu::new()?;
-        let (picture_source, (canvas_w, canvas_h)) = PictureSource::plan(&s.video)?;
+        let (picture_source, canvas) = PictureSource::plan(&s.video)?;
+        // Cropped: what's kept, recorded as a screen that size.
+        let crop = crate::crop_of(&s.video);
+        let (canvas_w, canvas_h) = crate::cropped_size(crop, canvas);
         let (width, height) = crate::recorded_size(canvas_w, canvas_h, s.target_height, s.shape);
         // Without a shape, a window that isn't the screen's goes in whole.
         let framing = s.shape.map_or(crate::Framing::Fit, |shape| shape.framing);
@@ -328,8 +331,8 @@ impl Session {
             let shutter = crate::shutter::Shutter::new(looks, s.blend_shape);
             let blend = FrameBlend::new(&gpu, &latest, looks, shutter.frames_open())?;
             latest.set_wants_queue(true);
-            let converter = d3d::Converter::new(&gpu, &blend.average, overlay.clone(), &encoder.pool.textures, true, width, height, s.fps, framing)?;
-            let preview = d3d::Previewer::new(&gpu, &latest, overlay, width, height, s.fps, framing, crate::preview::new_producer())?;
+            let converter = d3d::Converter::new(&gpu, &blend.average, overlay.clone(), &encoder.pool.textures, true, width, height, s.fps, framing, crop)?;
+            let preview = d3d::Previewer::new(&gpu, &latest, overlay, width, height, s.fps, framing, crop, crate::preview::new_producer())?;
             session.pacer = Some(spawn_blend_pacer(s.fps, looks, shutter, latest, blend, converter, encoder, preview, camera, clock));
             Ok(())
         })();
@@ -354,6 +357,11 @@ impl Session {
         let Some(sw) = &mut self.switch else { return false };
         if sw.source == *video {
             return true;
+        }
+        // Another crop is another size: that's a new recording.
+        if crate::crop_of(video) != crate::crop_of(&sw.source) {
+            eprintln!("can't switch what's recorded: another crop makes it another size");
+            return false;
         }
         let source = match PictureSource::plan(video) {
             Ok((source, _)) => source,
@@ -575,16 +583,18 @@ impl PreviewCapture {
             system::com_init();
             let opened = (|| -> Result<(Picture, d3d::Previewer, Option<camera::CameraLayer>)> {
                 let gpu = d3d::Gpu::new()?;
+                let crop = crate::crop_of(&source);
                 let (mut source, (w, h)) = PictureSource::plan(&source)?;
                 if let (PictureSource::Apps(list), Some(shared)) = (&mut source, apps2) {
                     *list = shared; // so `update` reaches the running follower
                 }
                 let picture = source.open(&gpu, w, h, fps, away)?;
-                let (width, height) = crate::recorded_size(w, h, target_height, shape);
+                let (cw, ch) = crate::cropped_size(crop, (w, h));
+                let (width, height) = crate::recorded_size(cw, ch, target_height, shape);
                 let framing = shape.map_or(crate::Framing::Fit, |shape| shape.framing);
                 let cam = webcam.as_ref().and_then(|wc| camera::CameraLayer::new(&gpu, wc).ok());
                 let overlay = cam.as_ref().zip(webcam.as_ref()).map(|(c, wc)| (&c.latest, wc.placement.clone()));
-                let preview = d3d::Previewer::new(&gpu, &picture.latest, overlay, width, height, fps, framing, generation)?;
+                let preview = d3d::Previewer::new(&gpu, &picture.latest, overlay, width, height, fps, framing, crop, generation)?;
                 Ok((picture, preview, cam))
             })();
             let (picture, preview, mut cam) = match opened {

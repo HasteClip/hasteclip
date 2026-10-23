@@ -737,6 +737,8 @@ pub(crate) struct Converter {
     height: u32,
     /// How the picture goes into the frame (see `crate::placement`).
     framing: crate::Framing,
+    /// The part of the picture used, if not all of it.
+    crop: Option<crate::Crop>,
     video: ID3D11VideoContext,
     base: Layer,
     overlay: Option<(Layer, crate::webcam::SharedPlacement)>,
@@ -839,7 +841,8 @@ impl Layer {
 
 impl Converter {
     /// `overlay`: the webcam's picture and where it goes, drawn over `source`.
-    /// `framing`: how `source` goes into the `width`×`height` frame.
+    /// `framing`: how `source` (`crop` of it, if any) goes into the
+    /// `width`×`height` frame.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         gpu: &Gpu,
@@ -851,6 +854,7 @@ impl Converter {
         height: u32,
         fps: u32,
         framing: crate::Framing,
+        crop: Option<crate::Crop>,
     ) -> Result<Self> {
         let video: ID3D11VideoContext = gpu.context.cast()?;
         let base = Layer::new(gpu, &video, source, targets, yuv, width, height, fps)?;
@@ -858,14 +862,14 @@ impl Converter {
             Some((cam, placement)) => Some((Layer::new(gpu, &video, cam, targets, yuv, width, height, fps)?, placement)),
             None => None,
         };
-        Ok(Self { gpu: gpu.clone(), width, height, framing, video, base, overlay })
+        Ok(Self { gpu: gpu.clone(), width, height, framing, crop, video, base, overlay })
     }
 
     /// Convert the latest captured image (and the webcam over it) into target `slot`.
     pub(crate) fn convert(&self, slot: usize) -> Result<()> {
         let (cw, ch) = self.base.source.content();
         let rect = |[x, y, w, h]: [u32; 4]| RECT { left: x as i32, top: y as i32, right: (x + w) as i32, bottom: (y + h) as i32 };
-        let (source, dest) = crate::placement((cw, ch), (self.width, self.height), self.framing);
+        let (source, dest) = crate::placement_cropped(self.crop, (cw, ch), (self.width, self.height), self.framing);
         let (source, dest) = (rect(source), rect(dest));
         let full = RECT { left: 0, top: 0, right: self.width as i32, bottom: self.height as i32 };
         let result = self.base.draw(&self.video, slot, source, dest, full, (false, false)).context("couldn't convert a screen frame");
@@ -948,6 +952,7 @@ impl Previewer {
         recorded_height: u32,
         fps: u32,
         framing: crate::Framing,
+        crop: Option<crate::Crop>,
         generation: u64,
     ) -> Result<Self> {
         let recorded = (recorded_width, recorded_height);
@@ -959,7 +964,7 @@ impl Previewer {
             let staging = (0..Self::SLOTS)
                 .map(|_| gpu.texture(width, height, format, 0, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ.0 as u32))
                 .collect::<Result<Vec<_>>>()?;
-            let converter = Converter::new(gpu, latest, overlay.clone(), std::slice::from_ref(&target), false, width, height, fps, framing)?;
+            let converter = Converter::new(gpu, latest, overlay.clone(), std::slice::from_ref(&target), false, width, height, fps, framing, crop)?;
             Ok((target, staging, converter))
         };
         let (rgba, (target, staging, converter)) = match make(DXGI_FORMAT_R8G8B8A8_UNORM) {
