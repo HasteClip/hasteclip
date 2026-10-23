@@ -13,10 +13,17 @@
 //! portal's (`super::screen`). It streams for as long as the Wayland
 //! connection that asked lives, so that's kept open alongside, on its own
 //! thread, which also notices when KWin stops the stream.
+//!
+//! KWin leaves the windows of the app that asks out of a monitor's stream
+//! (not out of a window's). Ours should be in the recording like any other
+//! app's, so a monitor's stream is asked for by a helper: this app started
+//! again (`helper`), whose only connection is the one that asks.
 
+use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsFd;
-use std::sync::Arc;
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -31,6 +38,14 @@ use wayland_protocols_plasma::screencast::v1::client::{
 
 /// `zkde_screencast_unstable_v1`'s pointer mode: drawn into the picture.
 const POINTER_EMBEDDED: u32 = 2;
+
+/// What the app is started with to be the helper (`helper`), then the
+/// monitor's id.
+const HELPER_ARG: &str = "--kde-screen-stream";
+
+/// Whether this program can be started as the helper: it called `helper`
+/// when it started. (One that never does, an example, asks itself.)
+static HELPS: AtomicBool = AtomicBool::new(false);
 
 /// Whether this is a KDE Plasma Wayland session that lets us have its
 /// screencast. Asked once: that doesn't change while the app runs (a new
@@ -166,29 +181,83 @@ impl Session {
         self.queue.dispatch_pending(&mut self.state)?;
         Ok(n > 0)
     }
+
+    /// The monitor with this id, else the main one.
+    fn output(&self, id: &str) -> Result<wl_output::WlOutput> {
+        let want = id.strip_prefix("kde:");
+        let mut outputs: Vec<&Output> = self.state.outputs.iter().filter(|o| o.size.is_some()).collect();
+        outputs.sort_by_key(|o| self.state.rank(o));
+        let output = outputs.iter().find(|o| o.name.as_deref() == want).or(outputs.first()).context("the desktop has no monitor")?;
+        Ok(output.wl.clone())
+    }
+
+    /// Wait (up to 5 seconds) for KWin to make `stream`'s PipeWire node.
+    fn wait_for_node(&mut self, stream: &stream::ZkdeScreencastStreamUnstableV1) -> Result<u32> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(node) = self.state.node {
+                return Ok(node);
+            }
+            if let Some(why) = self.state.ended.take() {
+                stream.close();
+                bail!("KDE didn't start the screen stream: {why}");
+            }
+            if !self.dispatch(deadline)? && Instant::now() >= deadline {
+                stream.close();
+                bail!("KDE didn't start the screen stream in time");
+            }
+        }
+    }
 }
 
-/// A KWin stream of one monitor: its PipeWire node is live for as long as
-/// this is held.
+/// A KWin stream of one monitor or window: its PipeWire node is live for as
+/// long as this is held.
 pub(crate) struct Cast {
     pub node: u32,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    /// The helper that asked for it, and its stdin: closed to let go.
+    helper: Option<(Child, ChildStdin)>,
+}
+
+/// Whom the helper's reader tells if KWin stops the stream.
+type Ended = Box<dyn FnOnce(String) + Send>;
+
+/// A helper with its stream.
+struct Helper {
+    node: u32,
+    child: Child,
+    stdin: ChildStdin,
+    /// Reads what it says; `tell` hands it `Ended` once the stream is wanted.
+    reader: JoinHandle<()>,
+    tell: mpsc::Sender<Ended>,
+    stop: Arc<AtomicBool>,
 }
 
 impl Cast {
     /// Ask KWin to stream the monitor with this id (the main one if there's
-    /// none such). `ended` is called if KWin stops the stream.
+    /// none such). `ended` is called if KWin stops the stream. Through the
+    /// helper, so our windows are in it; here, without them, if the helper
+    /// can't be started.
     pub(crate) fn open(id: &str, ended: impl FnOnce(String) + Send + 'static) -> Result<Self> {
-        let session = Session::connect()?;
-        let want = id.strip_prefix("kde:");
-        let mut outputs: Vec<&Output> = session.state.outputs.iter().filter(|o| o.size.is_some()).collect();
-        outputs.sort_by_key(|o| session.state.rank(o));
-        let output = outputs.iter().find(|o| o.name.as_deref() == want).or(outputs.first()).context("the desktop has no monitor")?;
-        let output = output.wl.clone();
-        let qh = session.queue.handle();
-        let stream = session.screencast.stream_output(&output, POINTER_EMBEDDED, &qh, ());
-        Self::stream(session, stream, ended)
+        let helper = if HELPS.load(Ordering::Relaxed) { Self::open_helper(id) } else { Err(anyhow!("this program can't be one")) };
+        match helper {
+            Ok(Ok(h)) => {
+                let _ = h.tell.send(Box::new(ended));
+                Ok(Self { node: h.node, stop: h.stop, thread: Some(h.reader), helper: Some((h.child, h.stdin)) })
+            }
+            Ok(Err(refused)) => Err(refused),
+            Err(e) => {
+                if HELPS.load(Ordering::Relaxed) {
+                    eprintln!("kde screen stream: no helper ({e:#}), so asked here: our windows aren't in it");
+                }
+                let session = Session::connect()?;
+                let output = session.output(id)?;
+                let qh = session.queue.handle();
+                let stream = session.screencast.stream_output(&output, POINTER_EMBEDDED, &qh, ());
+                Self::stream(session, stream, ended)
+            }
+        }
     }
 
     /// Ask KWin to stream one window (by its uuid in KWin's window list,
@@ -204,20 +273,7 @@ impl Cast {
     /// Wait for KWin to make `stream`'s PipeWire node, then keep the
     /// connection open on a thread for as long as this is held.
     fn stream(mut session: Session, stream: stream::ZkdeScreencastStreamUnstableV1, ended: impl FnOnce(String) + Send + 'static) -> Result<Self> {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let node = loop {
-            if let Some(node) = session.state.node {
-                break node;
-            }
-            if let Some(why) = session.state.ended.take() {
-                stream.close();
-                bail!("KDE didn't start the screen stream: {why}");
-            }
-            if !session.dispatch(deadline)? && Instant::now() >= deadline {
-                stream.close();
-                bail!("KDE didn't start the screen stream in time");
-            }
-        };
+        let node = session.wait_for_node(&stream)?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let thread = thread::Builder::new().name("kwin-cast".into()).spawn(move || {
@@ -234,17 +290,148 @@ impl Cast {
             stream.close();
             let _ = session.conn.flush();
         })?;
-        Ok(Self { node, stop, thread: Some(thread) })
+        Ok(Self { node, stop, thread: Some(thread), helper: None })
+    }
+
+    /// Start the helper and wait for its stream's node. An error if it can't
+    /// be used (then it's asked here); inside, KWin's refusal.
+    fn open_helper(id: &str) -> Result<Result<Helper>> {
+        // This app, even if its file has been replaced since (an update).
+        let mut child = Command::new("/proc/self/exe")
+            .arg(HELPER_ARG)
+            .arg(id)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .context("couldn't start it")?;
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("no pipes to it");
+        };
+        let (first_tx, first_rx) = mpsc::channel::<Option<String>>();
+        let (tell, told) = mpsc::channel::<Ended>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        // Its answer; then, once the stream is wanted, whether it ends: KWin
+        // stopped it, or the helper went while it was still wanted.
+        let reader = thread::Builder::new().name("kwin-cast".into()).spawn(move || {
+            let mut lines = BufReader::new(stdout).lines();
+            let _ = first_tx.send(lines.next().and_then(|l| l.ok()));
+            let Ok(ended) = told.recv() else { return };
+            let why = loop {
+                match lines.next() {
+                    Some(Ok(line)) => match line.strip_prefix("ended ") {
+                        Some(why) => break why.to_owned(),
+                        None => continue,
+                    },
+                    _ => break "the screen stream's helper stopped".to_owned(),
+                }
+            };
+            if !stop2.load(Ordering::Relaxed) {
+                ended(why);
+            }
+        })?;
+        let unusable = |mut child: Child, why: &str| -> Result<Result<Helper>> {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("{why}")
+        };
+        // It waits up to 5 seconds for KWin.
+        let first = match first_rx.recv_timeout(Duration::from_secs(8)) {
+            Ok(Some(line)) => line,
+            Ok(None) => return unusable(child, "it stopped without answering"),
+            Err(_) => return unusable(child, "it didn't answer"),
+        };
+        if let Some(node) = first.strip_prefix("node ").and_then(|n| n.trim().parse().ok()) {
+            return Ok(Ok(Helper { node, child, stdin, reader, tell, stop }));
+        }
+        match first.strip_prefix("failed ") {
+            Some(why) => {
+                // It exits after saying so.
+                drop(stdin);
+                let _ = child.wait();
+                Ok(Err(anyhow!("{why}")))
+            }
+            None => unusable(child, &format!("it answered {first:?}")),
+        }
     }
 }
 
 impl Drop for Cast {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        if let Some((mut child, stdin)) = self.helper.take() {
+            // Its stdin closing is its cue to let go of the stream and exit.
+            drop(stdin);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            if matches!(child.try_wait(), Ok(None)) {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+        }
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
     }
+}
+
+/// Called first thing by a program that can be the helper (the app): be the
+/// helper `Cast::open` starts, if that's what this process was started as.
+/// Ask KWin to stream the monitor, print `node <n>` (or `failed <why>`), keep
+/// it streaming until stdin closes (the app let go of it, or quit) and print
+/// `ended <why>` if KWin stops it first. Returns whether this was the
+/// helper; the program exits then.
+pub fn helper() -> bool {
+    HELPS.store(true, Ordering::Relaxed);
+    // `args_os`: the app may be opened with a path that isn't UTF-8.
+    let mut args = std::env::args_os().skip(1);
+    if args.next().is_none_or(|a| a != HELPER_ARG) {
+        return false;
+    }
+    let id = args.next().map(|a| a.to_string_lossy().into_owned()).unwrap_or_default();
+    let say = |what: &str, why: &str| {
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "{what} {}", why.replace(['\n', '\r'], " "));
+        let _ = out.flush();
+    };
+    let asked = Session::connect().and_then(|mut session| {
+        let output = session.output(&id)?;
+        let qh = session.queue.handle();
+        let stream = session.screencast.stream_output(&output, POINTER_EMBEDDED, &qh, ());
+        let node = session.wait_for_node(&stream)?;
+        Ok((session, stream, node))
+    });
+    let (mut session, stream, node) = match asked {
+        Ok(asked) => asked,
+        Err(e) => {
+            say("failed", &format!("{e:#}"));
+            return true;
+        }
+    };
+    say("node", &node.to_string());
+    let gone = Arc::new(AtomicBool::new(false));
+    let gone2 = gone.clone();
+    let _ = thread::Builder::new().name("stdin".into()).spawn(move || {
+        let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+        gone2.store(true, Ordering::Relaxed);
+    });
+    while !gone.load(Ordering::Relaxed) {
+        let next = Instant::now() + Duration::from_millis(100);
+        if let Err(e) = session.dispatch(next) {
+            session.state.ended = Some(format!("lost the connection to KDE: {e}"));
+        }
+        if let Some(why) = session.state.ended.take() {
+            say("ended", &why);
+            break;
+        }
+    }
+    stream.close();
+    let _ = session.conn.flush();
+    true
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {

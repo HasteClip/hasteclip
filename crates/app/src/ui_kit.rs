@@ -899,6 +899,7 @@ pub fn select(ui: &mut egui::Ui, value: &str, min_w: f32) -> Response {
     let id = ui.next_auto_id();
     let w = theme::value(ui.ctx(), id.with("w"), target, theme::NORMAL);
     let (rect, resp) = ui.allocate_exact_size(vec2(w, CONTROL_H), Sense::click());
+    crate::demo::mark(ui.ctx(), || format!("select:{value}"), rect);
     let open = egui::Popup::is_id_open(ui.ctx(), resp.id.with("menu"));
     let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered() || open, theme::FAST);
     let enabled = ui.is_enabled();

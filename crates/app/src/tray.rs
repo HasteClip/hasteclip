@@ -55,7 +55,7 @@ struct Inner {
 
 /// The tray / menu bar icon: the logo's glyph alone, as the bar's other icons
 /// are (the app icon, with its dark plate, looked small and boxed in there).
-/// Made from its SVG by `scripts/tray-icons.sh`.
+/// Made from its SVG by `scripts/icons.sh`.
 #[cfg(any(windows, target_os = "macos"))]
 fn tray_image() -> Option<tray_icon::Icon> {
     // macOS: 18 points high on a 2x display; macOS sizes it to the bar.

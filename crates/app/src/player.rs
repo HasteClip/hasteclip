@@ -4,12 +4,13 @@
 //! and mixed live in the cpal callback at the current gains, so moving a slider is
 //! heard instantly. The playhead is however many samples the callback has played.
 //!
-//! Video follows the clock. On Windows and macOS it comes from the in-process
-//! hardware decoder (`video.rs`), which keeps the next frames decoded so play
-//! starts at once; if that can't open a file (or elsewhere), an ffmpeg process streams
-//! scaled RGBA frames from the playhead onward, and single exact frames are
-//! decoded on demand when paused. Either way the UI shows whichever decoded
-//! frame matches the clock. While scrubbing, frames come from the hardware
+//! Video follows the clock. It comes from the in-process decoder (`video.rs`:
+//! the GPU's on Windows and macOS, libavcodec on Linux), which keeps the next
+//! frames decoded so play starts at once; if that can't open a file, an ffmpeg process streams
+//! frames from the playhead onward (NV12 at the video's own size, uploaded to
+//! draw with the same sharp filter), and single exact frames are decoded on
+//! demand when paused. Either way the UI shows whichever decoded frame
+//! matches the clock. While scrubbing, frames come from the hardware
 //! decoder, live (`video.rs`); without one, from the scrub proxy, small
 //! frames built ahead in the background (`proxy.rs`).
 
@@ -56,6 +57,7 @@ impl Video {
     fn take_upto(&self, _: u64) -> Option<Picture> { match *self {} }
     fn has(&self, _: u64) -> bool { match *self {} }
     fn open_for(&self) -> Option<std::time::Duration> { match *self {} }
+    fn set_skips(&self, _: Vec<(u64, u64)>) { match *self {} }
 }
 
 /// `HASTECLIP_DEBUG_VIDEO=1`: log what playback does, with times.
@@ -146,27 +148,37 @@ pub fn paint_proxy_bar(ui: &egui::Ui, player: &crate::player::Player, lane: egui
 
 /// What's on screen, with its size in pixels.
 enum Display {
-    /// An uploaded image: scrub proxy frames, frames that came back to the CPU.
+    /// An image through egui: scrub proxy frames, frames that came back to
+    /// the CPU.
     Image(egui::TextureId, egui::Vec2),
-    /// A decoded frame on the GPU, drawn with the sharp filter.
-    #[cfg(hw_decode)]
+    /// A frame on the GPU, drawn with the sharp filter: the hardware
+    /// decoder's, or one ffmpeg decoded, uploaded.
     Gpu(crate::gpu_frames::Shown, egui::Vec2),
 }
 
 impl Display {
     fn size(&self) -> egui::Vec2 {
         match self {
-            Display::Image(_, s) => *s,
-            #[cfg(hw_decode)]
-            Display::Gpu(_, s) => *s,
+            Display::Image(_, s) | Display::Gpu(_, s) => *s,
         }
     }
 }
 
+/// A frame from ffmpeg: NV12 at the video's own size, to upload and draw
+/// with the sharp filter; RGBA at [`PREVIEW_WIDTH`] where that can't be.
+enum Decoded {
+    Nv12(Vec<u8>),
+    Rgba(media::Frame),
+}
+
 /// Play waits at most this long for its first frame before the sound starts anyway.
 const START_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+/// The same for ffmpeg's first frame, which takes longer: it starts from the
+/// keyframe before (~170 ms for 1440p60).
+const FFMPEG_START_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Preview frames are decoded at this width; plenty for an in-app viewer.
+/// Frames from ffmpeg are decoded at this width when they can't be drawn
+/// with the sharp filter.
 pub const PREVIEW_WIDTH: u32 = 1280;
 
 /// Live mix state shared with the audio callback.
@@ -200,6 +212,39 @@ struct Shared {
     /// editor), as `f32` bits: applied to what's heard after the meters, so
     /// they show the edit's own levels.
     listen: AtomicU32,
+    /// The stretches cut out of the clip, which playing jumps over.
+    skips: Mutex<Vec<Skip>>,
+}
+
+/// A stretch cut out of the clip, in stereo frames: playing jumps from
+/// `from` to `to`, the sound crossfading over `fade` either side of the join
+/// as the saved clip's does (`media::join_fades`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Skip {
+    from: u64,
+    to: u64,
+    fade: u64,
+}
+
+impl Skip {
+    /// Playing at `pos`, within this join's crossfade: where the other side
+    /// of the join is, and how much of it is heard (half, at the join).
+    /// Before it, what comes after it fades in; after it, what came before
+    /// fades out.
+    fn across(&self, pos: u64) -> Option<(u64, f32)> {
+        if self.fade == 0 {
+            return None;
+        }
+        if pos < self.from && pos + self.fade >= self.from {
+            let left = self.from - pos;
+            Some((self.to - left, 0.5 * (1.0 - left as f32 / self.fade as f32)))
+        } else if pos >= self.to && pos < self.to + self.fade {
+            let past = pos - self.to;
+            Some((self.from + past, 0.5 * (1.0 - past as f32 / self.fade as f32)))
+        } else {
+            None
+        }
+    }
 }
 
 impl Shared {
@@ -214,6 +259,7 @@ impl Shared {
             step_us: AtomicU64::new(0),
             speed: AtomicU32::new(1.0f32.to_bits()),
             listen: AtomicU32::new(1.0f32.to_bits()),
+            skips: Mutex::new(Vec::new()),
         }
     }
 
@@ -237,7 +283,11 @@ impl Shared {
         let since = (uptime() * 1e6 - self.moved_at_us.load(Ordering::Relaxed) as f64).clamp(0.0, step_us);
         // Source frames per µs.
         let rate = PREVIEW_RATE as f64 * self.speed() / 1e6;
-        ((pos - (step_us - since) * rate) / PREVIEW_RATE as f64).max(0.0)
+        let behind = (pos - (step_us - since) * rate).max(0.0);
+        // A step behind a jump over a cut lands in what's cut out: it's at
+        // the frame after the cut by then.
+        let cut = self.skips.lock().ok().and_then(|s| s.iter().find(|s| (s.from as f64..s.to as f64).contains(&behind)).copied());
+        cut.map_or(behind, |s| s.to as f64) / PREVIEW_RATE as f64
     }
 
     /// How long until the playhead ([`Self::now`]) shows `t` seconds.
@@ -269,10 +319,15 @@ pub struct Player {
     /// GPU frames opened for drawing (see `gpu_frames.rs`).
     #[cfg(hw_decode)]
     gpu_frames: crate::gpu_frames::Frames,
+    /// Frames from ffmpeg, uploaded for drawing.
+    uploads: crate::gpu_frames::Uploads,
     shown_frame: Option<u64>,
     decoder: Option<FrameStream>,
+    /// Playing up to a cut: frames read from just after it (from the frame
+    /// numbered here), ready for when the playhead jumps there.
+    after_cut: Option<(u64, FrameStream)>,
     still_tx: Sender<(u64, f64)>,
-    still_rx: Receiver<(u64, media::Frame)>,
+    still_rx: Receiver<(u64, Decoded)>,
     /// Frame index the last on-demand still was requested for.
     still_wanted: Option<u64>,
     /// Every frame, small, for instant scrubbing, built in the background:
@@ -288,7 +343,8 @@ pub struct Player {
     /// The hardware decoder, while it works.
     video: Option<Video>,
     /// Play was pressed; the sound starts with the first frame (or after
-    /// [`START_WAIT`]), so picture and sound start together.
+    /// [`START_WAIT`], [`FFMPEG_START_WAIT`] for ffmpeg's), so picture and
+    /// sound start together.
     pending_start: Option<std::time::Instant>,
     /// The decoder was told to play (to tell it to stop when playback ends).
     video_playing: bool,
@@ -363,7 +419,7 @@ impl Player {
             Err(e) => (None, Some(e)),
         };
 
-        let (still_tx, still_rx) = still_worker(ctx, source);
+        let (still_tx, still_rx) = still_worker(ctx, source, nv12_size(&info));
 
         let video = open_video(ctx, source, info.fps);
         let proxy = video.is_none().then(|| Proxy::build(ctx, source, info.fps, total_frames(&info)));
@@ -380,8 +436,10 @@ impl Player {
             retired: Default::default(),
             #[cfg(hw_decode)]
             gpu_frames: Default::default(),
+            uploads: Default::default(),
             shown_frame: None,
             decoder: None,
+            after_cut: None,
             still_tx,
             still_rx,
             still_wanted: None,
@@ -407,7 +465,7 @@ impl Player {
     /// reloads, nothing stops.
     pub fn renamed(&mut self, ctx: &egui::Context, to: &Path) {
         self.source = to.to_path_buf();
-        (self.still_tx, self.still_rx) = still_worker(ctx, to);
+        (self.still_tx, self.still_rx) = still_worker(ctx, to, nv12_size(&self.info));
     }
 
     pub fn time(&self) -> f64 {
@@ -433,6 +491,7 @@ impl Player {
         let t = t.clamp(0.0, self.info.duration);
         self.shared.pos.store(to_samples(t), Ordering::Relaxed);
         self.decoder = None; // restarts from the new position if playing
+        self.after_cut = None;
         if self.is_playing() {
             if let Some(v) = self.hw() {
                 v.play(self.info.frame_index(t));
@@ -456,6 +515,12 @@ impl Player {
                 self.pending_start = Some(std::time::Instant::now());
                 return;
             }
+        } else {
+            // ffmpeg's frames: the sound waits for the first (`update`
+            // starts it). Starting together, the picture stood still while
+            // ffmpeg started, then jumped ahead.
+            self.pending_start = Some(std::time::Instant::now());
+            return;
         }
         self.shared.playing.store(true, Ordering::Relaxed);
     }
@@ -476,6 +541,7 @@ impl Player {
         }
         self.pending_start = None;
         self.decoder = None;
+        self.after_cut = None;
         // Only when it was playing: the decoder acts on its newest command, so
         // a needless pause right after asking for a frame would cancel that.
         if self.video_playing {
@@ -504,6 +570,43 @@ impl Player {
     /// built yet (for hover previews).
     pub fn proxy_frame(&self, idx: u64) -> Option<egui::ColorImage> {
         self.proxy.as_ref()?.frame(idx)
+    }
+
+    /// What's kept of the clip: these parts (in order, apart, as
+    /// `media::Edit::kept` has them). Playing jumps over what's cut out
+    /// between them, the sound crossfading at each join as the saved clip's
+    /// does.
+    pub fn set_cuts(&mut self, kept: &[(f64, f64)]) {
+        let fades = media::join_fades(kept);
+        let skips: Vec<Skip> = kept
+            .windows(2)
+            .zip(&fades)
+            .map(|(w, f)| Skip { from: to_samples(w[0].1), to: to_samples(w[1].0), fade: (f * PREVIEW_RATE as f64) as u64 })
+            .collect();
+        let Ok(mut now) = self.shared.skips.lock() else { return };
+        if *now == skips {
+            return;
+        }
+        // Playing in what's just been cut out: on from its end at once, the
+        // picture too (read on to there, it would stand still meanwhile).
+        let pos = self.shared.pos.load(Ordering::Relaxed);
+        let into = skips.iter().find(|s| (s.from..s.to).contains(&pos)).map(|s| s.to as f64 / PREVIEW_RATE as f64);
+        *now = skips;
+        drop(now);
+        // Frames read ahead from after a cut may be for one that's gone.
+        self.after_cut = None;
+        if let Some(v) = self.hw() {
+            v.set_skips(kept.windows(2).map(|w| (self.info.frame_index(w[0].1), self.info.frame_index(w[1].0))).collect());
+        }
+        if let Some(to) = into.filter(|_| self.is_playing()) {
+            self.seek(to);
+        }
+    }
+
+    /// The next stretch cut out after `t` seconds, if one is.
+    fn next_cut(&self, t: f64) -> Option<Skip> {
+        let pos = to_samples(t);
+        self.shared.skips.lock().ok()?.iter().find(|s| s.from > pos).copied()
     }
 
     pub fn set_mix(&self, gains: Vec<TrackEdit>) {
@@ -563,10 +666,34 @@ impl Player {
         if !self.is_playing() {
             // Stopped by itself at the out point: the stream is now stale.
             self.decoder = None;
+            self.after_cut = None;
         }
         if self.is_playing() {
+            // Over a cut: on with the frames read from after it.
+            if self.after_cut.as_ref().is_some_and(|(from, _)| want >= *from) {
+                self.decoder = self.after_cut.take().map(|(_, s)| s);
+            }
             if self.decoder.is_none() {
                 self.decoder = FrameStream::start(ctx, &self.source, &self.info, t).ok();
+            }
+            // Nearing a cut: start reading from after it, so its first frame
+            // is there when the playhead jumps (ffmpeg takes a moment to
+            // start, and reading on through what's cut out takes longer).
+            if let Some(cut) = self.next_cut(t).filter(|c| c.from as f64 / PREVIEW_RATE as f64 - t < 1.0) {
+                let at = cut.to as f64 / PREVIEW_RATE as f64;
+                let from = self.info.frame_index(at);
+                if self.after_cut.as_ref().is_none_or(|(f, _)| *f != from) {
+                    self.after_cut = FrameStream::start(ctx, &self.source, &self.info, at).ok().map(|s| (from, s));
+                }
+            }
+            // Waiting to start: the sound goes once the first frame is here.
+            if let Some(since) = self.pending_start {
+                let ready = self.decoder.as_mut().is_none_or(|d| d.peek().is_some());
+                if ready || since.elapsed() >= FFMPEG_START_WAIT {
+                    trace!("sound starts after {:.0} ms (frame ready: {ready})", since.elapsed().as_secs_f64() * 1000.0);
+                    self.pending_start = None;
+                    self.shared.playing.store(true, Ordering::Relaxed);
+                }
             }
             if let Some(dec) = &mut self.decoder {
                 // Drop frames we're already past; show the newest one not in the future.
@@ -578,6 +705,11 @@ impl Player {
                     best = dec.next();
                 }
                 if let Some((idx, frame)) = best {
+                    if debug() && self.sound_playing() {
+                        if let Some(line) = self.pacing.frame(idx, self.info.fps) {
+                            trace!("playing: {line}, now {idx} with the clock at {want}");
+                        }
+                    }
                     self.show(ctx, idx, frame);
                 }
             }
@@ -655,7 +787,6 @@ impl Player {
                 let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
                 painter.image(*id, rect.round_to_pixels(painter.pixels_per_point()), uv, egui::Color32::WHITE);
             }
-            #[cfg(hw_decode)]
             Some(Display::Gpu(shown, _)) => shown.paint(painter, rect),
             None => {}
         }
@@ -672,7 +803,6 @@ impl Player {
                 }
                 None => false,
             },
-            #[cfg(hw_decode)]
             Some(Display::Gpu(shown, _)) => {
                 shown.paint_glow(painter, cover, id);
                 true
@@ -843,9 +973,16 @@ impl Player {
         }
     }
 
-    fn show(&mut self, ctx: &egui::Context, idx: u64, frame: media::Frame) {
-        let img = egui::ColorImage::from_rgba_unmultiplied([frame.width as usize, frame.height as usize], &frame.rgba);
-        self.set_texture(ctx, img);
+    fn show(&mut self, ctx: &egui::Context, idx: u64, frame: Decoded) {
+        match frame {
+            Decoded::Nv12(data) => {
+                let (w, h) = (self.info.width, self.info.height);
+                let Some(shown) = self.uploads.show(w, h, &data, self.info.bt601) else { return };
+                self.display = Some(Display::Gpu(shown, egui::vec2(w as f32, h as f32)));
+                self.retire(ctx, None);
+            }
+            Decoded::Rgba(f) => self.set_texture(ctx, egui::ColorImage::from_rgba_unmultiplied([f.width as usize, f.height as usize], &f.rgba)),
+        }
         self.shown_frame = Some(idx);
         self.screen_index = Some(idx);
         self.showing_proxy = false;
@@ -883,9 +1020,16 @@ impl Player {
     }
 }
 
+/// The video's size, when frames from ffmpeg come as NV12 at that size: when
+/// they can be drawn with the sharp filter.
+fn nv12_size(info: &ClipInfo) -> Option<(u32, u32)> {
+    (crate::gpu_frames::can_upload() && info.width > 0 && info.height > 0).then_some((info.width, info.height))
+}
+
 /// On-demand exact stills (paused/scrubbing): one worker, the newest
-/// request wins. It opens the file by name for each still.
-fn still_worker(ctx: &egui::Context, source: &Path) -> (Sender<(u64, f64)>, Receiver<(u64, media::Frame)>) {
+/// request wins. It opens the file by name for each still. NV12 at `nv12`
+/// (the video's size), else RGBA.
+fn still_worker(ctx: &egui::Context, source: &Path, nv12: Option<(u32, u32)>) -> (Sender<(u64, f64)>, Receiver<(u64, Decoded)>) {
     let (still_tx, job_rx) = mpsc::channel::<(u64, f64)>();
     let (done_tx, still_rx) = mpsc::channel();
     let src = source.to_path_buf();
@@ -895,7 +1039,11 @@ fn still_worker(ctx: &egui::Context, source: &Path) -> (Sender<(u64, f64)>, Rece
             while let Ok(newer) = job_rx.try_recv() {
                 job = newer;
             }
-            if let Ok(frame) = media::frame_at(&src, job.1, PREVIEW_WIDTH) {
+            let frame = match nv12 {
+                Some(size) => media::nv12_at(&src, job.1, size).map(Decoded::Nv12),
+                None => media::frame_at(&src, job.1, PREVIEW_WIDTH).map(Decoded::Rgba),
+            };
+            if let Ok(frame) = frame {
                 if done_tx.send((job.0, frame)).is_err() {
                     break;
                 }
@@ -906,8 +1054,8 @@ fn still_worker(ctx: &egui::Context, source: &Path) -> (Sender<(u64, f64)>, Rece
     (still_tx, still_rx)
 }
 
-/// The hardware decoder for `source`, on Windows and macOS (unless
-/// `HASTECLIP_NO_HW_DECODE` is set, to compare with the ffmpeg path).
+/// The in-process decoder for `source` (unless `HASTECLIP_NO_HW_DECODE` is
+/// set, to compare with the ffmpeg path).
 fn open_video(ctx: &egui::Context, source: &Path, fps: f64) -> Option<Video> {
     #[cfg(hw_decode)]
     if std::env::var_os("HASTECLIP_NO_HW_DECODE").is_none() {
@@ -1211,6 +1359,7 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
             Ok(m) => m.tracks.clone(),
             Err(_) => return,
         };
+        let skips: Vec<Skip> = shared.skips.lock().map(|s| s.clone()).unwrap_or_default();
         // Volume can ramp (keyframes): evaluate it every 256 samples (~5 ms)
         // and interpolate in between, which is smooth and cheap.
         let mut gains: Vec<f32> = Vec::new();
@@ -1226,7 +1375,22 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
         // follows, like tape).
         let step = base_step * shared.speed();
 
+        // A track's sound at `pos` (between it and the next sample by `frac`).
+        let read = |track: &media::pcm::PcmTrack, pos: u64, frac: f64| -> Option<(f32, f32)> {
+            let (a, b) = track.frame(pos as usize)?;
+            Some(match track.frame(pos as usize + 1).filter(|_| frac > 0.0) {
+                Some((a2, b2)) => (a + (a2 - a) * frac as f32, b + (b2 - b) * frac as f32),
+                None => (a, b),
+            })
+        };
+
         for frame in out.chunks_mut(channels) {
+            // Into a stretch that's cut out: on from its end, as far past it
+            // as the step went.
+            if let Some(s) = skips.iter().find(|s| (s.from..s.to).contains(&pos)) {
+                pos = s.to + (pos - s.from);
+                next_eval = 0;
+            }
             if pos >= end {
                 shared.playing.store(false, Ordering::Relaxed);
                 break;
@@ -1236,16 +1400,19 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
                 gains = tracks.iter().map(|tr| tr.gain_at(t)).collect();
                 next_eval = pos + 256;
             }
+            // Either side of a join, the other side of it too, crossfading.
+            let across = skips.iter().find_map(|s| s.across(pos));
             let (mut l, mut r) = (0.0f32, 0.0f32);
             for (t, track) in pcm.tracks().iter().enumerate() {
                 // Not decoded yet (just opened, jumped far ahead): silence.
-                if let Some((a, b)) = track.frame(pos as usize) {
-                    let (a, b) = match track.frame(pos as usize + 1).filter(|_| frac > 0.0) {
-                        Some((a2, b2)) => (a + (a2 - a) * frac as f32, b + (b2 - b) * frac as f32),
-                        None => (a, b),
-                    };
+                if let Some((a, b)) = read(track, pos, frac) {
                     let g = gains.get(t).copied().unwrap_or(1.0);
-                    let (tl, tr) = (a * g, b * g);
+                    let (mut tl, mut tr) = (a * g, b * g);
+                    if let Some((other, w)) = across {
+                        let g = tracks.get(t).map_or(1.0, |e| e.gain_at(other as f64 / PREVIEW_RATE as f64));
+                        let (a, b) = read(track, other, frac).unwrap_or_default();
+                        (tl, tr) = (tl * (1.0 - w) + a * g * w, tr * (1.0 - w) + b * g * w);
+                    }
                     l += tl;
                     r += tr;
                     let a = tl.abs().max(tr.abs());
@@ -1373,21 +1540,28 @@ impl SoundPlayer {
     }
 }
 
-/// Streams consecutive preview frames from a start time via one ffmpeg process.
+/// Streams consecutive frames from a start time via one ffmpeg process.
 struct FrameStream {
     child: Child,
-    rx: Receiver<(u64, media::Frame)>,
-    peeked: Option<(u64, media::Frame)>,
+    rx: Receiver<(u64, Decoded)>,
+    peeked: Option<(u64, Decoded)>,
 }
 
 impl FrameStream {
     fn start(ctx: &egui::Context, source: &Path, info: &ClipInfo, t: f64) -> std::io::Result<Self> {
-        let w = PREVIEW_WIDTH;
-        let h = (((w as f64) * info.height as f64 / info.width.max(1) as f64 / 2.0).round() as u32 * 2).max(2);
+        let nv12 = nv12_size(info);
+        let (w, h) = nv12.unwrap_or_else(|| (PREVIEW_WIDTH, (((PREVIEW_WIDTH as f64) * info.height as f64 / info.width.max(1) as f64 / 2.0).round() as u32 * 2).max(2)));
+        let scale = format!("scale={w}:{h}:flags=bilinear");
+        let out = match nv12 {
+            Some(_) => media::NV12_OUT.to_vec(),
+            None => vec!["-vf", &scale, "-f", "rawvideo", "-pix_fmt", "rgba"],
+        };
         let mut child = media::ffmpeg()
             .args(["-hide_banner", "-loglevel", "error", "-ss", &format!("{t:.4}"), "-i"])
             .arg(source)
-            .args(["-an", "-vf", &format!("scale={w}:{h}:flags=bilinear"), "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+            .arg("-an")
+            .args(out)
+            .arg("-")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -1398,14 +1572,15 @@ impl FrameStream {
         let first = info.frame_index(t);
         let repaint = ctx.clone();
         std::thread::spawn(move || {
-            let size = (w * h * 4) as usize;
+            let size = if nv12.is_some() { media::nv12_len(w, h) } else { (w * h * 4) as usize };
             let mut idx = first;
             loop {
                 let mut buf = vec![0u8; size];
                 if stdout.read_exact(&mut buf).is_err() {
                     break;
                 }
-                if tx.send((idx, media::Frame { width: w, height: h, rgba: buf })).is_err() {
+                let frame = if nv12.is_some() { Decoded::Nv12(buf) } else { Decoded::Rgba(media::Frame { width: w, height: h, rgba: buf }) };
+                if tx.send((idx, frame)).is_err() {
                     break;
                 }
                 repaint.request_repaint();
@@ -1422,7 +1597,7 @@ impl FrameStream {
         self.peeked.as_ref().map(|(i, _)| (*i, ()))
     }
 
-    fn next(&mut self) -> Option<(u64, media::Frame)> {
+    fn next(&mut self) -> Option<(u64, Decoded)> {
         self.peek();
         self.peeked.take()
     }
@@ -1452,13 +1627,30 @@ mod tests {
     #[test]
     fn seeking_to_a_frame_lands_on_it() {
         for fps in [60.0, 107760.0 / 1799.0, 43128.0 / 719.0, 30000.0 / 1001.0, 144.0] {
-            let info = ClipInfo { duration: 120.0, fps, width: 2, height: 2, video_kbps: None, audio: Vec::new(), id: None };
+            let info = ClipInfo { duration: 120.0, fps, width: 2, height: 2, video_kbps: None, audio: Vec::new(), id: None, bt601: false };
             for k in 0..(120.0 * fps) as u64 - 1 {
                 let t = info.snap(k as f64 / fps + 1e-9) + 1e-6;
                 let back = to_samples(t) as f64 / PREVIEW_RATE as f64;
                 assert_eq!(info.frame_index(back), k, "frame {k} at {fps} fps");
             }
         }
+    }
+
+    /// Either side of a join, what's on the other side of it is heard too:
+    /// none of it at the crossfade's ends, half at the join itself, read from
+    /// just past where each side leaves off (as the saved clip's crossfade).
+    #[test]
+    fn joins_crossfade() {
+        let s = Skip { from: 1000, to: 5000, fade: 100 };
+        assert_eq!(s.across(899), None);
+        assert_eq!(s.across(900), Some((4900, 0.0)));
+        let (other, w) = s.across(999).unwrap();
+        assert!(other == 4999 && (w - 0.495).abs() < 1e-6, "{other} {w}");
+        assert_eq!(s.across(5000), Some((1000, 0.5)));
+        let (other, w) = s.across(5099).unwrap();
+        assert!(other == 1099 && w < 0.01, "{other} {w}");
+        assert_eq!(s.across(5100), None);
+        assert_eq!(Skip { fade: 0, ..s }.across(999), None);
     }
 
     /// A stereo tone at `hz`, `secs` long, at the source rate.

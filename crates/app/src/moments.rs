@@ -102,19 +102,19 @@ pub fn remove_marker(clip: &Path, t: f64) {
     });
 }
 
-/// The clip's recording now starts `cut` seconds later than it did and is
-/// `length` long (its original trimmed, or the edit became the recording,
-/// or a new clip saved from part of it, at `to`). `was`: how long it was.
-/// Its moments move with it; those outside it are left out.
-pub fn rebase(from: &Path, to: &Path, was: f64, cut: f64, length: f64) {
+/// The clip's recording is now these `parts` of what it was (in order, as
+/// `media::Edit::kept` has them): its original trimmed, or the edit became
+/// the recording, or a new clip saved from part of it, at `to`. `was`: how
+/// long it was. Its moments move with it; those cut away are left out.
+pub fn rebase(from: &Path, to: &Path, was: f64, parts: &[(f64, f64)]) {
     let m = of(from);
     if m.kills.is_empty() && m.markers.is_empty() {
         return;
     }
-    let inside = |t: f64| (0.0..=length).contains(&t);
+    let length: f64 = parts.iter().map(|(a, b)| b - a).sum();
     // Kills are kept from the end: where they are, then from the new end.
-    let kills: Vec<(f64, String)> = m.kills.iter().map(|(ago, what)| (was - ago - cut, what.clone())).filter(|(t, _)| inside(*t)).map(|(t, what)| (length - t, what)).collect();
-    let markers: Vec<f64> = m.markers.iter().map(|t| t - cut).filter(|t| inside(*t)).collect();
+    let kills: Vec<(f64, String)> = m.kills.iter().filter_map(|(ago, what)| Some((length - media::output_time(parts, was - ago)?, what.clone()))).collect();
+    let markers: Vec<f64> = m.markers.iter().filter_map(|&t| media::output_time(parts, t)).collect();
     change(to, |clips, key| {
         clips.insert(key.to_owned(), Moments { kills, markers });
     });
@@ -201,13 +201,22 @@ mod tests {
         keep(&a, &[(Duration::from_secs(50), "Kill".into()), (Duration::from_secs(10), "Ace".into())]);
         add_marker(&a, 30.0);
         // Saved as a new clip of 20..45 s.
-        rebase(&a, &b, 60.0, 20.0, 25.0);
+        rebase(&a, &b, 60.0, &[(20.0, 45.0)]);
         let pins = of(&b).pins(25.0);
         assert_eq!(pins.len(), 1);
         assert_eq!(pins[0].t, 10.0);
         assert!(pins[0].marker);
+        // Of 5..35 and 40..60 s: the kill at 10 s and the marker in the
+        // first part, the kill at 50 s in the second.
+        rebase(&a, &b, 60.0, &[(5.0, 35.0), (40.0, 60.0)]);
+        let ts: Vec<f64> = of(&b).pins(50.0).iter().map(|m| m.t).collect();
+        assert_eq!(ts, [5.0, 25.0, 40.0]);
+        // A moment in what's cut out is left out.
+        rebase(&a, &b, 60.0, &[(0.0, 20.0), (40.0, 60.0)]);
+        let ts: Vec<f64> = of(&b).pins(40.0).iter().map(|m| m.t).collect();
+        assert_eq!(ts, [10.0, 30.0]);
         // The first 5 s cut off the original itself.
-        rebase(&a, &a, 60.0, 5.0, 55.0);
+        rebase(&a, &a, 60.0, &[(5.0, 60.0)]);
         let ts: Vec<f64> = of(&a).pins(55.0).iter().map(|m| m.t).collect();
         assert_eq!(ts, [5.0, 25.0, 45.0]);
         let _ = std::fs::remove_dir_all(&lib);

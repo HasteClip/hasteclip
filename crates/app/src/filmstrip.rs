@@ -5,7 +5,8 @@
 //! there and the preview shows the same picture. Its full height always
 //! shows (only the sides are trimmed, by at most a fifth).
 //!
-//! On Windows and macOS the pictures are exact frames from the GPU's video decoder, in
+//! The pictures are exact frames from the in-process decoder (the GPU's on
+//! Windows and macOS, libavcodec on Linux), in
 //! stretches of a fixed number of frames laid end to end from the clip's
 //! start (the last one to its end), as many frames as fit a thumbnail at
 //! this zoom: they stay put while panning. A picture shows only its own frame:

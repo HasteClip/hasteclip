@@ -10,6 +10,11 @@ use capture::sources::{AudioSource, SourceKind};
 use capture::{EncodeSettings, Mode, mixer::LiveAudio};
 
 fn main() -> anyhow::Result<()> {
+    // Records KDE's screen as the app does: through a helper (this, again).
+    #[cfg(target_os = "linux")]
+    if capture::linux::kde_stream_helper() {
+        return Ok(());
+    }
     if std::env::var("LIST").is_ok() {
         let d = capture::audio::list_audio_devices();
         println!("inputs: {:?}

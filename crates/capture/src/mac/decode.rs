@@ -271,18 +271,25 @@ impl Decoder {
         None
     }
 
-    /// Smaller frames for scrubbing: none here (the buffers come from a pool
-    /// that grows as needed: scrubbing keeps a few full-size ones instead).
-    pub fn small_frames(&mut self, _width: u32, _bytes: u64) -> Result<usize> {
-        bail!("no small frames on macOS")
+    /// Frames kept for scrubbing back and forth: here full size, the
+    /// decoder's own buffers (nothing is scaled down; they come from a pool
+    /// that grows as needed), as many as were asked for (in frames of
+    /// `width`, in `bytes`) that fit in a share of the memory.
+    pub fn small_frames(&mut self, width: u32, bytes: u64) -> Result<usize> {
+        let w = width.min(self.source.0).max(2);
+        let asked = (bytes as f64 / (w as f64 * even_height(w, self.source) as f64 * 1.5)).round() as u64;
+        let full = (self.source.0 as u64 * self.source.1 as u64 * 3 / 2).max(1);
+        // A sixteenth of the memory, from 256 MB to 2 GB: a 1440p frame is 5.5 MB.
+        let budget = crate::total_memory().map_or(1 << 30, |m| (m / 16).clamp(256 << 20, 2 << 30));
+        Ok(asked.min(budget / full).max(16) as usize)
     }
 
-    /// [`Self::frame`] (no small frames here).
+    /// [`Self::frame`] (frames kept scrubbing are full size here).
     pub fn frame_small(&mut self, index: u64) -> Result<Option<Picture>> {
         self.frame(index)
     }
 
-    /// [`Self::next`] (no small frames here).
+    /// [`Self::next`] (frames kept scrubbing are full size here).
     pub fn next_small(&mut self) -> Result<Option<Picture>> {
         self.next()
     }

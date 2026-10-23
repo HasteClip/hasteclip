@@ -528,9 +528,11 @@ impl App {
                         w.placement = PlacementCfg::laid_out(Placement::default_for(camera_aspect, frame_aspect), frame_aspect);
                     }
                 }
-                ui.label(theme::text("Drag it on the preview", 12.5, W::Regular).color(pal.text3)).on_hover_text(
-                    "Drag a corner or edge to resize it, and past the opposite side to flip it. Hold Alt to crop, Ctrl to stop snapping. Right-click it to mirror, flip or turn it a quarter.",
-                );
+                ui.label(theme::text("Drag it on the preview", 12.5, W::Regular).color(pal.text3)).on_hover_text(format!(
+                    "Drag a corner or edge to resize it, and past the opposite side to flip it. Hold {} to crop, {} to stop snapping. Right-click it to mirror, flip or turn it a quarter.",
+                    crate::shortcuts::alt_name(),
+                    crate::shortcuts::ctrl_name()
+                ));
             });
         });
     }
@@ -684,15 +686,17 @@ impl App {
 
         // What the keys do, along the picture's foot (or top, if the box is
         // down there).
+        // (Alt is Option on a Mac, Ctrl Control: the keys as they're named there.)
+        let (alt, ctrl) = (crate::shortcuts::alt_name(), crate::shortcuts::ctrl_name());
         let hint = match dragging {
-            Some(Handle::Move) => "Ctrl: place freely",
-            Some(_) if modifiers.alt && modifiers.shift => "Cropping, keeping the shape",
-            Some(_) if modifiers.alt => "Cropping · Shift keeps the shape",
-            Some(_) => "Alt: crop · past the other side: flip",
+            Some(Handle::Move) => format!("{ctrl}: place freely"),
+            Some(_) if modifiers.alt && modifiers.shift => "Cropping, keeping the shape".to_owned(),
+            Some(_) if modifiers.alt => "Cropping · Shift keeps the shape".to_owned(),
+            Some(_) => format!("{alt}: crop · past the other side: flip"),
             None if self.webcam_view.menu => return,
-            None => "Drag to move · Alt + handle to crop · right-click to turn or flip",
+            None => format!("Drag to move · {alt} + handle to crop · right-click to turn or flip"),
         };
-        let galley = painter.layout_no_wrap(hint.into(), egui::FontId::proportional(11.5), Color32::from_gray(235));
+        let galley = painter.layout_no_wrap(hint, egui::FontId::proportional(11.5), Color32::from_gray(235));
         let size = galley.size() + vec2(14.0, 6.0);
         let y = if bx.center().y > frame_rect.center().y { frame_rect.top() + 8.0 + size.y / 2.0 } else { frame_rect.bottom() - 8.0 - size.y / 2.0 };
         let pill = Rect::from_center_size(Pos2::new(frame_rect.center().x, y), size);

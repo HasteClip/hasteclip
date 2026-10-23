@@ -1,6 +1,6 @@
-//! Playback frames from the in-process hardware decoder (`capture::decode`:
-//! Media Foundation on Windows, VideoToolbox on macOS), on a worker thread that keeps the next frames
-//! decoded before they're needed:
+//! Playback frames from the in-process decoder (`capture::decode`: Media
+//! Foundation on Windows, VideoToolbox on macOS, libavcodec on Linux), on a
+//! worker thread that keeps the next frames decoded before they're needed:
 //!
 //! - Paused, it decodes the exact frame asked for, then the few after it, so
 //!   pressing play has its frames in hand at once (pre-roll).
@@ -8,15 +8,16 @@
 //! - Scrubbing, it decodes the frame under the playhead, live, with nothing
 //!   built beforehand. A frame is decoded from the keyframe before it (once
 //!   a second in recordings; a keyframe alone takes 1-15 ms), so every frame
-//!   decoded on the way to the one asked for is kept (small, see
-//!   [`SMALL_WIDTH`]: a keyframe gap and a half of them), and while idle the
+//!   decoded on the way to the one asked for is kept (full size, see
+//!   [`KEPT_BUDGET`]: a keyframe gap and a half of them), and while idle the
 //!   ones on the way are decoded too (going back, the gap before those kept;
 //!   forward, on after them), 8 frames at a time, on from where it stopped:
 //!   a frame kept shows at once either way, no frame is decoded twice, and a
 //!   newer request never waits long. Fast, or forward far from the picture
 //!   shown, the frames on the way show as they come (the keyframe first).
-//!   The full-size frame comes when the scrub stops (on a 240 fps recording
+//!   A frame not kept comes when the scrub reaches it (on a 240 fps recording
 //!   with 480 frames between keyframes, 30-480 ms: decoded from the keyframe).
+//!   Every picture is the video itself, never scaled down.
 //!
 //!   Measured with `HASTECLIP_DEV_DRAG` (debug build; a release build is
 //!   the same: the decoder sets the pace), frames behind the playhead once
@@ -100,6 +101,12 @@ pub fn lower_priority() {
     unsafe {
         libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
     }
+    // Nicer, this thread only (and the decoding threads it starts, which
+    // take after it).
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, 10);
+    }
 }
 
 /// Frames kept decoded after the one shown, while paused.
@@ -128,16 +135,16 @@ const STEP: u64 = 8;
 /// slower, only the frame itself (a frame from up to a keyframe gap before
 /// would flash). A guess.
 const FAST: f64 = 4.0;
-/// Scrubbing back, frames are kept small: a keyframe gap and a half of them
-/// (every frame from a keyframe is decoded on the way: kept, none is decoded
-/// twice), at most this wide, smaller if that doesn't fit in
-/// [`SMALL_BUDGET`] of the graphics card's memory: 60 fps recordings with a
-/// keyframe a second, 1280 px (1.4 MB a frame); 240 fps with one every 2 s,
-/// 640. Only while scrubbing; sharp again once it stops.
-const SMALL_WIDTH: u32 = 1280;
-const SMALL_BUDGET: f64 = (256 << 20) as f64;
-/// Without small frames (macOS; frames read back to the CPU), full-size ones
-/// are kept instead, at most this many (playback's textures).
+/// Scrubbing, frames are kept to show again at once either way: a keyframe
+/// gap and a half of them (every frame from a keyframe is decoded on the
+/// way: kept, none is decoded twice), at full size (what's seen scrubbing is
+/// the video itself, never a smaller copy), as many as fit in this much of
+/// the graphics card's memory: a 1440p frame is 5.5 MB, so 139 of them, a
+/// keyframe gap and a half of 60 fps; 4K, 61. (On Linux the decoder keeps
+/// them in memory, within its own share of it.) Only while scrubbing.
+const KEPT_BUDGET: f64 = (768 << 20) as f64;
+/// Where the decoder can't keep frames of their own (Windows, frames read
+/// back to the CPU), playback's are kept instead, at most this many.
 const BEHIND: usize = 12;
 
 /// The queue starting with `front` can't play from `i`.
@@ -181,6 +188,24 @@ struct State {
     /// else): a frame the worker was already decoding for the old spot is
     /// dropped instead of joining the queue.
     generation: u64,
+    /// Frames cut out of the clip (`from..to`): playing reads on from the end
+    /// of each, ahead of the clock as ever, so the frame after a cut is there
+    /// when the playhead jumps to it.
+    skips: Vec<(u64, u64)>,
+}
+
+impl State {
+    /// Where playing goes on from at frame `i`: past the cut it's in, if any.
+    fn past_cut(&self, i: u64) -> Option<u64> {
+        self.skips.iter().find(|(a, b)| (*a..*b).contains(&i)).map(|&(_, b)| b)
+    }
+
+    /// Frames read ahead that are cut out go (the clock never shows them).
+    fn drop_cut(&mut self) {
+        let skips = std::mem::take(&mut self.skips);
+        self.ahead.retain(|p| !skips.iter().any(|(a, b)| (*a..*b).contains(&p.index)));
+        self.skips = skips;
+    }
 }
 
 pub struct Video {
@@ -389,7 +414,7 @@ impl Video {
                                             .ok();
                                         if crate::player::debug() {
                                             eprintln!(
-                                                "{:>8.3} video: {small:?} small frames at {w} px kept scrubbing ({gop} frames between keyframes), made in {:.0} ms",
+                                                "{:>8.3} video: {small:?} frames at {w} px kept scrubbing ({gop} frames between keyframes), made in {:.0} ms",
                                                 crate::player::uptime(),
                                                 started.elapsed().as_secs_f64() * 1000.0
                                             );
@@ -540,6 +565,7 @@ impl Video {
                             shown = None;
                             let mut s = shared.lock().unwrap();
                             generation = s.generation;
+                            s.drop_cut();
                             drop_superseded(&mut s.ahead, i);
                             // Carries on from what's decoded, unless that's from
                             // somewhere else (after a gap, the next frame can be
@@ -621,8 +647,27 @@ impl Video {
                     continue;
                 }
                 filling = None;
+                // Playing up to a cut: on from its end (paused, the frames
+                // after the one shown stay in order, for stepping on).
+                if playing && let Some(to) = shared.lock().unwrap().past_cut(next) {
+                    next = to;
+                    positioned = false;
+                }
+                let read_on = positioned;
                 let got = if positioned { dec.next() } else { dec.frame(next) };
                 positioned = true;
+                // Read on into a cut (past a gap in the numbers): on from its
+                // end instead. (A frame looked up is the one showing at the
+                // number asked for, whatever its own.)
+                let past = match &got {
+                    Ok(Some(p)) if playing && read_on => shared.lock().unwrap().past_cut(p.index),
+                    _ => None,
+                };
+                if let Some(to) = past {
+                    next = to;
+                    positioned = false;
+                    continue;
+                }
                 match got {
                     Ok(Some(p)) => {
                         next = p.index + 1;
@@ -675,6 +720,7 @@ impl Video {
     pub fn play(&self, i: u64) {
         {
             let mut s = self.state.lock().unwrap();
+            s.drop_cut();
             drop_superseded(&mut s.ahead, i);
             if elsewhere(s.ahead.front(), i) {
                 s.ahead.clear();
@@ -682,6 +728,14 @@ impl Video {
             }
         }
         let _ = self.tx.send(Cmd::Play(i));
+    }
+
+    /// The frames cut out of the clip, each `from..to`: playing jumps over
+    /// them (see `State::skips`).
+    pub fn set_skips(&self, skips: Vec<(u64, u64)>) {
+        let mut s = self.state.lock().unwrap();
+        s.skips = skips;
+        s.drop_cut();
     }
 
     /// How long ago the decoder opened, once it has.
@@ -700,12 +754,15 @@ impl Video {
     }
 
     /// Playing: the newest decoded frame at or before `i`, dropping the ones
-    /// it replaces.
+    /// it replaces (and any cut out, decoded just before its cut was made).
     pub fn take_upto(&self, i: u64) -> Option<Picture> {
         let mut s = self.state.lock().unwrap();
         let mut best = None;
         while s.ahead.front().is_some_and(|p| p.index <= i) {
-            best = s.ahead.pop_front();
+            let p = s.ahead.pop_front();
+            if p.as_ref().is_some_and(|p| s.past_cut(p.index).is_none()) {
+                best = p;
+            }
         }
         best
     }
@@ -743,6 +800,11 @@ fn open_decoder(path: &Path) -> anyhow::Result<Decoder> {
     #[cfg(target_os = "macos")]
     {
         anyhow::ensure!(crate::gpu_frames::available(), "the renderer can't draw decoded frames");
+        Decoder::open(path, capture::decode::Output::Screen)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        anyhow::ensure!(crate::gpu_frames::can_upload(), "the renderer can't draw decoded frames");
         Decoder::open(path, capture::decode::Output::Screen)
     }
 }
@@ -960,17 +1022,12 @@ fn wanted(f: (u64, u64), at: u64, dir: i8) -> bool {
     f.0 < f.1 && if dir < 0 { f.0 < at } else { f.0 + 1 >= at }
 }
 
-/// The small frames for scrubbing back (see [`SMALL_WIDTH`]): their width and
-/// the memory for them, for a video of `source` size with keyframes `gop`
-/// frames apart.
+/// The frames kept for scrubbing (see [`KEPT_BUDGET`]): their width (the
+/// video's own) and the memory for them, for a video of `source` size with
+/// keyframes `gop` frames apart.
 fn small_size((sw, sh): (u32, u32), gop: u64) -> (u32, u64) {
     let n = (gop * 3 / 2 + 16) as f64;
-    let bytes = |w: u32| (w as f64) * (w as f64 * sh as f64 / sw.max(1) as f64) * 1.5 * n;
-    let mut w = SMALL_WIDTH.min(sw);
-    while w > 480 && bytes(w) > SMALL_BUDGET {
-        w -= 16;
-    }
-    (w, bytes(w).min(SMALL_BUDGET) as u64)
+    (sw, (sw as f64 * sh as f64 * 1.5 * n).min(KEPT_BUDGET) as u64)
 }
 
 /// A decoded picture (one that came back to the CPU) as an egui image, without

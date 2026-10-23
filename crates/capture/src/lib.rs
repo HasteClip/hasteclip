@@ -21,7 +21,7 @@ pub mod monitor;
 #[cfg(target_os = "linux")]
 pub use linux::monitor;
 pub mod mp4meta;
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 pub(crate) mod mp4read;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 mod mp4file;
@@ -54,6 +54,8 @@ pub use shutter::BlendShape;
 pub use mac::decode;
 #[cfg(target_os = "windows")]
 pub use win::decode;
+#[cfg(target_os = "linux")]
+pub use linux::decode;
 
 #[cfg(target_os = "macos")]
 pub use sck::SckRecorder;

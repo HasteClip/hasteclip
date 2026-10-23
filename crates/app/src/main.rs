@@ -71,7 +71,6 @@ mod update_mac;
 mod upload_watch;
 #[cfg(target_os = "linux")]
 mod update_linux;
-#[cfg(hw_decode)]
 mod gpu_frames;
 #[cfg(hw_decode)]
 mod video;
@@ -112,6 +111,12 @@ impl log::Log for GpuLog {
 const SKIP_WINDOW: Duration = Duration::from_secs(5);
 
 fn main() -> eframe::Result<()> {
+    // Started again by itself to ask KDE for the screen (so its own windows
+    // are in the recording): does only that, and exits.
+    #[cfg(target_os = "linux")]
+    if capture::linux::kde_stream_helper() {
+        return Ok(());
+    }
     if std::env::var_os("HASTECLIP_DEBUG_GPU").is_some() {
         static LOGGER: GpuLog = GpuLog;
         let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Warn));
@@ -202,7 +207,6 @@ fn main() -> eframe::Result<()> {
         "HasteClip",
         options,
         Box::new(|cc| {
-            #[cfg(hw_decode)]
             gpu_frames::init(cc.wgpu_render_state.as_ref(), &cc.egui_ctx);
             #[cfg(target_os = "macos")]
             shell::centre_window_buttons(cc);
@@ -298,10 +302,6 @@ enum RecState {
     Recording,
 }
 
-/// The app icon (`assets/icon-mac.svg` rendered to PNG), shown in the Dock and taskbar
-/// while running. Release bundles use `assets/hasteclip.icns` instead. On
-/// Windows and Linux, where app icons aren't drawn on a plate, the glyph
-/// without the macOS one (`assets/icon-glyph.svg`): with it, it looked small.
 /// Quit from outside the UI's loop (a signal; the tray while the window's
 /// hidden, when the loop doesn't run): stop capturing, finish the file, and
 /// exit.
@@ -319,9 +319,18 @@ pub(crate) fn quit_now() {
     std::process::exit(0);
 }
 
+/// The app icon (`assets/icon-mac.svg` rendered to PNG), shown in the Dock and taskbar
+/// while running. Release bundles use `assets/hasteclip.icns` instead. On
+/// Windows and Linux, where app icons aren't drawn on a plate, the glyph
+/// without the macOS one: with the plate, it looked small.
 pub(crate) fn app_icon() -> egui::IconData {
-    #[cfg(not(target_os = "macos"))]
-    let png = include_bytes!("../assets/icon-glyph-256.png");
+    // Linux: the icon the desktop has for the app (scripts/icons.sh).
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let png = include_bytes!("../assets/glyph-icon/256.png");
+    // Windows: as the .exe's icon has it at the sizes a window's icon is
+    // shown (the taskbar's, 24-48 px): the glyph with its keyline.
+    #[cfg(windows)]
+    let png = include_bytes!("../assets/tray/glyph-64.png");
     #[cfg(target_os = "macos")]
     let png = include_bytes!("../assets/icon-1024.png");
     let img = image::load_from_memory_with_format(png, image::ImageFormat::Png)
@@ -431,7 +440,8 @@ struct App {
     /// Screens detected by the capture backend.
     screens: Vec<capture::Device>,
     /// The recording's frame size for (what's recorded, resolution), cached:
-    /// for keeping the webcam's box its shape.
+    /// for keeping the webcam's box its shape. Kept while capturing; cleared
+    /// when a capture starts or stops.
     frame_size: Option<((capture::VideoSource, Option<u32>, Option<capture::Shape>), Option<(u32, u32)>, Instant)>,
     /// Apps with a window, for the games-and-apps list: to add, and to show
     /// which are open. Refreshed while the Sources page shows.
@@ -946,8 +956,10 @@ impl App {
         }
         let key = (self.video_source(), self.settings.resolution.height(), self.settings.capture_shape());
         // Asked again now and then too: a display's mode can change, or it
-        // can be plugged in, under the same choice.
-        if self.frame_size.as_ref().is_none_or(|(k, _, at)| *k != key || at.elapsed() > Duration::from_secs(2)) {
+        // can be plugged in, under the same choice. Not while capturing: its
+        // frame stays the size it started at, whatever's chosen meanwhile.
+        let capturing = self.rec_state != RecState::Idle;
+        if self.frame_size.as_ref().is_none_or(|(k, _, at)| !capturing && (*k != key || at.elapsed() > Duration::from_secs(2))) {
             let size = capture::frame_size(&key.0, key.1, key.2);
             self.frame_size = Some((key, size, Instant::now()));
         }
@@ -1940,7 +1952,7 @@ impl App {
             let result = match &clip_id {
                 None => rendered.map(|()| {
                     // A new clip of part of this one: the moments in that part.
-                    moments::rebase(&target.clip, &dest, info.duration, edit.start, edit.end - edit.start);
+                    moments::rebase(&target.clip, &dest, info.duration, &edit.kept());
                     dest
                 }),
                 Some(clip_id) => {
@@ -2133,6 +2145,7 @@ impl App {
         self.service.start(capture::Mode::ReplayBuffer, self.encode_settings());
         self.rec_state = RecState::Buffering;
         self.rec_started = Some(Instant::now());
+        self.frame_size = None;
     }
 
     fn start_recording(&mut self) {
@@ -2143,6 +2156,7 @@ impl App {
         self.service.start(capture::Mode::Record, self.encode_settings());
         self.rec_state = RecState::Recording;
         self.rec_started = Some(Instant::now());
+        self.frame_size = None;
     }
 
     fn save_clip(&mut self) {
@@ -2269,6 +2283,7 @@ impl App {
                     };
                     if new != self.rec_state {
                         self.rec_started = (new != RecState::Idle).then(Instant::now);
+                        self.frame_size = None;
                     }
                     self.rec_state = new;
                     if new == RecState::Idle {

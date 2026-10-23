@@ -807,7 +807,7 @@ impl App {
         });
     }
 
-    /// The glyph (`assets/glyph.png`, made by scripts/tray-icons.sh), resized to
+    /// The glyph (`assets/glyph.png`, made by scripts/icons.sh), resized to
     /// the pixels it's drawn in (`size` points): the picture is 768 px, and the
     /// graphics card's filtering alone makes a 3-6x smaller copy choppy.
     fn glyph_texture(&mut self, ctx: &egui::Context, size: f32) -> egui::TextureHandle {
