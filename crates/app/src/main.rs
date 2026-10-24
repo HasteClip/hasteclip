@@ -108,10 +108,6 @@ impl log::Log for GpuLog {
     fn flush(&self) {}
 }
 
-/// The capture bar's skipped-frames warning stays this long after the last
-/// skip, and counts the frames skipped in this last stretch.
-const SKIP_WINDOW: Duration = Duration::from_secs(5);
-
 fn main() -> eframe::Result<()> {
     // Started again by itself to ask KDE for the screen (so its own windows
     // are in the recording): does only that, and exits.
@@ -401,12 +397,11 @@ struct App {
     rec_state: RecState,
     /// When the current recording/buffer started (for the live timer).
     rec_started: Option<Instant>,
-    /// Frames skipped so far, and when that last grew: the capture bar warns
-    /// while it's happening.
-    skipped_seen: (u64, Option<Instant>),
-    /// The capture's frame counts (skipped, encoded) as they were over the
-    /// last few seconds, oldest first: the warning counts what was skipped.
-    skip_counts: std::collections::VecDeque<(Instant, u64, u64)>,
+    /// How the capture kept up over what a clip saved now holds (frames
+    /// skipped, frame blending), for the status by the recorder, and when
+    /// that was last looked up.
+    health: Option<capture::CaptureHealth>,
+    health_at: Option<Instant>,
     /// A replay clip is being written; shows a placeholder card until it lands.
     /// Clips being written: replay clips still saving, and a stopped recording
     /// being finished. Each shows a placeholder card until it lands.
@@ -661,8 +656,8 @@ impl App {
             page: Page::Clips,
             rec_state: RecState::Idle,
             rec_started: None,
-            skipped_seen: (0, None),
-            skip_counts: Default::default(),
+            health: None,
+            health_at: None,
             saving: 0,
             settings,
             saved_settings,
@@ -1086,7 +1081,7 @@ impl eframe::App for App {
         if !full && !ctx.egui_wants_keyboard_input() && !ui_kit::overlay_open(&ctx) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
             self.page = Page::Settings;
         }
-        self.track_skips();
+        self.track_health();
         // Toasts sit over the middle of the page, clear of the rail, and above
         // the player's controls.
         self.toast_x_offset = if full { 0.0 } else { shell::RAIL_W / 2.0 };
@@ -1525,47 +1520,47 @@ impl App {
 
 // --- Capture status beside the recorder ---
 impl App {
-    /// Count skipped frames over the last few seconds, for the warning.
-    fn track_skips(&mut self) {
-        // Not capturing: no warning. The counts still hold the last capture's
-        // totals (until the next starts); taken as new, they showed after
-        // stopping, as all of the last few seconds' frames.
+    /// How the capture kept up over what a clip saved now holds, for the
+    /// status by the recorder: looked up a few times a second while capturing.
+    fn track_health(&mut self) {
         if self.rec_state == RecState::Idle {
-            self.skipped_seen = (0, None);
-            self.skip_counts.clear();
+            (self.health, self.health_at) = (None, None);
             return;
         }
-        let (skipped, encoded) = (capture::frames_skipped(), capture::frames_encoded());
-        if skipped < self.skipped_seen.0 {
-            self.skipped_seen = (0, None);
-            self.skip_counts.clear();
+        if self.health_at.is_some_and(|t| t.elapsed() < Duration::from_millis(200)) {
+            return;
         }
-        if skipped > self.skipped_seen.0 {
-            self.skipped_seen = (skipped, Some(Instant::now()));
-        }
-        let now = Instant::now();
-        self.skip_counts.push_back((now, skipped, encoded));
-        while self.skip_counts.len() > 1 && self.skip_counts.front().is_some_and(|(t, ..)| now - *t > SKIP_WINDOW) {
-            self.skip_counts.pop_front();
+        self.health = capture::health(Duration::from_secs(self.health_span() as u64));
+        self.health_at = Some(Instant::now());
+    }
+
+    /// What the status by the recorder counts over (seconds): what a clip
+    /// saved now holds; recording, the last minute (a few frames now and
+    /// then over a long recording are normal, not worth a total).
+    fn health_span(&self) -> u32 {
+        match self.rec_state {
+            RecState::Buffering => self.settings.replay_seconds.max(1),
+            _ => 60,
         }
     }
 
-    /// Shown while frames are being skipped (and a few seconds after): the
-    /// computer can't keep up with the recording settings. Says how many
-    /// frames (of the last few seconds': a few now and then over a long
-    /// recording are normal, not worth a total), what that does to the clip,
-    /// and what the settings are; a click opens Settings. Laid out right to
-    /// left, before the recorder.
-    pub(crate) fn skipped_warning(&mut self, ui: &mut egui::Ui) {
-        let Some(at) = self.skipped_seen.1.filter(|t| t.elapsed() < SKIP_WINDOW) else { return };
-        // Of the last few seconds' frames: how many were skipped, of how many.
-        let (skipped, encoded) = self.skip_counts.back().map_or((self.skipped_seen.0, 0), |&(_, s, e)| (s, e));
-        let (s0, e0) = self.skip_counts.front().map_or((0, 0), |&(_, s, e)| (s, e));
-        let lost = skipped - s0.min(skipped);
-        let all = lost + encoded - e0.min(encoded);
-        if lost == 0 {
-            return;
-        }
+    /// [`Self::health_span`] in words ("the last minute"), and what it
+    /// means for a clip.
+    fn health_words(&self) -> (String, &'static str) {
+        let words = crate::settings_ui::length_words(self.health_span());
+        let words = words.strip_prefix("1 ").filter(|w| !w.contains(' ')).map_or(words.clone(), str::to_owned);
+        let clip = if self.rec_state == RecState::Buffering { ": a clip saved now has them" } else { "" };
+        (format!("the last {words}"), clip)
+    }
+
+    /// Shown while what a clip saved now holds has skipped frames: the
+    /// computer couldn't keep up with the recording settings. Says how many,
+    /// what that does to the clip, and what the settings are; a click opens
+    /// Settings. `compact`: a narrow window, just the count. Laid out right
+    /// to left, before the recorder.
+    pub(crate) fn skipped_warning(&mut self, ui: &mut egui::Ui, compact: bool) {
+        let Some(h) = self.health.filter(|h| h.skipped > 0) else { return };
+        let (lost, all) = (h.skipped, h.encoded + h.skipped);
         let warn = theme::pal(ui).warn;
         let r = &self.settings;
         let size = match r.resolution {
@@ -1573,23 +1568,81 @@ impl App {
             res => res.label(),
         };
         let blending = r.blend_samples() > 1;
+        let (span, clip) = self.health_words();
+        let text = if lost == 1 { "Skipped 1 frame".to_owned() } else { format!("Skipped {lost} frames") };
         let tip = format!(
-            "{lost} of the {all} frames in the last {} seconds were skipped. \
+            "{text}: {lost} of the {all} frames in {span}{clip}. \
              The video encoder couldn't keep up: where a frame is skipped, the one before stays on screen longer, so the clip stutters there.\n\n\
              Recording at {size}, {} fps{}. A lower frame rate or resolution gives it less to do{}. Click to open Settings.",
-            SKIP_WINDOW.as_secs(),
             r.fps,
             if blending { format!(", blended from {} fps", r.fps * r.blend_samples()) } else { String::new() },
             if blending { ", and so does turning off frame blending" } else { "" },
         );
-        let text = if lost == 1 { "Skipped 1 frame".to_owned() } else { format!("Skipped {lost} frames") };
-        let label = egui::Label::new(theme::text(format!("{}  {text}", egui_phosphor::regular::WARNING), 13.0, theme::W::Semibold).color(warn)).sense(egui::Sense::click());
+        let shown = if compact { format!("{}  {lost} skipped", egui_phosphor::regular::WARNING) } else { format!("{}  {text}", egui_phosphor::regular::WARNING) };
+        let label = egui::Label::new(theme::text(shown, 13.0, theme::W::Semibold).color(warn)).sense(egui::Sense::click());
         ui.add_space(6.0);
         let response = ui.add(label).on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand);
         if response.clicked() {
             self.page = Page::Settings;
         }
-        ui.ctx().request_repaint_after(SKIP_WINDOW.saturating_sub(at.elapsed()));
+    }
+
+    /// Frame blending, while the capture blends: how many of the screen's
+    /// pictures a second it blends ("Blending 540 fps", or "Blending 412 of
+    /// 540 fps" when the screen showed no more, at its busiest moment of
+    /// what a clip saved now holds), and a warning instead when pictures
+    /// missed their frame (blending fell behind: those frames reused the
+    /// picture before), which a click takes to Settings. `compact`: a narrow
+    /// window, only the warning, as a count. Laid out right to left, before
+    /// the recorder.
+    pub(crate) fn blend_status(&mut self, ui: &mut egui::Ui, compact: bool) {
+        let Some(b) = self.health.and_then(|h| h.blend) else { return };
+        let p = theme::pal(ui);
+        let fps = b.rate / b.looks.max(1);
+        let (span, clip) = self.health_words();
+        if b.missed > 0 {
+            let text = if b.missed == 1 { "Blending missed 1 picture".to_owned() } else { format!("Blending missed {} pictures", b.missed) };
+            let tip = format!(
+                "{text}: in {span}, {} of the screen's pictures came too late for their frame, or were dropped while the computer was busy{clip}. \
+                 Those frames reused the picture before: their motion blur is made of fewer pictures.\n\n\
+                 Each {fps} fps frame blends {} looks at the screen, {} a second. Fewer looks, or a lower resolution, give it less to do. Click to open Settings.",
+                b.missed, b.looks, b.rate,
+            );
+            let shown = if compact { format!("{}  {} missed", egui_phosphor::regular::WARNING, b.missed) } else { format!("{}  {text}", egui_phosphor::regular::WARNING) };
+            let label = egui::Label::new(theme::text(shown, 13.0, theme::W::Semibold).color(p.warn)).sense(egui::Sense::click());
+            ui.add_space(6.0);
+            let response = ui.add(label).on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand);
+            if response.clicked() {
+                self.page = Page::Settings;
+            }
+            return;
+        }
+        // A whole second has to go by to say.
+        let (Some(busiest), false) = (b.busiest, compact) else { return };
+        let every = busiest as f64 >= b.rate as f64 * 0.95;
+        let (text, tip) = if every {
+            (
+                format!("Blending {} fps", b.rate),
+                format!(
+                    "Each {fps} fps frame blends {} looks at the screen, {} a second. In {span} the screen showed up to {busiest} new pictures a second: every look had a picture of its own.",
+                    b.looks, b.rate
+                ),
+            )
+        } else {
+            (
+                format!("Blending {busiest} of {} fps", b.rate),
+                format!(
+                    "Each {fps} fps frame blends {} looks at the screen, {} a second. In {span} the screen showed at most {busiest} new pictures a second, so looks shared them: about {} different ones in a frame.\n\n\
+                     None were lost: the game drew no more frames than that, or nothing moved. A game frame limit of {} fps or more gives every look a picture of its own.",
+                    b.looks,
+                    b.rate,
+                    (busiest as f64 / fps.max(1) as f64).round() as u32,
+                    b.rate
+                ),
+            )
+        };
+        ui.add_space(6.0);
+        ui.add(egui::Label::new(theme::text(text, 13.0, theme::W::Medium).color(p.text3)).sense(egui::Sense::hover())).on_hover_text(tip);
     }
 
     /// Follow the game being clipped, for Discord: the last one in focus, for

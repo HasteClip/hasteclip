@@ -646,6 +646,8 @@ struct Session {
 
 impl Session {
     fn start(s: &EncodeSettings, target: Target, live: &Arc<LiveAudio>, mov: bool) -> Result<Self> {
+        // How it keeps up (the warnings by the recorder) counts from here.
+        crate::capture_started();
         let feed = Feed::open(&s.video, s.away_screen.as_deref())?;
         let (width, height) = feed.recorded_size(s.target_height, s.shape);
         let framing = s.shape.map_or(crate::Framing::Fit, |shape| shape.framing);
@@ -872,6 +874,24 @@ fn submit_preview(picture: &mut Picture, sent: &mut Previewed) {
     sent.spare = Some(crate::preview::publish_frame(sent.generation, frame));
 }
 
+/// A frame handed to the video encoder: counted for the UI (to tell what
+/// share of the frames the [`skipped`] ones are).
+fn encoded() {
+    crate::count_encoded();
+}
+
+/// The encoder can't keep up (its queue is full): `n` frames are skipped,
+/// and the file shows the one before them longer. Counted for the UI's
+/// warning, and logged each time the total passes a power of two.
+fn skipped(dropped: &mut u64, n: u64) {
+    let before = *dropped;
+    *dropped += n;
+    crate::count_skipped(n);
+    if before.checked_ilog2() != dropped.checked_ilog2() {
+        eprintln!("video encoder is behind: {dropped} frames skipped");
+    }
+}
+
 /// Encode the newest picture every 1/fps on the host clock. The screen only
 /// sends pictures when something changes; repeating the last one keeps the
 /// output constant frame rate. Frame N is stamped N/fps seconds after t0, the
@@ -900,11 +920,10 @@ fn spawn_pacer(fps: u32, mut picture: Picture, encoder: ffmpeg::H264, clock: Arc
                         frame.extend_from_slice(&picture.nv12);
                         // The encoder can't keep up: skip this frame (the file
                         // shows the previous one a little longer).
-                        if !encoder.encode(frame, next) {
-                            dropped += 1;
-                            if dropped.is_power_of_two() {
-                                eprintln!("video encoder is behind: {dropped} frames skipped");
-                            }
+                        if encoder.encode(frame, next) {
+                            encoded();
+                        } else {
+                            skipped(&mut dropped, 1);
                         }
                     }
                     next += 1;

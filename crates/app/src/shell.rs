@@ -510,8 +510,10 @@ impl App {
                 self.recorder(ui, compact);
                 if !compact {
                     self.update_button(ui);
-                    self.skipped_warning(ui);
                 }
+                // How the recording keeps up: warnings, and frame blending's rate.
+                self.skipped_warning(ui, compact);
+                self.blend_status(ui, compact);
                 start - ui.cursor().max.x
             });
             ui.data_mut(|d| d.insert_temp(key, right.inner));

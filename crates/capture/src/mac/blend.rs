@@ -347,7 +347,10 @@ impl BlendPacer {
         self.closed = k;
         let Some(average) = self.blender.finish(k) else { return };
         let frame = self.frames.make(average);
-        if !self.encoder.0.encode(&frame.0, k, self.fps) {
+        if self.encoder.0.encode(&frame.0, k, self.fps) {
+            crate::count_encoded();
+        } else {
+            crate::count_skipped(1);
             self.skipped += 1;
             if self.skipped.is_power_of_two() {
                 eprintln!("video encoder is behind: {} frames skipped so far", self.skipped);
@@ -358,8 +361,10 @@ impl BlendPacer {
     /// A new picture came up at `at`: the looks before it saw the one before.
     /// Then the looks move toward halfway between pictures.
     fn arrive(&mut self, at: f64, picture: Arc<Buffer>, id: u64) {
+        crate::count_picture();
         if at < self.look_time(self.next - 1) {
             self.stats.late += 1;
+            crate::count_missed(1);
         }
         self.look_until(at);
         // Pictures belong on whole steps of the looks (halfway between two).
@@ -434,6 +439,7 @@ pub(crate) fn spawn_blend_pacer(
     latest.queue_arrivals();
     let encoder = SendEncoder(encoder);
     let handle = thread::spawn(move || {
+        crate::blending(fps, looks);
         let t0 = host_now();
         clock.set(t0);
         let mut p = BlendPacer {
