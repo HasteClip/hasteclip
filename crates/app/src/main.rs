@@ -1288,7 +1288,7 @@ impl eframe::App for App {
             self.save_clip();
         }
         // `HASTECLIP_DEV_CAMERA_PANEL`: open on Sources with the camera panel
-        // (to look at it without clicking there).
+        // (to look at it without clicking there); `=crop`, the webcam's crop page.
         static CAMERA_PANEL: std::sync::Once = std::sync::Once::new();
         if std::env::var_os("HASTECLIP_DEV_CAMERA_PANEL").is_some()
             && let Some(w) = &self.settings.webcam
@@ -1296,10 +1296,11 @@ impl eframe::App for App {
             let id = w.id.clone();
             CAMERA_PANEL.call_once(|| {
                 self.page = Page::Sources;
-                let mut panel = crate::webcam_ui::CameraPanel::open(&id);
-                // `=crop`: cropping already.
-                panel.set_cropping(std::env::var("HASTECLIP_DEV_CAMERA_PANEL").is_ok_and(|v| v == "crop"));
-                self.camera_panel = Some(panel);
+                if std::env::var("HASTECLIP_DEV_CAMERA_PANEL").is_ok_and(|v| v == "crop") {
+                    self.webcam_view.crop = Some(crate::webcam_ui::CameraPanel::cropping(&id));
+                } else {
+                    self.camera_panel = Some(crate::webcam_ui::CameraPanel::open(&id));
+                }
             });
         }
         // `HASTECLIP_DEV_PAGES=<secs>`: go round Clips, Sources and Settings,

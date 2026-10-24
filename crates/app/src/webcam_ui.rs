@@ -33,6 +33,8 @@ pub(crate) struct WebcamView {
     /// camera is still the old one (it takes a moment to reopen), and fitting
     /// to it would shape the box for the format just left.
     fit_from: Option<(u32, u32)>,
+    /// The crop's page, open: the camera's own picture, to crop on.
+    pub(crate) crop: Option<CameraPanel>,
 }
 
 impl WebcamView {
@@ -517,6 +519,24 @@ impl App {
                 }
             });
         }
+        // What's kept of its picture, and a way to the crop's page (as the
+        // screen's crop has). Off, the camera's closed: nothing to crop on.
+        crate::ui_kit::divider(ui, 0.0);
+        let cropped = cam.placement.crop.iter().any(|c| *c > 0.0);
+        let kept = self.webcam_kept();
+        row(ui, "Crop", &mut |ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            let tip = if cam.enabled { "Show only part of your camera's picture" } else { "Turn the webcam on to crop its picture" };
+            if Btn::normal("Adjust").trail(icon::CARET_RIGHT).small().enabled(cam.enabled).tip(tip).show(ui).clicked() {
+                self.webcam_view.crop = Some(CameraPanel::cropping(&cam.id));
+            }
+            let text = match kept {
+                _ if !cropped => "Off".to_owned(),
+                Some(((w, h), _)) => format!("{w}×{h}"),
+                None => "On".to_owned(),
+            };
+            ui.label(theme::text(text, 12.5, W::Regular).color(pal.text3));
+        });
         // Its position and size: set on the preview, reset here (named as
         // the screen's is).
         crate::ui_kit::divider(ui, 0.0);
@@ -711,10 +731,11 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// Camera page (Linux)
+// Camera page (Linux), and the webcam's crop page
 // ---------------------------------------------------------------------------
 
-/// The Camera page's state: the camera's settings as last read, and its picture.
+/// The Camera page's state (or the crop page's): the camera's settings as
+/// last read, and its picture.
 pub(crate) struct CameraPanel {
     device: String,
     controls: Vec<CameraControl>,
@@ -733,13 +754,18 @@ pub(crate) struct CameraPanel {
 }
 
 impl CameraPanel {
-    /// Start cropping on the picture (or not).
-    pub(crate) fn set_cropping(&mut self, on: bool) {
-        self.cropping = on;
+    /// The Camera page: its settings, read from the camera, and its picture.
+    pub(crate) fn open(device: &str) -> Self {
+        Self { controls: capture::webcam::camera_controls(device), ..Self::picture_of(device) }
     }
 
-    pub(crate) fn open(device: &str) -> Self {
-        Self { device: device.to_owned(), controls: capture::webcam::camera_controls(device), picture: None, seq: 0, new_pictures: 0, counted: None, fps: None, cropping: false, crop_drag: None }
+    /// The crop's page: the camera's picture, all of it, cropped on.
+    pub(crate) fn cropping(device: &str) -> Self {
+        Self { cropping: true, ..Self::picture_of(device) }
+    }
+
+    fn picture_of(device: &str) -> Self {
+        Self { device: device.to_owned(), controls: Vec::new(), picture: None, seq: 0, new_pictures: 0, counted: None, fps: None, cropping: false, crop_drag: None }
     }
 }
 
@@ -931,9 +957,8 @@ impl App {
         // How it's turned and mirrored in the clips (the webcam's placement).
         let orient = self.settings.webcam.as_ref().map_or_else(Orientation::default, |w| Orientation { flip_h: w.placement.flip_h, flip_v: w.placement.flip_v, turns: w.placement.turns });
         let mut reorient: Option<Orientation> = None;
-        // Its crop (the camera's sides cut off), and a new one.
+        // Its crop (the camera's sides cut off), set on its own page.
         let crop = self.settings.webcam.as_ref().map_or([0.0; 4], |w| w.placement.crop);
-        let mut recrop: Option<[f32; 4]> = None;
         // The frame rate the camera runs at: as picked, or Automatic's pick.
         let fps = current.or_else(|| self.camera_panel.as_ref().and_then(|p| capture::webcam::formats(&p.device).into_iter().max_by_key(|f| f.auto_rank()))).map(|f| f.fps());
         let Some(panel) = self.camera_panel.as_mut() else { return };
@@ -949,24 +974,24 @@ impl App {
                 ui.allocate_ui_with_layout(vec2(col, h), egui::Layout::top_down(egui::Align::Min), |ui| {
                     ui.set_width(col);
                     ui.add_space(4.0);
-                    picture_side(ui, panel, &name, fps, orient, crop, h * 0.7, &mut reset, &mut recrop);
+                    picture_side(ui, panel, &name, fps, orient, crop, h * 0.7, &mut reset);
                 });
                 ui.allocate_ui_with_layout(vec2(col, h), egui::Layout::top_down(egui::Align::Min), |ui| {
                     ui.set_width(col);
                     crate::ui_kit::scroll(ui, "camera_controls", |ui| {
                         format_view(ui, &panel.device, current, &mut pick);
-                        orientation_view(ui, orient, &mut reorient, &mut panel.cropping, crop != [0.0; 4], &mut recrop);
+                        orientation_view(ui, orient, &mut reorient);
                         controls_view(ui, panel, fps, &mut set);
                         ui.add_space(28.0);
                     });
                 });
             });
         } else {
-            picture_side(ui, panel, &name, fps, orient, crop, h * 0.4, &mut reset, &mut recrop);
+            picture_side(ui, panel, &name, fps, orient, crop, h * 0.4, &mut reset);
             crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
             crate::ui_kit::scroll(ui, "camera_controls", |ui| {
                 format_view(ui, &panel.device, current, &mut pick);
-                orientation_view(ui, orient, &mut reorient, &mut panel.cropping, crop != [0.0; 4], &mut recrop);
+                orientation_view(ui, orient, &mut reorient);
                 controls_view(ui, panel, fps, &mut set);
                 ui.add_space(28.0);
             });
@@ -1008,24 +1033,6 @@ impl App {
             }
             self.webcam_view.ask_fit();
         }
-        // Cropped: the box takes the shape of what's left (its width and
-        // middle kept), so nothing more is cut off to fill it; inside the frame.
-        if let (Some(c), Some(w)) = (recrop, self.settings.webcam.as_mut()) {
-            let aspect = w.placement.frame_aspect.unwrap_or(16.0 / 9.0);
-            let mut p: Placement = w.placement.into();
-            if let capture::webcam::Status::Live { width, height } = capture::webcam::status() {
-                let raw = width as f32 / height.max(1) as f32;
-                let full = if p.turns % 2 == 1 { 1.0 / raw } else { raw };
-                let kept = crop_shown(orient, c);
-                let visible = full * kept.width() / kept.height().max(0.01);
-                let (cx, cy) = (p.x + p.w / 2.0, p.y + p.h / 2.0);
-                p.h = p.w * aspect / visible;
-                p.x = cx - p.w / 2.0;
-                p.y = cy - p.h / 2.0;
-            }
-            p.crop = c;
-            w.placement = PlacementCfg::laid_out(contain(p), aspect);
-        }
         // Turned or mirrored: the placement, as the preview's right-click does
         // it (a quarter turn swaps the box's sides).
         if let (Some(o), Some(w)) = (reorient, self.settings.webcam.as_mut()) {
@@ -1047,6 +1054,196 @@ impl App {
         if back {
             self.camera_panel = None;
         }
+    }
+}
+
+impl App {
+    /// What's kept of the webcam's picture, in the camera's pixels as it
+    /// shows (turned), once it's live: its size, and the whole picture's.
+    fn webcam_kept(&self) -> Option<((u32, u32), (u32, u32))> {
+        let p = self.settings.webcam.as_ref()?.placement;
+        let (cw, ch) = self.camera_size()?;
+        let kept = |n: u32, a: f32, b: f32| ((n as f32 * (1.0 - a - b)).round() as u32).max(1);
+        Some(((kept(cw, p.crop[0], p.crop[2]), kept(ch, p.crop[1], p.crop[3])), (cw, ch)))
+    }
+
+    /// The webcam cropped to `c` (its sides cut off, as `Placement::crop`):
+    /// its box takes the shape of what's left (its width and middle kept),
+    /// so nothing more is cut off to fill it; inside the video.
+    fn webcam_recrop(&mut self, orient: Orientation, c: [f32; 4]) {
+        let Some(w) = self.settings.webcam.as_mut() else { return };
+        let aspect = w.placement.frame_aspect.unwrap_or(16.0 / 9.0);
+        let mut p: Placement = w.placement.into();
+        if let Status::Live { width, height } = capture::webcam::status() {
+            let raw = width as f32 / height.max(1) as f32;
+            let full = if p.turns % 2 == 1 { 1.0 / raw } else { raw };
+            let kept = crop_shown(orient, c);
+            let visible = full * kept.width() / kept.height().max(0.01);
+            let (cx, cy) = (p.x + p.w / 2.0, p.y + p.h / 2.0);
+            p.h = p.w * aspect / visible;
+            p.x = cx - p.w / 2.0;
+            p.y = cy - p.h / 2.0;
+        }
+        p.crop = c;
+        w.placement = PlacementCfg::laid_out(contain(p), aspect);
+    }
+
+    /// The webcam's crop page, in Sources' place (as the screen's crop has
+    /// one): the camera's own picture, all of it as it shows in the clips
+    /// (turned and mirrored), what's kept dragged on it, and its size and
+    /// place in the camera's pixels. It goes into the clips at once, the
+    /// webcam's box taking the shape of what's kept.
+    pub(crate) fn webcam_crop_page(&mut self, ui: &mut egui::Ui) {
+        use crate::theme::{self, W};
+        use crate::ui_kit::Btn;
+        let pal = theme::pal(ui);
+        // Closed with the arrow or Esc, or when there's no webcam on to crop.
+        let Some(cam) = self.settings.webcam.clone().filter(|w| w.enabled) else {
+            self.webcam_view.crop = None;
+            return;
+        };
+        if !crate::ui_kit::overlay_open(ui.ctx()) && !ui.ctx().egui_wants_keyboard_input() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.webcam_view.crop = None;
+            return;
+        }
+        // Another camera picked: its picture.
+        if self.webcam_view.crop.as_ref().is_some_and(|p| p.device != cam.id) {
+            self.webcam_view.crop = Some(CameraPanel::cropping(&cam.id));
+        }
+        let mut back = false;
+        self.page_head(ui, "", |_, ui| {
+            back = Btn::icon(crate::ui_kit::Kind::Ghost, egui_phosphor::regular::CARET_LEFT).tip("Back to Sources  (Esc)").show(ui).clicked();
+            ui.label(theme::text("Crop", 20.0, W::Semibold).color(pal.text));
+            ui.label(theme::text(&cam.name, 13.0, W::Regular).color(pal.text3));
+        });
+        if back {
+            self.webcam_view.crop = None;
+            return;
+        }
+        let orient = Orientation { flip_h: cam.placement.flip_h, flip_v: cam.placement.flip_v, turns: cam.placement.turns };
+        let crop = cam.placement.crop;
+        // Its size's link keeps the shape as its edges are dragged too.
+        let keep = crate::ui_kit::size_field_keeps(ui.ctx(), "webcam_crop").is_some();
+        let size = self.camera_size();
+        let mut recrop: Option<[f32; 4]> = None;
+        let Some(panel) = self.webcam_view.crop.as_mut() else { return };
+        let picture = |ui: &mut egui::Ui, panel: &mut CameraPanel, max_h: f32, recrop: &mut Option<[f32; 4]>| {
+            if let Some(c) = picture_view(ui, panel, orient, crop, max_h, keep) {
+                *recrop = Some(c);
+            }
+            ui.add_space(8.0);
+            ui.vertical_centered(|ui| {
+                let hint = if keep {
+                    "Drag the edges or corners (the shape's kept), or the middle to move it."
+                } else {
+                    "Drag the edges or corners (Shift keeps the shape), or the middle to move it."
+                };
+                ui.label(theme::text(hint, 12.5, W::Regular).color(pal.text3));
+            });
+        };
+        ui.add_space(4.0);
+        let (avail_w, avail_h) = (ui.available_width(), ui.available_height());
+        if avail_w >= crate::sources_ui::TWO_COLUMNS {
+            let col = (avail_w - 28.0) / 2.0;
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 28.0;
+                ui.allocate_ui_with_layout(vec2(col, avail_h), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.set_width(col);
+                    ui.add_space(4.0);
+                    picture(ui, panel, avail_h * 0.7, &mut recrop);
+                });
+                ui.allocate_ui_with_layout(vec2(col, avail_h), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.set_width(col);
+                    crop_numbers(ui, orient, crop, size, &mut recrop);
+                });
+            });
+        } else {
+            crate::ui_kit::scroll(ui, "webcam_crop_page", |ui| {
+                picture(ui, panel, avail_h * 0.4, &mut recrop);
+                ui.add_space(16.0);
+                crop_numbers(ui, orient, crop, size, &mut recrop);
+            });
+        }
+        if let Some(c) = recrop {
+            self.webcam_recrop(orient, c);
+        }
+    }
+}
+
+/// The webcam crop's size and place, in the camera's pixels as its picture
+/// shows (`size`, turned; none until it's live), as the screen's crop has
+/// them; then what's kept of it, and Reset. A new crop goes in `recrop`.
+fn crop_numbers(ui: &mut egui::Ui, orient: Orientation, crop: [f32; 4], size: Option<(u32, u32)>, recrop: &mut Option<[f32; 4]>) {
+    use crate::theme::{self, W};
+    use crate::ui_kit::{Btn, Row};
+    const BOX: f32 = 64.0;
+    let pal = theme::pal(ui);
+    let cropped = crop.iter().any(|c| *c > 0.0);
+    let shown = crop_shown(orient, crop);
+    // What's kept, in pixels.
+    let kept = size.map(|(cw, ch)| {
+        let px = |v: f32, n: u32| ((v * n as f32).round().max(0.0) as u32).min(n);
+        ([px(shown.min.x, cw), px(shown.min.y, ch), px(shown.width(), cw).max(1), px(shown.height(), ch).max(1)], (cw, ch))
+    });
+    if let Some(([x, y, w, h], (cw, ch))) = kept {
+        // Back to a crop, from the part kept in pixels.
+        let to_crop = |x: u32, y: u32, w: u32, h: u32| {
+            crop_from_shown(orient, Rect::from_min_size(Pos2::new(x as f32 / cw as f32, y as f32 / ch as f32), vec2(w as f32 / cw as f32, h as f32 / ch as f32)))
+        };
+        // As little as dragging on the picture keeps: a tenth of it.
+        let least = ((cw / 10).max(2), (ch / 10).max(2));
+        let centred = x.abs_diff((cw - w) / 2) <= 1 && y.abs_diff((ch - h) / 2) <= 1;
+        crate::ui_kit::list(ui, "webcam_crop", |l| {
+            // Its size: its middle stays put (with the shape kept, one side
+            // follows the other).
+            l.row(Row::new("Size").note("What's kept of the camera's picture"), |ui| {
+                if let Some((nw, nh)) = crate::ui_kit::size_field(ui, "webcam_crop", (w, h), least.0..=cw, least.1..=ch) {
+                    let at = |p: u32, s: u32, ns: u32, n: u32| (p + s / 2).saturating_sub(ns / 2).min(n.saturating_sub(ns));
+                    *recrop = Some(to_crop(at(x, w, nw, cw), at(y, h, nh, ch), nw, nh));
+                }
+            });
+            // Where it is: its top-left corner, or the middle.
+            let note = if centred { "In the middle of the picture" } else { "Its top-left corner, from the picture's" };
+            l.row(Row::new("Position").note(note), |ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                if Btn::normal("Centre").small().enabled(!centred).tip("Put it in the middle of the picture").show(ui).clicked() {
+                    *recrop = Some(to_crop((cw - w) / 2, (ch - h) / 2, w, h));
+                }
+                // Left to right at the row's end, so Tab goes through them in reading order.
+                ui.allocate_ui_with_layout(vec2(BOX * 2.0 + 6.0 + 16.0 + 6.0 * 3.0, crate::ui_kit::CONTROL_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let small = |ui: &mut egui::Ui, t: &str| ui.label(theme::text(t, 12.5, W::Regular).color(pal.text3));
+                    if let Some(v) = crate::ui_kit::number_box(ui, egui::Id::new("webcam_crop_x"), x, 0..=cw - w, BOX) {
+                        *recrop = Some(to_crop(v, y, w, h));
+                    }
+                    small(ui, ",");
+                    if let Some(v) = crate::ui_kit::number_box(ui, egui::Id::new("webcam_crop_y"), y, 0..=ch - h, BOX) {
+                        *recrop = Some(to_crop(x, v, w, h));
+                    }
+                    small(ui, "px");
+                });
+            });
+        });
+        ui.add_space(8.0);
+    }
+    ui.horizontal(|ui| {
+        ui.add_space(2.0);
+        let what = match kept {
+            Some(([_, _, w, h], (cw, ch))) if cropped => format!("{w}×{h} of {cw}×{ch}"),
+            Some((_, (cw, ch))) => format!("All of the picture, {cw}×{ch}"),
+            None => "Waiting for the camera…".to_owned(),
+        };
+        ui.label(theme::text(what, 12.5, W::Regular).color(pal.text3));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if cropped && Btn::ghost("Reset").small().tip("All of the camera's picture again").show(ui).clicked() {
+                *recrop = Some([0.0; 4]);
+            }
+        });
+    });
+    // Where the camera zooms itself (Linux's Camera page), that's sharper.
+    if capture::webcam::HAS_CONTROLS {
+        ui.add_space(6.0);
+        ui.add(egui::Label::new(theme::text("The camera's own Zoom, in Camera settings, crops inside the camera instead, from its sensor, which can be sharper.", 12.0, W::Regular).color(pal.text3)).wrap());
     }
 }
 
@@ -1145,12 +1342,10 @@ fn curve_value(pos: f32, min: i64, max: i64) -> i64 {
 /// The Camera page's still side: the picture, which camera it is and in what
 /// size, and resetting its settings.
 #[allow(clippy::too_many_arguments)]
-fn picture_side(ui: &mut egui::Ui, panel: &mut CameraPanel, name: &str, fps: Option<f32>, orient: Orientation, crop: [f32; 4], max_h: f32, reset: &mut bool, recrop: &mut Option<[f32; 4]>) {
+fn picture_side(ui: &mut egui::Ui, panel: &mut CameraPanel, name: &str, fps: Option<f32>, orient: Orientation, crop: [f32; 4], max_h: f32, reset: &mut bool) {
     use crate::theme::{self, W};
     let pal = theme::pal(ui);
-    if let Some(c) = picture_view(ui, panel, orient, crop, max_h) {
-        *recrop = Some(c);
-    }
+    picture_view(ui, panel, orient, crop, max_h, false);
     crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
     let status = match (capture::webcam::status(), panel.fps) {
         (capture::webcam::Status::Live { width, height }, Some(fps)) => format!("{name} · {width}×{height} · {fps:.0} new pictures/s"),
@@ -1185,8 +1380,10 @@ fn slowdown(measured: Option<f32>, fps: Option<f32>) -> Option<String> {
 }
 
 /// The camera's own picture, live, as wide as there's room for and at most
-/// `max_h` tall.
-fn picture_view(ui: &mut egui::Ui, panel: &mut CameraPanel, orient: Orientation, crop: [f32; 4], max_h: f32) -> Option<[f32; 4]> {
+/// `max_h` tall: cropped, or (on the crop's page) all of it, the crop
+/// dragged on it, its shape kept with Shift or `keep`. The new crop, when
+/// it's dragged.
+fn picture_view(ui: &mut egui::Ui, panel: &mut CameraPanel, orient: Orientation, crop: [f32; 4], max_h: f32, keep: bool) -> Option<[f32; 4]> {
     let pal = crate::theme::pal(ui);
     let w = ui.available_width();
     if let Some(p) = capture::webcam::camera_picture((w * ui.ctx().pixels_per_point()) as u32, panel.seq) {
@@ -1254,7 +1451,7 @@ fn picture_view(ui: &mut egui::Ui, panel: &mut CameraPanel, orient: Orientation,
         }
         // The crop on the whole picture: the rest dimmed, its edges dragged.
         let unit = egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-        if let Some(s) = crop_editor(ui, &resp, rect, unit, shown, vec2(0.1, 0.1), false, &mut panel.crop_drag) {
+        if let Some(s) = crop_editor(ui, &resp, rect, unit, shown, vec2(0.1, 0.1), keep, &mut panel.crop_drag) {
             changed = Some(crop_from_shown(orient, s));
         }
     });
@@ -1384,8 +1581,9 @@ impl Orientation {
 
 /// The webcam's orientation in the clips, after its format: the same as the
 /// preview's right-click. What's wanted goes in `reorient`, its `turns` as
-/// seen (`Orientation::seen_turns`).
-fn orientation_view(ui: &mut egui::Ui, now: Orientation, reorient: &mut Option<Orientation>, cropping: &mut bool, cropped: bool, recrop: &mut Option<[f32; 4]>) {
+/// seen (`Orientation::seen_turns`). Its crop is on its card, as on every
+/// system.
+fn orientation_view(ui: &mut egui::Ui, now: Orientation, reorient: &mut Option<Orientation>) {
     use crate::ui_kit::{Item, Row};
     crate::ui_kit::section_head(ui, "Orientation", false, |_| {});
     crate::ui_kit::list(ui, "camera_orientation", |l| {
@@ -1399,17 +1597,6 @@ fn orientation_view(ui: &mut egui::Ui, now: Orientation, reorient: &mut Option<O
             let mut on = now.flip_v;
             if crate::ui_kit::switch(ui, &mut on).changed() {
                 *reorient = Some(Orientation { flip_v: on, turns: now.seen_turns(), ..now });
-            }
-        });
-        let tip = "Drag the picture's edges or corners to cut off what you don't want (hold Shift to keep its shape); the rest stays dimmed while you do. The camera's own Zoom crops inside the camera instead, from its sensor, which can be sharper.";
-        l.row(Row::new("Crop").tip("Crop", tip), |ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            let label = if *cropping { "Done" } else { "Crop" };
-            if crate::ui_kit::Btn::normal(label).small().show(ui).clicked() {
-                *cropping = !*cropping;
-            }
-            if cropped && crate::ui_kit::Btn::ghost("Reset").small().tip("The whole picture again").show(ui).clicked() {
-                *recrop = Some([0.0; 4]);
             }
         });
         l.row(Row::new("Rotation"), |ui| {

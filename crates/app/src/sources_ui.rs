@@ -125,9 +125,13 @@ impl App {
         let every = if capture::preview::AVAILABLE { Duration::from_secs_f64(0.5 / self.settings.fps.max(1) as f64) } else { Duration::from_millis(16) };
         crate::ui_kit::repaint_after(ui.ctx(), every);
 
-        // Adjusting the camera, or the crop: its own page, in Sources' place.
+        // Adjusting the camera, or a crop: its own page, in Sources' place.
         if self.camera_panel.is_some() {
             self.camera_page(ui);
+            return;
+        }
+        if self.webcam_view.crop.is_some() {
+            self.webcam_crop_page(ui);
             return;
         }
         if self.sources_view.crop_open {
