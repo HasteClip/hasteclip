@@ -115,6 +115,32 @@ pub fn keep_open(want: Option<(String, Option<crate::webcam::Format>)>) {
     thread::spawn(move || run(feed));
 }
 
+/// The open camera's newest picture, if it's newer than picture
+/// `newer_than`: shrunk to at most `max_width` wide (each pixel the one
+/// under it), in RGBA, for showing it on its own (the webcam's crop page).
+pub(crate) fn picture(max_width: u32, newer_than: u64) -> Option<crate::webcam::CameraPreview> {
+    let feed = CURRENT.lock().unwrap().clone().filter(|f| !f.stop.load(Ordering::Relaxed))?;
+    let f = feed.latest().filter(|f| f.seq > newer_than)?;
+    let (sw, sh) = (f.width as usize, f.height as usize);
+    if sw == 0 || sh == 0 || f.bgra.len() < sw * sh * 4 {
+        return None;
+    }
+    let scale = (max_width as f64 / sw as f64).min(1.0);
+    let (w, h) = (((sw as f64 * scale).round() as usize).max(1), ((sh as f64 * scale).round() as usize).max(1));
+    let mut rgba = vec![255u8; w * h * 4];
+    for oy in 0..h {
+        let sy = ((oy * 2 + 1) * sh / (h * 2)).min(sh - 1);
+        for ox in 0..w {
+            let sx = ((ox * 2 + 1) * sw / (w * 2)).min(sw - 1);
+            let from = &f.bgra[(sy * sw + sx) * 4..][..3];
+            let to = &mut rgba[(oy * w + ox) * 4..][..3];
+            (to[0], to[1], to[2]) = (from[2], from[1], from[0]);
+        }
+    }
+    // Each picture the camera sends is a new one (it doesn't say otherwise).
+    Some(crate::webcam::CameraPreview { width: w as u32, height: h as u32, rgba, seq: f.seq, new_pictures: f.seq })
+}
+
 /// Open the camera and keep reading it until told to stop. If it can't be
 /// opened (unplugged, in use) or stops, try again every few seconds.
 fn run(feed: Arc<CameraFeed>) {

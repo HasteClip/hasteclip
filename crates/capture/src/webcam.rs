@@ -324,8 +324,8 @@ pub fn camera_controls(device: &str) -> Vec<CameraControl> {
     }
 }
 
-/// The open camera's own picture, for showing it alone while its settings
-/// are changed: R, G, B, A rows.
+/// The open camera's own picture, for showing it alone (its crop, and on
+/// Linux its settings): R, G, B, A rows.
 pub struct CameraPreview {
     pub width: u32,
     pub height: u32,
@@ -338,13 +338,21 @@ pub struct CameraPreview {
 }
 
 /// The open camera's newest picture, shrunk to at most `max_width` wide,
-/// if there's one newer than picture `newer_than` (Linux, so far).
+/// if there's one newer than picture `newer_than`.
 pub fn camera_picture(max_width: u32, newer_than: u64) -> Option<CameraPreview> {
     #[cfg(target_os = "linux")]
     {
         crate::linux::camera_picture(max_width, newer_than)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        crate::mac::camera::picture(max_width, newer_than)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        crate::win::camera_picture(max_width, newer_than)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = (max_width, newer_than);
         None
