@@ -79,6 +79,21 @@ pub(crate) struct SourcesView {
     card_order: (Vec<crate::canvas_ui::Layer>, Option<Instant>),
 }
 
+impl SourcesView {
+    /// Dev aid: the cards named open (`screen`, `webcam`), or the crop's page.
+    pub(crate) fn open_dev(&mut self, names: &str) {
+        use crate::canvas_ui::Layer;
+        for name in names.split(',').map(str::trim) {
+            match name {
+                "screen" => self.open_cards.push(Layer::Screen),
+                "webcam" => self.open_cards.push(Layer::Webcam),
+                "crop" => self.crop_open = true,
+                _ => {}
+            }
+        }
+    }
+}
+
 /// What a preview shows: the picture, its height and shape, the frame rate,
 /// the webcam, and whether it's all of the screen, uncropped (to crop on).
 pub(crate) type PreviewSetup = (capture::VideoSource, capture::VideoSize, u32, Option<capture::webcam::Webcam>, bool);

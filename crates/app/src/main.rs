@@ -848,10 +848,12 @@ impl App {
         if let Some(clip) = std::env::var_os("HASTECLIP_DEMO_PREBUILD").map(PathBuf::from) {
             proxy::prebuild(&app.ctx(), &clip);
         }
-        // `HASTECLIP_OPEN_SOURCES=1` opens on the Sources page.
+        // `HASTECLIP_OPEN_SOURCES=1` opens on the Sources page; naming
+        // sources (`=screen,webcam`) opens their cards too, `crop` the crop's page.
         let open_sources = std::env::var_os("HASTECLIP_OPEN_SOURCES").is_some();
-        if open_sources {
+        if let Some(v) = std::env::var_os("HASTECLIP_OPEN_SOURCES") {
             app.page = Page::Sources;
+            app.sources_view.open_dev(&v.to_string_lossy());
         }
         // `HASTECLIP_OPEN_VOICE_REVIEW=1` opens the voice samples review.
         let open_review = std::env::var_os("HASTECLIP_OPEN_VOICE_REVIEW").is_some();
