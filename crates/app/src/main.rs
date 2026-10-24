@@ -398,9 +398,9 @@ struct App {
     rec_state: RecState,
     /// When the current recording/buffer started (for the live timer).
     rec_started: Option<Instant>,
-    /// How the capture kept up over what a clip saved now holds (frames
-    /// skipped, frame blending), for the status by the recorder, and when
-    /// that was last looked up.
+    /// How the capture keeps up (frames skipped and pictures missed in its
+    /// last whole second, frame blending), for the status by the recorder,
+    /// and when that was last looked up.
     health: Option<capture::CaptureHealth>,
     health_at: Option<Instant>,
     /// A replay clip is being written; shows a placeholder card until it lands.
@@ -1581,9 +1581,8 @@ impl App {
         self.health_at = Some(Instant::now());
     }
 
-    /// What the status by the recorder counts over (seconds): what a clip
-    /// saved now holds; recording, the last minute (a few frames now and
-    /// then over a long recording are normal, not worth a total).
+    /// How far back frame blending's busiest second is looked for (seconds):
+    /// what a clip saved now holds; recording, the last minute.
     fn health_span(&self) -> u32 {
         match self.rec_state {
             RecState::Buffering => self.settings.replay_seconds.max(1),
@@ -1591,41 +1590,41 @@ impl App {
         }
     }
 
-    /// [`Self::health_span`] in words ("the last minute"), and what it
-    /// means for a clip.
-    fn health_words(&self) -> (String, &'static str) {
+    /// [`Self::health_span`] in words ("the last minute").
+    fn health_words(&self) -> String {
         let words = crate::settings_ui::length_words(self.health_span());
         let words = words.strip_prefix("1 ").filter(|w| !w.contains(' ')).map_or(words.clone(), str::to_owned);
-        let clip = if self.rec_state == RecState::Buffering { ": a clip saved now has them" } else { "" };
-        (format!("the last {words}"), clip)
+        format!("the last {words}")
     }
 
-    /// Shown while what a clip saved now holds has skipped frames: the
-    /// computer couldn't keep up with the recording settings. Says how many,
-    /// what that does to the clip, and what the settings are; a click opens
-    /// Settings. `compact`: a narrow window, just the count. Laid out right
-    /// to left, before the recorder.
+    /// Shown while frames are being skipped, as a frame rate counter would
+    /// say it: how many of the last whole second's ("Skipping 30 of 60
+    /// fps"), what that does to the clip, and what the settings are; a click
+    /// opens Settings. `compact`: a narrow window, just the count. Laid out
+    /// right to left, before the recorder.
     pub(crate) fn skipped_warning(&mut self, ui: &mut egui::Ui, compact: bool) {
-        let Some(h) = self.health.filter(|h| h.skipped > 0) else { return };
-        let (lost, all) = (h.skipped, h.encoded + h.skipped);
+        let Some(s) = self.health.and_then(|h| h.last_second).filter(|s| s.skipped > 0) else { return };
         let warn = theme::pal(ui).warn;
         let r = &self.settings;
+        // Caught up after a stall, more than a second's frames go at once.
+        let lost = s.skipped.min(r.fps);
         let size = match r.resolution {
             settings::OutputResolution::Native => "native resolution".to_owned(),
             res => res.label(),
         };
         let blending = r.blend_samples() > 1;
-        let (span, clip) = self.health_words();
-        let text = if lost == 1 { "Skipped 1 frame".to_owned() } else { format!("Skipped {lost} frames") };
+        let text = format!("Skipping {lost} of {} fps", r.fps);
+        let frames = if lost == 1 { "frame was" } else { "frames were" };
         let tip = format!(
-            "{text}: {lost} of the {all} frames in {span}{clip}. \
+            "{text}: in the last second, {lost} of its {} {frames} skipped. \
              The video encoder couldn't keep up: where a frame is skipped, the one before stays on screen longer, so the clip stutters there.\n\n\
              Recording at {size}, {} fps{}. A lower frame rate or resolution gives it less to do{}. Click to open Settings.",
+            r.fps,
             r.fps,
             if blending { format!(", blended from {} fps", r.fps * r.blend_samples()) } else { String::new() },
             if blending { ", and so does turning off frame blending" } else { "" },
         );
-        let shown = if compact { format!("{}  {lost} skipped", egui_phosphor::regular::WARNING) } else { format!("{}  {text}", egui_phosphor::regular::WARNING) };
+        let shown = if compact { format!("{}  {lost} of {} skipped", egui_phosphor::regular::WARNING, r.fps) } else { format!("{}  {text}", egui_phosphor::regular::WARNING) };
         let label = egui::Label::new(theme::text(shown, 13.0, theme::W::Semibold).color(warn)).sense(egui::Sense::click());
         ui.add_space(6.0);
         let response = ui.add(label).on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -1637,25 +1636,26 @@ impl App {
     /// Frame blending, while the capture blends: how many of the screen's
     /// pictures a second it blends ("Blending 540 fps", or "Blending 412 of
     /// 540 fps" when the screen showed no more, at its busiest moment of
-    /// what a clip saved now holds), and a warning instead when pictures
-    /// missed their frame (blending fell behind: those frames reused the
-    /// picture before), which a click takes to Settings. `compact`: a narrow
-    /// window, only the warning, as a count. Laid out right to left, before
-    /// the recorder.
+    /// what a clip saved now holds), and a warning instead while pictures
+    /// miss their frame (blending fell behind: those frames reused the
+    /// picture before), as many as the last whole second's, which a click
+    /// takes to Settings. `compact`: a narrow window, only the warning, as a
+    /// count. Laid out right to left, before the recorder.
     pub(crate) fn blend_status(&mut self, ui: &mut egui::Ui, compact: bool) {
         let Some(b) = self.health.and_then(|h| h.blend) else { return };
         let p = theme::pal(ui);
         let fps = b.rate / b.looks.max(1);
-        let (span, clip) = self.health_words();
-        if b.missed > 0 {
-            let text = if b.missed == 1 { "Blending missed 1 picture".to_owned() } else { format!("Blending missed {} pictures", b.missed) };
+        let span = self.health_words();
+        let missed = self.health.and_then(|h| h.last_second).map_or(0, |s| s.missed.min(b.rate));
+        if missed > 0 {
+            let text = format!("Blending missed {missed} of {} fps", b.rate);
             let tip = format!(
-                "{text}: in {span}, {} of the screen's pictures came too late for their frame, or were dropped while the computer was busy{clip}. \
+                "{text}: in the last second, {missed} of the screen's pictures came too late for their frame, or were dropped while the computer was busy. \
                  Those frames reused the picture before: their motion blur is made of fewer pictures.\n\n\
                  Each {fps} fps frame blends {} looks at the screen, {} a second. Fewer looks, or a lower resolution, give it less to do. Click to open Settings.",
-                b.missed, b.looks, b.rate,
+                b.looks, b.rate,
             );
-            let shown = if compact { format!("{}  {} missed", egui_phosphor::regular::WARNING, b.missed) } else { format!("{}  {text}", egui_phosphor::regular::WARNING) };
+            let shown = if compact { format!("{}  {missed} missed", egui_phosphor::regular::WARNING) } else { format!("{}  {text}", egui_phosphor::regular::WARNING) };
             let label = egui::Label::new(theme::text(shown, 13.0, theme::W::Semibold).color(p.warn)).sense(egui::Sense::click());
             ui.add_space(6.0);
             let response = ui.add(label).on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand);

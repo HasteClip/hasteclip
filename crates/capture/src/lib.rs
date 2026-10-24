@@ -931,16 +931,27 @@ pub(crate) fn count_missed(n: u64) {
     count(|s| s.missed = s.missed.saturating_add(n.min(u32::MAX as u64) as u32));
 }
 
-/// How the running capture kept up over its last `span` ([`health`]).
+/// How the running capture keeps up ([`health`]).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CaptureHealth {
+    /// Its last whole second, as a frame rate counter would have it (none
+    /// until one has gone by).
+    pub last_second: Option<LastSecond>,
+    /// Frame blending, if the capture blends.
+    pub blend: Option<BlendHealth>,
+}
+
+/// One whole second of the running capture ([`CaptureHealth::last_second`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LastSecond {
     /// Frames handed to the video encoder, and frames skipped because it (or
     /// the graphics card making them) couldn't keep up: the file shows the one
     /// before a skipped frame longer.
-    pub encoded: u64,
-    pub skipped: u64,
-    /// Frame blending, if the capture blends.
-    pub blend: Option<BlendHealth>,
+    pub encoded: u32,
+    pub skipped: u32,
+    /// Frame blending's pictures that missed their frame (came too late for
+    /// it, or were let go of waiting): those frames reused the picture before.
+    pub missed: u32,
 }
 
 /// How frame blending kept up ([`CaptureHealth::blend`]).
@@ -949,17 +960,15 @@ pub struct BlendHealth {
     /// Looks at the screen a second, and per frame.
     pub rate: u32,
     pub looks: u32,
-    /// The screen's new pictures in the busiest whole second (none until
-    /// one has gone by): the screen only sends one when something changes.
+    /// The screen's new pictures in the busiest whole second of the span
+    /// (none until one has gone by): the screen only sends one when
+    /// something changes.
     pub busiest: Option<u32>,
-    /// Pictures that missed their frame (came too late for it, or were let
-    /// go of waiting): those frames reused the picture before.
-    pub missed: u64,
 }
 
-/// How the running capture kept up over its last `span`, counted each second
-/// from its start (the second under way counts toward the sums, not the
-/// busiest second). None before a capture starts.
+/// How the running capture keeps up: its last whole second, and frame
+/// blending's busiest whole second in its last `span`, counted each second
+/// from its start. None before a capture starts.
 pub fn health(span: std::time::Duration) -> Option<CaptureHealth> {
     HISTORY.lock().unwrap().summary(span)
 }
@@ -968,20 +977,12 @@ impl History {
     /// [`health`] of this history.
     fn summary(&mut self, span: std::time::Duration) -> Option<CaptureHealth> {
         self.now()?;
-        let whole = (span.as_secs().max(1) as usize).min(self.seconds.len().saturating_sub(1));
-        let mut out = CaptureHealth::default();
-        let (mut missed, mut busiest) = (0u64, None::<u32>);
-        // The second under way, then the span's whole seconds before it.
-        for (k, s) in self.seconds.iter().rev().take(whole + 1).enumerate() {
-            out.encoded += s.encoded as u64;
-            out.skipped += s.skipped as u64;
-            missed += s.missed as u64;
-            if k > 0 {
-                busiest = Some(busiest.unwrap_or(0).max(s.pictures));
-            }
-        }
-        out.blend = (self.rate > 0).then_some(BlendHealth { rate: self.rate, looks: self.looks, busiest, missed });
-        Some(out)
+        // The second under way is the last: those before it are whole.
+        let whole = || self.seconds.iter().rev().skip(1);
+        let last_second = whole().next().map(|s| LastSecond { encoded: s.encoded, skipped: s.skipped, missed: s.missed });
+        let busiest = whole().take(span.as_secs().max(1) as usize).map(|s| s.pictures).max();
+        let blend = (self.rate > 0).then_some(BlendHealth { rate: self.rate, looks: self.looks, busiest });
+        Some(CaptureHealth { last_second, blend })
     }
 }
 
@@ -995,47 +996,50 @@ mod health_tests {
         History { started: Some(Instant::now() - Duration::from_secs(secs)), ..History::NONE }
     }
 
-    /// Counts go to the second they happened in; a span sums its seconds
-    /// and the one under way, and the busiest second is a whole one.
+    /// Counts go to the second they happened in: the last whole second is
+    /// as it was, and the busiest second a whole one of the span.
     #[test]
-    fn a_span_counts_its_seconds() {
+    fn the_last_whole_second() {
         let mut h = started(0);
-        assert!(h.summary(Duration::from_secs(60)).is_some_and(|s| s.blend.is_none()), "not blending");
+        assert!(h.summary(Duration::from_secs(60)).is_some_and(|s| s.blend.is_none() && s.last_second.is_none()), "not blending, no whole second yet");
         h.rate = 540;
         h.looks = 9;
         // Three seconds in: 500 pictures in second 0, 530 in second 1, 40 so far in second 2.
         h.started = Some(Instant::now() - Duration::from_millis(2500));
         h.seconds = [500u32, 530, 40].iter().map(|&p| Second { encoded: 60, skipped: 0, pictures: p, missed: 0 }).collect();
+        h.seconds[0].skipped = 7;
         h.seconds[1].skipped = 3;
         h.seconds[2].missed = 2;
         let s = h.summary(Duration::from_secs(60)).unwrap();
-        assert_eq!((s.encoded, s.skipped), (180, 3));
+        assert_eq!(s.last_second, Some(LastSecond { encoded: 60, skipped: 3, missed: 0 }), "the second under way isn't whole yet");
         let b = s.blend.unwrap();
-        assert_eq!((b.rate, b.looks, b.busiest, b.missed), (540, 9, Some(530), 2), "the second under way isn't the busiest");
-        // A one-second span: the last whole second and the one under way.
-        let s = h.summary(Duration::from_secs(1)).unwrap();
-        assert_eq!((s.encoded, s.skipped, s.blend.unwrap().busiest), (120, 3, Some(530)));
+        assert_eq!((b.rate, b.looks, b.busiest), (540, 9, Some(530)), "the second under way isn't the busiest");
+        // A one-second span: the busiest is the last whole second's.
+        h.seconds[0].pictures = 539;
+        assert_eq!(h.summary(Duration::from_secs(1)).unwrap().blend.unwrap().busiest, Some(530));
     }
 
     /// Seconds with nothing counted still go by: a span reaches only as far
-    /// back as it says, and the first second has no busiest yet.
+    /// back as it says, and the last whole second is a quiet one.
     #[test]
     fn quiet_seconds_go_by() {
         let mut h = started(0);
         h.rate = 540;
         h.looks = 9;
         h.now().unwrap().missed = 5;
+        h.now().unwrap().pictures = 500;
         assert_eq!(h.summary(Duration::from_secs(60)).unwrap().blend.unwrap().busiest, None, "no whole second yet");
-        // Ten seconds later, nothing more counted: the missed ones are outside a 5 s span.
+        // Ten seconds later, nothing more counted.
         h.started = Some(Instant::now() - Duration::from_secs(10));
-        let b = h.summary(Duration::from_secs(5)).unwrap().blend.unwrap();
-        assert_eq!((b.missed, b.busiest), (0, Some(0)));
-        assert_eq!(h.summary(Duration::from_secs(60)).unwrap().blend.unwrap().missed, 5);
-        // Over an hour later: only the last hour is kept.
+        let s = h.summary(Duration::from_secs(5)).unwrap();
+        assert_eq!((s.last_second, s.blend.unwrap().busiest), (Some(LastSecond::default()), Some(0)));
+        assert_eq!(h.summary(Duration::from_secs(60)).unwrap().blend.unwrap().busiest, Some(500));
+        // Over an hour later: only the last hour is kept (and nothing of it
+        // was counted: no whole second known yet).
         h.started = Some(Instant::now() - Duration::from_secs(5000));
-        h.summary(Duration::from_secs(60));
+        let s = h.summary(Duration::from_secs(4000)).unwrap();
         assert!(h.seconds.len() <= HEALTH_SECONDS + 1);
-        assert_eq!(h.summary(Duration::from_secs(4000)).unwrap().blend.unwrap().missed, 0);
+        assert_eq!((s.last_second, s.blend.unwrap().busiest), (None, None));
     }
 }
 
