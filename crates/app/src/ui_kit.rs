@@ -857,6 +857,7 @@ pub fn segmented_opts(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::De
     for (i, o) in opts.iter().enumerate() {
         let r = Rect::from_min_size(Pos2::new(xs[i], inner.top()), vec2(ws[i], inner.height()));
         let resp = ui.interact(r, base_id.with(i), if enabled { Sense::click() } else { Sense::hover() });
+        crate::demo::mark(ui.ctx(), || format!("button:{}", if o.label.is_empty() { o.tip.unwrap_or("") } else { o.label }), r);
         let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered() && enabled, theme::FAST);
         let on = i == chosen;
         let color = if on { p.text } else { theme::mix(p.text2, p.text, hv) };

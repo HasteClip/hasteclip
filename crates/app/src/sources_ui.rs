@@ -377,13 +377,11 @@ impl App {
         }
         let idle = self.rec_state == crate::RecState::Idle;
         let pal = crate::theme::pal(ui);
-        let size_text = frame.as_ref().map(|f| format!("{}×{} at {} fps", f.recorded.0, f.recorded.1, self.settings.fps));
-        column_head(ui, "Picture", |ui| {
-            if let Some(t) = &size_text {
-                ui.label(crate::theme::text(t, 12.5, crate::theme::W::Regular).color(pal.text3))
-                    .on_hover_text(format!("What's recorded. Change it in Settings, Video. The preview shows {} frames a second.", self.sources_view.preview_rate.2));
-            }
-        });
+        // What's recorded; while a preview of another size starts, the size
+        // it will be (the button stays, and its choices stay open).
+        let size = frame.as_ref().map(|f| f.recorded).or_else(|| capture::frame_size(&self.video_source(), self.settings.video_size()));
+        let size_text = size.map_or_else(|| format!("{} fps", self.settings.fps), |(w, h)| format!("{w}×{h} at {} fps", self.settings.fps));
+        column_head(ui, "Picture", |ui| self.size_button(ui, &size_text));
 
         // What to record: changes right away, while capturing too (the clip
         // switches mid-way; nothing restarts), except the display, which
@@ -479,6 +477,110 @@ impl App {
         }
         crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
         self.screen_place_card(ui);
+    }
+
+    /// The video's size, as recorded, over the preview: a button opening the
+    /// size's own choices (the same setting as Settings' Resolution and
+    /// Aspect ratio), so the video can change shape while it's arranged.
+    fn size_button(&mut self, ui: &mut egui::Ui, text: &str) {
+        use crate::theme::{self, W};
+        let pal = theme::pal(ui);
+        let locked = self.rec_state != crate::RecState::Idle;
+        let galley = ui.painter().layout_no_wrap(text.to_owned(), theme::font(12.5, W::Regular), pal.text3);
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(galley.size().x + 30.0, 24.0), Sense::click());
+        crate::demo::mark(ui.ctx(), || "button:Video size".into(), rect);
+        let id = resp.id.with("size");
+        let open = egui::Popup::is_id_open(ui.ctx(), id);
+        let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered() || open, theme::FAST);
+        if hv > 0.0 {
+            ui.painter().rect_filled(rect, crate::ui_kit::RADIUS, theme::fade(pal.control, hv));
+        }
+        let ink = theme::mix(pal.text3, pal.text, hv);
+        ui.painter().galley_with_override_text_color(egui::pos2(rect.left() + 8.0, rect.center().y - galley.size().y / 2.0), galley, ink);
+        let mark = egui::pos2(rect.right() - 11.0, rect.center().y);
+        if locked {
+            ui.painter().text(mark, egui::Align2::CENTER_CENTER, egui_phosphor::regular::LOCK_SIMPLE, egui::FontId::proportional(12.0), ink);
+        } else {
+            crate::ui_kit::chevron(ui.painter(), mark, 3.5, theme::value(ui.ctx(), resp.id.with("turn"), if open { 1.0 } else { 0.0 }, theme::NORMAL), ink);
+        }
+        let tip = if locked { "Locked while clipping: the video's size is set when clipping starts" } else { "The video's size: what your clips are" };
+        let resp = resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand);
+        egui::Popup::from_toggle_button_response(&resp)
+            .id(id)
+            .gap(6.0)
+            .align(egui::RectAlign::BOTTOM_END)
+            .frame(crate::ui_kit::pop_frame(ui))
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| self.size_panel(ui, locked));
+    }
+
+    /// The video size's choices: a resolution and an aspect ratio, each one
+    /// click (an exact size, and the rest, in Settings).
+    fn size_panel(&mut self, ui: &mut egui::Ui, locked: bool) {
+        use crate::settings::OutputResolution as R;
+        use crate::theme::{self, W};
+        use crate::ui_kit::Seg;
+        let pal = theme::pal(ui);
+        ui.set_width(380.0);
+        ui.spacing_mut().item_spacing.y = 6.0;
+        ui.horizontal(|ui| {
+            ui.label(theme::text("Video size", 13.5, W::Semibold).color(pal.text));
+            ui.label(theme::text("what your clips are", 12.5, W::Regular).color(pal.text3));
+        });
+        if locked {
+            ui.horizontal(|ui| {
+                ui.label(theme::ic(egui_phosphor::regular::LOCK_SIMPLE, 12.5).color(pal.text3));
+                ui.label(theme::text("Stop clipping to change it: the size is set when clipping starts", 12.5, W::Regular).color(pal.text2));
+            });
+        }
+        ui.add_enabled_ui(!locked, |ui| {
+            let label = |ui: &mut egui::Ui, t: &str| {
+                ui.add_space(4.0);
+                ui.label(theme::text(t, 12.0, W::Medium).color(pal.text2));
+            };
+            label(ui, "Resolution");
+            const SIZES: [R; 5] = [R::Native, R::P1440, R::P1080, R::P720, R::P480];
+            let names = SIZES.map(|r| r.label());
+            let opts: Vec<Seg> = names.iter().map(|n| Seg { icon: None, label: n.as_str(), tip: None }).collect();
+            let now = SIZES.iter().position(|r| *r == self.settings.resolution).unwrap_or(usize::MAX);
+            if let Some(i) = crate::ui_kit::segmented_opts(ui, "size_res", &opts, now, None, !locked) {
+                self.settings.resolution = SIZES[i];
+            }
+            label(ui, "Aspect ratio");
+            const SHAPES: [Option<[u32; 2]>; 6] = [None, Some([16, 9]), Some([9, 16]), Some([1, 1]), Some([4, 3]), Some([21, 9])];
+            let names: Vec<String> = SHAPES.iter().map(|s| s.map_or("Same as screen".to_owned(), |[w, h]| format!("{w}:{h}"))).collect();
+            let opts: Vec<Seg> = names.iter().map(|n| Seg { icon: None, label: n.as_str(), tip: None }).collect();
+            let exact = self.settings.resolution.exact();
+            let now = if exact.is_some() { usize::MAX } else { SHAPES.iter().position(|s| *s == self.settings.shape).unwrap_or(usize::MAX) };
+            if let Some(i) = crate::ui_kit::segmented_opts(ui, "size_shape", &opts, now, None, !locked) {
+                self.settings.shape = SHAPES[i];
+                // An exact size is its own shape: a resolution in p, as near it, instead.
+                if let Some((w, h)) = exact {
+                    let short = w.min(h);
+                    self.settings.resolution = R::PRESETS.iter().copied().find(|r| r.short_side() == Some(short)).unwrap_or(R::Custom(short));
+                }
+            }
+        });
+        ui.add_space(4.0);
+        crate::ui_kit::divider(ui, 0.0);
+        let size = capture::frame_size(&self.video_source(), self.settings.video_size());
+        let native = capture::frame_size(&self.video_source(), capture::VideoSize { shape: self.settings.capture_shape(), ..Default::default() });
+        let note = match (size, self.settings.resolution.exact(), native) {
+            (Some((w, h)), Some(_), _) => format!("Records at exactly {w}×{h}"),
+            (Some((w, h)), None, Some((nw, nh))) if self.settings.resolution.short_side().is_some_and(|t| t > nw.min(nh)) => format!("Records at {w}×{h}: as big as your screen allows"),
+            (Some((w, h)), None, _) => format!("Records at {w}×{h}"),
+            (None, ..) => String::new(),
+        };
+        ui.horizontal(|ui| {
+            ui.label(theme::text(note, 12.5, W::Regular).color(pal.text2));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let more = crate::ui_kit::Btn::ghost("More in Settings").trail(egui_phosphor::regular::CARET_RIGHT).small().tip("Every resolution, an exact size, frame rate and quality");
+                if more.show(ui).clicked() {
+                    self.page = crate::Page::Settings;
+                    ui.close();
+                }
+            });
+        });
     }
 
     /// The Crop row: what's kept of the screen, and a way to its page.
