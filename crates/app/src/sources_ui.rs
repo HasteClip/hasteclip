@@ -74,6 +74,9 @@ pub(crate) struct SourcesView {
     /// how far below its top it was taken hold of, and how the sources were
     /// before (to undo it).
     reorder: Option<(crate::canvas_ui::Layer, f32, crate::canvas_ui::Arrangement)>,
+    /// The cards' order as last shown, and when it last changed: they slide
+    /// to their new places for a moment after.
+    card_order: (Vec<crate::canvas_ui::Layer>, Option<Instant>),
 }
 
 /// What a preview shows: the picture, its height and shape, the frame rate,
@@ -382,10 +385,14 @@ impl App {
 
     /// The video's sources, one card each, the one in front first: a card's
     /// line says what it is, clicking it opens its settings, and dragging it
-    /// by its handle puts it in front of or behind the others.
+    /// by its handle puts it in front of or behind the others. Each card is
+    /// laid out in a place of its own (its switch and menus stay its own as
+    /// cards change places) and slides to its new place when the order
+    /// changes; the one dragged follows the pointer, over the others.
     fn layer_cards(&mut self, ui: &mut egui::Ui, frame: Option<&capture::preview::PreviewFrame>) {
         use crate::canvas_ui::Layer;
         use crate::theme::{self, W};
+        use egui::{pos2, vec2};
         let pal = theme::pal(ui);
         let aspect = frame.map_or(16.0 / 9.0, |f| f.width as f32 / f.height.max(1) as f32);
         if self.settings.webcam.is_some() {
@@ -400,26 +407,63 @@ impl App {
             });
             ui.add_space(2.0);
         }
-        // The card the pointer's on: its source is outlined on the preview.
-        self.canvas.card_hover = None;
-        let mut rects = Vec::new();
-        for (i, layer) in order.iter().enumerate() {
-            if i > 0 {
-                ui.add_space(8.0);
-            }
-            let top = ui.cursor().top();
-            self.layer_card(ui, *layer, order.len() > 1, frame, aspect);
-            let rect = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=ui.min_rect().bottom().max(top + 1.0));
-            let held = self.sources_view.reorder.map(|(l, ..)| l);
-            if held == Some(*layer) {
-                ui.painter().rect_stroke(rect, 8.0, egui::Stroke::new(1.5, pal.text3), egui::StrokeKind::Outside);
-            }
-            if held.map_or_else(|| ui.rect_contains_pointer(rect), |l| l == *layer) {
-                self.canvas.card_hover = Some(*layer);
-            }
-            rects.push((*layer, rect));
+        if self.sources_view.card_order.0 != order {
+            let moved = !self.sources_view.card_order.0.is_empty();
+            self.sources_view.card_order = (order.clone(), moved.then(Instant::now));
         }
-        self.reorder_cards(ui, &rects);
+        // Slides for a moment after the order changed (dragged, or put in
+        // front from a menu); else a card's place follows the ones above it
+        // at once (one opening pushes the others down as it opens).
+        let held = self.sources_view.reorder.map(|(l, grab, _)| (l, grab));
+        let sliding = held.is_some() || self.sources_view.card_order.1.is_some_and(|t| t.elapsed() < Duration::from_millis(400));
+        const GAP: f32 = 8.0;
+        let w = ui.available_width();
+        let ctx = ui.ctx().clone();
+        let height = |l: Layer| ctx.data(|d| d.get_temp::<f32>(egui::Id::new(("layer_card_h", l)))).unwrap_or(CARD_HEAD_H + 12.0);
+        let heights: Vec<f32> = order.iter().map(|l| height(*l)).collect();
+        let total = heights.iter().sum::<f32>() + GAP * order.len().saturating_sub(1) as f32;
+        let (area, _) = ui.allocate_exact_size(vec2(w, total), Sense::hover());
+        let pointer = ui.input(|i| i.pointer.latest_pos());
+        // Each card's place in the order, and where it's drawn now.
+        let mut slots = Vec::new();
+        let mut top = area.top();
+        for (layer, h) in order.iter().zip(&heights) {
+            let slot = egui::Rect::from_min_size(pos2(area.left(), top), vec2(w, *h));
+            top += h + GAP;
+            let id = egui::Id::new(("layer_card_y", *layer));
+            let y = match (held, pointer) {
+                // Held: where the pointer has it, and from there to its place once let go.
+                (Some((l, grab)), Some(p)) if l == *layer => {
+                    let y = (p.y - grab).clamp(area.top(), (area.bottom() - h).max(area.top()));
+                    theme::value(ui.ctx(), id, y - area.top(), 0.0);
+                    y
+                }
+                _ => area.top() + theme::value(ui.ctx(), id, slot.top() - area.top(), if sliding { theme::NORMAL } else { 0.0 }),
+            };
+            slots.push((*layer, slot, y));
+        }
+        // The one held last, over the others.
+        self.canvas.card_hover = None;
+        let mut drawn = slots.clone();
+        drawn.sort_by_key(|(l, ..)| held.is_some_and(|(h, _)| h == *l));
+        for (layer, _, y) in drawn {
+            let lifted = held.is_some_and(|(h, _)| h == layer);
+            let layer_id = if lifted { egui::LayerId::new(egui::Order::Foreground, egui::Id::new("layer_card_held")) } else { ui.layer_id() };
+            let at = egui::Rect::from_min_size(pos2(area.left(), y), vec2(w, 10_000.0));
+            let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(at).layout(egui::Layout::top_down(egui::Align::Min)).id_salt(("layer_card", layer)).layer_id(layer_id));
+            if lifted {
+                let shadow = egui::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_black_alpha(90) };
+                let r = egui::Rect::from_min_size(at.min, vec2(w, height(layer)));
+                cui.painter().add(shadow.as_shape(r, 8));
+            }
+            self.layer_card(&mut cui, layer, order.len() > 1, frame, aspect, y);
+            let shown = egui::Rect::from_min_size(at.min, vec2(w, cui.min_rect().height()));
+            ui.data_mut(|d| d.insert_temp(egui::Id::new(("layer_card_h", layer)), shown.height()));
+            if held.map_or_else(|| ui.rect_contains_pointer(shown), |(h, _)| h == layer) {
+                self.canvas.card_hover = Some(layer);
+            }
+        }
+        self.reorder_cards(ui, &slots);
         // Adding sources.
         if capture::webcam::AVAILABLE && self.settings.webcam.is_none() {
             ui.add_space(12.0);
@@ -434,21 +478,20 @@ impl App {
     }
 
     /// Dragging a card by its handle, live (the preview shows it): it goes
-    /// above a card once its top (where it would be, following the pointer)
-    /// is past that card's middle, below one once its bottom is. Let go, it
-    /// can be undone.
-    fn reorder_cards(&mut self, ui: &egui::Ui, rects: &[(crate::canvas_ui::Layer, egui::Rect)]) {
+    /// above a card once its top (following the pointer) is past that
+    /// card's middle, below one once its bottom is. Let go, it can be undone.
+    fn reorder_cards(&mut self, ui: &egui::Ui, slots: &[(crate::canvas_ui::Layer, egui::Rect, f32)]) {
         let Some((held, grab, was)) = self.sources_view.reorder else { return };
         let down = ui.input(|i| i.pointer.primary_down());
         if down
             && let Some(p) = ui.input(|i| i.pointer.interact_pos())
-            && let Some((_, me)) = rects.iter().find(|(l, _)| *l == held)
+            && let Some((_, me, _)) = slots.iter().find(|(l, ..)| *l == held)
         {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
             let (top, bottom) = (p.y - grab, p.y - grab + me.height());
             let above = |r: &egui::Rect| if r.center().y < me.center().y { top >= r.center().y } else { bottom > r.center().y };
-            let mut order: Vec<_> = rects.iter().map(|(l, _)| *l).filter(|l| *l != held).collect();
-            let at = rects.iter().filter(|(l, r)| *l != held && above(r)).count();
+            let mut order: Vec<_> = slots.iter().map(|(l, ..)| *l).filter(|l| *l != held).collect();
+            let at = slots.iter().filter(|(l, r, _)| *l != held && above(r)).count();
             order.insert(at.min(order.len()), held);
             self.set_layer_order(&order);
         }
@@ -457,13 +500,15 @@ impl App {
                 self.keep_for_undo(was);
             }
             self.sources_view.reorder = None;
+            // Let go: it slides from there into its place.
+            self.sources_view.card_order.1 = Some(Instant::now());
         }
     }
 
-    /// One source's card: its handle (`movable`: with others to go in front
-    /// of or behind), what it is and its state on one line (with its
-    /// switch), its settings below when it's open.
-    fn layer_card(&mut self, ui: &mut egui::Ui, layer: crate::canvas_ui::Layer, movable: bool, frame: Option<&capture::preview::PreviewFrame>, aspect: f32) {
+    /// One source's card, its top at `top`: its handle (`movable`: with
+    /// others to go in front of or behind), what it is and its state on one
+    /// line (with its switch), its settings below when it's open.
+    fn layer_card(&mut self, ui: &mut egui::Ui, layer: crate::canvas_ui::Layer, movable: bool, frame: Option<&capture::preview::PreviewFrame>, aspect: f32, top: f32) {
         use crate::canvas_ui::Layer;
         use crate::theme::{self, W};
         use egui::{Align2, FontId, pos2, vec2};
@@ -471,7 +516,6 @@ impl App {
         let pal = theme::pal(ui);
         let open = self.sources_view.open_cards.contains(&layer);
         let held = self.sources_view.reorder.is_some_and(|(l, ..)| l == layer);
-        let card_top = ui.cursor().top();
         // Its line: what it is, then what's wrong with it, if anything.
         let (glyph, name, line, state, on) = match layer {
             Layer::Screen => {
@@ -501,7 +545,7 @@ impl App {
         group_rows(ui, ("layer_card", layer), |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             // All of its line opens and closes it, but for its handle and switch.
-            let (head, resp) = ui.allocate_exact_size(vec2(ui.available_width(), GROUP_ROW_H), Sense::click());
+            let (head, resp) = ui.allocate_exact_size(vec2(ui.available_width(), CARD_HEAD_H), Sense::click());
             let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
             crate::demo::mark(ui.ctx(), || format!("card:{name}"), head);
             let painter = ui.painter().clone();
@@ -515,7 +559,7 @@ impl App {
                 let ink = if held || grip.hovered() { pal.text } else { pal.text3 };
                 painter.text(pos2(x + 5.0, cy), Align2::CENTER_CENTER, icon::DOTS_SIX_VERTICAL, FontId::proportional(16.0), ink);
                 if grip.drag_started() {
-                    let grab = ui.input(|i| i.pointer.press_origin()).map_or(0.0, |p| p.y - card_top);
+                    let grab = ui.input(|i| i.pointer.press_origin()).map_or(0.0, |p| p.y - top);
                     self.sources_view.reorder = Some((layer, grab, self.arrangement()));
                 }
                 x += 20.0;
@@ -1985,6 +2029,10 @@ pub(crate) fn group(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debu
 pub(crate) const GROUP_PAD: f32 = 12.0;
 /// How tall a row in a group of rows is (`group_rows`).
 pub(crate) const GROUP_ROW_H: f32 = 42.0;
+
+/// A picture source's card's line: as tall as its menu button and a little
+/// room (its settings below are rows of `GROUP_ROW_H`).
+const CARD_HEAD_H: f32 = 34.0;
 
 /// A group of rows (`GROUP_ROW_H` tall, their control centred): less above
 /// and below, so the controls are as far from its edges as from its sides.
