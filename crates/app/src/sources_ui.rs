@@ -647,7 +647,7 @@ impl App {
                 // display that would make it another size (it's the size of
                 // the display, in p or Native) waits until clipping stops.
                 // Any other is shown in it as the one before was.
-                let recording = self.frame_size.as_ref().and_then(|(_, size, _)| *size).filter(|_| !idle);
+                let recording = frame.map(|f| f.recorded).filter(|_| !idle);
                 let sized: Vec<Option<(u32, u32)>> = match recording {
                     Some(_) => self.screens.iter().map(|d| capture::frame_size(&self.display_source(&d.id), self.settings.video_size())).collect(),
                     None => Vec::new(),

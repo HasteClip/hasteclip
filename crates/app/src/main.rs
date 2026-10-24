@@ -440,7 +440,7 @@ struct App {
     /// The recording's frame size for (what's recorded, resolution), cached:
     /// for keeping the webcam's box its shape. Kept while capturing; cleared
     /// when a capture starts or stops.
-    pub(crate) frame_size: Option<((capture::VideoSource, capture::VideoSize), Option<(u32, u32)>, Instant)>,
+    frame_size: Option<((capture::VideoSource, capture::VideoSize), Option<(u32, u32)>, Instant)>,
     /// Apps with a window, for the games-and-apps list: to add, and to show
     /// which are open. Refreshed while the Sources page shows.
     pub(crate) windowed_apps: Vec<capture::Device>,
