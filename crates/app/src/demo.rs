@@ -28,6 +28,7 @@
 //!   { "drag": "clip:2", "to": "filter:Best of the week" },  // or "by": [x, y]
 //!   { "key": "cmd+s" },  { "type": "text" },  { "scroll": 300 },
 //!   { "drag": "preview:0.9,0.9", "by": [-80, 0], "mods": "alt" },  // keys held while dragging
+//!   { "hold": "alt" },  { "hold": "" }       // keys held from now on, and let go
 //!   { "shot": "sources.png" },               // this moment's frame as a picture
 //!   { "pointer": false }                     // hide the pointer
 //! ] }
@@ -235,6 +236,8 @@ enum Step {
     },
     /// Save the frame drawn now as a PNG (relative to the script).
     Shot { shot: PathBuf },
+    /// Hold keys down (`"alt"`) from now on; `""` lets go.
+    Hold { hold: String },
     /// Press a key, with modifiers: `"space"`, `"cmd+s"`, `"alt+f10"`, `"e"`.
     Key { key: String },
     /// Type text into whatever has focus.
@@ -657,6 +660,11 @@ impl Demo {
             }
             Step::Shot { shot } => {
                 self.shots.push((self.dir.join(shot), 3));
+                next(self);
+            }
+            Step::Hold { hold } => {
+                let held = if hold.is_empty() { Modifiers::NONE } else { parse_key(&format!("{hold}+a")).1 };
+                raw.events.push(Event::ModifiersChanged(held));
                 next(self);
             }
             Step::Drag { drag, by, to, secs, mods } => {
