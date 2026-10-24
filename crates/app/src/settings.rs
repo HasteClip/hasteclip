@@ -92,7 +92,7 @@ pub enum RateControl {
     Cqp,
 }
 
-/// What [`RecordSettings::size_version`] is for settings saved now.
+/// What [`RecordSettings::size_version`] is for settings made now.
 pub const SIZE_VERSION: u32 = 1;
 
 /// Output resolution. `Native` records at the capture source's resolution;
@@ -194,6 +194,15 @@ impl Default for ScreenCfg {
     fn default() -> Self {
         Self { enabled: true, in_front: false, placed: None }
     }
+}
+
+/// The video's size as it's chosen, saved apart from `resolution` and
+/// `shape` themselves, which are saved as older versions read them (see
+/// [`RecordSettings::to_json`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SizeCfg {
+    pub resolution: OutputResolution,
+    pub shape: Option<[u32; 2]>,
 }
 
 /// A box in the video: left, top, width, height as fractions of the video,
@@ -809,14 +818,24 @@ pub struct RecordSettings {
     pub blend_fps: u32,
     /// How the looks in a blended frame are weighed.
     pub blend_shape: BlendShape,
+    /// The video's size: Native, in p on its short side, or a width and
+    /// height of its own. Saved as older versions read it (p was the
+    /// height, there was no size of its own), the size itself in
+    /// `saved_size`.
     pub resolution: OutputResolution,
-    /// What `resolution`'s p means in this file: 0 from before it was the
-    /// short side (it was the height), 1 since. Read once, on load.
-    #[serde(default)]
+    /// What `resolution`'s p means in a file without `saved_size`: 0 from
+    /// before it was the short side (it was the height), 1 in one saved by
+    /// a version that had it be the short side. Read once, on load.
+    #[serde(default, skip_serializing)]
     pub size_version: u32,
     /// The shape recordings are made in, width to height, when it isn't the
-    /// screen's (16:9 out of an ultrawide screen).
+    /// screen's (16:9 out of an ultrawide screen). Saved as `resolution` is.
     pub shape: Option<[u32; 2]>,
+    /// `resolution` and `shape` as they are, in the file (see `to_json`):
+    /// read instead of them when it's there. Older versions don't know it,
+    /// and leave it out when they save.
+    #[serde(rename = "video_size", skip_serializing_if = "Option::is_none")]
+    saved_size: Option<SizeCfg>,
     /// How the screen went into that shape when Fill, Fit and Stretch were
     /// chosen: a Fit or Stretch from then becomes a box showing all of the
     /// screen, once (see `App::refit_boxes`). Fill (its middle) is all there is.
@@ -929,6 +948,7 @@ impl Default for RecordSettings {
             resolution: OutputResolution::Native,
             size_version: SIZE_VERSION,
             shape: None,
+            saved_size: None,
             framing: Framing::Fill,
             screen_crop: None,
             video_bitrate_mbps: 40,
@@ -1125,6 +1145,31 @@ impl RecordSettings {
     }
 }
 
+/// A shape `w`:`h` in small numbers, as older versions' Aspect ratio takes
+/// them (up to 99 each): 1920×1080 is 16:9, 1366×768 about that.
+fn small_ratio(w: u32, h: u32) -> [u32; 2] {
+    let gcd = |mut a: u32, mut b: u32| {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a.max(1)
+    };
+    let g = gcd(w, h);
+    let (w, h) = (w / g, h / g);
+    if w.max(h) <= 99 {
+        return [w.max(1), h.max(1)];
+    }
+    // The nearest with both up to 99.
+    let ratio = w as f64 / h.max(1) as f64;
+    let candidates = (1..=99u32).flat_map(|q| [(((q as f64 * ratio).round() as u32), q), (q, ((q as f64 / ratio).round() as u32))]);
+    let ok = candidates.filter(|&(a, b)| (1..=99).contains(&a) && (1..=99).contains(&b));
+    let best = ok.min_by(|x, y| ((x.0 as f64 / x.1 as f64 - ratio).abs()).total_cmp(&(y.0 as f64 / y.1 as f64 - ratio).abs()));
+    best.map_or([16, 9], |(a, b)| {
+        let g = gcd(a, b);
+        [a / g, b / g]
+    })
+}
+
 /// Common frame rates for the picker; those above the display's refresh
 /// rate (and 240) aren't offered.
 pub const FPS_CHOICES: [u32; 9] = [30, 60, 120, 144, 165, 240, 360, 480, 540];
@@ -1168,10 +1213,7 @@ fn load_path() -> Option<PathBuf> {
 impl RecordSettings {
     /// Last saved settings, or defaults on first run / unreadable file.
     pub fn load() -> Self {
-        let mut s: Self = load_path()
-            .and_then(|p| std::fs::read(p).ok())
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+        let mut s: Self = load_path().and_then(|p| std::fs::read(p).ok()).and_then(|b| Self::from_json(&b)).unwrap_or_default();
         s.upgrade_capture();
         s.upgrade_save_sound();
         s.upgrade_noise_reduction();
@@ -1203,17 +1245,40 @@ impl RecordSettings {
         }
     }
 
-    /// A resolution from when p was the height keeps making clips the same
-    /// size now it's the short side: upright, 1080p was 608×1080, so it's
-    /// 608p now (wider shapes' height is their short side already).
-    fn upgrade_sizes(&mut self) {
-        if self.size_version >= SIZE_VERSION {
-            return;
+    /// Settings as saved (see `to_json`): the video's size as it is, from
+    /// a file this version saved; else moved over from an older one's.
+    fn from_json(bytes: &[u8]) -> Option<Self> {
+        let mut s: Self = serde_json::from_slice(bytes).ok()?;
+        match s.saved_size.take() {
+            Some(size) => (s.resolution, s.shape) = (size.resolution, size.shape),
+            None => s.upgrade_sizes(),
         }
-        self.size_version = SIZE_VERSION;
-        if let (Some([w, h]), Some(p)) = (self.shape.filter(|[w, h]| *w > 0 && w < h), self.resolution.short_side()) {
+        Some(s)
+    }
+
+    /// The video's size from a version before it was its own, making clips
+    /// the size they were: p was the height, so upright, 1080p was 608×1080,
+    /// and it's 608p now (wider shapes' height is their short side already).
+    fn upgrade_sizes(&mut self) {
+        if self.size_version < 1
+            && let (Some([w, h]), Some(p)) = (self.shape.filter(|[w, h]| *w > 0 && w < h), self.resolution.short_side())
+        {
             let short = ((p as f64 * w as f64 / h as f64 / 2.0).round() as u32 * 2).max(2);
             self.resolution = OutputResolution::PRESETS.iter().copied().find(|r| r.short_side() == Some(short)).unwrap_or(OutputResolution::Custom(short));
+        }
+        self.size_version = SIZE_VERSION;
+    }
+
+    /// `resolution` and `shape` as versions from before they changed read
+    /// them, for about the same size there: p was the height (an upright
+    /// 1080p is 1920p there), and a size of its own is a height in a shape
+    /// of its own.
+    fn size_for_older(&self) -> (OutputResolution, Option<[u32; 2]>) {
+        let height = |h: u32| OutputResolution::PRESETS.iter().copied().find(|r| r.short_side() == Some(h)).unwrap_or(OutputResolution::Custom(h));
+        match (self.resolution, self.resolution.short_side(), self.shape) {
+            (OutputResolution::Exact(w, h), ..) => (height(h), Some(small_ratio(w, h))),
+            (_, Some(short), Some([w, h])) if w > 0 && w < h => (height(((short as f64 * h as f64 / w as f64 / 2.0).round() as u32 * 2).max(2)), self.shape),
+            (r, ..) => (r, self.shape),
         }
     }
 
@@ -1228,8 +1293,14 @@ impl RecordSettings {
     }
 
     /// Serialized form, used both to save and to detect changes cheaply.
+    /// The video's size is saved in `video_size`, and as older versions read
+    /// it where it always was (see `size_for_older`): going back to one
+    /// keeps every setting, and about the same size.
     pub fn to_json(&self) -> String {
-        serde_json::to_string_pretty(self).unwrap_or_default()
+        let mut s = self.clone();
+        s.saved_size = Some(SizeCfg { resolution: self.resolution, shape: self.shape });
+        (s.resolution, s.shape) = self.size_for_older();
+        serde_json::to_string_pretty(&s).unwrap_or_default()
     }
 
     pub fn save_json(json: &str) {
@@ -1290,11 +1361,7 @@ mod shape_tests {
     /// already moved over aren't touched.
     #[test]
     fn old_upright_resolutions_keep_their_size() {
-        let load = |json: &str| {
-            let mut s: RecordSettings = serde_json::from_str(json).unwrap();
-            s.upgrade_sizes();
-            s
-        };
+        let load = |json: &str| RecordSettings::from_json(json.as_bytes()).unwrap();
         let s = load(r#"{"shape":[9,16],"resolution":"P1080"}"#);
         assert_eq!(s.resolution, OutputResolution::Custom(608));
         assert_eq!(s.size_version, SIZE_VERSION);
@@ -1307,6 +1374,69 @@ mod shape_tests {
         let mut fresh = RecordSettings { shape: Some([9, 16]), resolution: OutputResolution::P1080, ..Default::default() };
         fresh.upgrade_sizes();
         assert_eq!(fresh.resolution, OutputResolution::P1080);
+    }
+
+    /// Saved and read again, the size is as it was.
+    #[test]
+    fn the_size_is_saved_as_it_is() {
+        let sizes = [
+            (OutputResolution::Exact(1080, 1350), Some([4, 3])),
+            (OutputResolution::P1080, Some([9, 16])),
+            (OutputResolution::Custom(608), Some([9, 16])),
+            (OutputResolution::P720, None),
+            (OutputResolution::Native, Some([21, 9])),
+        ];
+        for (resolution, shape) in sizes {
+            let s = RecordSettings { resolution, shape, ..Default::default() };
+            let back = RecordSettings::from_json(s.to_json().as_bytes()).unwrap();
+            assert_eq!((back.resolution, back.shape), (resolution, shape));
+        }
+    }
+
+    /// What's saved, read the way the version before a size of its own
+    /// reads it (its own settings, in miniature): every setting is there
+    /// (one value it doesn't know would lose them all), at about the size,
+    /// p being the height there.
+    #[test]
+    fn older_versions_read_what_is_saved() {
+        #[derive(Debug, PartialEq, Deserialize)]
+        enum Old {
+            Native,
+            P480,
+            P720,
+            P900,
+            P1080,
+            P1440,
+            P2160,
+            Custom(u32),
+        }
+        #[derive(Deserialize)]
+        struct Older {
+            resolution: Old,
+            shape: Option<[u32; 2]>,
+            fps: u32,
+        }
+        let read = |resolution, shape| {
+            let s = RecordSettings { resolution, shape, fps: 120, ..Default::default() };
+            let old: Older = serde_json::from_str(&s.to_json()).expect("an older version reads it");
+            assert_eq!(old.fps, 120);
+            (old.resolution, old.shape)
+        };
+        assert_eq!(read(OutputResolution::P1080, None), (Old::P1080, None));
+        assert_eq!(read(OutputResolution::P1080, Some([9, 16])), (Old::Custom(1920), Some([9, 16])));
+        assert_eq!(read(OutputResolution::Custom(608), Some([9, 16])), (Old::P1080, Some([9, 16])));
+        assert_eq!(read(OutputResolution::Exact(1080, 1350), None), (Old::Custom(1350), Some([4, 5])));
+        assert_eq!(read(OutputResolution::Exact(1920, 1080), Some([1, 1])), (Old::P1080, Some([16, 9])));
+        assert_eq!(read(OutputResolution::Exact(1366, 768), None).1, Some([16, 9]));
+        // Saved again by an older version (without the size as it is), it's
+        // moved over: the same size.
+        for (resolution, shape) in [(OutputResolution::P1080, Some([9, 16])), (OutputResolution::Custom(608), Some([9, 16]))] {
+            let s = RecordSettings { resolution, shape, ..Default::default() };
+            let mut json: serde_json::Value = serde_json::from_str(&s.to_json()).unwrap();
+            json.as_object_mut().unwrap().remove("video_size");
+            let back = RecordSettings::from_json(json.to_string().as_bytes()).unwrap();
+            assert_eq!((back.resolution, back.shape), (resolution, shape));
+        }
     }
 }
 
