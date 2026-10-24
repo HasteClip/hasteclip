@@ -240,11 +240,45 @@ pub(crate) fn plan(source: &VideoSource, size: crate::VideoSize) -> Result<(Reta
 }
 
 /// How the stream puts what it records into the frame for the screen placed
-/// as `placed` says, and the part of a display it records: filling the
-/// frame, as the placement says; in a box, all of it (it's cut to the box's
-/// shape by the compositor, see [`Frames`]).
-pub(crate) fn stream_view(placed: &crate::ScreenPlacement) -> (crate::Framing, Option<crate::Crop>) {
-    (if placed.is_whole() { placed.framing } else { crate::Framing::Fit }, placed.crop)
+/// as `placed` says, and the part of a display it records (`display`
+/// pixels big, while a display's recorded): filling the frame, as the
+/// placement says; in a box covering the frame, the part of it showing,
+/// over all of the frame (see [`showing`]); in any other box, all of it
+/// (it's cut to the box's shape by the compositor, see [`Frames`]).
+pub(crate) fn stream_view(placed: &crate::ScreenPlacement, display: Option<(u32, u32)>) -> (crate::Framing, Option<crate::Crop>) {
+    if placed.is_whole() {
+        return (placed.framing, placed.crop);
+    }
+    match display.and_then(|px| showing(placed, px)) {
+        Some(part) => (crate::Framing::Stretch, Some(part)),
+        None => (crate::Framing::Fit, placed.crop),
+    }
+}
+
+/// The part of a display `dw`×`dh` pixels big that shows while the screen
+/// is stretched over a box covering all of the frame (a screen bigger than
+/// the video, its middle or another part showing). The stream records just
+/// that, at the frame's size, so it's as sharp as filling the frame is
+/// (the compositor would scale up a picture fitted in the frame).
+fn showing(placed: &crate::ScreenPlacement, (dw, dh): (u32, u32)) -> Option<crate::Crop> {
+    if !placed.covers() || placed.framing != crate::Framing::Stretch || placed.hidden {
+        return None;
+    }
+    let [x, y, w, h] = placed.rect;
+    let [cx, cy, cw, ch] = placed.crop.map_or([0, 0, dw & !1, dh & !1], |c| c.rect(dw, dh));
+    // Where the frame's edges are on the picture, from 0 to 1 across it.
+    let along = |edge: f32, at: f32, size: f32| ((edge - at) / size.max(1e-6)).clamp(0.0, 1.0) as f64;
+    let px = |u: f64, from: u32, n: u32| (from as f64 + u * n as f64).round() as u32 & !1;
+    let (x0, x1) = (px(along(0.0, x, w), cx, cw), px(along(1.0, x, w), cx, cw));
+    let (y0, y1) = (px(along(0.0, y, h), cy, ch), px(along(1.0, y, h), cy, ch));
+    Some(crate::Crop { w: x1.saturating_sub(x0).max(2), h: y1.saturating_sub(y0).max(2), at: Some((x0, y0)) })
+}
+
+/// Whether the stream's frames are the screen's part of the frame as they
+/// are (see [`stream_view`]): it fills the frame, or covers it, stretched
+/// over its box, from a display `display` pixels big.
+fn as_streamed(placed: &crate::ScreenPlacement, display: Option<(u32, u32)>) -> bool {
+    placed.is_whole() || display.is_some_and(|px| showing(placed, px).is_some())
 }
 
 /// One running capture: its stream, and for games and apps the thread that
@@ -335,6 +369,11 @@ impl StreamCtl {
     /// How what's recorded goes into the frame now.
     pub(crate) fn framing(&self) -> crate::Framing {
         self.ctl.lock().unwrap().wanted.framing
+    }
+
+    /// The display's size in pixels, while a display's recorded (not a window).
+    pub(crate) fn display(&self) -> Option<(u32, u32)> {
+        self.ctl.lock().unwrap().wanted.display
     }
 
     /// Put what's recorded into the frame as `framing` says from now on,
@@ -441,7 +480,6 @@ impl Picture {
         let latest = Arc::new(Latest::default());
         let out = Arc::new(Output { latest: latest.clone(), paused: AtomicBool::new(false), frames: AtomicU64::new(0) });
         let output = ScreenOutput::new(out.clone());
-        let (framing, crop) = stream_view(&placed);
         let pixels = match source {
             VideoSource::Screen { .. } => {
                 let (pw, ph) = display_pixels(display);
@@ -449,6 +487,7 @@ impl Picture {
             }
             VideoSource::Apps { .. } => None,
         };
+        let (framing, crop) = stream_view(&placed, pixels);
         let shown = points(display);
         let config = stream_config(width, height, fps, framing, Some(shown), pixels.and_then(|px| crop_points(shown, px, crop)));
         // Games and apps start on the away screen (the stream shows the
@@ -909,20 +948,22 @@ impl Frames {
     /// or under it.
     pub(crate) fn make(&mut self, screen: Arc<Buffer>) -> Arc<Buffer> {
         let placed = *self.screen.lock().unwrap();
-        // Filling the frame, ScreenCaptureKit puts the picture in as the
-        // placement says; in a box, all of it, cut to the box's shape here.
-        // It cuts out the crop either way.
+        // Filling the frame (or covering it), ScreenCaptureKit puts the
+        // picture in as the placement says; in a box, all of it, cut to the
+        // box's shape here. It cuts out the crop either way.
+        let display = self.ctl.as_ref().and_then(|c| c.display());
         if let Some(ctl) = &self.ctl {
-            let (framing, crop) = stream_view(&placed);
+            let (framing, crop) = stream_view(&placed, display);
             ctl.set_view(framing, crop);
         }
+        let streamed = if self.ctl.is_some() { as_streamed(&placed, display) } else { placed.is_whole() };
         let cam = self.camera.as_mut().and_then(|(layer, placement)| {
             let p = *placement.lock().unwrap();
             if p.is_hidden() { None } else { layer.latest().map(|c| (c, p)) }
         });
         let frame = match &self.gpu {
             // Nothing to put together: the screen's own buffer.
-            _ if cam.is_none() && placed.is_whole() && !placed.hidden => {
+            _ if cam.is_none() && streamed && !placed.hidden => {
                 self.last = None;
                 screen
             }
@@ -936,7 +977,7 @@ impl Frames {
                     _ => {
                         let (w, h) = size_of(&screen.0);
                         let picture = self.ctl.as_ref().map_or([0, 0, w as u32, h as u32], |c| c.picture_rect());
-                        let shown = screen_rects(&placed, picture, (w as u32, h as u32));
+                        let shown = screen_rects(&placed, streamed, picture, (w as u32, h as u32));
                         match pool.take().and_then(|out| gpu.compose(&screen.0, shown, placed.in_front, cam.as_ref().map(|(c, _)| &*c.buffer), p, &out).map(|()| out)) {
                             Ok(out) => {
                                 let b = Arc::new(Buffer(out));
@@ -959,22 +1000,57 @@ impl Frames {
 
 /// Where the screen's picture is drawn from and to, for the compositor, in
 /// a `frame`-size frame whose stream put the picture at `picture`: as it is
-/// while it fills the frame (copied), else cut to its box's shape and drawn
-/// there. `None` when it's hidden.
-pub(crate) fn screen_rects(placed: &crate::ScreenPlacement, picture: [u32; 4], (fw, fh): (u32, u32)) -> Option<super::gpu::ScreenRects> {
+/// while the stream's frames are the screen's part of the frame
+/// (`streamed`: it fills the frame, or covers it), copied; else cut to its
+/// box's shape and drawn there, as much of it as is in the frame. `None`
+/// when it's hidden.
+pub(crate) fn screen_rects(placed: &crate::ScreenPlacement, streamed: bool, picture: [u32; 4], frame: (u32, u32)) -> Option<super::gpu::ScreenRects> {
     if placed.hidden {
         return None;
     }
     let edges = |[x, y, w, h]: [u32; 4]| [x as f32, y as f32, (x + w) as f32, (y + h) as f32];
-    if placed.is_whole() {
+    if streamed {
         return Some(super::gpu::ScreenRects { src: edges(picture), dest: edges(picture), copy: true });
     }
     let [px, py, pw, ph] = picture;
-    let ([sx, sy, sw, sh], dest) = crate::placement_in((pw, ph), placed.rect_in(fw, fh), placed.framing);
+    let ([sx, sy, sw, sh], dest) = placed.place_picture((pw, ph), frame);
     Some(super::gpu::ScreenRects { src: edges([px + sx, py + sy, sw, sh]), dest: edges(dest), copy: false })
 }
 
 /// A buffer's size.
 pub(crate) fn size_of(b: &CVPixelBuffer) -> (usize, usize) {
     (CVPixelBufferGetWidth(b), CVPixelBufferGetHeight(b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Crop, Framing, ScreenPlacement};
+
+    /// The stream records as the placement says filling the frame, all of
+    /// the screen for a box (the compositor puts it there), and just the
+    /// part showing for a box covering the frame, so it's as sharp.
+    #[test]
+    fn what_the_stream_records() {
+        let display = Some((3024, 1964));
+        let fill = ScreenPlacement::whole(Framing::Fill);
+        assert_eq!(stream_view(&fill, display), (Framing::Fill, None));
+        let boxed = ScreenPlacement { rect: [0.1, 0.1, 0.5, 0.5], framing: Framing::Stretch, ..fill };
+        assert_eq!(stream_view(&boxed, display), (Framing::Fit, None));
+        assert!(!as_streamed(&boxed, display));
+        // A 16:10 display covering a 16:9 frame, moved down to its top: its
+        // top 3024×1700, the frame's shape.
+        let over = ScreenPlacement { rect: [0.0, 0.0, 1.0, 1964.0 / 1700.0], ..boxed };
+        assert_eq!(stream_view(&over, display), (Framing::Stretch, Some(Crop { w: 3024, h: 1700, at: Some((0, 0)) })));
+        assert!(as_streamed(&over, display));
+        // In the middle, cropped: the middle of the crop.
+        let crop = Some(Crop { w: 2000, h: 1300, at: Some((100, 200)) });
+        let middle = ScreenPlacement { rect: [0.0, -0.1, 1.0, 1.2], crop, ..boxed };
+        assert_eq!(stream_view(&middle, display), (Framing::Stretch, Some(Crop { w: 2000, h: 1084, at: Some((100, 308)) })));
+        // A window (no display): the compositor's.
+        assert_eq!(stream_view(&over, None), (Framing::Fit, None));
+        assert!(!as_streamed(&over, None));
+        // Fitted in its box, the picture doesn't cover the frame.
+        assert_eq!(stream_view(&ScreenPlacement { framing: Framing::Fit, ..over }, display).0, Framing::Fit);
+    }
 }
