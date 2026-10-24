@@ -1214,11 +1214,15 @@ fn load_path() -> Option<PathBuf> {
 impl RecordSettings {
     /// Last saved settings, or defaults on first run / unreadable file.
     pub fn load() -> Self {
-        let mut s: Self = load_path().and_then(|p| std::fs::read(p).ok()).and_then(|b| Self::from_json(&b)).unwrap_or_default();
+        Self::from_saved(load_path().and_then(|p| std::fs::read(p).ok()).as_deref())
+    }
+
+    /// Settings from a saved file (defaults without one), brought up to date.
+    fn from_saved(bytes: Option<&[u8]>) -> Self {
+        let mut s: Self = bytes.and_then(Self::from_json).unwrap_or_default();
         s.upgrade_capture();
         s.upgrade_save_sound();
         s.upgrade_noise_reduction();
-        s.upgrade_sizes();
         if let Some(old) = s.audio_tracks.take() {
             s.audio_sources = migrate(&old);
             // Persist now: sources get fresh ids, and their volumes key on them.
@@ -1403,6 +1407,16 @@ mod shape_tests {
         assert_eq!(load(&format!(r#"{{{crop},"resolution":"Native","capture":{{"type":"apps","apps":[]}}}}"#)), OutputResolution::Native);
         assert_eq!(load(&format!(r#"{{{crop},"resolution":{{"Exact":[1920,1080]}},"size_version":1}}"#)), OutputResolution::Exact(1920, 1080));
         assert_eq!(load(r#"{"resolution":"Native"}"#), OutputResolution::Native);
+    }
+
+    /// A crop saved by this version is only what's shown of the screen:
+    /// loaded again and again, the size stays as chosen.
+    #[test]
+    fn a_crop_from_now_leaves_the_size_alone() {
+        let s = RecordSettings { resolution: OutputResolution::P1080, screen_crop: Some(ScreenCrop { w: 2400, h: 1600, at: None }), ..Default::default() };
+        let once = RecordSettings::from_saved(Some(s.to_json().as_bytes()));
+        let twice = RecordSettings::from_saved(Some(once.to_json().as_bytes()));
+        assert_eq!((once.resolution, twice.resolution), (OutputResolution::P1080, OutputResolution::P1080));
     }
 
     /// Saved and read again, the size is as it was.
