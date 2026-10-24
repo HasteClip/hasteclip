@@ -19,6 +19,7 @@ use media::{ClipInfo, Edit};
 use crate::filmstrip::Filmstrip;
 use crate::player::Player;
 use crate::store::{self, EditTarget};
+use crate::viewer::Resume;
 
 /// Timeline geometry, in points.
 const RULER_H: f32 = crate::transport::RULER_H;
@@ -219,12 +220,15 @@ pub struct Editor {
     preview_share: f32,
     /// Snapping, as the app keeps it (settings), until the clip has loaded.
     snap: bool,
+    /// Where the player was when the editor was opened from it (the clip
+    /// preview), to start the timeline there.
+    from: Option<Resume>,
 }
 
 impl Editor {
     /// Edit the clip at `clip`. An edited clip is decoded from its original, so
     /// every earlier decision can still be changed.
-    pub fn open(ctx: &egui::Context, clip: &Path, preview_share: f32, snap: bool) -> Self {
+    pub fn open(ctx: &egui::Context, clip: &Path, preview_share: f32, snap: bool, from: Option<Resume>) -> Self {
         let target = EditTarget::of(clip);
         let (tx, rx) = mpsc::channel();
         let src = target.source.clone();
@@ -251,7 +255,7 @@ impl Editor {
             let _ = tx.send(result);
             repaint.request_repaint();
         });
-        Self { target, state: State::Loading(rx), preview_share, snap }
+        Self { target, state: State::Loading(rx), preview_share, snap, from }
     }
 
     /// The clip was renamed from `from` to `to`: saved under the new name.
@@ -273,7 +277,7 @@ impl Editor {
                 r.player.renamed(ctx, to);
                 r.strip.renamed(to);
             }
-            _ => *self = Self::open(ctx, to, self.preview_share, self.snap()),
+            _ => *self = Self::open(ctx, to, self.preview_share, self.snap(), self.from),
         }
     }
 
@@ -295,11 +299,19 @@ impl Editor {
         }
     }
 
+    pub fn resume(&self) -> Option<Resume> {
+        let State::Ready(r) = &self.state else { return None };
+        Some(Resume {
+            at: settle(&r.edit.kept(), r.player.time(), r.info.frame_duration()),
+            playing: r.player.is_playing(),
+        })
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui) -> EditorOutcome {
         if let State::Loading(rx) = &self.state {
             if let Ok(result) = rx.try_recv() {
                 self.state = match result {
-                    Ok(l) => State::Ready(Box::new(Ready::new(ui.ctx(), &self.target, l, self.snap))),
+                    Ok(l) => State::Ready(Box::new(Ready::new(ui.ctx(), &self.target, l, self.snap, self.from))),
                     Err(e) => State::Failed(e),
                 };
             }
@@ -338,7 +350,7 @@ impl Editor {
 }
 
 impl Ready {
-    fn new(ctx: &egui::Context, target: &EditTarget, l: Loaded, snap: bool) -> Self {
+    fn new(ctx: &egui::Context, target: &EditTarget, l: Loaded, snap: bool, from: Option<Resume>) -> Self {
         let source = &target.source;
         let mut edit = store::load_edit(target).unwrap_or_else(|| Edit::new(&l.info));
         // Sidecar from an older layout or a hand-edited file: make it fit.
@@ -349,8 +361,14 @@ impl Ready {
         let gains = edit.tracks.clone();
         let n = l.pcm.len();
         let waves = (0..n).map(|i| crate::waveform::follow(l.pcm.clone(), i, ctx)).collect();
+        let playhead = from.map_or(edit.start, |r| settle(&edit.kept(), r.at, l.info.frame_duration()));
         let mut player = Player::new(ctx, source, l.info.clone(), l.pcm, gains);
-        player.seek(edit.start);
+        player.seek(playhead);
+        if from.is_some_and(|r| r.playing) {
+            player.set_cuts(&edit.kept());
+            player.set_listening(crate::transport::listening_gain(ctx));
+            player.play(edit.end);
+        }
 
         let full = l.info.duration.max(1e-6);
         let strip = Filmstrip::build(ctx, source, &l.info);
@@ -2477,6 +2495,15 @@ fn trim_to_length(info: &media::ClipInfo, start: f64, end: f64, secs: f64) -> (f
     let a = info.snap(a.max(0.0));
     (a, (info.snap(a + secs)).min(info.duration).max(a + fd))
 }
+/// Returns the nearest time on a playhead
+fn settle(parts: &[(f64, f64)], t: f64, fd: f64) -> f64 {
+    for &(a, b) in parts {
+        if t < b - fd * 0.5 {
+            return t.max(a);
+        }
+    }
+    parts.last().map_or(t, |&(a, b)| (b - fd).max(a))
+}
 
 /// The part of `parts` a split at `t` (a frame's start) splits: one with a
 /// frame or more either side of it.
@@ -2653,6 +2680,21 @@ mod part_tests {
         // Not in what's cut out or trimmed off.
         assert_eq!(splits(&PARTS, 5.0, FD), None);
         assert_eq!(splits(&PARTS, 0.5, FD), None);
+    }
+
+    /// Opening the editor from the preview: the playhead lands in what's kept,
+    /// wherever the preview was.
+    #[test]
+    fn the_playhead_settles_in_what_is_kept() {
+        // In a kept part: where it was.
+        assert_eq!(settle(&PARTS, 2.5, FD), 2.5);
+        assert_eq!(settle(&PARTS, 3.9, FD), 3.9);
+        // In what's cut out: the next part starts there.
+        assert_eq!(settle(&PARTS, 5.0, FD), 6.0);
+        // Before the first part or after the last: its first frame, its last.
+        assert_eq!(settle(&PARTS, 0.2, FD), 1.0);
+        assert!((settle(&PARTS, 9.5, FD) - 8.9).abs() < 1e-9);
+        assert!((settle(&PARTS, 8.9, FD) - 8.9).abs() < 1e-9);
     }
 
     #[test]

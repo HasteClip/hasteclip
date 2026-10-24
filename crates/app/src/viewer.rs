@@ -106,6 +106,15 @@ enum State {
 pub struct Viewer {
     clip: PathBuf,
     state: State,
+    resume: Option<Resume>,
+}
+
+/// A player opening again: the moment to carry on at (the recording's time),
+/// and whether it was playing then.
+#[derive(Clone, Copy)]
+pub struct Resume {
+    pub at: f64,
+    pub playing: bool,
 }
 
 struct Ready {
@@ -146,9 +155,9 @@ struct Ready {
 }
 
 impl Viewer {
-    pub fn open(ctx: &egui::Context, clip: &Path) -> Self {
+    pub fn open(ctx: &egui::Context, clip: &Path, resume: Option<Resume>) -> Self {
         if crate::clips::is_image(clip) {
-            return Self { clip: clip.to_path_buf(), state: State::LoadingPicture(crate::picture::load(ctx, clip)) };
+            return Self { clip: clip.to_path_buf(), state: State::LoadingPicture(crate::picture::load(ctx, clip)), resume: None };
         }
         if crate::player::debug() {
             eprintln!("{:>8.3} viewer: opening {}", crate::player::uptime(), clip.display());
@@ -183,17 +192,28 @@ impl Viewer {
             let _ = tx.send(result);
             repaint.request_repaint();
         });
-        Self { clip: clip.to_path_buf(), state: State::Loading(rx) }
+        Self { clip: clip.to_path_buf(), state: State::Loading(rx), resume }
     }
 
     pub fn clip(&self) -> &Path {
         &self.clip
     }
 
+    pub fn at(&self) -> Option<Resume> {
+        match &self.state {
+            State::Ready(r) => Some(Resume { at: media::source_time(&r.span.parts, r.player.time()), playing: r.player.is_playing() }),
+            _ => None,
+        }
+    }
+
+    pub fn resume(&self) -> Option<Resume> {
+        self.resume
+    }
+
     /// The clip, while its edit is being saved: the app opens it with
     /// [`Viewer::open`] when that's done.
-    pub fn saving(clip: &Path) -> Self {
-        Self { clip: clip.to_path_buf(), state: State::Saving }
+    pub fn saving(clip: &Path, resume: Option<Resume>) -> Self {
+        Self { clip: clip.to_path_buf(), state: State::Saving, resume }
     }
 
     pub fn is_saving(&self) -> bool {
@@ -216,7 +236,7 @@ impl Viewer {
             // On screen already: nothing reads it again.
             State::Picture(_) => {}
             // Still loading from the old name: start again.
-            _ => *self = Self::open(ctx, to),
+            _ => *self = Self::open(ctx, to, self.resume),
         }
     }
 
@@ -224,7 +244,7 @@ impl Viewer {
         if let State::Loading(rx) = &self.state {
             if let Ok(result) = rx.try_recv() {
                 self.state = match result {
-                    Ok(l) => State::Ready(Box::new(Ready::new(ui.ctx(), &self.clip, l))),
+                    Ok(l) => State::Ready(Box::new(Ready::new(ui.ctx(), &self.clip, l, self.resume))),
                     Err(e) => State::Failed(e),
                 };
             }
@@ -461,7 +481,7 @@ impl Viewer {
 }
 
 impl Ready {
-    fn new(ctx: &egui::Context, clip: &Path, l: Loaded) -> Self {
+    fn new(ctx: &egui::Context, clip: &Path, l: Loaded, resume: Option<Resume>) -> Self {
         let wave = crate::waveform::follow(l.pcm.clone(), 0, ctx);
         let mut player = Player::new(ctx, clip, l.info.clone(), l.pcm, Vec::new());
         // Dev aid: `HASTECLIP_START_AT=<seconds>` starts there (to check a
@@ -469,8 +489,16 @@ impl Ready {
         if let Some(t) = std::env::var("HASTECLIP_START_AT").ok().and_then(|s| s.parse::<f64>().ok()) {
             player.seek(t);
         }
-        // Opened to watch: start right away.
-        player.play(l.info.duration);
+        if let Some(r) = resume
+            && let Some(at) = media::output_time(&l.span.parts, r.at)
+        {
+            player.seek(at.min(l.info.duration));
+            if r.playing {
+                player.play(l.info.duration);
+            }
+        } else {
+            player.play(l.info.duration);
+        }
         let r = Self {
             strip: Filmstrip::build(ctx, clip, &l.info),
             info: l.info,
