@@ -431,8 +431,8 @@ impl App {
         if response.drag_started() {
             let origin = ui.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos());
             if let Some(((layer, handle), from)) = origin.and_then(|p| hit(&layers, &to_screen, p).map(|h| (h, p))) {
-                self.save_arrangement();
-                self.canvas.drag = Some(match layer {
+                let was = self.arrangement();
+                let drag = match layer {
                     Layer::Webcam => self.take_webcam(handle, from, aspect),
                     Layer::Screen => {
                         let r = layers.iter().find(|(l, _)| *l == Layer::Screen).map_or(Rect::NOTHING, |(_, r)| *r);
@@ -445,7 +445,12 @@ impl App {
                             Drag::Screen(handle, from, r)
                         }
                     }
-                });
+                };
+                // Something that moves can be put back (one held that can't, can't).
+                if !matches!(drag, Drag::Stuck(_)) {
+                    self.keep_for_undo(was);
+                }
+                self.canvas.drag = Some(drag);
             }
         }
         let mut guides = Vec::new();
