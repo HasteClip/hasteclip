@@ -751,12 +751,31 @@ impl App {
                 ui.label(theme::text(t, 12.0, W::Medium).color(pal.text2));
             };
             label(ui, "Resolution");
+            // The common ones in p, or a custom size: its width and height
+            // in boxes under them.
             const SIZES: [R; 5] = [R::Native, R::P1440, R::P1080, R::P720, R::P480];
             let names = SIZES.map(|r| r.label());
-            let opts: Vec<Seg> = names.iter().map(|n| Seg { icon: None, label: n.as_str(), tip: None }).collect();
-            let now = SIZES.iter().position(|r| *r == self.settings.resolution).unwrap_or(usize::MAX);
-            if let Some(i) = crate::ui_kit::segmented_opts(ui, "size_res", &opts, now, None, !locked) {
-                self.settings.resolution = SIZES[i];
+            let mut opts: Vec<Seg> = names.iter().map(|n| Seg { icon: None, label: n.as_str(), tip: None }).collect();
+            opts.push(Seg { icon: None, label: "Custom", tip: Some("Any width and height") });
+            let exact = self.settings.resolution.exact();
+            let now = if exact.is_some() { SIZES.len() } else { SIZES.iter().position(|r| *r == self.settings.resolution).unwrap_or(usize::MAX) };
+            match crate::ui_kit::segmented_opts(ui, "size_res", &opts, now, None, !locked) {
+                Some(i) if i < SIZES.len() => self.settings.resolution = SIZES[i],
+                // From the size it records at now, the width chosen to type over.
+                Some(_) if exact.is_none() => {
+                    let (w, h) = capture::frame_size(&self.video_source(), self.settings.video_size()).unwrap_or((1920, 1080));
+                    self.settings.resolution = R::Exact(w & !1, h & !1);
+                    crate::settings_ui::type_in_width(ui.ctx(), "popover_size");
+                }
+                _ => {}
+            }
+            if let Some(size) = self.settings.resolution.exact() {
+                ui.horizontal(|ui| {
+                    if let Some((w, h)) = crate::settings_ui::size_boxes(ui, "popover_size", size) {
+                        self.settings.resolution = R::Exact(w, h);
+                    }
+                    ui.label(theme::text("pixels, width × height", 12.5, W::Regular).color(pal.text3));
+                });
             }
             label(ui, "Aspect ratio");
             const SHAPES: [Option<[u32; 2]>; 6] = [None, Some([16, 9]), Some([9, 16]), Some([1, 1]), Some([4, 3]), Some([21, 9])];
@@ -766,7 +785,7 @@ impl App {
             let now = if exact.is_some() { usize::MAX } else { SHAPES.iter().position(|s| *s == self.settings.shape).unwrap_or(usize::MAX) };
             if let Some(i) = crate::ui_kit::segmented_opts(ui, "size_shape", &opts, now, None, !locked) {
                 self.settings.shape = SHAPES[i];
-                // An exact size is its own shape: a resolution in p, as near it, instead.
+                // A custom size is its own shape: a resolution in p, as near it, instead.
                 if let Some((w, h)) = exact {
                     let short = w.min(h);
                     self.settings.resolution = R::PRESETS.iter().copied().find(|r| r.short_side() == Some(short)).unwrap_or(R::Custom(short));
@@ -777,16 +796,15 @@ impl App {
         crate::ui_kit::divider(ui, 0.0);
         let size = capture::frame_size(&self.video_source(), self.settings.video_size());
         let native = capture::frame_size(&self.video_source(), capture::VideoSize { shape: self.settings.capture_shape(), ..Default::default() });
-        let note = match (size, self.settings.resolution.exact(), native) {
-            (Some((w, h)), Some(_), _) => format!("Records at exactly {w}×{h}"),
-            (Some((w, h)), None, Some((nw, nh))) if self.settings.resolution.short_side().is_some_and(|t| t > nw.min(nh)) => format!("Records at {w}×{h}: as big as your screen allows"),
-            (Some((w, h)), None, _) => format!("Records at {w}×{h}"),
-            (None, ..) => String::new(),
+        let note = match (size, native) {
+            (Some((w, h)), Some((nw, nh))) if self.settings.resolution.short_side().is_some_and(|t| t > nw.min(nh)) => format!("Records at {w}×{h}: as big as your screen allows"),
+            (Some((w, h)), _) => format!("Records at {w}×{h}"),
+            (None, _) => String::new(),
         };
         ui.horizontal(|ui| {
             ui.label(theme::text(note, 12.5, W::Regular).color(pal.text2));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let more = crate::ui_kit::Btn::ghost("More in Settings").trail(egui_phosphor::regular::CARET_RIGHT).small().tip("Every resolution, an exact size, frame rate and quality");
+                let more = crate::ui_kit::Btn::ghost("More in Settings").trail(egui_phosphor::regular::CARET_RIGHT).small().tip("Every resolution, frame rate and quality");
                 if more.show(ui).clicked() {
                     self.page = crate::Page::Settings;
                     ui.close();

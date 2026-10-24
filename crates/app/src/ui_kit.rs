@@ -1788,6 +1788,9 @@ pub struct ValueField<'a> {
     pub current: Option<usize>,
     /// What "Type your own…" says about the range.
     pub range: &'a str,
+    /// One more choice under the common values, and its note: a way to a
+    /// value that isn't one number (a resolution's custom size).
+    pub more: Option<(&'a str, &'a str)>,
 }
 
 /// What happened to a [`ValueField`] this frame.
@@ -1799,6 +1802,8 @@ pub enum Typed {
     Preset(usize),
     /// A length typed or stepped in a time field ([`ValueField::show_time`]).
     Secs(f64),
+    /// Its one more choice ([`ValueField::more`]) was picked.
+    More,
 }
 
 impl ValueField<'_> {
@@ -1939,6 +1944,11 @@ impl ValueField<'_> {
                 Item::new(format!("{}{}{}", self.text, if self.unit.is_empty() { "" } else { " " }, self.unit)).check(true).value("yours").show(ui);
             }
             menu_sep(ui);
+            if let Some((label, note)) = self.more
+                && Item::new(label).icon(icon::FRAME_CORNERS).value(note).show(ui).clicked()
+            {
+                out = Typed::More;
+            }
             if Item::new("Type your own…").icon(icon::TEXT_T).value(self.range.to_owned()).show(ui).clicked() {
                 focus = true;
             }
@@ -2313,12 +2323,13 @@ mod tests {
             let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0))), events, ..Default::default() };
             let mut out = ctx.run_ui(raw, |ui| {
                 let mut at = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(Pos2::new(10.0, 10.0), vec2(150.0, CONTROL_H))));
-                let field = ValueField { id: egui::Id::new("vf"), text: text.to_owned(), unit: "", width: 150.0, hint: "", presets: presets.clone(), current: None, range: "" };
+                let field = ValueField { id: egui::Id::new("vf"), text: text.to_owned(), unit: "", width: 150.0, hint: "", presets: presets.clone(), current: None, range: "", more: None };
                 got.push(match field.show(&mut at) {
                     Typed::None => String::new(),
                     Typed::Text(t) => format!("text {t}"),
                     Typed::Preset(i) => format!("preset {i}"),
                     Typed::Secs(s) => format!("secs {s}"),
+                    Typed::More => "more".to_owned(),
                 });
             });
             out.textures_delta.clear();
