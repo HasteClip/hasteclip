@@ -32,7 +32,9 @@
 //! ```
 //!
 //! Targets: `preview:x,y` (a point of the Sources page's preview, as
-//! fractions of it), `clip:<title>` or `clip:N` (the Nth card on screen),
+//! fractions of it), `card:<source>` and `grip:<source>` (a picture
+//! source's card under it, and its handle: `card:Webcam`), `clip:<title>`
+//! or `clip:N` (the Nth card on screen),
 //! `filter:<name>` (the library's games and collections), `button:<label>`
 //! (buttons and menu items, by label or tooltip), `select:<value>` (a
 //! dropdown, by what it shows), `play`, `trim:in`,

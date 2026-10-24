@@ -9,6 +9,8 @@
 //! a box of its own showing all of it, in its own shape
 //! (`settings::ScreenCfg::placed`), and Reset puts it back. Both placements
 //! are shared with the capture, so what's dragged is what's recorded, live.
+//! Which is in front is the order of their cards under the preview (see
+//! `sources_ui`), or their menus' Bring to front.
 
 use capture::webcam::Placement;
 use egui::{Color32, CursorIcon, Pos2, Rect, Stroke, vec2};
@@ -29,7 +31,7 @@ const CROP: Color32 = Color32::from_rgb(80, 220, 120);
 const MIN_SIZE: f32 = 0.05;
 
 /// One of the picture's sources.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Layer {
     Screen,
     Webcam,
@@ -57,6 +59,9 @@ pub(crate) struct CanvasView {
     /// Arrangements to go back to (Ctrl+Z), and forward again.
     undo: Vec<Arrangement>,
     redo: Vec<Arrangement>,
+    /// The source whose card (under the preview) the pointer is on: it's
+    /// outlined on the preview, so it's clear which it is.
+    pub(crate) card_hover: Option<Layer>,
 }
 
 /// Where the sources are, as undo keeps it: the screen (its box, in front
@@ -175,6 +180,10 @@ impl App {
     /// `was` (how the sources were before a change just made) can be gone
     /// back to.
     pub(crate) fn keep_for_undo(&mut self, was: Arrangement) {
+        // Taking the webcam out (or putting one in) isn't a step to go back to.
+        if was.webcam.is_some() != self.settings.webcam.is_some() {
+            return;
+        }
         if self.canvas.undo.last() != Some(&was) {
             self.canvas.undo.push(was);
             if self.canvas.undo.len() > 100 {
@@ -230,6 +239,22 @@ impl App {
     /// Where the webcam goes.
     fn webcam_placement(&self) -> Option<Placement> {
         self.settings.webcam.as_ref().map(|w| w.placement.into())
+    }
+
+    /// The picture's sources, front first, for their cards: the screen, and
+    /// the webcam once there is one (off too).
+    pub(crate) fn layer_order(&self) -> Vec<Layer> {
+        let webcam = self.settings.webcam.is_some().then_some(Layer::Webcam);
+        let order = if self.settings.screen.in_front { [Some(Layer::Screen), webcam] } else { [webcam, Some(Layer::Screen)] };
+        order.into_iter().flatten().collect()
+    }
+
+    /// The sources in this order, front first.
+    pub(crate) fn set_layer_order(&mut self, order: &[Layer]) {
+        let at = |l: Layer| order.iter().position(|o| *o == l);
+        if let (Some(screen), Some(webcam)) = (at(Layer::Screen), at(Layer::Webcam)) {
+            self.settings.screen.in_front = screen < webcam;
+        }
     }
 
     /// The sources in the video, front first, and where each is (fractions
@@ -340,7 +365,9 @@ impl App {
             Drag::Stuck(l) => (l, None),
         });
         let over = pointer.and_then(|p| hit(&layers, &to_screen, p));
-        let Some((active, handle)) = held.or(over.map(|(l, h)| (l, Some(h)))) else { return };
+        // Else the source whose card the pointer's on: only its outline.
+        let card = self.canvas.card_hover.filter(|_| held.is_none() && over.is_none());
+        let Some((active, handle)) = held.or(over.map(|(l, h)| (l, Some(h)))).or(card.map(|l| (l, None))) else { return };
         if held.is_none() && self.canvas.menu.is_some() {
             return;
         }
@@ -392,6 +419,9 @@ impl App {
         painter.line_segment([line.left_bottom(), line.right_bottom()], side(bottom));
         painter.line_segment([line.left_top(), line.left_bottom()], side(left));
         painter.line_segment([line.right_top(), line.right_bottom()], side(right));
+        if card.is_some() {
+            return;
+        }
 
         // Handles: round, white, green while Alt is held on the webcam (they'll
         // crop); the one held or under the pointer a little bigger.
@@ -450,47 +480,10 @@ impl App {
         self.settings.screen.placed = None;
     }
 
-    /// The screen's place, on Sources: over all of the video, or in a box
-    /// placed on the preview (Reset puts it back); and whether it's in
-    /// front of the webcam. Changes apply at once, while clipping too.
-    pub(crate) fn screen_place_card(&mut self, ui: &mut egui::Ui) {
-        use crate::theme::{self, W};
-        let pal = theme::pal(ui);
-        let placed = self.settings.screen.placed.is_some();
-        let webcam_on = self.settings.webcam.as_ref().is_some_and(|w| w.enabled);
-        let row = |ui: &mut egui::Ui, label: &str, add: &mut dyn FnMut(&mut egui::Ui)| {
-            ui.horizontal(|ui| {
-                ui.set_min_height(crate::sources_ui::GROUP_ROW_H);
-                ui.label(theme::text(label, 13.5, W::Regular).color(pal.text));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| add(ui));
-            });
-        };
-        let was = self.arrangement();
-        crate::sources_ui::group_rows(ui, "screen_place", |ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            row(ui, "Position", &mut |ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
-                if crate::ui_kit::Btn::normal("Reset").small().enabled(placed).tip("Over all of the video again").show(ui).clicked() {
-                    self.screen_to_whole();
-                }
-                let state = if placed { "Placed by hand · drag it on the preview" } else { "Over all of the video · drag a corner to make it smaller" };
-                ui.label(theme::text(state, 12.5, W::Regular).color(pal.text3));
-            });
-            if webcam_on && self.settings.screen.enabled {
-                crate::ui_kit::divider(ui, 0.0);
-                row(ui, "In front of the webcam", &mut |ui| {
-                    crate::ui_kit::switch(ui, &mut self.settings.screen.in_front);
-                });
-            }
-        });
-        if self.arrangement() != was {
-            self.keep_for_undo(was);
-        }
-    }
-
-    /// A source's right-click menu: its place back as it was, the webcam's
-    /// turns and flips, and which is in front.
-    fn layer_menu(&mut self, ui: &mut egui::Ui, layer: Layer, aspect: f32) {
+    /// A source's menu (right-click it on the preview, or its card's ⋯):
+    /// its place back as it was, the webcam's turns and flips, which is in
+    /// front, and taking the webcam out.
+    pub(crate) fn layer_menu(&mut self, ui: &mut egui::Ui, layer: Layer, aspect: f32) {
         match layer {
             Layer::Screen => {
                 if Item::new("Reset position").icon(icon::ARROWS_OUT).enabled(self.settings.screen.placed.is_some()).tip("Over all of the video again").show(ui).clicked() {
@@ -537,6 +530,13 @@ impl App {
             let (label, ic) = if in_front { ("Send to back", icon::SELECTION_BACKGROUND) } else { ("Bring to front", icon::SELECTION_FOREGROUND) };
             if Item::new(label).icon(ic).show(ui).clicked() {
                 self.settings.screen.in_front = !self.settings.screen.in_front;
+                ui.close();
+            }
+        }
+        if layer == Layer::Webcam {
+            crate::ui_kit::menu_sep(ui);
+            if Item::new("Remove the webcam").icon(icon::TRASH).danger().tip("Take it out of your clips, and forget its place").show(ui).clicked() {
+                self.settings.webcam = None;
                 ui.close();
             }
         }
