@@ -733,15 +733,15 @@ impl App {
                 }
             }
         }
-        // How it sits in the video: as Fill, Fit or Stretch say, in a video
-        // of a shape of its own (else all of it); or placed by hand on the
-        // preview, when picking one puts it back.
+        // Its position and size: as Fill, Fit or Stretch put it, in a video
+        // of a shape of its own (else all of the video); or placed by hand
+        // on the preview, when picking one puts it back.
         crate::ui_kit::divider(ui, 0.0);
         let placed = self.settings.screen.placed.is_some();
         let shaped = self.video_shaped();
         let was = self.arrangement();
         row(ui, &mut |ui| {
-            ui.label(crate::theme::text("In the video", 13.5, crate::theme::W::Regular).color(pal.text));
+            ui.label(crate::theme::text("Position and size", 13.5, crate::theme::W::Regular).color(pal.text));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 if shaped {
@@ -755,7 +755,7 @@ impl App {
                     if crate::ui_kit::Btn::normal("Reset").small().enabled(placed).tip("Over all of the video again").show(ui).clicked() {
                         self.screen_to_whole();
                     }
-                    let state = if placed { "Placed by hand on the preview" } else { "All of it" };
+                    let state = if placed { "Placed by hand on the preview" } else { "Fills the video" };
                     ui.label(crate::theme::text(state, 12.5, crate::theme::W::Regular).color(pal.text3));
                 }
             });

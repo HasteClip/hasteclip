@@ -517,11 +517,11 @@ impl App {
                 }
             });
         }
-        // Where it sits in the clips: set on the preview, reset here (named
-        // as the screen's is).
+        // Its position and size: set on the preview, reset here (named as
+        // the screen's is).
         crate::ui_kit::divider(ui, 0.0);
         let was = self.arrangement();
-        row(ui, "In the video", &mut |ui| {
+        row(ui, "Position and size", &mut |ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
             if Btn::normal("Reset").small().tip("Back to the bottom-right corner").show(ui).clicked() {
                 self.webcam_to_corner(frame_aspect);
