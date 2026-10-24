@@ -1272,6 +1272,18 @@ impl eframe::App for App {
             eprintln!("dev: quitting");
             self.quit(ctx);
         }
+        // `HASTECLIP_DEV_SAVE=<secs>`: save a clip once, that long after
+        // opening (with the replay buffer running, as `HASTECLIP_DEV_BUFFER_QUIT`
+        // starts it), to check what's recorded without a key press.
+        static SAVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if let Some(secs) = std::env::var("HASTECLIP_DEV_SAVE").ok().and_then(|s| s.parse::<f64>().ok())
+            && launched.elapsed().as_secs_f64() > secs
+            && self.rec_state == RecState::Buffering
+            && !SAVED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            eprintln!("dev: saving a clip");
+            self.save_clip();
+        }
         // `HASTECLIP_DEV_CAMERA_PANEL`: open on Sources with the camera panel
         // (to look at it without clicking there).
         static CAMERA_PANEL: std::sync::Once = std::sync::Once::new();
