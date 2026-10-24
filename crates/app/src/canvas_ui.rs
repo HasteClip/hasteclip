@@ -1,18 +1,21 @@
 //! The picture's sources on the Sources page's preview, placed the way OBS
 //! places them: the screen and the webcam, each dragged to move it and by a
-//! handle to resize it (never stretched), one in front of the other, and
-//! cropped with Alt and a handle (the picture keeps its scale, its box
-//! shrinks with it). The webcam also flips (past its opposite side) and
-//! turns (its right-click menu): see `webcam_ui`. Moves snap to the video's
-//! edges and middle and to the other source's edges (Ctrl to place freely).
+//! handle to resize it (keeping its shape; Shift stretches the screen), one
+//! in front of the other, and cropped with Alt and a handle (the picture
+//! keeps its scale, its box shrinks with it). The webcam also flips (past
+//! its opposite side) and turns (its right-click menu): see `webcam_ui`.
+//! Moves snap to the video's edges and middle and to the other source's
+//! edges (Ctrl to place freely).
 //!
-//! The screen fills the video until a corner makes it smaller (or it's
-//! cropped here): then it's in a box of its own showing all of it, in its
-//! own shape (`settings::ScreenCfg::placed`), and Reset puts it back. Its
-//! crop is the crop's page's (`settings::ScreenCrop`). Both placements are
-//! shared with the capture, so what's dragged is what's recorded, live.
-//! Which is in front is the order of their cards under the preview (see
-//! `sources_ui`), or their menus' Bring to front.
+//! The screen goes into the video as Fill, Fit or Stretch say (its menu)
+//! until it's taken hold of: then it's in a box of its own where it was, so
+//! nothing jumps (`settings::ScreenCfg::placed`), and Reset puts it back.
+//! Bigger than the video (Fill's), its box reaches past the video's edges,
+//! and moving it shows another part of it. Its crop is the crop's page's
+//! (`settings::ScreenCrop`). Both placements are shared with the capture,
+//! so what's dragged is what's recorded, live. Which is in front is the
+//! order of their cards under the preview (see `sources_ui`), or their
+//! menus' Bring to front.
 
 use capture::webcam::Placement;
 use egui::{Color32, CursorIcon, Pos2, Rect, Stroke, vec2};
@@ -96,16 +99,17 @@ pub(crate) struct Arrangement {
     webcam: Option<PlacementCfg>,
 }
 
-/// What's at `p` on the preview (`to_screen` puts a box there): a handle of a
-/// source (front first), else the source in front there.
-fn hit(layers: &[(Layer, Rect)], to_screen: &dyn Fn(Rect) -> Rect, p: Pos2) -> Option<(Layer, Handle)> {
+/// What's at `p` on the preview (`shown` puts a box there, as much of it as
+/// is on the preview: its handles are on that): a handle of a source (front
+/// first), else the source in front there.
+fn hit(layers: &[(Layer, Rect)], shown: &dyn Fn(Rect) -> Rect, p: Pos2) -> Option<(Layer, Handle)> {
     for (l, r) in layers {
-        let bx = to_screen(*r);
+        let bx = shown(*r);
         if let Some(h) = Handle::ALL.into_iter().find(|h| h.pos(bx).distance(p) <= HANDLE) {
             return Some((*l, h));
         }
     }
-    layers.iter().find(|(_, r)| to_screen(*r).expand(2.0).contains(p)).map(|(l, _)| (*l, Handle::Move))
+    layers.iter().find(|(_, r)| shown(*r).expand(2.0).contains(p)).map(|(l, _)| (*l, Handle::Move))
 }
 
 /// What a move of `me` snaps to besides the video's edges and middle: the
@@ -120,9 +124,15 @@ fn lines_of(layers: &[(Layer, Rect)], me: Layer) -> Lines {
     lines
 }
 
-/// Whether a box is all of the video.
+/// Whether a box covers all of the video (all of it, or past its edges).
 fn fills(r: Rect) -> bool {
     r.min.x <= 1e-4 && r.min.y <= 1e-4 && r.max.x >= 1.0 - 1e-4 && r.max.y >= 1.0 - 1e-4
+}
+
+/// Whether a box is all of the video, no more: it has nowhere to move.
+fn stuck(r: Rect) -> bool {
+    let on = |v: f32, edge: f32| (v - edge).abs() <= 1e-4;
+    on(r.min.x, 0.0) && on(r.min.y, 0.0) && on(r.max.x, 1.0) && on(r.max.y, 1.0)
 }
 
 /// The lines a box moved onto, to draw: the video's middle, or another
@@ -150,11 +160,51 @@ pub(crate) fn fitted(picture_aspect: f32, frame_aspect: f32) -> Rect {
     Rect::from_center_size(Pos2::new(0.5, 0.5), size)
 }
 
+/// Where a picture of shape `picture_aspect` goes in a frame of shape
+/// `frame_aspect` as small as covers it, in the middle (fractions of the
+/// frame): past two of its edges.
+pub(crate) fn covering(picture_aspect: f32, frame_aspect: f32) -> Rect {
+    let size = if picture_aspect > frame_aspect { vec2(picture_aspect / frame_aspect, 1.0) } else { vec2(1.0, frame_aspect / picture_aspect) };
+    Rect::from_center_size(Pos2::new(0.5, 0.5), size)
+}
+
+/// Where a picture of shape `picture_aspect` is in a video of shape
+/// `frame_aspect` (fractions of it), put in as `framing` says: its middle
+/// covering it (past its edges), all of it as big as fits, or all of it
+/// stretched over all of it. In the video's own shape (but for rounding),
+/// all of the video.
+pub(crate) fn framed(framing: capture::Framing, picture_aspect: f32, frame_aspect: f32) -> Rect {
+    let whole = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+    if (picture_aspect / frame_aspect - 1.0).abs() < 0.005 {
+        return whole;
+    }
+    match framing {
+        capture::Framing::Fill => covering(picture_aspect, frame_aspect),
+        capture::Framing::Fit => fitted(picture_aspect, frame_aspect),
+        capture::Framing::Stretch => whole,
+    }
+}
+
+/// The part of a box (`shown`, fractions of the video) that's in the
+/// video, and the part of its picture (`part`, in the picture's pixels)
+/// that's there. All of it, for a box in the video.
+pub(crate) fn in_video(shown: Rect, part: Rect) -> (Rect, Rect) {
+    let seen = shown.intersect(Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)));
+    if seen == shown || !seen.is_positive() {
+        return (shown, part);
+    }
+    let at = |p: Pos2| part.min + vec2((p.x - shown.min.x) / shown.width() * part.width(), (p.y - shown.min.y) / shown.height() * part.height());
+    (seen, Rect::from_min_max(at(seen.min), at(seen.max)))
+}
+
 /// The screen's box after dragging `handle` by `(dx, dy)` (fractions of the
 /// video) from `start`: moved (snapping to the video and to `lines`, unless
-/// `snap` is off), or scaled from the opposite corner or side, keeping its
-/// shape. It stays inside the video.
-pub(crate) fn screen_drag(start: Rect, handle: Handle, dx: f32, dy: f32, snap: bool, lines: &Lines) -> Rect {
+/// `snap` is off), or resized from the opposite corner or side, keeping its
+/// shape unless it's to `stretch`. Moved, it stays in the video while it
+/// fits in it, and over all of it (across or down) while it's bigger,
+/// never further out than it was; resized, it goes as far as the video's
+/// edges, or as far past them as it was.
+pub(crate) fn screen_drag(start: Rect, handle: Handle, dx: f32, dy: f32, snap: bool, stretch: bool, lines: &Lines) -> Rect {
     if handle == Handle::Move {
         let mut r = start.translate(vec2(dx, dy));
         if snap {
@@ -162,12 +212,15 @@ pub(crate) fn screen_drag(start: Rect, handle: Handle, dx: f32, dy: f32, snap: b
             let sy = webcam_ui::snap_offset(&[r.min.y, r.max.y], r.center().y, &lines.ys);
             r = r.translate(vec2(sx, sy));
         }
-        let x = r.min.x.clamp(0.0, (1.0 - r.width()).max(0.0));
-        let y = r.min.y.clamp(0.0, (1.0 - r.height()).max(0.0));
+        let keep = |at: f32, size: f32, was: f32| {
+            let (lo, hi) = ((1.0 - size).min(0.0), (1.0 - size).max(0.0));
+            at.clamp(lo.min(was), hi.max(was))
+        };
+        let (x, y) = (keep(r.min.x, r.width(), start.min.x), keep(r.min.y, r.height(), start.min.y));
         return Rect::from_min_size(Pos2::new(x, y), r.size());
     }
-    let bounds = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-    webcam_ui::resize_within(start, handle.sides(), vec2(dx, dy), true, bounds, vec2(MIN_SIZE, MIN_SIZE))
+    let bounds = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)).union(start);
+    webcam_ui::resize_within(start, handle.sides(), vec2(dx, dy), !stretch, bounds, vec2(MIN_SIZE, MIN_SIZE))
 }
 
 /// The screen's box and crop after cropping it by dragging `handle` by
@@ -206,19 +259,27 @@ impl App {
         self.canvas.picture.as_ref().and_then(|(_, size, _)| *size).map(|size| capture::cropped_size(crop, size))
     }
 
-    /// Where the screen's picture is in the video (fractions of it): its box
-    /// when it's been placed by hand, else all of the video, or where Fit
-    /// puts it (its own shape, as big as fits).
+    /// The screen's picture's shape (width / height), as `screen_picture`.
+    fn screen_aspect(&mut self) -> Option<f32> {
+        self.screen_picture().map(|(w, h)| w as f32 / h.max(1) as f32)
+    }
+
+    /// Where the screen's picture is in the video (fractions of it, past its
+    /// edges for a screen bigger than it): its box when it's been placed by
+    /// hand, else where Fill, Fit or Stretch put it (see [`framed`]).
     pub(crate) fn screen_rect(&mut self, frame_aspect: f32) -> Rect {
-        let whole = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
         if let Some(b) = self.settings.screen.placed {
             return Rect::from_min_size(Pos2::new(b.x, b.y), vec2(b.w, b.h));
         }
-        if self.settings.screen_placement().framing != capture::Framing::Fit {
-            return whole;
-        }
-        let Some((w, h)) = self.screen_picture() else { return whole };
-        fitted(w as f32 / h.max(1) as f32, frame_aspect)
+        let framing = self.settings.screen_placement().framing;
+        self.screen_aspect().map_or(Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), |picture| framed(framing, picture, frame_aspect))
+    }
+
+    /// The screen in the box `r` (fractions of a video of shape `aspect`),
+    /// for the picture its box was laid out for.
+    fn place_screen(&mut self, r: Rect, aspect: f32) {
+        let picture = self.settings.screen.placed.and_then(|b| b.picture_aspect).or_else(|| self.screen_aspect());
+        self.settings.screen.placed = Some(BoxCfg::new([r.min.x, r.min.y, r.width(), r.height()], aspect, picture));
     }
 
     pub(crate) fn arrangement(&self) -> Arrangement {
@@ -327,6 +388,9 @@ impl App {
             self.canvas.drag = None;
             return;
         }
+        // As much of a box as is on the preview: a screen bigger than the
+        // video reaches past it, and its outline and handles stay on it.
+        let shown = move |r: Rect| to_screen(r).intersect(frame_rect);
         let modifiers = ui.input(|i| i.modifiers);
         let pointer = ui.input(|i| i.pointer.hover_pos()).filter(|p| frame_rect.expand(HANDLE).contains(*p));
 
@@ -334,13 +398,13 @@ impl App {
         // grabbed is judged by where the button went down, not where it is now.
         if response.drag_started() {
             let origin = ui.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos());
-            if let Some(((layer, handle), from)) = origin.and_then(|p| hit(&layers, &to_screen, p).map(|h| (h, p))) {
+            if let Some(((layer, handle), from)) = origin.and_then(|p| hit(&layers, &shown, p).map(|h| (h, p))) {
                 let was = self.arrangement();
                 let crop = (layer == Layer::Screen && modifiers.alt && handle != Handle::Move).then(|| self.screen_crop_hold(aspect)).flatten();
                 let drag = match (layer, crop) {
                     (Layer::Webcam, _) => Drag::Webcam(handle, from, self.webcam_placement().unwrap_or_else(Placement::hidden)),
                     (Layer::Screen, Some((start, part, display))) => Drag::ScreenCrop(handle, from, start, part, display),
-                    (Layer::Screen, None) => self.take_screen(handle, from, aspect, &layers),
+                    (Layer::Screen, None) => self.take_screen(handle, from, aspect),
                 };
                 // Something that moves can be put back (one held that can't, can't).
                 if !matches!(drag, Drag::Stuck(_)) {
@@ -371,8 +435,8 @@ impl App {
                     Drag::Screen(handle, from, start) => {
                         let lines = lines_of(&layers, Layer::Screen);
                         let (dx, dy) = d(from);
-                        let r = screen_drag(start, handle, dx, dy, snap, &lines);
-                        self.settings.screen.placed = Some(BoxCfg::new([r.min.x, r.min.y, r.width(), r.height()], aspect));
+                        let r = screen_drag(start, handle, dx, dy, snap, modifiers.shift, &lines);
+                        self.place_screen(r, aspect);
                         if handle == Handle::Move && snap {
                             guides = snapped(r, &lines);
                         }
@@ -380,7 +444,9 @@ impl App {
                     Drag::ScreenCrop(handle, from, start, part, display) => {
                         let (dx, dy) = d(from);
                         let (b, crop) = screen_crop_drag(start, part, display, handle, dx, dy, modifiers.shift);
-                        self.settings.screen.placed = Some(BoxCfg::new([b.min.x, b.min.y, b.width(), b.height()], aspect));
+                        // Its picture's what's kept of the display now.
+                        let (w, h) = crop.map_or(display, |c| (c.w, c.h));
+                        self.settings.screen.placed = Some(BoxCfg::new([b.min.x, b.min.y, b.width(), b.height()], aspect, Some(w as f32 / h.max(1) as f32)));
                         self.settings.screen_crop = crop;
                     }
                     Drag::Stuck(_) => {}
@@ -394,13 +460,13 @@ impl App {
             if response.drag_stopped() || !response.dragged() && !ui.input(|i| i.pointer.any_down()) {
                 self.canvas.drag = None;
             }
-        } else if let Some((_, h)) = pointer.and_then(|p| hit(&layers, &to_screen, p)) {
+        } else if let Some((_, h)) = pointer.and_then(|p| hit(&layers, &shown, p)) {
             ui.ctx().set_cursor_icon(h.cursor());
         }
 
         // Right-click on a source: its menu (tied to the click that opened it).
         if response.secondary_clicked() {
-            self.canvas.menu = ui.input(|i| i.pointer.interact_pos()).and_then(|p| hit(&layers, &to_screen, p)).map(|(l, _)| l);
+            self.canvas.menu = ui.input(|i| i.pointer.interact_pos()).and_then(|p| hit(&layers, &shown, p)).map(|(l, _)| l);
         }
         if let Some(layer) = self.canvas.menu {
             let was = self.arrangement();
@@ -414,15 +480,16 @@ impl App {
         }
 
         // The source held or under the pointer: its outline and handles, over
-        // the picture. Not clipped to the picture: a box against its edge
-        // keeps all of its outline.
+        // the picture, on as much of it as is in the video (a screen bigger
+        // than the video, past its edges, along them). Not clipped further:
+        // a box against the picture's edge keeps all of its outline.
         let layers = self.layers(aspect);
         let held = self.canvas.drag.map(|d| match d {
             Drag::Webcam(h, ..) => (Layer::Webcam, Some(h)),
             Drag::Screen(h, ..) | Drag::ScreenCrop(h, ..) => (Layer::Screen, Some(h)),
             Drag::Stuck(l) => (l, None),
         });
-        let over = pointer.and_then(|p| hit(&layers, &to_screen, p));
+        let over = pointer.and_then(|p| hit(&layers, &shown, p));
         // Else the source whose card the pointer's on: only its outline.
         let card = self.canvas.card_hover.filter(|_| held.is_none() && over.is_none());
         let Some((active, handle)) = held.or(over.map(|(l, h)| (l, Some(h)))).or(card.map(|l| (l, None))) else { return };
@@ -430,7 +497,10 @@ impl App {
             return;
         }
         let Some(rect) = layers.iter().find(|(l, _)| *l == active).map(|(_, r)| *r) else { return };
-        let bx = to_screen(rect);
+        let bx = shown(rect);
+        if !bx.is_positive() {
+            return;
+        }
         let painter = ui.painter().clone();
         let webcam: Option<Placement> = (active == Layer::Webcam).then(|| self.webcam_placement()).flatten();
         // The screen's box, the part of the display it shows and the
@@ -478,7 +548,8 @@ impl App {
         // The outline, just inside the box, over a soft dark edge so it shows
         // on a bright picture. The camera's own sides, as they show (a
         // mirrored picture's left is the camera's right), and the display's,
-        // are green if cropped.
+        // are green if cropped (not one past the video: the video's edge
+        // is drawn there).
         let [cl, ct, cr, cb] = match (webcam, self.screen_crop_rect()) {
             (Some(p), _) => p.crop.map(|c| c > 0.0),
             (None, Some(([x, y, w, h], (dw, dh)))) if active == Layer::Screen => [x > 0, y > 0, x + w < dw & !1, y + h < dh & !1],
@@ -487,6 +558,8 @@ impl App {
         let (flip_h, flip_v) = webcam.map_or((false, false), |p| (p.flip_h, p.flip_v));
         let (left, right) = if flip_h { (cr, cl) } else { (cl, cr) };
         let (top, bottom) = if flip_v { (cb, ct) } else { (ct, cb) };
+        let (left, top) = (left && rect.min.x >= -1e-4, top && rect.min.y >= -1e-4);
+        let (right, bottom) = (right && rect.max.x <= 1.0 + 1e-4, bottom && rect.max.y <= 1.0 + 1e-4);
         let line = bx.shrink(1.0);
         painter.rect_stroke(bx.shrink(0.5), 0.0, Stroke::new(3.0, Color32::from_black_alpha(110)), egui::StrokeKind::Middle);
         let side = |cropped: bool| Stroke::new(2.0, if cropped || cropping { CROP } else { ACCENT });
@@ -510,18 +583,21 @@ impl App {
         // down there). (Alt is Option on a Mac, Ctrl Control: the keys as
         // they're named there.)
         let (alt, ctrl) = (crate::shortcuts::alt_name(), crate::shortcuts::ctrl_name());
-        let boxed = self.settings.screen.placed.is_some();
+        // All of the video exactly, it has nowhere to move.
+        let moves = !stuck(rect);
         let hint = match (self.canvas.drag, active) {
             (Some(Drag::Stuck(_)), _) => "It fills the video: drag a corner to make it smaller".to_owned(),
             (Some(Drag::Webcam(Handle::Move, ..) | Drag::Screen(Handle::Move, ..)), _) => format!("{ctrl}: place freely"),
             (Some(Drag::Webcam(..) | Drag::ScreenCrop(..)), _) if cropping && modifiers.shift => "Cropping, keeping the shape".to_owned(),
             (Some(Drag::Webcam(..) | Drag::ScreenCrop(..)), _) if cropping => "Cropping · Shift keeps the shape".to_owned(),
             (Some(Drag::Webcam(..)), _) => format!("{alt}: crop · past the other side: flip"),
-            (Some(Drag::Screen(..) | Drag::ScreenCrop(..)), _) => return,
+            (Some(Drag::Screen(..)), _) if modifiers.shift => "Stretching · let go of Shift to keep its shape".to_owned(),
+            (Some(Drag::Screen(..)), _) => "Shift: stretch".to_owned(),
+            (Some(Drag::ScreenCrop(..)), _) => return,
             (None, Layer::Webcam) => format!("Drag to move · {alt} + handle to crop · right-click for more"),
-            (None, Layer::Screen) if croppable && boxed => format!("Drag to move · {alt} + handle to crop · right-click for more"),
+            (None, Layer::Screen) if croppable && moves => format!("Drag to move · {alt} + handle to crop · right-click for more"),
             (None, Layer::Screen) if croppable => format!("Drag a corner to make it smaller · {alt} + handle to crop"),
-            (None, Layer::Screen) if boxed => "Drag to move · a corner to resize · right-click for more".to_owned(),
+            (None, Layer::Screen) if moves => "Drag to move · a corner to resize · right-click for more".to_owned(),
             (None, Layer::Screen) => "Drag a corner to make your screen smaller · right-click for more".to_owned(),
         };
         let galley = painter.layout_no_wrap(hint, egui::FontId::proportional(11.5), Color32::from_gray(235));
@@ -536,20 +612,20 @@ impl App {
         painter.galley(pill.center() - galley.size() / 2.0, galley, Color32::WHITE);
     }
 
-    /// Take hold of the screen: in its box as it is; filling the video, from
-    /// all of it in its own shape, as big as fits, into a box of its own
-    /// (the same place, when it's the video's shape). Filling the video in
-    /// its own shape, it has nowhere to move: held in the middle, it stays.
-    fn take_screen(&mut self, handle: Handle, from: Pos2, aspect: f32, layers: &[(Layer, Rect)]) -> Drag {
-        if let Some(b) = self.settings.screen.placed {
-            return Drag::Screen(handle, from, Rect::from_min_size(Pos2::new(b.x, b.y), vec2(b.w, b.h)));
+    /// Take hold of the screen: in its box as it is; put in by Fill, Fit or
+    /// Stretch, into a box of its own where it shows, so nothing jumps
+    /// (Fill's past the video's edges, Stretch's all of it, stretched). Over
+    /// all of the video exactly, it has nowhere to move: held in the
+    /// middle, it stays.
+    fn take_screen(&mut self, handle: Handle, from: Pos2, aspect: f32) -> Drag {
+        let shown = self.screen_rect(aspect);
+        if self.settings.screen.placed.is_none() {
+            if stuck(shown) && handle == Handle::Move {
+                return Drag::Stuck(Layer::Screen);
+            }
+            self.place_screen(shown, aspect);
         }
-        let all = self.screen_picture().map_or_else(|| layers.iter().find(|(l, _)| *l == Layer::Screen).map_or(Rect::NOTHING, |(_, r)| *r), |(w, h)| fitted(w as f32 / h.max(1) as f32, aspect));
-        if fills(all) && handle == Handle::Move {
-            return Drag::Stuck(Layer::Screen);
-        }
-        self.settings.screen.placed = Some(BoxCfg::new([all.min.x, all.min.y, all.width(), all.height()], aspect));
-        Drag::Screen(handle, from, all)
+        Drag::Screen(handle, from, shown)
     }
 
     /// The screen's crop as it is (left, top, width, height in the
@@ -562,19 +638,16 @@ impl App {
     }
 
     /// The screen as it's taken hold of to crop it (Alt with a handle): its
-    /// box, the part of the display it shows, and the display's size.
-    /// Filling the video, that's the part showing (its middle, in the
-    /// video's shape) over all of it, so nothing moves as it's taken hold
-    /// of. `None` when it can't be cropped (see `screen_crop_rect`).
+    /// box, the part of the display it shows, and the display's size. Past
+    /// the video's edges (Fill's middle, a screen bigger than the video),
+    /// that's the part showing, so nothing moves as it's taken hold of and
+    /// what's cropped is what's seen. `None` when it can't be cropped (see
+    /// `screen_crop_rect`).
     fn screen_crop_hold(&mut self, aspect: f32) -> Option<(Rect, Rect, (u32, u32))> {
         let ([x, y, w, h], display) = self.screen_crop_rect()?;
         let part = Rect::from_min_size(Pos2::new(x as f32, y as f32), vec2(w as f32, h as f32));
-        let fills_with_middle = self.settings.screen.placed.is_none() && self.settings.screen_placement().framing == capture::Framing::Fill;
-        if !fills_with_middle {
-            return Some((self.screen_rect(aspect), part, display));
-        }
-        let size = if part.aspect_ratio() > aspect { vec2(part.height() * aspect, part.height()) } else { vec2(part.width(), part.width() / aspect) };
-        Some((Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Rect::from_center_size(part.center(), size), display))
+        let (shown, part) = in_video(self.screen_rect(aspect), part);
+        Some((shown, part, display))
     }
 
     /// The screen back over all of the video (Reset).
@@ -697,22 +770,76 @@ mod tests {
     fn the_screens_box() {
         let none = Lines::default();
         let start = rect(0.1, 0.1, 0.4, 0.4);
-        assert!(close(screen_drag(start, Handle::Move, 0.1, 0.0, false, &none), rect(0.2, 0.1, 0.4, 0.4)));
-        assert!(close(screen_drag(start, Handle::Move, 0.9, 0.9, false, &none), rect(0.6, 0.6, 0.4, 0.4)));
+        assert!(close(screen_drag(start, Handle::Move, 0.1, 0.0, false, false, &none), rect(0.2, 0.1, 0.4, 0.4)));
+        assert!(close(screen_drag(start, Handle::Move, 0.9, 0.9, false, false, &none), rect(0.6, 0.6, 0.4, 0.4)));
         // Its middle onto the video's, from close by.
-        assert!(close(screen_drag(start, Handle::Move, 0.195, 0.0, true, &none), rect(0.3, 0.1, 0.4, 0.4)));
+        assert!(close(screen_drag(start, Handle::Move, 0.195, 0.0, true, false, &none), rect(0.3, 0.1, 0.4, 0.4)));
         // Its right edge onto the webcam's left.
         let webcam = Lines { xs: vec![0.75], ys: vec![] };
-        assert!(close(screen_drag(start, Handle::Move, 0.245, 0.0, true, &webcam), rect(0.35, 0.1, 0.4, 0.4)));
+        assert!(close(screen_drag(start, Handle::Move, 0.245, 0.0, true, false, &webcam), rect(0.35, 0.1, 0.4, 0.4)));
         // The bottom-right corner, dragged out: twice as big from the top-left.
-        let r = screen_drag(start, Handle::SE, 0.4, 0.4, false, &none);
+        let r = screen_drag(start, Handle::SE, 0.4, 0.4, false, false, &none);
         assert!(close(r, rect(0.1, 0.1, 0.8, 0.8)), "{r:?}");
         // Only as big as fits.
-        let r = screen_drag(start, Handle::SE, 2.0, 2.0, false, &none);
+        let r = screen_drag(start, Handle::SE, 2.0, 2.0, false, false, &none);
         assert!(close(r, rect(0.1, 0.1, 0.9, 0.9)), "{r:?}");
         // Never smaller than the least, the other corner where it was.
-        let r = screen_drag(start, Handle::NW, 1.0, 1.0, false, &none);
+        let r = screen_drag(start, Handle::NW, 1.0, 1.0, false, false, &none);
         assert!((r.width() - MIN_SIZE).abs() < 1e-4 && (r.max - start.max).length() < 1e-4, "{r:?}");
+        // Shift: stretched, each side on its own, as far as the video's edges.
+        let r = screen_drag(start, Handle::SE, 0.4, 2.0, false, true, &none);
+        assert!(close(r, rect(0.1, 0.1, 0.8, 0.9)), "{r:?}");
+        let r = screen_drag(start, Handle::E, 0.2, 0.3, false, true, &none);
+        assert!(close(r, rect(0.1, 0.1, 0.6, 0.4)), "{r:?}");
+    }
+
+    /// Fill, Fit and Stretch as boxes: Fill's middle covering the video,
+    /// past its edges; Fit's all of it, as big as fits; Stretch's all of
+    /// the video. In the video's own shape (but for rounding), all of it.
+    /// Taken hold of to crop, Fill's starts from the part showing.
+    #[test]
+    fn where_the_screen_is_put() {
+        let (mac, wide) = (3024.0 / 1964.0, 16.0 / 9.0);
+        let fill = framed(capture::Framing::Fill, mac, wide);
+        assert!(fills(fill) && !stuck(fill), "{fill:?}");
+        assert!((fill.width() - 1.0).abs() < 1e-4 && (fill.height() - wide / mac).abs() < 1e-4 && (fill.center().y - 0.5).abs() < 1e-4, "{fill:?}");
+        assert!(close(framed(capture::Framing::Fit, mac, wide), fitted(mac, wide)));
+        assert!(stuck(framed(capture::Framing::Stretch, mac, wide)));
+        // 1662×1080: the display at 1080p, its shape but for rounding.
+        assert!(stuck(framed(capture::Framing::Fill, mac, 1662.0 / 1080.0)));
+        let (seen, part) = in_video(fill, rect(0.0, 0.0, 3024.0, 1964.0));
+        assert!(stuck(seen), "{seen:?}");
+        assert!((part.width() - 3024.0).abs() < 0.5 && (part.height() - 3024.0 / wide).abs() < 0.5 && (part.center().y - 982.0).abs() < 0.5, "{part:?}");
+        let inside = rect(0.1, 0.1, 0.5, 0.5);
+        assert_eq!(in_video(inside, rect(0.0, 0.0, 100.0, 100.0)), (inside, rect(0.0, 0.0, 100.0, 100.0)));
+    }
+
+    /// A screen bigger than the video (Fill's) moves to show another part of
+    /// it, always over all of the video; a box hanging past an edge doesn't
+    /// jump in as it's taken hold of, nor go further out; and taking hold
+    /// of a handle doesn't make either jump.
+    #[test]
+    fn a_screen_bigger_than_the_video() {
+        let none = Lines::default();
+        // A 16:10 screen over a 16:9 video: past its top and bottom.
+        let over = covering(1.6, 16.0 / 9.0);
+        assert!(close(over, rect(0.0, -1.0 / 18.0, 1.0, 10.0 / 9.0)), "{over:?}");
+        // Down as far as it goes, its top at the video's; not sideways.
+        let r = screen_drag(over, Handle::Move, 0.3, 0.5, false, false, &none);
+        assert!(close(r, rect(0.0, 0.0, 1.0, 10.0 / 9.0)), "{r:?}");
+        let r = screen_drag(over, Handle::Move, 0.0, -0.5, false, false, &none);
+        assert!(close(r, rect(0.0, -1.0 / 9.0, 1.0, 10.0 / 9.0)), "{r:?}");
+        // Its middle snaps back onto the video's.
+        assert!(close(screen_drag(over, Handle::Move, 0.0, 0.005, true, false, &none), over));
+        // Hanging past the top (made smaller from below): it moves in, not out.
+        let hanging = rect(0.0, -0.05, 0.9, 1.0);
+        assert!(close(screen_drag(hanging, Handle::Move, 0.0, 0.0, false, false, &none), hanging));
+        assert!(close(screen_drag(hanging, Handle::Move, 0.0, -0.1, false, false, &none), hanging));
+        assert!(close(screen_drag(hanging, Handle::Move, 0.0, 0.2, false, false, &none), rect(0.0, 0.0, 0.9, 1.0)));
+        // Its side handle: where it was, then smaller, keeping its shape.
+        assert!(close(screen_drag(over, Handle::E, 0.0, 0.0, false, false, &none), over));
+        let r = screen_drag(over, Handle::E, -0.5, 0.0, false, false, &none);
+        assert!(close(r, rect(0.0, 0.5 - 5.0 / 18.0, 0.5, 5.0 / 9.0)), "{r:?}");
     }
 
     /// Cropped with Alt: the picture keeps its scale and place, the box

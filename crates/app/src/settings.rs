@@ -205,9 +205,11 @@ pub struct SizeCfg {
     pub shape: Option<[u32; 2]>,
 }
 
-/// A box in the video: left, top, width, height as fractions of the video,
-/// and the shape (width / height) of the video it was laid out in, to keep
-/// its own shape in a video of another (see [`PlacementCfg::refit`]).
+/// A box in the video: left, top, width, height as fractions of the video
+/// (it can reach past the video's edges: a screen bigger than it), the
+/// shape (width / height) of the video it was laid out in, to keep its own
+/// shape in a video of another, and of the picture it was laid out for: a
+/// box of another shape stretches it (see [`BoxCfg::refit`]).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct BoxCfg {
     pub x: f32,
@@ -215,6 +217,9 @@ pub struct BoxCfg {
     pub w: f32,
     pub h: f32,
     pub frame_aspect: f32,
+    /// `None` in a box from before boxes could stretch: it has the picture's shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picture_aspect: Option<f32>,
 }
 
 /// What the video shows.
@@ -335,15 +340,17 @@ impl PlacementCfg {
 
 /// A box (left, top, width, height as fractions of the frame) of shape
 /// `box_aspect` in pixels, in a frame of shape `frame_aspect`: as wide a
-/// share of the frame (narrower if that won't fit), at the same place in the
-/// room it has to move in (so a box in a corner stays in it).
+/// share of the frame (narrower if that won't fit, for a box that was in
+/// it), at the same place in the room it has to move in (so a box in a
+/// corner stays in it, and one bigger than the frame covers as much of it).
 fn refit_box([x, y, w, h]: [f32; 4], box_aspect: f32, frame_aspect: f32) -> [f32; 4] {
     // From 0 against the left or top edge to 1 against the other.
-    let along = |at: f32, size: f32| if size < 1.0 - 1e-4 { (at / (1.0 - size)).clamp(0.0, 1.0) } else { 0.5 };
+    let along = |at: f32, size: f32| if (1.0 - size).abs() > 1e-4 { (at / (1.0 - size)).clamp(0.0, 1.0) } else { 0.5 };
     let (ax, ay) = (along(x, w), along(y, h));
-    let mut w = w.min(1.0);
+    let inside = w <= 1.0 + 1e-4 && h <= 1.0 + 1e-4;
+    let mut w = if inside { w.min(1.0) } else { w };
     let mut h = w * frame_aspect / box_aspect;
-    if h > 1.0 {
+    if inside && h > 1.0 {
         w *= 1.0 / h;
         h = 1.0;
     }
@@ -352,9 +359,10 @@ fn refit_box([x, y, w, h]: [f32; 4], box_aspect: f32, frame_aspect: f32) -> [f32
 
 impl BoxCfg {
     /// `rect` (left, top, width, height as fractions of the frame), laid out
-    /// in a frame of shape `frame_aspect`.
-    pub fn new([x, y, w, h]: [f32; 4], frame_aspect: f32) -> Self {
-        Self { x, y, w, h, frame_aspect }
+    /// in a frame of shape `frame_aspect` for a picture of shape
+    /// `picture_aspect`, when it's known.
+    pub fn new([x, y, w, h]: [f32; 4], frame_aspect: f32, picture_aspect: Option<f32>) -> Self {
+        Self { x, y, w, h, frame_aspect, picture_aspect }
     }
 
     pub fn rect(&self) -> [f32; 4] {
@@ -362,23 +370,34 @@ impl BoxCfg {
     }
 
     /// Keep it right for a frame of shape `frame_aspect`: its shape in
-    /// pixels kept, at the same place (see [`refit_box`]). Its shape is the
-    /// screen's (`screen_aspect`, as cropped, when known): a box of another
-    /// shape (another display, another crop) gets it, keeping its width
-    /// and place. Returns whether it changed.
-    pub fn refit(&mut self, frame_aspect: f32, screen_aspect: Option<f32>) -> bool {
+    /// pixels kept, at the same place (see [`refit_box`]). For a picture of
+    /// another shape (`picture_aspect`: another display, another crop) it
+    /// gets the picture's, as stretched as it was, keeping its width and
+    /// place; a box from before boxes could stretch, the picture's own.
+    /// Returns whether it changed.
+    pub fn refit(&mut self, frame_aspect: f32, picture_aspect: Option<f32>) -> bool {
         if frame_aspect <= 0.0 || self.w <= 0.0 || self.h <= 0.0 {
             return false;
         }
         let had = self.w * self.frame_aspect / self.h;
-        let box_aspect = match screen_aspect.filter(|&a| a > 0.0) {
-            // Off by more than rounding.
-            Some(screen) if (had / screen - 1.0).abs() > 0.02 => screen,
-            _ if (self.frame_aspect - frame_aspect).abs() < 1e-3 => return false,
+        let now = picture_aspect.filter(|&a| a > 0.0);
+        // Off by more than rounding.
+        let off = |a: f32, b: f32| (a / b - 1.0).abs() > 0.02;
+        let box_aspect = match (now, self.picture_aspect) {
+            (Some(now), Some(was)) if off(now, was) => had * now / was,
+            (Some(now), None) if off(had, now) => now,
+            _ if (self.frame_aspect - frame_aspect).abs() < 1e-3 => {
+                let known = self.picture_aspect.is_some() || now.is_none();
+                self.picture_aspect = self.picture_aspect.or(now);
+                return !known;
+            }
             _ => had,
         };
         [self.x, self.y, self.w, self.h] = refit_box(self.rect(), box_aspect, frame_aspect);
         self.frame_aspect = frame_aspect;
+        if now.is_some_and(|now| self.picture_aspect.is_none_or(|was| off(now, was))) {
+            self.picture_aspect = now;
+        }
         true
     }
 }
@@ -1127,15 +1146,16 @@ impl RecordSettings {
     }
 
     /// Where the screen's picture goes in the video, for the capture: its
-    /// box, which has its shape, when it's been placed by hand (a game's
-    /// window, whatever its shape, all of it); else all of the video, as
-    /// `framing` says in a shape of the video's own (else all of the
-    /// picture). A display's crop, if it's cropped.
+    /// box when it's been placed by hand, all of the box (stretched, if
+    /// it's been stretched; a game's window, whatever its shape, all of it,
+    /// as big as fits); else all of the video, as `framing` says in a shape
+    /// of the video's own (else all of the picture). A display's crop, if
+    /// it's cropped.
     pub fn screen_placement(&self) -> capture::ScreenPlacement {
         let s = &self.screen;
         let apps = matches!(self.capture, CaptureTarget::Apps { .. });
         let (rect, framing) = match s.placed {
-            Some(b) => ([b.x, b.y, b.w, b.h], if apps { capture::Framing::Fit } else { capture::Framing::Fill }),
+            Some(b) => ([b.x, b.y, b.w, b.h], if apps { capture::Framing::Fit } else { capture::Framing::Stretch }),
             None if self.capture_shape().is_some() => ([0.0, 0.0, 1.0, 1.0], self.framing.into()),
             None => ([0.0, 0.0, 1.0, 1.0], capture::Framing::Fit),
         };
@@ -1366,14 +1386,16 @@ mod shape_tests {
     #[test]
     fn how_the_screen_goes_in() {
         let framed = |shape: Option<[u32; 2]>, framing, placed: bool| {
-            let screen = ScreenCfg { placed: placed.then(|| BoxCfg::new([0.1, 0.1, 0.5, 0.5], 16.0 / 9.0)), ..Default::default() };
+            let screen = ScreenCfg { placed: placed.then(|| BoxCfg::new([0.1, -0.1, 0.5, 1.5], 16.0 / 9.0, None)), ..Default::default() };
             RecordSettings { shape, framing, screen, ..Default::default() }.screen_placement()
         };
         assert_eq!(framed(Some([4, 3]), Framing::Stretch, false).framing, capture::Framing::Stretch);
         assert_eq!(framed(Some([4, 3]), Framing::Fit, false).framing, capture::Framing::Fit);
         assert_eq!(framed(None, Framing::Fill, false).framing, capture::Framing::Fit);
-        let boxed = framed(Some([4, 3]), Framing::Stretch, true);
-        assert_eq!((boxed.framing, boxed.rect), (capture::Framing::Fill, [0.1, 0.1, 0.5, 0.5]));
+        // In its box, past the video's edge too: all of it over all of the
+        // box, stretched as the box is.
+        let boxed = framed(Some([4, 3]), Framing::Fill, true);
+        assert_eq!((boxed.framing, boxed.rect), (capture::Framing::Stretch, [0.1, -0.1, 0.5, 1.5]));
     }
 
     /// An exact size is its own shape, whatever aspect ratio was chosen, and
@@ -1530,7 +1552,7 @@ mod placement_tests {
     #[test]
     fn the_screens_box_keeps_its_shape() {
         let wide = 16.0 / 9.0;
-        let mut b = BoxCfg::new([0.6, 0.0, 0.4, 0.4], wide);
+        let mut b = BoxCfg::new([0.6, 0.0, 0.4, 0.4], wide, Some(wide));
         assert!(!b.refit(wide, Some(wide)));
         assert!(b.refit(9.0 / 16.0, Some(wide)));
         let pixels = |b: &BoxCfg, frame: f32| b.w * frame / b.h;
@@ -1539,9 +1561,52 @@ mod placement_tests {
         assert!(b.h <= 1.0 && b.w <= 1.0);
         // Another screen (an ultrawide): its shape, the box's width and
         // place kept.
-        let mut b = BoxCfg::new([0.6, 0.0, 0.4, 0.4], wide);
+        let mut b = BoxCfg::new([0.6, 0.0, 0.4, 0.4], wide, Some(wide));
         assert!(b.refit(wide, Some(21.0 / 9.0)));
         assert!((pixels(&b, wide) - 21.0 / 9.0).abs() < 1e-4 && (b.w - 0.4).abs() < 1e-4, "{b:?}");
+        assert_eq!(b.picture_aspect, Some(21.0 / 9.0));
+    }
+
+    /// A box stretched by hand stays stretched: in a video of another shape,
+    /// and for another screen (as much wider as that screen is). One from
+    /// before boxes could stretch is given the screen's shape, once.
+    #[test]
+    fn a_stretched_box_stays_stretched() {
+        let (wide, mac) = (16.0 / 9.0, 3024.0 / 1964.0);
+        let pixels = |b: &BoxCfg, frame: f32| b.w * frame / b.h;
+        // A 16:10 screen stretched over all of a 16:9 video.
+        let mut b = BoxCfg::new([0.0, 0.0, 1.0, 1.0], wide, Some(mac));
+        assert!(!b.refit(wide, Some(mac)));
+        assert_eq!(b.rect(), [0.0, 0.0, 1.0, 1.0]);
+        // The video goes 4:3: the box keeps its own shape (as wide as the video).
+        assert!(b.refit(4.0 / 3.0, Some(mac)));
+        assert!((pixels(&b, 4.0 / 3.0) - wide).abs() < 1e-4 && (b.w - 1.0).abs() < 1e-4, "{b:?}");
+        // An ultrawide screen instead: as stretched, wider.
+        let mut b = BoxCfg::new([0.0, 0.0, 1.0, 1.0], wide, Some(mac));
+        assert!(b.refit(wide, Some(21.0 / 9.0)));
+        assert!((pixels(&b, wide) - wide * (21.0 / 9.0) / mac).abs() < 1e-3, "{b:?}");
+        // From before: the screen's shape, and then it's known.
+        let mut old = BoxCfg::new([0.0, 0.0, 1.0, 1.0], wide, None);
+        assert!(old.refit(wide, Some(mac)));
+        assert!((pixels(&old, wide) - mac).abs() < 1e-4 && old.picture_aspect == Some(mac), "{old:?}");
+        assert!(!old.refit(wide, Some(mac)));
+    }
+
+    /// A screen bigger than the video (its middle covering it) keeps
+    /// covering as much of it in a video of another shape, its share of the
+    /// width kept; one in the video stays in it.
+    #[test]
+    fn a_box_past_the_video() {
+        let (wide, mac) = (16.0 / 9.0, 3024.0 / 1964.0);
+        // Covering a 16:9 video, moved to its top.
+        let mut b = BoxCfg::new([0.0, 0.0, 1.0, wide / mac], wide, Some(mac));
+        assert!(b.refit(21.0 / 9.0, Some(mac)));
+        let [x, y, w, h] = b.rect();
+        assert!(x.abs() < 1e-4 && (w - 1.0).abs() < 1e-4 && (h - (21.0 / 9.0) / mac).abs() < 1e-4, "{b:?}");
+        assert!(y.abs() < 1e-4, "still at its top: {b:?}");
+        // Upright, it's narrower than tall: as wide as the video, in it.
+        assert!(b.refit(9.0 / 16.0, Some(mac)));
+        assert!(b.y >= -1e-4 && b.y + b.h <= 1.0 + 1e-4 && (b.w - 1.0).abs() < 1e-4, "{b:?}");
     }
 
     fn pixel_aspect(p: &PlacementCfg, frame: f32) -> f32 {
