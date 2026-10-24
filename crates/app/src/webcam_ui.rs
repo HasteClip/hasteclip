@@ -520,20 +520,19 @@ impl App {
             });
         }
         // What's kept of its picture, and a way to the crop's page (as the
-        // screen's crop has). Off, the camera's closed: nothing to crop on.
+        // screen's crop has). Off, the camera opens while it's cropped.
         crate::ui_kit::divider(ui, 0.0);
         let cropped = cam.placement.crop.iter().any(|c| *c > 0.0);
         let kept = self.webcam_kept();
         row(ui, "Crop", &mut |ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
-            let tip = if cam.enabled { "Show only part of your camera's picture" } else { "Turn the webcam on to crop its picture" };
-            if Btn::normal("Adjust").trail(icon::CARET_RIGHT).small().enabled(cam.enabled).tip(tip).show(ui).clicked() {
+            if Btn::normal("Adjust").trail(icon::CARET_RIGHT).small().tip("Show only part of your camera's picture").show(ui).clicked() {
                 self.webcam_view.crop = Some(CameraPanel::cropping(&cam.id));
             }
             let text = match kept {
                 _ if !cropped => "Off".to_owned(),
                 Some(((w, h), _)) => format!("{w}×{h}"),
-                None => "On".to_owned(),
+                None => "Cropped".to_owned(),
             };
             ui.label(theme::text(text, 12.5, W::Regular).color(pal.text3));
         });
@@ -1059,10 +1058,13 @@ impl App {
 
 impl App {
     /// What's kept of the webcam's picture, in the camera's pixels as it
-    /// shows (turned), once it's live: its size, and the whole picture's.
+    /// shows (turned): its size, and the whole picture's. From the camera
+    /// while it's live, else its format, if one's picked.
     fn webcam_kept(&self) -> Option<((u32, u32), (u32, u32))> {
-        let p = self.settings.webcam.as_ref()?.placement;
-        let (cw, ch) = self.camera_size()?;
+        let w = self.settings.webcam.as_ref()?;
+        let p = w.placement;
+        let picked = w.format.map(|f| if p.turns % 2 == 1 { (f.height, f.width) } else { (f.width, f.height) });
+        let (cw, ch) = self.camera_size().or(picked)?;
         let kept = |n: u32, a: f32, b: f32| ((n as f32 * (1.0 - a - b)).round() as u32).max(1);
         Some(((kept(cw, p.crop[0], p.crop[2]), kept(ch, p.crop[1], p.crop[3])), (cw, ch)))
     }
@@ -1097,8 +1099,9 @@ impl App {
         use crate::theme::{self, W};
         use crate::ui_kit::Btn;
         let pal = theme::pal(ui);
-        // Closed with the arrow or Esc, or when there's no webcam on to crop.
-        let Some(cam) = self.settings.webcam.clone().filter(|w| w.enabled) else {
+        // Closed with the arrow or Esc, or when there's no webcam to crop.
+        // Off, its camera's open while this is (see `App::logic`).
+        let Some(cam) = self.settings.webcam.clone() else {
             self.webcam_view.crop = None;
             return;
         };
@@ -1119,6 +1122,9 @@ impl App {
         if back {
             self.webcam_view.crop = None;
             return;
+        }
+        if !cam.enabled {
+            crate::ui_kit::hint(ui, "Your webcam's off: its camera's on while you crop it, and it stays out of your clips.");
         }
         let orient = Orientation { flip_h: cam.placement.flip_h, flip_v: cam.placement.flip_v, turns: cam.placement.turns };
         let crop = cam.placement.crop;

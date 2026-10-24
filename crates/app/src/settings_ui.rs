@@ -676,7 +676,7 @@ impl App {
                     match status {
                         Status::Ready(_) => {
                             let recording = self.rec_state == RecState::Recording;
-                            if Btn::normal("Restart now").small().enabled(!recording).tip(if recording { "Finish your recording first" } else { "Restart into the new version" }).show(ui).clicked() && self.updater.install_on_exit(true) {
+                            if Btn::normal("Restart now").small().tip("Restart into the new version").locked(recording.then(|| "Finish your recording first".to_owned())).show(ui).clicked() && self.updater.install_on_exit(true) {
                                 self.quit(ui.ctx());
                             }
                         }
@@ -701,7 +701,7 @@ impl App {
             }
             if f.shows(&["reset", "defaults"]) {
                 l.row(Row::new("Reset all settings").note("Your clips, folders and sources are kept."), |ui| {
-                    let b = Btn::new(Kind::DangerText, "Reset…").small().enabled(idle).tip(if idle { "Back to the defaults" } else { "Stop capturing first" });
+                    let b = Btn::new(Kind::DangerText, "Reset…").small().tip("Back to the defaults").locked((!idle).then(|| "Stop capturing first".to_owned()));
                     if b.show(ui).clicked() {
                         self.confirm_reset = true;
                     }

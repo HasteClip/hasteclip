@@ -689,7 +689,7 @@ impl App {
                     ui.label(crate::theme::text("Display", 13.5, crate::theme::W::Regular).color(pal.text));
                     ui.label(crate::theme::text("picked in your desktop's sharing dialog", 12.5, crate::theme::W::Regular).color(pal.text3));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let b = crate::ui_kit::Btn::normal("Choose another…").small().enabled(idle).tip(if idle { "Your desktop asks again which screen to record" } else { "Stop capturing to switch screens" });
+                        let b = crate::ui_kit::Btn::normal("Choose another…").small().tip("Your desktop asks again which screen to record").locked((!idle).then(|| "Stop capturing to switch screens".to_owned()));
                         if b.show(ui).clicked() {
                             capture::choose_screen_again();
                             self.video_preview = None; // restarts, and asks

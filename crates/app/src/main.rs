@@ -1434,6 +1434,11 @@ impl App {
         self.sync_capture_mics();
         self.sync_capture_settings();
         self.refit_boxes();
+        // A locked button clicked anywhere: why, in a toast, as a locked
+        // setting says it.
+        if let Some(why) = ui_kit::take_locked_click(ctx) {
+            self.toast_icon(egui_phosphor::regular::LOCK_SIMPLE, why);
+        }
         *self.webcam_placement.lock().unwrap() = match &self.settings.webcam {
             Some(w) if w.enabled => w.placement.into(),
             _ => capture::webcam::Placement::hidden(),
@@ -1441,8 +1446,9 @@ impl App {
         *self.screen_placement.lock().unwrap() = self.settings.screen_placement();
         // Keep the webcam open whenever one is set up and on, previewed or
         // recorded or not: closing a camera can reset its own settings. Off,
-        // it's closed (its light goes out); a capture takes it up again.
-        let on = self.settings.webcam.as_ref().is_some_and(|w| w.enabled);
+        // it's closed (its light goes out), but while its crop's set (its
+        // picture's cropped on); a capture takes it up again.
+        let on = self.settings.webcam.as_ref().is_some_and(|w| w.enabled) || self.webcam_view.crop.is_some();
         let camera = self.webcam_source().filter(|_| on).map(|w| (w.device, w.format));
         if camera != self.kept_camera {
             // Its settings go back on as it opens.
@@ -1762,7 +1768,7 @@ impl App {
         } else {
             format!("HasteClip {version} is ready. Click to restart into it now, or it installs when you quit.")
         };
-        let b = ui_kit::Btn::ghost("Update ready").with_icon(egui_phosphor::regular::ARROW_CIRCLE_UP).enabled(!recording).tip(tip);
+        let b = ui_kit::Btn::ghost("Update ready").with_icon(egui_phosphor::regular::ARROW_CIRCLE_UP).tip(tip.clone()).locked(recording.then_some(tip));
         if b.show(ui).clicked() && self.updater.install_on_exit(true) {
             // Really quit (not to the tray): the update goes in, then it starts again.
             self.quit(ui.ctx());

@@ -8,6 +8,12 @@
 //!   the why behind a setting.
 //! - **Buttons**: main (one per screen, the brightest), normal, quiet
 //!   (ghost), destructive. 30 px tall, corners of 6.
+//! - **Can't be used now**: a control with nothing to do (an empty undo, a
+//!   reset with nothing to reset) is dimmed, keeping its shape
+//!   ([`Btn::enabled`]). One held back by what the app's doing (clipping,
+//!   recording) is locked: dimmed, with a lock, saying why on hover and in a
+//!   toast when clicked ([`Btn::locked`], [`Row::locked`]). Anything that
+//!   works now is left usable, even when it changes something not running.
 //! - **Space** in steps of 4; corners 4 for small marks, 6 for controls, 8
 //!   for groups and menus. Only switches, the play button and dots are round.
 //! - **Motion**: hover fades in, a chosen option slides to its place, a
@@ -458,6 +464,8 @@ pub struct Btn<'a> {
     min_w: f32,
     tip: Option<String>,
     enabled: bool,
+    /// Held back by what the app's doing, and why.
+    locked: Option<String>,
     corners: CornerRadius,
     id: Option<egui::Id>,
     progress: Option<f32>,
@@ -476,6 +484,7 @@ impl<'a> Btn<'a> {
             min_w: 0.0,
             tip: None,
             enabled: true,
+            locked: None,
             corners: CornerRadius::same(RADIUS),
             id: None,
             progress: None,
@@ -522,8 +531,19 @@ impl<'a> Btn<'a> {
         self.tip = Some(tip.into());
         self
     }
+    /// Off while there's nothing for it to do (an empty undo): dimmed,
+    /// keeping its shape. For one held back by what the app's doing, see
+    /// [`Btn::locked`].
     pub fn enabled(mut self, on: bool) -> Self {
         self.enabled = on;
+        self
+    }
+    /// Held back by what the app's doing (`Some(why)`: "Stop clipping
+    /// first"), as a setting row's [`Row::locked`]: dimmed, a lock in place
+    /// of its icon, why on hover, and in a toast when it's clicked (the app
+    /// shows it: [`take_locked_click`]). It never reports a click.
+    pub fn locked(mut self, why: Option<String>) -> Self {
+        self.locked = why;
         self
     }
     pub fn corners(mut self, c: CornerRadius) -> Self {
@@ -538,7 +558,12 @@ impl<'a> Btn<'a> {
     }
 
     fn icon_font(&self, size: f32) -> FontId {
-        if self.filled { FontId::new(size, theme::fill_family()) } else { FontId::proportional(size) }
+        if self.filled && self.locked.is_none() { FontId::new(size, theme::fill_family()) } else { FontId::proportional(size) }
+    }
+
+    /// Its icon as drawn: a lock while it's locked.
+    fn shown_icon(&self) -> Option<&'a str> {
+        if self.locked.is_some() { Some(icon::LOCK_SIMPLE) } else { self.icon }
     }
 
     /// How wide it's drawn this frame (its width eases to fit its words).
@@ -557,14 +582,14 @@ impl<'a> Btn<'a> {
         let icon_size = if self.small { 14.0 } else { 15.5 };
         let text_w = |t: &str, f: FontId| ui.painter().layout_no_wrap(t.to_owned(), f, Color32::PLACEHOLDER).size().x;
         let label_w = (!self.label.is_empty()).then(|| text_w(&self.label, theme::font(size, W::Medium)));
-        let icon_w = self.icon.map(|i| text_w(i, self.icon_font(icon_size)));
+        let icon_w = self.shown_icon().map(|i| text_w(i, self.icon_font(icon_size)));
         let trail_w = self.trail.map(|i| text_w(i, FontId::proportional(icon_size - 1.5)));
         let keys_w = self.keys.as_ref().map(|k| key_hint_width(ui, k, 11.0));
         let only_icon = label_w.is_none() && trail_w.is_none() && keys_w.is_none();
         if only_icon {
             return h;
         }
-        let pad_l = if self.icon.is_some() { 10.0 } else if self.small { 9.0 } else { 12.0 };
+        let pad_l = if self.shown_icon().is_some() { 10.0 } else if self.small { 9.0 } else { 12.0 };
         let pad_r = if self.keys.is_some() || self.trail.is_some() { 8.0 } else if self.small { 9.0 } else { 12.0 };
         let parts: Vec<f32> = [icon_w, label_w, trail_w, keys_w].into_iter().flatten().collect();
         let content = parts.iter().sum::<f32>() + 7.0 * (parts.len().max(1) - 1) as f32;
@@ -578,12 +603,12 @@ impl<'a> Btn<'a> {
         let font = theme::font(size, W::Medium);
         let icon_size = if self.small { 14.0 } else { 15.5 };
         let galley = (!self.label.is_empty()).then(|| ui.painter().layout_no_wrap(self.label.clone(), font.clone(), Color32::PLACEHOLDER));
-        let icon_g = self.icon.map(|i| ui.painter().layout_no_wrap(i.to_owned(), self.icon_font(icon_size), Color32::PLACEHOLDER));
+        let icon_g = self.shown_icon().map(|i| ui.painter().layout_no_wrap(i.to_owned(), self.icon_font(icon_size), Color32::PLACEHOLDER));
         let trail_g = self.trail.map(|i| ui.painter().layout_no_wrap(i.to_owned(), FontId::proportional(icon_size - 1.5), Color32::PLACEHOLDER));
         let keys_w = self.keys.as_ref().map_or(0.0, |k| key_hint_width(ui, k, 11.0));
         let gap = 7.0;
         let only_icon = galley.is_none() && trail_g.is_none() && self.keys.is_none();
-        let pad_l = if only_icon { 0.0 } else if self.icon.is_some() { 10.0 } else if self.small { 9.0 } else { 12.0 };
+        let pad_l = if only_icon { 0.0 } else if self.shown_icon().is_some() { 10.0 } else if self.small { 9.0 } else { 12.0 };
         let pad_r = if only_icon { 0.0 } else if self.keys.is_some() || self.trail.is_some() { 8.0 } else if self.small { 9.0 } else { 12.0 };
         let mut content = 0.0;
         let mut parts = 0;
@@ -595,11 +620,12 @@ impl<'a> Btn<'a> {
         let target_w = if only_icon { h } else { (pad_l + content + pad_r).max(self.min_w) };
         let id = self.id.unwrap_or_else(|| ui.next_auto_id());
         let w = theme::value(ui.ctx(), id.with("w"), target_w, theme::NORMAL);
-        let sense = if self.enabled { Sense::click() } else { Sense::hover() };
+        let usable = self.enabled && self.locked.is_none();
+        let sense = if usable { Sense::click() } else { Sense::hover() };
         let (rect, mut resp) = ui.allocate_exact_size(vec2(w, h), sense);
         if ui.is_rect_visible(rect) {
-            let hovered = self.enabled && resp.hovered();
-            let pressed = self.enabled && resp.is_pointer_button_down_on();
+            let hovered = usable && resp.hovered();
+            let pressed = usable && resp.is_pointer_button_down_on();
             let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), hovered, theme::FAST);
             let (fill, fg) = match self.kind {
                 Kind::Primary => (theme::mix(p.primary, if p.dark { Color32::from_gray(255) } else { Color32::from_gray(60) }, hv * 0.25), p.primary_fg),
@@ -609,10 +635,12 @@ impl<'a> Btn<'a> {
                 Kind::DangerText => (theme::fade(p.sel, hv).blend(theme::fade(p.control, if p.dark { 0.0 } else { hv })), p.danger),
                 Kind::On => (p.seg_on, p.text),
             };
-            let fg = if self.enabled { fg } else { theme::fade(fg, 0.38) };
-            let fill = if self.enabled || self.kind == Kind::Primary || self.kind == Kind::Stop { fill } else { Color32::TRANSPARENT };
+            // Not usable now, it keeps its shape, dimmed: still a button, not
+            // text (a quiet one has no fill to keep).
+            let fg = if usable { fg } else { theme::fade(fg, 0.38) };
+            let fill = if usable { fill } else { theme::fade(fill, 0.45) };
             let rect_d = if pressed { rect.shrink(0.5) } else { rect };
-            ui.painter().rect_filled(rect_d, self.corners, if self.enabled { fill } else { theme::fade(fill, 0.4) });
+            ui.painter().rect_filled(rect_d, self.corners, fill);
             // Content: centred when it fits, clipped when the width is still
             // catching up.
             let painter = ui.painter_at(rect);
@@ -641,6 +669,16 @@ impl<'a> Btn<'a> {
             }
         }
         crate::demo::mark(ui.ctx(), || format!("button:{}", if self.label.is_empty() { self.tip.as_deref().unwrap_or("") } else { &self.label }), resp.rect);
+        if let Some(why) = &self.locked {
+            // Its own click, apart from the button's: it says why, and the
+            // button reports none.
+            let lock = ui.interact(rect, resp.id.with("locked"), Sense::click()).on_hover_cursor(egui::CursorIcon::NotAllowed).on_hover_text(why);
+            if lock.clicked() {
+                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(LOCKED_CLICK), why.clone()));
+                ui.ctx().request_repaint();
+            }
+            return resp;
+        }
         if let Some(tip) = &self.tip {
             resp = if self.enabled { resp.on_hover_text(tip) } else { resp.on_disabled_hover_text(tip) };
         }
@@ -649,6 +687,19 @@ impl<'a> Btn<'a> {
         }
         resp
     }
+}
+
+/// Where a locked button's reason waits for the app, once it's clicked.
+const LOCKED_CLICK: &str = "locked_click";
+
+/// Why a locked button that was clicked is locked, once: the app shows it
+/// in a toast, wherever the button is ([`Btn::locked`]).
+pub fn take_locked_click(ctx: &egui::Context) -> Option<String> {
+    ctx.data_mut(|d| {
+        let why = d.get_temp::<String>(egui::Id::new(LOCKED_CLICK));
+        d.remove::<String>(egui::Id::new(LOCKED_CLICK));
+        why
+    })
 }
 
 /// A button at the standard height; `primary` is the screen's main action.
