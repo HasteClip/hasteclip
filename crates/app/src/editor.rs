@@ -94,6 +94,11 @@ struct Ready {
     resume: bool,
     /// While the selection is dragged: how far into it it was grabbed.
     grab_offset: f64,
+    /// The timeline's pixels per second, as last drawn.
+    px_per_s: f64,
+    /// The dragged playhead sits on a snap target (an edge, a marker, an
+    /// end): it stays there, its own frame fetched.
+    playhead_snapped: bool,
     /// How far the audio tracks are scrolled up when they don't all fit.
     lane_scroll: f32,
     /// Wheel scrolling and Ctrl+wheel zoom, eased out over a few frames.
@@ -364,6 +369,8 @@ impl Ready {
             dragging: None,
             resume: false,
             grab_offset: 0.0,
+            px_per_s: 0.0,
+            playhead_snapped: false,
             lane_scroll: 0.0,
             glide: Default::default(),
             zoom_glide: Default::default(),
@@ -589,6 +596,12 @@ impl Ready {
         // scrolling) whenever the picture can still have a third of the room.
         let preview_h = (total * *preview_share).min((total - below_max).max(total / 3.0)).max(total - below_max).min(total - below_min).max(MIN_PREVIEW_H);
         let (preview_rect, preview_resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), preview_h), Sense::click());
+        // Dragging the playhead: held still, the picture stays, and letting
+        // go lands on it, within a dozen pixels of the timeline. (A trim's
+        // edge instead gets its frame: the edge is where it's put.)
+        let reach = (12.0 / self.px_per_s.max(1e-9)).min(0.5);
+        let free = matches!(self.dragging, Some(Drag::Playhead)) && !self.playhead_snapped;
+        self.player.set_landing(free.then_some(reach));
         let size = self.player.update(&ctx, self.dragging.is_some());
         let player = &self.player;
         let frame = (self.info.width, self.info.height);
@@ -1089,8 +1102,13 @@ impl Ready {
     /// it's within a few points of one (and snapping is on). `except`: what's
     /// being moved, which mustn't snap to itself.
     fn snapped(&self, t: f64, px_per_s: f64, except: Option<Drag>) -> f64 {
+        self.snap_target(t, px_per_s, except).unwrap_or(t)
+    }
+
+    /// What [`Self::snapped`] snaps `t` to, if anything.
+    fn snap_target(&self, t: f64, px_per_s: f64, except: Option<Drag>) -> Option<f64> {
         if !self.snap {
-            return t;
+            return None;
         }
         let reach = 8.0 / px_per_s.max(1e-6);
         let mut targets = vec![0.0, self.info.duration];
@@ -1109,7 +1127,7 @@ impl Ready {
                 targets.push(b);
             }
         }
-        targets.into_iter().filter(|x| (x - t).abs() < reach).min_by(|a, b| (a - t).abs().total_cmp(&(b - t).abs())).unwrap_or(t)
+        targets.into_iter().filter(|x| (x - t).abs() < reach).min_by(|a, b| (a - t).abs().total_cmp(&(b - t).abs()))
     }
 
     fn dirty(&self) -> bool {
@@ -1506,6 +1524,7 @@ impl Ready {
         self.zoom_and_pan(lanes, dur, pointer, pan, zoom);
         let (v0, span) = self.view;
         let px_per_s = lanes.width() as f64 / span.max(1e-9);
+        self.px_per_s = px_per_s;
         let x_of = |t: f64| lanes.left() + ((t - v0) / span) as f32 * lanes.width();
         let t_of = |x: f32| (v0 + ((x - lanes.left()) / lanes.width()).clamp(0.0, 1.0) as f64 * span).clamp(0.0, dur);
         // Everything on the time axis is clipped to the lanes, so a zoomed-in
@@ -2101,8 +2120,11 @@ impl Ready {
                     }
                     Drag::Start(_) | Drag::End(_) | Drag::Range(_) | Drag::Split(_) => {}
                     Drag::Playhead => {
-                        let t = self.snapped(t, px_per_s, Some(Drag::Playhead));
-                        self.player.seek(self.info.snap(t) + 1e-6);
+                        let target = self.snap_target(t, px_per_s, Some(Drag::Playhead));
+                        // On an edge, a marker or an end: that frame exactly,
+                        // not a picture near it (letting go doesn't land).
+                        self.playhead_snapped = target.is_some();
+                        self.player.seek(self.info.snap(target.unwrap_or(t)) + 1e-6);
                     }
                     Drag::Line(i) => {
                         // The whole curve, up or down by how far it's been
@@ -2177,7 +2199,12 @@ impl Ready {
             {
                 self.push_undo(was);
             }
+            // The playhead on the frame you see, not one decoded after.
+            if self.dragging == Some(Drag::Playhead) {
+                self.player.land();
+            }
             self.dragging = None;
+            self.playhead_snapped = false;
             if std::mem::take(&mut self.resume) && self.player.time() < self.edit.end - fd {
                 self.player.play(self.edit.end);
             }

@@ -51,7 +51,7 @@ mod metal;
 pub use metal::{Frames, available};
 mod upload;
 #[cfg(target_os = "linux")]
-pub use upload::Frames;
+pub use upload::{Frames, Ring};
 pub use upload::{Uploads, can_upload};
 
 static RENDER: OnceLock<RenderState> = OnceLock::new();

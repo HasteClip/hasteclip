@@ -547,6 +547,7 @@ impl Ready {
         // A scroll-scrub has settled: sharpen, and carry on playing if it was.
         if let Some((at, was_playing)) = self.scrolled {
             if at.elapsed() >= SCROLL_SETTLE {
+                self.player.land();
                 self.scrolled = None;
                 self.scroll_to = None;
                 if was_playing {
@@ -566,6 +567,7 @@ impl Ready {
                 ctx.request_repaint();
             }
             Some(None) => {
+                self.player.land();
                 if self.dragging.take() == Some(true) {
                     self.play();
                 }
@@ -583,6 +585,11 @@ impl Ready {
         // Click to play or pause; drag out of the window to share the clip.
         let (preview, preview_resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), preview_h), Sense::click_and_drag());
         self.player.set_stepping(self.stepping_back);
+        // Scrubbing the playhead: held still, the picture stays, and letting
+        // go lands on it, if it's within a dozen pixels of the timeline (the
+        // width of the picture, near enough).
+        let reach = (12.0 * self.info.duration / preview.width().max(1.0) as f64).min(0.5);
+        self.player.set_landing(scrubbing.then_some(reach));
         let size = self.player.update(&ctx, scrubbing);
         let player = &self.player;
         let picture = crate::transport::stage(ui, preview, size, |p, cover| player.paint_glow(p, cover, egui::Id::new("viewer_stage")), |r| player.paint(ui.painter(), r));
@@ -838,6 +845,8 @@ impl Ready {
             }
         }
         if resp.drag_stopped() {
+            // On the frame you see, not one decoded after.
+            self.player.land();
             if self.dragging.take() == Some(true) {
                 self.play();
             }

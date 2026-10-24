@@ -49,7 +49,7 @@ enum Video {}
 impl Video {
     fn failed(&self) -> bool { match *self {} }
     fn show(&self, _: u64) { match *self {} }
-    fn scrub(&self, _: u64) { match *self {} }
+    fn scrub(&self, _: u64, _: Option<u64>) { match *self {} }
     fn take_scrub(&self) -> Option<Scrubbed> { match *self {} }
     fn play(&self, _: u64) { match *self {} }
     fn pause(&self) { match *self {} }
@@ -173,6 +173,11 @@ enum Decoded {
 
 /// Play waits at most this long for its first frame before the sound starts anyway.
 const START_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+/// The same when the decoder had to go to the playhead first (after a
+/// scrub or a paused jump): it decodes from the keyframe before, up to a
+/// second of frames.
+#[cfg(hw_decode)]
+const CATCH_UP_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 /// The same for ffmpeg's first frame, which takes longer: it starts from the
 /// keyframe before (~170 ms for 1440p60).
 const FFMPEG_START_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
@@ -342,6 +347,40 @@ pub struct Player {
     stand_in: Option<u64>,
     /// The hardware decoder, while it works.
     video: Option<Video>,
+    /// Live scrubbing (`scrub.rs`): frames decoded ahead of the playhead
+    /// by several decoders, read on every redraw.
+    #[cfg(hw_decode)]
+    scrub: Option<crate::scrub::Engine>,
+    /// The playhead's motion while scrubbing.
+    #[cfg(hw_decode)]
+    motion: Option<Motion>,
+    /// How long a redraw takes while scrubbing (s), smoothed.
+    #[cfg(hw_decode)]
+    redraw_secs: f64,
+    /// The engine's frames uploaded ahead of the playhead (`scrub.rs`).
+    #[cfg(all(hw_decode, target_os = "linux"))]
+    uploader: Option<crate::scrub::Uploader>,
+    /// The playhead frame a stand-in (the nearest frame decoded, its own
+    /// not being yet) was put on screen for: one per frame the playhead is
+    /// at, then only its own. (Each frame decoded on the way to it showed
+    /// as it came, nearer and nearer: stopped, the picture played on a
+    /// few frames.)
+    #[cfg(hw_decode)]
+    stood_in_for: Option<u64>,
+    /// The playback decoder isn't at the playhead yet: scrubbing left it
+    /// elsewhere, or it's still decoding the frame it was asked for. Play
+    /// waits for it rather than start the sound over a still picture.
+    #[cfg(hw_decode)]
+    catching_up: bool,
+    /// How long play waits for its first frame before the sound starts
+    /// anyway (longer while the decoder is catching up: it decodes from
+    /// the keyframe before).
+    pending_wait: std::time::Duration,
+    /// While the playhead itself is scrubbed (a drag of it, the wheel), how
+    /// near the playhead (seconds) a picture held still on stays, and where
+    /// letting go lands ([`Self::land`]); `None` for other drags (a trim's
+    /// edge: the picture is fetched for where the edge is).
+    landing: Option<f64>,
     /// Play was pressed; the sound starts with the first frame (or after
     /// [`START_WAIT`], [`FFMPEG_START_WAIT`] for ffmpeg's), so picture and
     /// sound start together.
@@ -364,6 +403,28 @@ pub struct Player {
     stepping: bool,
 }
 
+/// How the playhead moves while it's scrubbed (with the scrub engine).
+#[cfg(hw_decode)]
+#[derive(Clone, Copy)]
+struct Motion {
+    /// Where it was at the last redraw, and when that was.
+    at: u64,
+    seen: std::time::Instant,
+    /// Frames a second (below zero going back), smoothed.
+    speed: f64,
+    /// When it got where it is, and whether by a jump (a click) rather
+    /// than moving there.
+    moved: std::time::Instant,
+    jumped: bool,
+}
+
+/// Scrubbing, the playhead that hasn't moved for this long is held still:
+/// the scrub engine decodes around it, and the picture settles. (A pointer
+/// held still sends nothing: the UI redraws this long after it last moved
+/// to see that.)
+#[cfg(hw_decode)]
+const HELD: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Debug log: while scrubbing, once a second, how many new pictures came
 /// up, how many redraws showed the frame wanted, and how far behind it the
 /// picture was (in frames, over the redraws).
@@ -376,9 +437,18 @@ struct ScrubStats {
     behind: u64,
     worst: u64,
     last: Option<u64>,
+    /// Time putting new pictures on screen (s), in all and the longest.
+    showing: f64,
+    showing_max: f64,
 }
 
 impl ScrubStats {
+    #[cfg(hw_decode)]
+    fn showed(&mut self, secs: f64) {
+        self.showing += secs;
+        self.showing_max = self.showing_max.max(secs);
+    }
+
     fn note(&mut self, want: u64, on_screen: Option<u64>, exact: bool) {
         let since = *self.since.get_or_insert_with(std::time::Instant::now);
         self.redraws += 1;
@@ -392,12 +462,14 @@ impl ScrubStats {
         self.worst = self.worst.max(off);
         if since.elapsed().as_secs_f64() >= 1.0 {
             trace!(
-                "scrubbing: {} new pictures/s, {} of {} redraws exact, behind by {:.1} frames on average (at most {})",
+                "scrubbing: {} new pictures/s, {} of {} redraws exact, behind by {:.1} frames on average (at most {}), showing a picture took {:.2} ms (at most {:.2})",
                 self.pictures,
                 self.exact,
                 self.redraws,
                 self.behind as f64 / self.redraws as f64,
-                self.worst
+                self.worst,
+                self.showing * 1000.0 / self.pictures.max(1) as f64,
+                self.showing_max * 1000.0
             );
             *self = Self { last: self.last, ..Self::default() };
         }
@@ -408,10 +480,16 @@ impl Player {
     /// `pcm` track `i` is source track `i` as interleaved stereo at
     /// [`PREVIEW_RATE`]; it may still be filling in (it plays as it's decoded).
     pub fn new(ctx: &egui::Context, source: &Path, info: ClipInfo, pcm: Arc<Pcm>, gains: Vec<TrackEdit>) -> Self {
-        Self::with_pcm(ctx, source, info, pcm, gains)
+        Self::with_pcm(ctx, source, info, pcm, gains, true)
     }
 
-    fn with_pcm(ctx: &egui::Context, source: &Path, info: ClipInfo, pcm: Arc<Pcm>, gains: Vec<TrackEdit>) -> Self {
+    /// A player that only plays (a card's preview in the library): no
+    /// scrub engine, whose decoders and kept frames would go unused.
+    pub fn preview(ctx: &egui::Context, source: &Path, info: ClipInfo, pcm: Arc<Pcm>, gains: Vec<TrackEdit>) -> Self {
+        Self::with_pcm(ctx, source, info, pcm, gains, false)
+    }
+
+    fn with_pcm(ctx: &egui::Context, source: &Path, info: ClipInfo, pcm: Arc<Pcm>, gains: Vec<TrackEdit>, scrubs: bool) -> Self {
         let n = pcm.len();
         let shared = Arc::new(Shared::new(Mix { tracks: gains, track_levels: vec![(0.0, 0.0); n], master_level: (0.0, 0.0), master_stereo: Default::default() }));
         let (stream, audio_error) = match start_audio(shared.clone(), pcm.clone()) {
@@ -423,6 +501,15 @@ impl Player {
 
         let video = open_video(ctx, source, info.fps);
         let proxy = video.is_none().then(|| Proxy::build(ctx, source, info.fps, total_frames(&info)));
+        // `HASTECLIP_SCRUB_ENGINE=0`: scrub through the playback decoder
+        // instead, to compare (as it does where the engine can't start).
+        #[cfg(hw_decode)]
+        let scrub = video
+            .as_ref()
+            .filter(|_| scrubs && std::env::var_os("HASTECLIP_SCRUB_ENGINE").is_none_or(|v| v != "0"))
+            .and_then(|_| crate::scrub::Engine::open(ctx, source, info.fps, total_frames(&info) as u64));
+        #[cfg(not(hw_decode))]
+        let _ = scrubs;
         Self {
             source: source.to_path_buf(),
             info,
@@ -448,6 +535,20 @@ impl Player {
             showing_proxy: false,
             stand_in: None,
             video,
+            #[cfg(hw_decode)]
+            scrub,
+            #[cfg(hw_decode)]
+            motion: None,
+            #[cfg(hw_decode)]
+            redraw_secs: 1.0 / 240.0,
+            #[cfg(all(hw_decode, target_os = "linux"))]
+            uploader: None,
+            #[cfg(hw_decode)]
+            stood_in_for: None,
+            #[cfg(hw_decode)]
+            catching_up: false,
+            pending_wait: START_WAIT,
+            landing: None,
             pending_start: None,
             video_playing: false,
             played_at: None,
@@ -504,14 +605,28 @@ impl Player {
         trace!("play at frame {} (showing {:?}{})", self.info.frame_index(self.time()), self.shown_frame, if self.showing_proxy { ", proxy" } else { "" });
         self.played_at = Some(std::time::Instant::now());
         self.shared.end.store((until * PREVIEW_RATE as f64) as u64, Ordering::Relaxed);
+        // The playback decoder still on its way to the playhead (scrubbing
+        // left it elsewhere, or it's decoding the frame asked for): play
+        // waits for it.
+        #[cfg(hw_decode)]
+        let behind = std::mem::take(&mut self.catching_up);
+        #[cfg(not(hw_decode))]
+        let behind = false;
+        // Asked for this frame, it decodes the next few after it too.
+        let asked = std::mem::take(&mut self.still_wanted);
+        self.pending_wait = START_WAIT;
         if let Some(v) = self.hw() {
             // Showing the frame under the playhead already: carry on from the
             // next, which was decoded while paused. Otherwise wait for this one.
             let want = self.info.frame_index(self.time());
             let showing = self.shown_frame == Some(want) && !self.showing_proxy;
-            v.play(if showing { want + 1 } else { want });
+            v.play(if showing && (!behind || asked == Some(want)) { want + 1 } else { want });
             self.video_playing = true;
-            if !showing {
+            if !showing || behind {
+                #[cfg(hw_decode)]
+                if behind {
+                    self.pending_wait = CATCH_UP_WAIT;
+                }
                 self.pending_start = Some(std::time::Instant::now());
                 return;
             }
@@ -642,6 +757,14 @@ impl Player {
         // proxy after all.
         if self.proxy.is_none() && self.hw().is_none() {
             self.proxy = Some(Proxy::build(ctx, &self.source, self.info.fps, total_frames(&self.info)));
+            #[cfg(hw_decode)]
+            {
+                #[cfg(target_os = "linux")]
+                {
+                    self.uploader = None;
+                }
+                self.scrub = None;
+            }
         }
         if let Some(proxy) = &self.proxy {
             proxy.set_focus(self.info.frame_index(self.time()));
@@ -795,6 +918,10 @@ impl Player {
     /// The picture's colours, blurred very wide, over `cover` (clipped to
     /// `painter`): the light the stage around it takes. `id`: which stage.
     pub fn paint_glow(&self, painter: &egui::Painter, cover: egui::Rect, id: egui::Id) -> bool {
+        // Dev aid: `HASTECLIP_DEV_NO_GLOW=1` draws no light, to measure its cost.
+        if dev_flag("HASTECLIP_DEV_NO_GLOW") {
+            return false;
+        }
         match &self.display {
             Some(Display::Image(..)) => match &self.glow {
                 Some(tex) => {
@@ -816,13 +943,34 @@ impl Player {
     fn update_hw(&mut self, ctx: &egui::Context, scrubbing: bool) {
         let Some(v) = self.video.as_ref() else { return };
         let want = self.info.frame_index(self.time());
+        #[cfg(hw_decode)]
+        {
+            // Its decoders gone: its frames and textures go too (scrubbing
+            // carries on through the playback decoder).
+            if self.scrub.as_ref().is_some_and(|e| e.failed()) {
+                #[cfg(target_os = "linux")]
+                {
+                    self.uploader = None;
+                }
+                self.scrub = None;
+            }
+            if let Some(engine) = self.scrub.as_ref().filter(|_| self.is_playing()) {
+                engine.rest(want);
+            }
+            // Nothing to upload ahead unless scrubbing (playing on from a
+            // scrub, it kept going).
+            #[cfg(target_os = "linux")]
+            if let Some(u) = self.uploader.as_ref().filter(|_| self.is_playing() || !scrubbing) {
+                u.rest();
+            }
+        }
         // Waiting to start: the sound goes once the first frame is here.
         if let Some(since) = self.pending_start {
             // The wait counts from when the decoder opened (a few hundred ms
             // after a clip opens), so picture and sound start together then
             // too; at most 1.5 s in all.
             let waited = v.open_for().map_or(std::time::Duration::ZERO, |open| open.min(since.elapsed()));
-            if v.has(want) || waited >= START_WAIT || since.elapsed() >= std::time::Duration::from_millis(1500) {
+            if v.has(want) || waited >= self.pending_wait || since.elapsed() >= std::time::Duration::from_millis(1500) {
                 trace!("sound starts after {:.0} ms (frame ready: {})", since.elapsed().as_secs_f64() * 1000.0, v.has(want));
                 self.pending_start = None;
                 self.shared.playing.store(true, Ordering::Relaxed);
@@ -849,6 +997,11 @@ impl Player {
                 }
             }
             if let Some(p) = v.take_upto(want) {
+                // Kept for scrubbing back over it, at no cost.
+                #[cfg(hw_decode)]
+                if let Some(engine) = &self.scrub {
+                    engine.offer(p.clone());
+                }
                 self.show_picture(ctx, p);
             }
             self.repaint_at_next_frame(ctx, want);
@@ -860,9 +1013,45 @@ impl Player {
             self.video_playing = false;
             self.still_wanted = None;
         }
+        // Scrubbing with the scrub engine: the picture at the playhead (or
+        // the nearest decoded) out of its cache, on this very redraw. Paused,
+        // it decodes around the playhead for the next drag.
+        #[cfg(hw_decode)]
+        if self.scrub.as_ref().is_some_and(|e| !e.failed()) {
+            if scrubbing {
+                self.scrub_engine(ctx, want);
+                return;
+            }
+            // Not (or no longer) scrubbing: the engine decodes around the
+            // playhead for the next drag, and its frame shows if the engine
+            // has it.
+            let was_scrubbing = self.motion.take().is_some();
+            self.stood_in_for = None;
+            let found = {
+                let engine = self.scrub.as_ref().expect("checked above");
+                engine.idle_at(want);
+                engine.frame_for(want)
+            };
+            let showed = match found.filter(|_| self.shown_frame != Some(want)) {
+                Some((p, true)) => {
+                    self.show_scrubbed(ctx, p, Some(want), 0.0);
+                    true
+                }
+                _ => false,
+            };
+            // The playback decoder isn't where a scrub, or a jump the engine
+            // showed at once, left the playhead: asked once, it decodes this
+            // frame (on screen already) and the next few, ready for play.
+            // (Not asked, play started the sound over the frame standing
+            // still while the decoder went there from the keyframe before.)
+            if (was_scrubbing || showed) && self.still_wanted != Some(want) {
+                self.ask_exact(want);
+            }
+        }
         // Scrubbing: what the decoder found for the newest frame asked (the
         // keyframe on the way there, or the frame itself); then the exact
         // frame asked once paused, which is newer.
+        let v = self.video.as_ref().expect("checked above");
         let (found, exact) = (v.take_scrub(), v.take_exact(want));
         if let Some(found) = found {
             // Kept small while scrubbing back: sharp again once it stops.
@@ -879,7 +1068,14 @@ impl Player {
             if let Some(at) = self.asked_at.take() {
                 trace!("sharp frame {want} (picture {}) {:.0} ms after asking", p.index, at.elapsed().as_secs_f64() * 1000.0);
             }
-            self.show_picture(ctx, p);
+            #[cfg(hw_decode)]
+            {
+                self.catching_up = false;
+            }
+            // On screen already (the scrub engine had it): nothing to redraw.
+            if self.screen_index != Some(p.index) || self.showing_proxy {
+                self.show_picture(ctx, p);
+            }
             // It's the picture for `want` even when its own number is lower (a
             // dropped frame's slot).
             self.shown_frame = Some(want);
@@ -895,16 +1091,223 @@ impl Player {
                 self.scrub_asked = Some(want);
                 // Stopping here again asks for the exact frame again.
                 self.still_wanted = None;
-                v.scrub(want);
+                v.scrub(want, self.screen_index);
             }
         } else if self.still_wanted != Some(want) {
             // Paused somewhere new, or a scrub stopped (the mouse let go, the
             // wheel settled) before its frame came: that frame, exactly.
             // Asked once per frame wanted.
-            self.still_wanted = Some(want);
-            self.scrub_asked = None;
-            self.asked_at = Some(std::time::Instant::now());
+            self.ask_exact(want);
+        }
+    }
+
+    /// Ask the playback decoder for frame `want`, exactly (asked once per
+    /// frame wanted): it decodes it with all its threads, then the next few
+    /// frames, ready for play.
+    fn ask_exact(&mut self, want: u64) {
+        self.still_wanted = Some(want);
+        self.scrub_asked = None;
+        self.asked_at = Some(std::time::Instant::now());
+        // On its way there until the frame comes back (`take_exact`).
+        #[cfg(hw_decode)]
+        {
+            self.catching_up = true;
+        }
+        if let Some(v) = self.video.as_ref() {
             v.show(want);
+        }
+    }
+
+    /// Scrubbing with the scrub engine, the playhead at frame `want`: its
+    /// picture out of the engine's cache, on this very redraw.
+    ///
+    /// Moving, it's the playhead's own frame if it's decoded, else the
+    /// nearest that is: one per frame the playhead is at, then only its own
+    /// (each frame decoded on the way to it showed as it came, nearer and
+    /// nearer: stopped, the picture played on a few frames).
+    ///
+    /// Held still, the engine decodes around it. Scrubbing the playhead
+    /// itself, a picture near it stays put (letting go lands on it,
+    /// [`Self::land`]); otherwise its own frame comes in one step, the
+    /// engine's or the playback decoder's (all its threads on the one
+    /// frame: soonest).
+    #[cfg(hw_decode)]
+    fn scrub_engine(&mut self, ctx: &egui::Context, want: u64) {
+        let m = self.motion_at(want);
+        let held = m.moved.elapsed() >= HELD;
+        let speed = if held { 0.0 } else { m.speed };
+        let found = {
+            let engine = self.scrub.as_ref().expect("the scrub engine");
+            engine.scrub_to(want, speed, held || m.jumped);
+            engine.frame_for(want)
+        };
+        #[cfg(target_os = "linux")]
+        if let Some(u) = &self.uploader {
+            u.steer(want, speed, self.redraw_secs);
+        }
+        if !held {
+            self.catching_up = true;
+            // Stopping here asks for its frame again.
+            self.still_wanted = None;
+            // Drawn again once it's been still a moment, to see that it's
+            // stopped (a pointer held still sends nothing).
+            ctx.request_repaint_after(HELD.saturating_sub(m.moved.elapsed()) + std::time::Duration::from_millis(2));
+        }
+        if self.shown_frame == Some(want) {
+            return;
+        }
+        let fps = self.info.fps;
+        let keep = held && !m.jumped && self.landing.zip(self.screen_index).is_some_and(|(reach, i)| i.abs_diff(want) as f64 <= reach * fps);
+        if keep {
+            return;
+        }
+        match found {
+            Some((p, true)) => {
+                self.show_scrubbed(ctx, p, Some(want), speed);
+                return;
+            }
+            Some((p, false)) if self.stood_in_for != Some(want) => {
+                if self.screen_index != Some(p.index) {
+                    self.show_scrubbed(ctx, p, None, speed);
+                }
+                self.stood_in_for = Some(want);
+            }
+            _ => {}
+        }
+        if held {
+            match self.video.as_ref().and_then(|v| v.take_exact(want)) {
+                Some(p) => {
+                    if let Some(at) = self.asked_at.take() {
+                        trace!("sharp frame {want} (picture {}) {:.0} ms after asking, held still", p.index, at.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    self.catching_up = false;
+                    self.show_picture(ctx, p);
+                    self.shown_frame = Some(want);
+                }
+                None if self.still_wanted != Some(want) => self.ask_exact(want),
+                None => {}
+            }
+        }
+    }
+
+    /// Put picture `p` from the scrub engine on screen. Linux: from the
+    /// uploader's textures if it's uploaded already (or one within half a
+    /// redraw's travel at `speed` that's nearer than what's on screen), else
+    /// uploaded now. Elsewhere it's on the GPU already, drawn from where it
+    /// is. `exact_for`: the playhead frame it's the picture of (when it's
+    /// that, a dropped frame's slot showing the frame before).
+    #[cfg(hw_decode)]
+    fn show_scrubbed(&mut self, ctx: &egui::Context, p: Picture, exact_for: Option<u64>, speed: f64) {
+        let t = std::time::Instant::now();
+        let wanted = p.index;
+        #[cfg(target_os = "linux")]
+        let got = {
+            if self.uploader.is_none() && !dev_flag("HASTECLIP_DEV_NO_UPLOADER") {
+                self.uploader = self.scrub.as_ref().and_then(|e| crate::scrub::Uploader::new(e, p.width, p.height));
+            }
+            let near = (speed.abs() * self.redraw_secs / 2.0).floor() as u64;
+            let ready = self.uploader.as_ref().filter(|u| u.size() == (p.width, p.height)).and_then(|u| u.find(p.index, near, self.screen_index));
+            match ready {
+                Some((shown, idx)) => {
+                    self.display = Some(Display::Gpu(shown, egui::vec2(p.width as f32, p.height as f32)));
+                    self.retire(ctx, Some(p));
+                    self.screen_index = Some(idx);
+                    self.showing_proxy = false;
+                    self.stand_in = None;
+                    idx
+                }
+                None => {
+                    self.put_picture(ctx, p);
+                    wanted
+                }
+            }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let got = {
+            let _ = speed;
+            self.put_picture(ctx, p);
+            wanted
+        };
+        if debug() {
+            self.scrub_stats.showed(t.elapsed().as_secs_f64());
+        }
+        // One near it instead isn't the frame asked.
+        self.shown_frame = exact_for.filter(|_| got == wanted);
+    }
+
+    /// The playhead's motion while scrubbing, it being at frame `want`
+    /// now: how fast (smoothed over the last few redraws), and since when
+    /// it's been where it is. Over ten seconds of video at once, or faster
+    /// than 300× real time since it last moved, is a jump (a click), not
+    /// motion: the speed starts over from nothing, then from the first
+    /// step's own pace. (Judged by distance alone, a fast drag on a slow
+    /// display moved over a second a redraw and counted as clicks.)
+    #[cfg(hw_decode)]
+    fn motion_at(&mut self, want: u64) -> Motion {
+        /// Smoothing time (s): about a dozen redraws at 144 Hz.
+        const TAU: f64 = 0.08;
+        let now = std::time::Instant::now();
+        let fps = self.info.fps;
+        let m = match self.motion {
+            // The first redraw of a scrub: where a press put it.
+            None => Motion { at: want, seen: now, speed: 0.0, moved: now, jumped: true },
+            Some(m) => {
+                let dt = now.duration_since(m.seen).as_secs_f64();
+                if dt > 0.0 && dt < 0.1 {
+                    self.redraw_secs += (dt - self.redraw_secs) * 0.1;
+                }
+                let d = want as f64 - m.at as f64;
+                let speed = if dt > 0.0 { m.speed + (d / dt - m.speed) * (1.0 - (-dt / TAU).exp()) } else { m.speed };
+                let since = now.duration_since(m.moved).as_secs_f64().max(1e-3);
+                if want == m.at {
+                    Motion { seen: now, speed, ..m }
+                } else if d.abs() > 10.0 * fps || d.abs() / since > 300.0 * fps {
+                    Motion { at: want, seen: now, speed: 0.0, moved: now, jumped: true }
+                } else {
+                    // Moving off from where a click put it: at its own pace.
+                    let speed = if m.jumped { d / since } else { speed };
+                    Motion { at: want, seen: now, speed, moved: now, jumped: false }
+                }
+            }
+        };
+        self.motion = Some(m);
+        m
+    }
+
+    /// While the playhead itself is scrubbed (`Some`), how near the
+    /// playhead (seconds) the picture it's held still on may be to stay,
+    /// and where letting go lands ([`Self::land`]). Set every frame, before
+    /// [`Self::update`].
+    pub fn set_landing(&mut self, reach: Option<f64>) {
+        self.landing = reach;
+    }
+
+    /// A scrub of the playhead (a drag of it, the wheel) ended: when the
+    /// picture on screen is a frame near the playhead (within the reach
+    /// [`Self::set_landing`] gave) but not the playhead's own, the playhead
+    /// goes to it. Letting go lands on the frame you see, rather than the
+    /// picture jumping to the one under the pointer once it's decoded. Not
+    /// after a jump (a click): that picture is only a stand-in for where it
+    /// went. Nor into a stretch cut out of the clip.
+    pub fn land(&mut self) {
+        #[cfg(hw_decode)]
+        {
+            let (Some(reach), Some(on_screen)) = (self.landing, self.screen_index) else { return };
+            if self.scrub.as_ref().is_none_or(|e| e.failed()) || self.motion.is_none_or(|m| m.jumped) {
+                return;
+            }
+            let want = self.info.frame_index(self.time());
+            if self.shown_frame == Some(want) || on_screen == want || on_screen.abs_diff(want) as f64 > reach * self.info.fps {
+                return;
+            }
+            let t = self.info.snap(on_screen as f64 / self.info.fps + 1e-9) + 1e-6;
+            let cut = self.shared.skips.lock().is_ok_and(|s| s.iter().any(|k| (k.from..k.to).contains(&to_samples(t))));
+            if cut || t > self.info.duration {
+                return;
+            }
+            trace!("scrub lands on the frame shown, {on_screen} (the playhead was at {want})");
+            self.seek(t);
+            self.shown_frame = Some(on_screen);
         }
     }
 
@@ -933,6 +1336,16 @@ impl Player {
     #[cfg_attr(not(windows), allow(dead_code))]
     fn put_picture(&mut self, ctx: &egui::Context, p: Picture) {
         let idx = p.index;
+        // Dev aid: `HASTECLIP_DEV_NO_UPLOAD=1` keeps the picture on screen
+        // as it is, to measure what showing a new one costs.
+        if dev_flag("HASTECLIP_DEV_NO_UPLOAD") {
+            let _ = ctx;
+            self.shown_frame = Some(idx);
+            self.screen_index = Some(idx);
+            self.showing_proxy = false;
+            self.stand_in = None;
+            return;
+        }
         #[cfg(hw_decode)]
         {
             // On the GPU: draw its texture as it is.
@@ -1480,6 +1893,20 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
         .map_err(|e| e.to_string())?;
     stream.play().map_err(|e| e.to_string())?;
     Ok(stream)
+}
+
+/// Whether the dev aid `name` (an environment variable) is set, read once.
+fn dev_flag(name: &'static str) -> bool {
+    static FLAGS: std::sync::Mutex<Vec<(&'static str, bool)>> = std::sync::Mutex::new(Vec::new());
+    let mut flags = FLAGS.lock().unwrap();
+    match flags.iter().find(|(n, _)| *n == name) {
+        Some((_, on)) => *on,
+        None => {
+            let on = std::env::var_os(name).is_some();
+            flags.push((name, on));
+            on
+        }
+    }
 }
 
 /// Dev aid: `HASTECLIP_MUTE=1` plays everything silently, with the same

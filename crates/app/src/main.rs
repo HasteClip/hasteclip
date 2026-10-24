@@ -73,6 +73,8 @@ mod upload_watch;
 mod update_linux;
 mod gpu_frames;
 #[cfg(hw_decode)]
+mod scrub;
+#[cfg(hw_decode)]
 mod video;
 mod voice;
 mod voice_review;

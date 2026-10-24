@@ -29,6 +29,10 @@
 //!
 //! Commands are coalesced: only the newest request matters, so a burst of
 //! seeks costs one decode.
+//!
+//! Scrubbing is `scrub.rs`'s (several decoders at once, a cache the UI
+//! reads on each redraw) wherever it starts; this decoder plays, shows
+//! paused frames, and scrubs where the engine can't (or is turned off).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
@@ -155,8 +159,9 @@ fn elsewhere(front: Option<&Picture>, i: u64) -> bool {
 enum Cmd {
     /// Paused: decode exactly this frame.
     Show(u64),
-    /// Scrubbing to this frame: it, or what's quicker to see on the way.
-    Scrub(u64),
+    /// Scrubbing to this frame: it, or what's quicker to see on the way;
+    /// and the frame whose picture is on screen, if known.
+    Scrub(u64, Option<u64>),
     /// Play: deliver frames from this one on.
     Play(u64),
     Pause,
@@ -330,7 +335,7 @@ impl Video {
                         cmd = newer;
                     }
                     // Anything but scrubbing on: the frames kept for it go.
-                    if !matches!(cmd, Cmd::Scrub(_)) {
+                    if !matches!(cmd, Cmd::Scrub(..)) {
                         kept.clear();
                         filling = None;
                         last_scrub = None;
@@ -370,14 +375,31 @@ impl Video {
                             s.scrub = None;
                             ctx.request_repaint();
                         }
-                        Cmd::Scrub(i) => {
+                        Cmd::Scrub(i, on_screen) => {
                             playing = false;
+                            // After playing, the picture on screen is the last
+                            // frame played, which this worker didn't hand over
+                            // as an answer: told, so a scrub near it isn't
+                            // taken for one far from anything shown (that
+                            // showed the keyframe before it first, flashing
+                            // back up to a second).
+                            if shown.is_none() {
+                                shown = on_screen;
+                            }
                             let started = std::time::Instant::now();
                             if let Some((j, at)) = last_scrub {
                                 let dt = started.duration_since(at).as_secs_f64().max(1e-3);
-                                if i.abs_diff(j) as f64 > fps {
-                                    // More than a second of video at once: a
-                                    // jump (a click), not how fast it moves.
+                                let d = i.abs_diff(j) as f64;
+                                if d > 10.0 * fps || d / dt > 300.0 * fps || dt > 0.25 {
+                                    // Over ten seconds of video at once, or
+                                    // faster than 300× real time: a jump (a
+                                    // click), not how fast it moves. (Judged
+                                    // by how far alone, a fast drag read as
+                                    // clicks: its requests come as fast as
+                                    // they're handled, over a second of video
+                                    // apart at 50×, and the picture froze.) A
+                                    // quarter of a second since the last: a new
+                                    // gesture, not this one going on.
                                     speed = 0.0;
                                 } else {
                                     // Smoothed over a few requests (one comes with each redraw).
@@ -425,9 +447,10 @@ impl Video {
                                         let use_small = small.is_some();
                                         let back = speed < 0.0;
                                         let k = key.unwrap_or(0);
-                                        // Forward far from the picture shown: the
-                                        // frames on the way show as they come.
-                                        let far = !back && shown.is_some_and(|s| s.abs_diff(i) as f64 > FAR * fps);
+                                        // Forward far from the picture shown (or
+                                        // none shown, after playing): the frames
+                                        // on the way show as they come.
+                                        let far = !back && shown.is_none_or(|s| s.abs_diff(i) as f64 > FAR * fps);
                                         // Decoding toward it already (on from its
                                         // keyframe): on to it. Else from its keyframe,
                                         // or where the frames kept from it end.
@@ -494,7 +517,7 @@ impl Video {
                                         // Decoding on from where the decoder is
                                         // gets there without passing a keyframe.
                                         let on_the_way = positioned && next <= i && key.is_none_or(|k| k < next);
-                                        let far = shown.is_some_and(|s| s.abs_diff(i) as f64 > FAR * fps);
+                                        let far = shown.is_none_or(|s| s.abs_diff(i) as f64 > FAR * fps);
                                         // Far: on the way there a few frames at a
                                         // time, each shown, from the keyframe before
                                         // it (a jump) or from where the decoder is,
@@ -703,9 +726,10 @@ impl Video {
     }
 
     /// Scrubbing to frame `i`: its picture as soon as it can be had, maybe
-    /// frames on the way first (see [`Self::take_scrub`]).
-    pub fn scrub(&self, i: u64) {
-        let _ = self.tx.send(Cmd::Scrub(i));
+    /// frames on the way first (see [`Self::take_scrub`]). `on_screen`: the
+    /// frame whose picture the UI shows.
+    pub fn scrub(&self, i: u64, on_screen: Option<u64>) {
+        let _ = self.tx.send(Cmd::Scrub(i, on_screen));
     }
 
     /// The newest picture a scrub found, once.
