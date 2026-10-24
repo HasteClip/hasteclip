@@ -2073,6 +2073,18 @@ pub fn size_field_keeps(ctx: &egui::Context, id: &str) -> Option<f64> {
     ctx.data(|d| d.get_temp(egui::Id::new((id, "keep"))))
 }
 
+/// Have a [`size_field`] keep this shape (width over height), its link on,
+/// or none: an aspect ratio picked beside it.
+pub fn set_size_field_keeps(ctx: &egui::Context, id: &str, keep: Option<f64>) {
+    let key = egui::Id::new((id, "keep"));
+    ctx.data_mut(|d| match keep {
+        Some(k) => {
+            d.insert_temp(key, k);
+        }
+        None => d.remove::<f64>(key),
+    });
+}
+
 /// The next frame, typing goes into the [`size_field`] `id`'s width (it's
 /// just been shown, from a menu).
 pub fn type_in_size(ctx: &egui::Context, id: &str) {

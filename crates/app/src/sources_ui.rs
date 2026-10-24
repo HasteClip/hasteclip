@@ -1040,6 +1040,26 @@ impl App {
             };
             const BOX: f32 = 64.0;
             crate::ui_kit::list(ui, "screen_crop", |l| {
+                // Its shape: the biggest of it there's room for, where it is,
+                // and kept as it's sized (it's the size's link).
+                let (_, c) = l.row(Row::new("Aspect ratio"), |ui| {
+                    let now = crate::ui_kit::size_field_keeps(ui.ctx(), "screen_crop");
+                    match crate::crop_ui::shape_choice(ui, "screen_crop_shape", now, None) {
+                        Some(None) => crate::ui_kit::set_size_field_keeps(ui.ctx(), "screen_crop", None),
+                        Some(Some(i)) => {
+                            let (_, aw, ah, _) = crate::crop_ui::SHAPES[i];
+                            crate::ui_kit::set_size_field_keeps(ui.ctx(), "screen_crop", Some(aw as f64 / ah as f64));
+                            let centre = (x as f64 + w as f64 / 2.0, y as f64 + h as f64 / 2.0);
+                            // All of the display, when it's that shape.
+                            *set = Some(match media::Crop::largest(sw, sh, aw, ah, centre).within(sw, sh) {
+                                Some(c) => ScreenCrop { w: c.w, h: c.h, at: (!centred).then_some([c.x, c.y]) },
+                                None => ScreenCrop::default(),
+                            });
+                        }
+                        None => {}
+                    }
+                });
+                *locked_click |= c;
                 // Its size: the game's resolution. Centred, it stays in the
                 // middle; else its top-left corner stays put. With the shape
                 // kept, one follows the other.

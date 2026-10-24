@@ -20,6 +20,23 @@ pub const SHAPES: [(&str, u32, u32, &str); 4] = [
     ("9:16", 9, 16, "Upright, for phones: Shorts, TikTok, Reels"),
 ];
 
+/// Any, or one of [`SHAPES`], side by side: the one clicked (`Some(None)`:
+/// Any). `now`: the shape kept now (width over height; `None`: any), lit
+/// if it's one of them. As wide as `width`, if given. Every crop has it:
+/// the editor's, the screen's and the webcam's.
+pub fn shape_choice(ui: &mut egui::Ui, id: &str, now: Option<f64>, width: Option<f32>) -> Option<Option<usize>> {
+    use crate::ui_kit::Seg;
+    let opts: Vec<Seg> = std::iter::once(Seg { icon: None, label: "Any", tip: Some("Any aspect ratio: its sides can be dragged too") })
+        .chain(SHAPES.iter().map(|&(name, _, _, tip)| Seg { icon: None, label: name, tip: Some(tip) }))
+        .collect();
+    let chosen = match now {
+        None => 0,
+        Some(r) => SHAPES.iter().position(|&(_, w, h, _)| (r / (w as f64 / h as f64) - 1.0).abs() < 0.005).map_or(usize::MAX, |i| i + 1),
+    };
+    let enabled = ui.is_enabled();
+    crate::ui_kit::segmented_opts(ui, id, &opts, chosen, width, enabled).map(|i| i.checked_sub(1))
+}
+
 /// Which of [`SHAPES`] `c` is (to a pixel or so), if one.
 pub fn shape_of(c: &Crop) -> Option<usize> {
     let r = c.w as f64 / c.h.max(1) as f64;
@@ -171,7 +188,7 @@ impl CropTool {
 
     /// Along the top: the crop's size, the shapes, and Reset and Done.
     fn bar(&mut self, ui: &mut egui::Ui, rect: Rect, (fw, fh): (u32, u32), crop: &mut Option<Crop>, did: &mut Did) {
-        use crate::ui_kit::{Btn, Seg};
+        use crate::ui_kit::Btn;
         let pal = theme::pal(ui);
         let c = crop.unwrap_or(Crop::whole(fw, fh));
         let middle = Rect::from_center_size(rect.center(), vec2(SHAPES_W, rect.height()));
@@ -179,12 +196,10 @@ impl CropTool {
             let size = format!("{} × {}", c.w, c.h);
             ui.painter().text(pos2(rect.left() + PAD, rect.center().y), egui::Align2::LEFT_CENTER, size, theme::font(13.0, W::Medium), pal.text2);
         }
-        let opts: Vec<Seg> = std::iter::once(Seg { icon: None, label: "Any", tip: Some("Any aspect ratio: its sides can be dragged too") })
-            .chain(SHAPES.iter().map(|&(name, _, _, tip)| Seg { icon: None, label: name, tip: Some(tip) }))
-            .collect();
         let mut mid = ui.new_child(egui::UiBuilder::new().max_rect(middle).layout(egui::Layout::left_to_right(egui::Align::Center)));
-        if let Some(i) = crate::ui_kit::segmented_opts(&mut mid, "crop_shape", &opts, self.shape.map_or(0, |s| s + 1), Some(SHAPES_W), true) {
-            self.shape = i.checked_sub(1);
+        let now = self.shape.map(|s| SHAPES[s].1 as f64 / SHAPES[s].2 as f64);
+        if let Some(pick) = shape_choice(&mut mid, "crop_shape", now, Some(SHAPES_W)) {
+            self.shape = pick;
             // The biggest of the shape there's room for, where the crop is.
             if let Some(s) = self.shape {
                 *crop = Crop::largest(fw, fh, SHAPES[s].1, SHAPES[s].2, c.centre()).within(fw, fh);

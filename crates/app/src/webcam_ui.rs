@@ -1200,6 +1200,21 @@ fn crop_numbers(ui: &mut egui::Ui, orient: Orientation, crop: [f32; 4], size: Op
         let least = ((cw / 10).max(2), (ch / 10).max(2));
         let centred = x.abs_diff((cw - w) / 2) <= 1 && y.abs_diff((ch - h) / 2) <= 1;
         crate::ui_kit::list(ui, "webcam_crop", |l| {
+            // Its shape: the biggest of it there's room for, where it is, and
+            // kept as it's sized (it's the size's link).
+            l.row(Row::new("Aspect ratio"), |ui| {
+                let now = crate::ui_kit::size_field_keeps(ui.ctx(), "webcam_crop");
+                match crate::crop_ui::shape_choice(ui, "webcam_crop_shape", now, None) {
+                    Some(None) => crate::ui_kit::set_size_field_keeps(ui.ctx(), "webcam_crop", None),
+                    Some(Some(i)) => {
+                        let (_, aw, ah, _) = crate::crop_ui::SHAPES[i];
+                        crate::ui_kit::set_size_field_keeps(ui.ctx(), "webcam_crop", Some(aw as f64 / ah as f64));
+                        let c = media::Crop::largest(cw, ch, aw, ah, (x as f64 + w as f64 / 2.0, y as f64 + h as f64 / 2.0));
+                        *recrop = Some(to_crop(c.x, c.y, c.w, c.h));
+                    }
+                    None => {}
+                }
+            });
             // Its size: its middle stays put (with the shape kept, one side
             // follows the other).
             l.row(Row::new("Size").note("What's kept of the camera's picture"), |ui| {
