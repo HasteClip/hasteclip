@@ -1202,7 +1202,7 @@ fn plan(source: &Path, info: &ClipInfo, edit: &Edit) -> Vec<Piece> {
         return kept.into_iter().map(|(a, b)| Piece::Encode(a, b)).collect();
     }
     let fd = info.frame_duration();
-    let keys = keyframes(source).unwrap_or_default();
+    let keys = known_keyframes(source).map(|all| all.to_vec()).unwrap_or_else(|| keyframes(source, Some(&kept)).unwrap_or_default());
     let h264 = std::sync::OnceLock::new();
     let mut pieces = Vec::new();
     for (a, b) in kept {
@@ -1586,17 +1586,56 @@ fn run_progress(cmd: &mut Command, duration: f64, progress: &dyn Fn(f32)) -> Res
     Ok(())
 }
 
+static KEYFRAMES: std::sync::Mutex<Vec<(PathBuf, Stamp, Option<std::sync::Arc<Vec<f64>>>)>> = std::sync::Mutex::new(Vec::new());
+
+const KEYFRAMES_KEEP: usize = 8;
+
+pub fn warm_keyframes(source: &Path) {
+    let Some(stamp) = stamp(source) else { return };
+    {
+        let Ok(mut known) = KEYFRAMES.lock() else { return };
+        if known.iter().any(|(path, at, _)| path == source && *at == stamp) {
+            return;
+        }
+        known.retain(|(path, _, _)| path != source);
+        known.push((source.to_path_buf(), stamp, None));
+        if known.len() > KEYFRAMES_KEEP {
+            known.remove(0);
+        }
+    }
+    let source = source.to_path_buf();
+    std::thread::spawn(move || {
+        let Ok(keys) = keyframes(&source, None) else { return };
+        let Ok(mut known) = KEYFRAMES.lock() else { return };
+        if let Some(entry) = known.iter_mut().find(|(path, at, _)| *path == source && *at == stamp) {
+            entry.2 = Some(std::sync::Arc::new(keys));
+        }
+    });
+}
+
+fn known_keyframes(source: &Path) -> Option<std::sync::Arc<Vec<f64>>> {
+    let stamp = stamp(source)?;
+    let known = KEYFRAMES.lock().ok()?;
+    let entry = known.iter().find(|(path, at, _)| path == source && *at == stamp)?;
+    entry.2.clone()
+}
+
 /// Keyframe timestamps of the video stream.
-fn keyframes(source: &Path) -> Result<Vec<f64>> {
-    let out = ffprobe()
-        .args(["-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey"])
-        .args(["-show_entries", "frame=pts_time", "-of", "csv=p=0"])
-        .arg(source)
-        .output()?;
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| l.trim().trim_end_matches(',').parse().ok())
-        .collect())
+fn keyframes(source: &Path, spans: Option<&[(f64, f64)]>) -> Result<Vec<f64>> {
+    let mut cmd = ffprobe();
+    cmd.args(["-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey"]);
+    if let Some(spans) = spans {
+        if spans.is_empty() {
+            return Ok(Vec::new());
+        }
+        let read: Vec<String> = spans.iter().map(|(a, b)| format!("{:.6}%{:.6}", (a - 1.0).max(0.0), b)).collect();
+        cmd.args(["-read_intervals", &read.join(",")]);
+    }
+    let out = cmd.args(["-show_entries", "frame=pts_time", "-of", "csv=p=0"]).arg(source).output()?;
+    let mut keys: Vec<f64> = String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.trim().trim_end_matches(',').parse().ok()).collect();
+    keys.sort_by(f64::total_cmp);
+    keys.dedup();
+    Ok(keys)
 }
 
 fn is_h264(source: &Path) -> bool {
@@ -1998,6 +2037,28 @@ mod cut_render_tests {
     /// How far apart two frames are: the mean difference of their pixels.
     fn apart(a: &Frame, b: &Frame) -> f64 {
         a.rgba.iter().zip(&b.rgba).map(|(x, y)| x.abs_diff(*y) as f64).sum::<f64>() / a.rgba.len() as f64
+    }
+
+    #[test]
+    fn warmed_keyframes_match_the_ranged_scan() {
+        let dir = std::env::temp_dir().join(format!("hc-media-keys-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.mp4");
+        clip(&src);
+        let spans = [(1.2, 4.7)];
+        let ranged: Vec<f64> = keyframes(&src, Some(&spans[..])).unwrap().into_iter().filter(|k| (1.2..=4.7).contains(k)).collect();
+        assert!(!ranged.is_empty());
+        warm_keyframes(&src);
+        let whole = loop {
+            if let Some(keys) = known_keyframes(&src) {
+                break keys;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let warmed: Vec<f64> = whole.iter().copied().filter(|k| (1.2..=4.7).contains(k)).collect();
+        assert_eq!(ranged, warmed);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A clip with a stretch cut out of its middle saves as the parts kept,
