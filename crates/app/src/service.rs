@@ -156,9 +156,8 @@ impl CaptureService {
         let (evt_tx, evt_rx) = std::sync::mpsc::channel::<Evt>();
 
         let _ = STOP_HOOK.get_or_init(|| Mutex::new(None)).lock().map(|mut h| *h = Some(cmd_tx.clone()));
-        // A demo recording clips nothing: its stand-in hands over prepared
-        // clips (unless it clips for real).
-        if crate::demo::on() && !crate::demo::real_capture() {
+        // A demo recording clips nothing: its stand-in hands over prepared clips.
+        if crate::demo::on() {
             let thread = crate::demo::capture_thread(cmd_rx, evt_tx);
             return Self { cmd_tx: Some(cmd_tx), evt_rx, thread: Some(thread) };
         }

@@ -27,15 +27,9 @@
 //!   { "seek": "marker:1", "before": 1 },     // the playhead to a moment
 //!   { "drag": "clip:2", "to": "filter:Best of the week" },  // or "by": [x, y]
 //!   { "key": "cmd+s" },  { "type": "text" },  { "scroll": 300 },
-//!   { "drag": "preview:0.9,0.9", "by": [-80, 0], "mods": "alt" },  // keys held while dragging
-//!   { "hold": "alt" },  { "hold": "" }       // keys held from now on, and let go
-//!   { "shot": "sources.png" },               // this moment's frame as a picture
 //!   { "pointer": false }                     // hide the pointer
 //! ] }
 //! ```
-//!
-//! With `"capture": true` it clips for real, as the app does for you (to
-//! check what's recorded): saving saves, into the library it's given.
 //!
 //! Targets: `preview:x,y` (a point of the Sources page's preview, as
 //! fractions of it), `card:<source>` and `grip:<source>` (a picture
@@ -166,25 +160,12 @@ struct Script {
     #[serde(default)]
     #[allow(dead_code)] // read by `clipping_from_start`
     clipping: bool,
-    /// Clipping captures for real, instead of handing over `saves`.
-    #[serde(default)]
-    #[allow(dead_code)] // read by `real_capture`
-    capture: bool,
     steps: Vec<Step>,
 }
 
 /// Whether the script has clipping on from the start.
 pub fn clipping_from_start() -> bool {
-    script_value("clipping")
-}
-
-/// Whether the script clips for real (`"capture": true`).
-pub fn real_capture() -> bool {
-    script_value("capture")
-}
-
-fn script_value(key: &str) -> bool {
-    script_path().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).is_some_and(|v| v[key] == true)
+    script_path().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).is_some_and(|v| v["clipping"] == true)
 }
 
 fn default_fps() -> u32 {
@@ -221,8 +202,7 @@ enum Step {
         mods: Option<String>,
     },
     /// Press the button on a target (or where the pointer is), move by `by`
-    /// points or onto `to`, let go; with keys held (`"alt"`, `"shift+alt"`)
-    /// the whole way.
+    /// points or onto `to`, let go.
     Drag {
         drag: Target,
         #[serde(default)]
@@ -231,13 +211,7 @@ enum Step {
         to: Option<Target>,
         #[serde(default = "default_move")]
         secs: f64,
-        #[serde(default)]
-        mods: Option<String>,
     },
-    /// Save the frame drawn now as a PNG (relative to the script).
-    Shot { shot: PathBuf },
-    /// Hold keys down (`"alt"`) from now on; `""` lets go.
-    Hold { hold: String },
     /// Press a key, with modifiers: `"space"`, `"cmd+s"`, `"alt+f10"`, `"e"`.
     Key { key: String },
     /// Type text into whatever has focus.
@@ -343,11 +317,6 @@ pub struct Demo {
     /// have come on time.
     last_frame: Option<f64>,
     steady_since: Option<f64>,
-    /// Where the script is (shots are saved beside it).
-    dir: PathBuf,
-    /// Shots asked for: where each goes, and how many frames to wait (the
-    /// GPU's copy of a frame comes back a frame or two later).
-    shots: Vec<(PathBuf, u8)>,
 }
 
 /// Seconds of steady frames before the recording starts.
@@ -382,8 +351,6 @@ impl Demo {
             action: None,
             last_frame: None,
             steady_since: None,
-            dir: path.parent().unwrap_or(std::path::Path::new(".")).to_owned(),
-            shots: Vec::new(),
         })
     }
 
@@ -402,23 +369,6 @@ impl Demo {
             _ => true,
         });
         let now = raw.time.unwrap_or(0.0);
-        for f in &frames {
-            for (path, wait) in &mut self.shots {
-                *wait = wait.saturating_sub(1);
-                // Not one of the frames where only the rail was drawn (the
-                // page is laid out again in a second pass): the next one.
-                if *wait == 0 && blank_page(f) {
-                    *wait = 1;
-                } else if *wait == 0 {
-                    let [w, h] = f.size;
-                    match image::RgbaImage::from_raw(w as u32, h as u32, f.as_raw().to_vec()).map(|img| img.save(&*path)) {
-                        Some(Ok(())) => eprintln!("demo: shot {}", path.display()),
-                        _ => eprintln!("demo: couldn't save {}", path.display()),
-                    }
-                }
-            }
-            self.shots.retain(|(_, wait)| *wait > 0);
-        }
         if let Some(rec) = &mut self.recorder {
             for f in frames {
                 rec.frame(f, now - self.zero.unwrap_or(now));
@@ -658,17 +608,7 @@ impl Demo {
                     next(self);
                 }
             }
-            Step::Shot { shot } => {
-                self.shots.push((self.dir.join(shot), 3));
-                next(self);
-            }
-            Step::Hold { hold } => {
-                let held = if hold.is_empty() { Modifiers::NONE } else { parse_key(&format!("{hold}+a")).1 };
-                raw.events.push(Event::ModifiersChanged(held));
-                next(self);
-            }
-            Step::Drag { drag, by, to, secs, mods } => {
-                let modifiers = mods.as_deref().map_or(Modifiers::NONE, |m| parse_key(&format!("{m}+a")).1);
+            Step::Drag { drag, by, to, secs } => {
                 // Found until it's grabbed: what it is may change once pulled
                 // (a split pulled open is two handles).
                 let Some(grab) = self.grabbed.or_else(|| resolve(self, &drag)) else {
@@ -685,9 +625,6 @@ impl Demo {
                 }
                 if !self.down {
                     self.pointer = grab;
-                    if modifiers != Modifiers::NONE {
-                        raw.events.push(Event::ModifiersChanged(modifiers));
-                    }
                     raw.events.push(Event::PointerButton { pos: grab, button: PointerButton::Primary, pressed: true, modifiers });
                     self.down = true;
                     self.grabbed = Some(grab);
@@ -708,9 +645,6 @@ impl Demo {
                 self.pointer = glide(grab, end, pull, secs);
                 if pull >= secs + 0.05 {
                     raw.events.push(Event::PointerButton { pos: self.pointer, button: PointerButton::Primary, pressed: false, modifiers });
-                    if modifiers != Modifiers::NONE {
-                        raw.events.push(Event::ModifiersChanged(Modifiers::NONE));
-                    }
                     self.down = false;
                     next(self);
                 }
@@ -978,14 +912,6 @@ pub(crate) fn capture_thread(rx: mpsc::Receiver<crate::service::Cmd>, tx: mpsc::
             }
         }
     })
-}
-
-/// Whether a frame's page (right of the rail) is all one colour.
-fn blank_page(f: &egui::ColorImage) -> bool {
-    let [w, h] = f.size;
-    let at = |x: usize, y: usize| f.pixels[y * w + x];
-    let first = at(w / 2, h / 2);
-    (0..64).all(|i| (0..64).all(|j| at(w / 5 + i * (w * 4 / 5 - 1) / 64, j * (h - 1) / 64) == first))
 }
 
 fn fail(msg: &str) -> ! {

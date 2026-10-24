@@ -544,14 +544,12 @@ impl App {
                 && let Some(w) = self.settings.webcam.as_mut()
             {
                 let tip = if w.enabled { "Turn the webcam off: it leaves your clips, and its place, size, crop and format are kept" } else { "Put your webcam back in your clips" };
-                let r = crate::ui_kit::switch(&mut rui, &mut w.enabled).on_hover_text(tip);
-                crate::demo::mark(ui.ctx(), || format!("switch:{name}"), r.rect);
+                crate::ui_kit::switch(&mut rui, &mut w.enabled).on_hover_text(tip);
             }
             if layer == Layer::Screen {
                 let what = if name == "Screen" { "your screen" } else { "your games and apps" };
                 let tip = if self.settings.screen.enabled { format!("Turn {what} off: it leaves your clips, and its place and crop are kept") } else { format!("Put {what} back in your clips") };
-                let r = crate::ui_kit::switch(&mut rui, &mut self.settings.screen.enabled).on_hover_text(tip);
-                crate::demo::mark(ui.ctx(), || format!("switch:{name}"), r.rect);
+                crate::ui_kit::switch(&mut rui, &mut self.settings.screen.enabled).on_hover_text(tip);
             }
             rui.add_space(-4.0);
             let more = crate::ui_kit::Btn::icon(crate::ui_kit::Kind::Ghost, icon::DOTS_THREE).small().tip(if layer == Layer::Webcam { "Turn, flip, put in front or behind, remove" } else { "Reset, put in front or behind" }).show(&mut rui);
