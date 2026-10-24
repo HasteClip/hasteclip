@@ -68,10 +68,6 @@ pub(crate) struct SourcesView {
     /// held there.
     pub(crate) crop_open: bool,
     crop_drag: Option<(crate::webcam_ui::Handle, egui::Rect, egui::Pos2)>,
-    /// Its width and height change together, keeping this shape (width over
-    /// height, as it was when they were linked: rounding each change to even
-    /// pixels doesn't make it drift).
-    crop_keep_shape: Option<f64>,
     /// The picture's sources whose cards are open, showing their settings.
     open_cards: Vec<crate::canvas_ui::Layer>,
     /// A card dragged by its handle to put it in front or behind: which,
@@ -772,17 +768,15 @@ impl App {
                 Some(_) if exact.is_none() => {
                     let (w, h) = capture::frame_size(&self.video_source(), self.settings.video_size()).unwrap_or((1920, 1080));
                     self.settings.resolution = R::Exact(w & !1, h & !1);
-                    crate::settings_ui::type_in_width(ui.ctx(), "popover_size");
+                    crate::ui_kit::type_in_size(ui.ctx(), "res_size");
                 }
                 _ => {}
             }
-            if let Some(size) = self.settings.resolution.exact() {
-                ui.horizontal(|ui| {
-                    if let Some((w, h)) = crate::settings_ui::size_boxes(ui, "popover_size", size) {
-                        self.settings.resolution = R::Exact(w, h);
-                    }
-                    ui.label(theme::text("pixels, width × height", 12.5, W::Regular).color(pal.text3));
-                });
+            // The same boxes as Settings' (and their link).
+            if let Some(size) = self.settings.resolution.exact()
+                && let Some((w, h)) = crate::ui_kit::size_field(ui, "res_size", size, 144..=capture::MAX_SIDE, 144..=capture::MAX_SIDE)
+            {
+                self.settings.resolution = R::Exact(w, h);
             }
             label(ui, "Aspect ratio");
             const SHAPES: [Option<[u32; 2]>; 6] = [None, Some([16, 9]), Some([9, 16]), Some([1, 1]), Some([4, 3]), Some([21, 9])];
@@ -889,7 +883,8 @@ impl App {
             self.sources_view.crop_open = false;
             return;
         }
-        let keep = self.sources_view.crop_keep_shape.is_some();
+        // Its size's link keeps the shape as its edges are dragged too.
+        let keep = crate::ui_kit::size_field_keeps(ui.ctx(), "screen_crop").is_some();
         let mut back = false;
         self.page_head(ui, "", |_, ui| {
             back = Btn::icon(crate::ui_kit::Kind::Ghost, egui_phosphor::regular::CARET_LEFT).tip("Back to Sources  (Esc)").show(ui).clicked();
@@ -958,8 +953,7 @@ impl App {
             });
         };
         let mut locked_click = false;
-        let mut keep_now = self.sources_view.crop_keep_shape;
-        let numbers = |ui: &mut egui::Ui, set: &mut Option<ScreenCrop>, locked_click: &mut bool, keep: &mut Option<f64>, match_crop: &mut bool| {
+        let numbers = |ui: &mut egui::Ui, set: &mut Option<ScreenCrop>, locked_click: &mut bool, match_crop: &mut bool| {
             let small = |ui: &mut egui::Ui, t: &str| ui.label(theme::text(t, 12.5, W::Regular).color(pal.text3));
             // Laid out left to right at the row's end, so Tab goes through
             // them in reading order: `width` across, made by `add`.
@@ -974,32 +968,10 @@ impl App {
                 // Its size: the game's resolution. Centred, it stays in the
                 // middle; else its top-left corner stays put. With the shape
                 // kept, one follows the other.
-                let even = |v: f64| ((v / 2.0).round() as u32 * 2).max(least);
                 let (_, c) = l.row(Row::new("Size").note("The game's resolution, like 1600 × 900"), |ui| {
-                    boxes(ui, BOX * 2.0 + 28.0 + 16.0 + 6.0 * 3.0, &mut |ui| {
-                        if let Some(v) = crate::ui_kit::number_box(ui, egui::Id::new("screen_crop_w"), w, least..=sw, BOX) {
-                            let h = keep.map_or(h, |shape| even(v as f64 / shape).min(sh));
-                            *set = Some(ScreenCrop { w: v, h, ..crop });
-                        }
-                        // The link between them goes here, but is made after
-                        // the height: Tab goes from width to height.
-                        let (slot, _) = ui.allocate_exact_size(egui::vec2(28.0, crate::ui_kit::CONTROL_H), Sense::hover());
-                        if let Some(v) = crate::ui_kit::number_box(ui, egui::Id::new("screen_crop_h"), h, least..=sh, BOX) {
-                            let w = keep.map_or(w, |shape| even(v as f64 * shape).min(sw));
-                            *set = Some(ScreenCrop { w, h: v, ..crop });
-                        }
-                        small(ui, "px");
-                        let (icon, tip) = if keep.is_some() {
-                            (egui_phosphor::regular::LINK_SIMPLE_HORIZONTAL, "The shape's kept: changing one changes the other. Click to set them on their own.")
-                        } else {
-                            (egui_phosphor::regular::LINK_SIMPLE_HORIZONTAL_BREAK, "Keep the shape: changing one changes the other")
-                        };
-                        let kind = if keep.is_some() { crate::ui_kit::Kind::Normal } else { crate::ui_kit::Kind::Ghost };
-                        let link = ui.scope_builder(egui::UiBuilder::new().max_rect(slot).layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)), |ui| Btn::icon(kind, icon).small().tip(tip).show(ui));
-                        if link.inner.clicked() {
-                            *keep = if keep.is_some() { None } else { Some(w as f64 / h.max(1) as f64) };
-                        }
-                    });
+                    if let Some((w, h)) = crate::ui_kit::size_field(ui, "screen_crop", (w, h), least..=sw, least..=sh) {
+                        *set = Some(ScreenCrop { w, h, ..crop });
+                    }
                 });
                 *locked_click |= c;
                 // Where it is: its top-left corner, or the middle.
@@ -1081,17 +1053,16 @@ impl App {
                 });
                 ui.allocate_ui_with_layout(egui::vec2(col, avail_h), egui::Layout::top_down(egui::Align::Min), |ui| {
                     ui.set_width(col);
-                    numbers(ui, &mut set, &mut locked_click, &mut keep_now, &mut match_crop);
+                    numbers(ui, &mut set, &mut locked_click, &mut match_crop);
                 });
             });
         } else {
             crate::ui_kit::scroll(ui, "screen_crop_page", |ui| {
                 picture(ui, self, avail_h * 0.4, &mut set);
                 ui.add_space(16.0);
-                numbers(ui, &mut set, &mut locked_click, &mut keep_now, &mut match_crop);
+                numbers(ui, &mut set, &mut locked_click, &mut match_crop);
             });
         }
-        self.sources_view.crop_keep_shape = keep_now;
         if locked_click && let Some(why) = &size_lock {
             self.toast_icon(egui_phosphor::regular::LOCK_SIMPLE, why.clone());
         }

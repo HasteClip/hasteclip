@@ -719,13 +719,13 @@ impl App {
         let secs = self.settings.replay_seconds;
         let presets: Vec<(String, String, String)> = REPLAY_CHOICES.iter().map(|&s| (length_words(s), clock_label(s), String::new())).collect();
         let current = REPLAY_CHOICES.iter().position(|&s| s == secs);
-        let field = ValueField { id: egui::Id::new("vf_length"), text: clock_label(secs), unit: "", width: 116.0, hint: "Type the digits: 230 is 2:30. ↑ ↓ change the part chosen", presets, current, range: "5 s – 1 h", more: None };
+        let field = ValueField { id: egui::Id::new("vf_length"), text: clock_label(secs), unit: "", width: 116.0, hint: "Type the digits: 230 is 2:30. ↑ ↓ change the part chosen", presets, current, range: "5 s – 1 h" };
         match field.show_time(ui, f64::from(secs), 5.0, 3600.0) {
             Typed::Preset(i) => self.settings.replay_seconds = REPLAY_CHOICES[i],
             Typed::Secs(v) if (5.0..=3600.0).contains(&v.round()) => self.settings.replay_seconds = v.round() as u32,
             Typed::Secs(v) => self.toast_error(format!("{} isn't a length from 5 seconds to an hour", length_words(v.round() as u32))),
             Typed::Text(t) => self.toast_error(format!("“{}” isn't a length from 5 seconds to an hour", t.trim())),
-            Typed::None | Typed::More => {}
+            Typed::None => {}
         }
     }
 
@@ -733,133 +733,67 @@ impl App {
     /// screen's, or a common one), or two numbers of your own (Custom), each
     /// in its own box.
     fn shape_field(&mut self, ui: &mut egui::Ui, screen: Option<(u32, u32)>) {
-        let pal = theme::pal(ui);
         // A custom size is its own shape: shown, not picked.
         if let Some((w, h)) = self.settings.resolution.exact() {
             ui.add_enabled_ui(false, |ui| ui_kit::select(ui, &ratio_label(w, h), 150.0)).inner.on_disabled_hover_text("Your custom size sets it. Pick a resolution in p to choose one.");
             return;
         }
-        let custom_id = egui::Id::new("aspect_custom");
         let shape = self.settings.shape;
-        // Custom: picked from the menu, or a ratio that isn't a common one.
-        let custom = ui.data(|d| d.get_temp::<bool>(custom_id)).unwrap_or(false) || shape.is_some_and(|s| !RATIOS.iter().any(|r| [r.0, r.1] == s));
-        let shown = match shape {
-            _ if custom => "Custom".to_owned(),
-            None => SAME_AS_SCREEN.to_owned(),
-            Some([w, h]) => format!("{w}:{h}"),
-        };
-        let r = ui_kit::select(ui, &shown, if custom { 100.0 } else { 150.0 });
-        let (mut picked, mut to_custom) = (None, false);
+        let shown = shape.map_or(SAME_AS_SCREEN.to_owned(), |[w, h]| format!("{w}:{h}"));
+        let r = ui_kit::select(ui, &shown, 150.0);
         ui_kit::menu_popup(&r, false, 250.0, |ui| {
-            let mut same = Item::new(SAME_AS_SCREEN).check(!custom && shape.is_none());
+            let mut same = Item::new(SAME_AS_SCREEN).check(shape.is_none());
             if let Some((w, h)) = screen {
                 same = same.value(format!("{w}×{h}"));
             }
             if same.show(ui).clicked() {
-                picked = Some(None);
+                self.settings.shape = None;
             }
             for &(w, h, note) in &RATIOS {
-                if Item::new(format!("{w}:{h}")).check(!custom && shape == Some([w, h])).value(note).show(ui).clicked() {
-                    picked = Some(Some([w, h]));
+                if Item::new(format!("{w}:{h}")).check(shape == Some([w, h])).value(note).show(ui).clicked() {
+                    self.settings.shape = Some([w, h]);
                 }
             }
-            ui_kit::menu_sep(ui);
-            to_custom = Item::new("Custom…").check(custom).tip("Two numbers of your own, like 5:4").show(ui).clicked();
         });
-        if let Some(p) = picked {
-            ui.data_mut(|d| d.remove::<bool>(custom_id));
-            self.settings.shape = p;
-        }
-        if to_custom {
-            // From the ratio there is (or 16:9), to change.
-            ui.data_mut(|d| d.insert_temp(custom_id, true));
-            self.settings.shape = Some(shape.unwrap_or([16, 9]));
-        }
-        if custom || to_custom {
-            let [w, h] = self.settings.shape.unwrap_or([16, 9]);
-            // The width's box, then the height's, left to right, so Tab goes
-            // from one to the other.
-            let boxes = ui.allocate_ui_with_layout(egui::vec2(2.0 * 46.0 + 16.0, ui_kit::CONTROL_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                let w = ui_kit::number_box(ui, egui::Id::new("aspect_w"), w, 1..=99, 46.0).unwrap_or(w);
-                ui.label(theme::text(":", 13.5, W::Medium).color(pal.text2));
-                let h = ui_kit::number_box(ui, egui::Id::new("aspect_h"), h, 1..=99, 46.0).unwrap_or(h);
-                [w, h]
-            });
-            self.settings.shape = Some(kept_ratio(boxes.inner));
-        }
     }
 
-    /// The resolution: one in p (or Native) picked or typed, in the aspect
-    /// ratio chosen; or a custom size, its width and height each in its own
-    /// box.
+    /// The resolution: Native or one in p, in the aspect ratio chosen,
+    /// picked from its menu; or a size of its own, its width and height in
+    /// boxes beside it (the shape kept, if its link's on).
     fn resolution_field(&mut self, ui: &mut egui::Ui) {
         let r = self.settings.resolution;
+        let exact = r.exact();
         // Native in the aspect ratio chosen (a custom size isn't one).
         let aspect = capture::VideoSize { shape: self.settings.aspect_shape(), ..Default::default() };
         let native = capture::frame_size(&self.video_source(), aspect);
-        let presets: Vec<(String, String, String)> = OutputResolution::PRESETS
-            .iter()
-            .map(|p| {
+        let shown = if exact.is_some() { "Custom".to_owned() } else { r.label() };
+        let menu = ui_kit::select(ui, &shown, if exact.is_some() { 110.0 } else { 150.0 });
+        let mut picked = None;
+        ui_kit::menu_popup(&menu, false, 260.0, |ui| {
+            for p in OutputResolution::PRESETS {
                 let note = match (p, native) {
                     (OutputResolution::Native, Some((w, h))) => format!("{w}×{h}"),
                     _ => p.note().to_owned(),
                 };
-                (p.label(), p.short_side().map_or("Native".into(), |h| h.to_string()), note)
-            })
-            .collect();
-        if let Some((w, h)) = r.exact() {
-            // Back to one in p from the menu (Custom), the size in the boxes.
-            let shown = ui_kit::select(ui, "Custom", 100.0);
-            let mut picked = None;
-            ui_kit::menu_popup(&shown, false, 250.0, |ui| {
-                for (i, (label, _, note)) in presets.iter().enumerate() {
-                    if Item::new(label.clone()).value(note.clone()).show(ui).clicked() {
-                        picked = Some(OutputResolution::PRESETS[i]);
-                    }
-                }
-                ui_kit::menu_sep(ui);
-                Item::new("Custom size").icon(icon::FRAME_CORNERS).check(true).show(ui);
-            });
-            match picked {
-                Some(p) => self.settings.resolution = p,
-                None => {
-                    if let Some((w, h)) = size_boxes(ui, "res_size", (w, h)) {
-                        self.settings.resolution = OutputResolution::Exact(w, h);
-                    }
+                if Item::new(p.label()).check(exact.is_none() && p.short_side() == r.short_side()).value(note).show(ui).clicked() {
+                    picked = Some(p);
                 }
             }
-            return;
-        }
-        let current = OutputResolution::PRESETS.iter().position(|p| *p == r || (p.short_side() == r.short_side()));
-        let (text, unit) = match r.short_side() {
-            Some(h) => (h.to_string(), "p"),
-            None => ("Native".to_owned(), ""),
-        };
-        let field = ValueField {
-            id: egui::Id::new("vf_res"),
-            text,
-            unit,
-            width: 116.0,
-            hint: "Type a resolution like 1080, a size like 1920×1080, or Native",
-            presets,
-            current,
-            range: "like 1080",
-            more: Some(("Custom size…", "any width and height")),
-        };
-        match field.show(ui) {
-            Typed::Preset(i) => self.settings.resolution = OutputResolution::PRESETS[i],
-            Typed::Text(t) => match parse_resolution(&t) {
-                Some(r) => self.settings.resolution = r,
-                None => self.toast_error(format!("“{}” isn't a resolution from 144p to 4320p, or a size like 1920×1080", t.trim())),
-            },
+            ui_kit::menu_sep(ui);
             // From the size it records at now, the width chosen to type over.
-            Typed::More => {
+            if Item::new("Custom size…").check(exact.is_some()).value("any width and height").show(ui).clicked() && exact.is_none() {
                 let (w, h) = self.recorded_size().unwrap_or((1920, 1080));
-                self.settings.resolution = OutputResolution::Exact(w & !1, h & !1);
-                type_in_width(ui.ctx(), "res_size");
+                picked = Some(OutputResolution::Exact(w & !1, h & !1));
+                ui_kit::type_in_size(ui.ctx(), "res_size");
             }
-            Typed::None | Typed::Secs(_) => {}
+        });
+        if let Some(p) = picked {
+            self.settings.resolution = p;
+        }
+        if let Some(size) = self.settings.resolution.exact()
+            && let Some((w, h)) = ui_kit::size_field(ui, "res_size", size, 144..=capture::MAX_SIDE, 144..=capture::MAX_SIDE)
+        {
+            self.settings.resolution = OutputResolution::Exact(w, h);
         }
     }
 
@@ -875,14 +809,14 @@ impl App {
         let max = settings::MAX_FPS;
         let hint = format!("Type any frame rate from 10 to {max}");
         let range = format!("10–{max}");
-        let field = ValueField { id: egui::Id::new("vf_fps"), text: fps.to_string(), unit: "fps", width: 104.0, hint: &hint, presets, current, range: &range, more: None };
+        let field = ValueField { id: egui::Id::new("vf_fps"), text: fps.to_string(), unit: "fps", width: 104.0, hint: &hint, presets, current, range: &range };
         match field.show(ui) {
             Typed::Preset(i) => self.settings.fps = choices[i],
             Typed::Text(t) => match t.trim().trim_end_matches("fps").trim().parse::<u32>() {
                 Ok(v) if (10..=max).contains(&v) => self.settings.fps = v,
                 _ => self.toast_error(format!("“{}” isn't a frame rate from 10 to {max}", t.trim())),
             },
-            Typed::None | Typed::Secs(_) | Typed::More => {}
+            Typed::None | Typed::Secs(_) => {}
         }
     }
 
@@ -900,7 +834,6 @@ impl App {
             presets: presets.iter().map(|(n, m)| (n.to_string(), m.to_string(), format!("{m} Mbps"))).collect(),
             current: preset,
             range: "1–300",
-            more: None,
         };
         match field.show(ui) {
             Typed::Preset(i) => self.settings.video_bitrate_mbps = presets[i].1,
@@ -908,7 +841,7 @@ impl App {
                 Ok(v) if (1.0..=300.0).contains(&v) => self.settings.video_bitrate_mbps = v.round() as u32,
                 _ => self.toast_error(format!("“{}” isn't a bitrate from 1 to 300 Mbps", t.trim())),
             },
-            Typed::None | Typed::Secs(_) | Typed::More => {}
+            Typed::None | Typed::Secs(_) => {}
         }
         if !presets.is_empty() {
             let opts: Vec<Seg> = presets.iter().map(|(n, _)| Seg { icon: None, label: n, tip: None }).collect();
@@ -934,7 +867,7 @@ impl App {
         };
         let text = used.map_or("Off".to_owned(), |r| r.to_string());
         let unit = if used.is_some() { "fps" } else { "" };
-        let field = ValueField { id: egui::Id::new("vf_blend"), text, unit, width: 104.0, hint: "Type a capture rate (a multiple of the frame rate), or Off", presets, current, range: "", more: None };
+        let field = ValueField { id: egui::Id::new("vf_blend"), text, unit, width: 104.0, hint: "Type a capture rate (a multiple of the frame rate), or Off", presets, current, range: "" };
         match field.show(ui) {
             Typed::Preset(0) => self.settings.blend_fps = 0,
             Typed::Preset(i) => self.settings.blend_fps = choices[i - 1],
@@ -956,7 +889,7 @@ impl App {
                     }
                 }
             }
-            Typed::None | Typed::Secs(_) | Typed::More => {}
+            Typed::None | Typed::Secs(_) => {}
         }
     }
 
@@ -1403,21 +1336,6 @@ pub const BLEND_SOFT_TIP: &str = "The middle of each frame counts most, fading i
 /// Resolution's tip.
 const RESOLUTION_TIP: &str = "Lower makes smaller files that are quicker to share. Native keeps every pixel of your display. 1080p is 1920×1080 widescreen and 1080×1920 upright. A custom size records at exactly the width and height you give it, whatever your display is.";
 
-/// A resolution typed: a short side ("1080", "1080p"), Native, or an exact
-/// size ("1920×1080", "1920x1080", "1920 1080"). `None` if it's none of them.
-fn parse_resolution(t: &str) -> Option<OutputResolution> {
-    let t = t.trim().to_lowercase();
-    if t.starts_with('n') {
-        return Some(OutputResolution::Native);
-    }
-    let numbers: Vec<u32> = t.split(|c: char| !c.is_ascii_digit()).filter(|n| !n.is_empty()).map(|n| n.parse().ok()).collect::<Option<_>>()?;
-    match numbers[..] {
-        [h] if (144..=4320).contains(&h) => Some(OutputResolution::PRESETS.iter().copied().find(|p| p.short_side() == Some(h)).unwrap_or(OutputResolution::Custom(h))),
-        [w, h] if (144..=capture::MAX_SIDE).contains(&w) && (144..=capture::MAX_SIDE).contains(&h) => Some(OutputResolution::Exact(w & !1, h & !1)),
-        _ => None,
-    }
-}
-
 /// A custom size's shape, as a ratio when it's a readable one ("16:9",
 /// "64:27"), else to two places ("1.78:1").
 fn ratio_label(w: u32, h: u32) -> String {
@@ -1433,7 +1351,7 @@ fn ratio_label(w: u32, h: u32) -> String {
 }
 
 /// Aspect ratio's tip.
-const SHAPE_TIP: &str = "Record in another aspect ratio than your screen's: 16:9 out of an ultrawide screen, say, or 9:16 for phones. Type any other, like 21:9. Every recording and clip is made in it. Your screen fills it, its middle: make it smaller on the Sources page's preview to show all of it, wherever you like.";
+const SHAPE_TIP: &str = "Record in another aspect ratio than your screen's: 16:9 out of an ultrawide screen, say, or 9:16 for phones. Every recording and clip is made in it. Your screen fills it, its middle: make it smaller on the Sources page's preview to show all of it, wherever you like.";
 
 /// The screen capture setting shows: Windows, where there's a choice.
 const SCREEN_CAPTURE: bool = cfg!(target_os = "windows");
@@ -1465,44 +1383,6 @@ fn screen_capture_note(choice: settings::ScreenCapture, apps: bool, in_use: Opti
         Wgc => "What HasteClip has always used",
     };
     (note.into(), false)
-}
-
-/// What's typed next goes into a custom size's width (`size_boxes` with
-/// this `id`), once it shows. Not in the frame of the click that chose it:
-/// a click anywhere else takes a box's typing away.
-pub(crate) fn type_in_width(ctx: &egui::Context, id: &str) {
-    ctx.data_mut(|d| d.insert_temp(egui::Id::new((id, "type_in")), true));
-}
-
-/// A custom size's width and height, each in its own box (Tab goes from
-/// one to the other), from 144 to the biggest side a recording can have.
-/// Sizes are even (video needs them so): a number between two goes the
-/// way it was changed. The new size, when it changes.
-pub(crate) fn size_boxes(ui: &mut egui::Ui, id: &str, (w, h): (u32, u32)) -> Option<(u32, u32)> {
-    let pal = theme::pal(ui);
-    let type_in = egui::Id::new((id, "type_in"));
-    if ui.data(|d| d.get_temp::<bool>(type_in)).is_some() && !ui.input(|i| i.pointer.any_click()) {
-        ui.data_mut(|d| d.remove::<bool>(type_in));
-        ui.memory_mut(|m| m.request_focus(egui::Id::new((id, "w"))));
-    }
-    let range = 144..=capture::MAX_SIDE;
-    let typed = ui.allocate_ui_with_layout(egui::vec2(2.0 * 58.0 + 20.0, ui_kit::CONTROL_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        let nw = ui_kit::number_box(ui, egui::Id::new((id, "w")), w, range.clone(), 58.0).map(|v| even_side(v, w));
-        ui.label(theme::text("×", 13.5, W::Medium).color(pal.text2));
-        let nh = ui_kit::number_box(ui, egui::Id::new((id, "h")), h, range, 58.0).map(|v| even_side(v, h));
-        (nw, nh)
-    });
-    match typed.inner {
-        (None, None) => None,
-        (nw, nh) => Some((nw.unwrap_or(w), nh.unwrap_or(h))).filter(|s| *s != (w, h)),
-    }
-}
-
-/// A side typed or stepped (from `was`) made even: up when it went up, so
-/// ↑ from 1080 reaches 1082 rather than staying.
-fn even_side(new: u32, was: u32) -> u32 {
-    if new > was { (new + 1) & !1 } else { new & !1 }
 }
 
 /// What recording in `shape` does to a `w`×`h` screen filling it, in words:
@@ -1538,13 +1418,6 @@ const RATIOS: [(u32, u32, &str); 7] = [
     (1, 1, "square"),
     (9, 16, "upright, for phones"),
 ];
-
-/// A custom ratio kept from 1:4 to 4:1: a side that's too long is cut to
-/// four times the other.
-fn kept_ratio([w, h]: [u32; 2]) -> [u32; 2] {
-    let w = w.clamp(1, 4 * h.max(1));
-    [w, h.clamp(1, 4 * w)]
-}
 
 /// "48 MB", "1.2 GB".
 fn human_bytes(b: f64) -> String {
@@ -1604,47 +1477,11 @@ mod ratio_tests {
     use super::*;
 
     #[test]
-    fn custom_ratios_stay_within_four_to_one() {
-        assert_eq!(kept_ratio([21, 9]), [21, 9]);
-        assert_eq!(kept_ratio([99, 1]), [4, 1]);
-        assert_eq!(kept_ratio([1, 99]), [1, 4]);
-    }
-
-    #[test]
     fn exact_sizes_name_their_shape() {
         assert_eq!(ratio_label(1920, 1080), "16:9");
         assert_eq!(ratio_label(1080, 1350), "4:5");
         assert_eq!(ratio_label(2560, 1080), "64:27");
         assert_eq!(ratio_label(1366, 768), "1.78:1");
-    }
-
-    /// A custom size's sides are even, rounded the way they were changed.
-    #[test]
-    fn custom_sides_are_even() {
-        assert_eq!(even_side(1081, 1080), 1082);
-        assert_eq!(even_side(1079, 1080), 1078);
-        assert_eq!(even_side(1350, 1080), 1350);
-        assert_eq!(even_side(1351, 1920), 1350);
-        assert_eq!(even_side(capture::MAX_SIDE, capture::MAX_SIDE), capture::MAX_SIDE);
-        assert_eq!(even_side(145, 144), 146);
-    }
-
-    /// A resolution is typed as a short side, Native, or an exact size,
-    /// however it's written.
-    #[test]
-    fn typed_resolutions() {
-        use settings::OutputResolution::*;
-        assert_eq!(parse_resolution("1080"), Some(P1080));
-        assert_eq!(parse_resolution(" 1080p "), Some(P1080));
-        assert_eq!(parse_resolution("1200"), Some(Custom(1200)));
-        assert_eq!(parse_resolution("n"), Some(Native));
-        assert_eq!(parse_resolution("1920×1080"), Some(Exact(1920, 1080)));
-        assert_eq!(parse_resolution("1920x1080"), Some(Exact(1920, 1080)));
-        assert_eq!(parse_resolution("1081 x 1351"), Some(Exact(1080, 1350)));
-        assert_eq!(parse_resolution("100"), None);
-        assert_eq!(parse_resolution("8000x1000"), None);
-        assert_eq!(parse_resolution("big"), None);
-        assert_eq!(parse_resolution("1920x1080x3"), None);
     }
 }
 

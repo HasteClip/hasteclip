@@ -1788,9 +1788,6 @@ pub struct ValueField<'a> {
     pub current: Option<usize>,
     /// What "Type your own…" says about the range.
     pub range: &'a str,
-    /// One more choice under the common values, and its note: a way to a
-    /// value that isn't one number (a resolution's custom size).
-    pub more: Option<(&'a str, &'a str)>,
 }
 
 /// What happened to a [`ValueField`] this frame.
@@ -1802,8 +1799,6 @@ pub enum Typed {
     Preset(usize),
     /// A length typed or stepped in a time field ([`ValueField::show_time`]).
     Secs(f64),
-    /// Its one more choice ([`ValueField::more`]) was picked.
-    More,
 }
 
 impl ValueField<'_> {
@@ -1944,11 +1939,6 @@ impl ValueField<'_> {
                 Item::new(format!("{}{}{}", self.text, if self.unit.is_empty() { "" } else { " " }, self.unit)).check(true).value("yours").show(ui);
             }
             menu_sep(ui);
-            if let Some((label, note)) = self.more
-                && Item::new(label).icon(icon::FRAME_CORNERS).value(note).show(ui).clicked()
-            {
-                out = Typed::More;
-            }
             if Item::new("Type your own…").icon(icon::TEXT_T).value(self.range.to_owned()).show(ui).clicked() {
                 focus = true;
             }
@@ -1958,6 +1948,84 @@ impl ValueField<'_> {
         }
         out
     }
+}
+
+/// A size's width and height, each in its own box (Tab goes from one to the
+/// other), with a link between them that keeps its shape: changing one
+/// changes the other. Sides are even (video needs them so) and kept within
+/// their ranges; one typed between two goes the way it was changed. The new
+/// size, when it changes. The link is kept under `id`, for as long as the
+/// app runs ([`size_field_keeps`]); [`type_in_size`] puts the typing in its
+/// width.
+pub fn size_field(ui: &mut egui::Ui, id: &str, (w, h): (u32, u32), ws: std::ops::RangeInclusive<u32>, hs: std::ops::RangeInclusive<u32>) -> Option<(u32, u32)> {
+    const BOX: f32 = 58.0;
+    let p = theme::pal(ui);
+    let type_in = egui::Id::new((id, "type_in"));
+    if ui.data(|d| d.get_temp::<bool>(type_in)).is_some() && !ui.input(|i| i.pointer.any_click()) {
+        ui.data_mut(|d| d.remove::<bool>(type_in));
+        ui.memory_mut(|m| m.request_focus(egui::Id::new((id, "w"))));
+    }
+    let keep_id = egui::Id::new((id, "keep"));
+    let mut keep: Option<f64> = ui.data(|d| d.get_temp(keep_id));
+    let mut out = None;
+    ui.allocate_ui_with_layout(vec2(BOX * 2.0 + 28.0 + 16.0 + 6.0 * 3.0, CONTROL_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        if let Some(v) = number_box(ui, egui::Id::new((id, "w")), w, ws.clone(), BOX) {
+            let nw = typed_side(v, w, &ws);
+            out = Some((nw, keep.map_or(h, |shape| following_side(nw as f64 / shape, &hs))));
+        }
+        // The link goes between them, but is made after the height: Tab
+        // goes from the width to the height.
+        let (slot, _) = ui.allocate_exact_size(vec2(28.0, CONTROL_H), Sense::hover());
+        if let Some(v) = number_box(ui, egui::Id::new((id, "h")), h, hs.clone(), BOX) {
+            let nh = typed_side(v, h, &hs);
+            out = Some((keep.map_or(w, |shape| following_side(nh as f64 * shape, &ws)), nh));
+        }
+        ui.label(theme::text("px", 12.5, W::Regular).color(p.text3));
+        let (glyph, tip) = if keep.is_some() {
+            (icon::LINK_SIMPLE_HORIZONTAL, "The shape's kept: changing one changes the other. Click to set them on their own.")
+        } else {
+            (icon::LINK_SIMPLE_HORIZONTAL_BREAK, "Keep the shape: changing one changes the other")
+        };
+        let kind = if keep.is_some() { Kind::Normal } else { Kind::Ghost };
+        let link = ui.scope_builder(egui::UiBuilder::new().max_rect(slot).layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)), |ui| Btn::icon(kind, glyph).small().tip(tip).show(ui));
+        if link.inner.clicked() {
+            keep = if keep.is_some() { None } else { Some(w as f64 / h.max(1) as f64) };
+        }
+    });
+    ui.data_mut(|d| {
+        match keep {
+            Some(k) => {
+                d.insert_temp(keep_id, k);
+            }
+            None => {
+                d.remove::<f64>(keep_id);
+            }
+        };
+    });
+    out.filter(|s| *s != (w, h))
+}
+
+/// A side typed or stepped (from `was`), made even: up when it went up, so
+/// ↑ from 1080 reaches 1082 rather than staying. Within `r`.
+fn typed_side(v: u32, was: u32, r: &std::ops::RangeInclusive<u32>) -> u32 {
+    (if v > was { (v + 1) & !1 } else { v & !1 }).clamp(*r.start(), *r.end() & !1)
+}
+
+/// A side following the other, its shape kept: the nearest even, within `r`.
+fn following_side(v: f64, r: &std::ops::RangeInclusive<u32>) -> u32 {
+    (((v / 2.0).round() as u32) * 2).clamp(*r.start(), *r.end() & !1)
+}
+
+/// The shape a [`size_field`] keeps (width over height), if its link is on.
+pub fn size_field_keeps(ctx: &egui::Context, id: &str) -> Option<f64> {
+    ctx.data(|d| d.get_temp(egui::Id::new((id, "keep"))))
+}
+
+/// The next frame, typing goes into the [`size_field`] `id`'s width (it's
+/// just been shown, from a menu).
+pub fn type_in_size(ctx: &egui::Context, id: &str) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new((id, "type_in")), true));
 }
 
 /// A whole number in a box of its own, typed or stepped: clicking it
@@ -2162,6 +2230,22 @@ pub fn replay_click(ctx: &egui::Context, raw: &mut egui::RawInput) {
 mod tests {
     use super::*;
 
+    /// A size's sides are even: typed, rounded the way they were changed;
+    /// following the other (its shape kept), the nearest; within range.
+    #[test]
+    fn sizes_are_even() {
+        let r = 144..=4096;
+        assert_eq!(typed_side(1081, 1080, &r), 1082);
+        assert_eq!(typed_side(1079, 1080, &r), 1078);
+        assert_eq!(typed_side(1351, 1920, &r), 1350);
+        assert_eq!(typed_side(4096, 4096, &r), 4096);
+        assert_eq!(typed_side(145, 144, &r), 146);
+        assert_eq!(following_side(1080.0 * 16.0 / 9.0, &r), 1920);
+        assert_eq!(following_side(607.5, &r), 608);
+        assert_eq!(following_side(9000.0, &r), 4096);
+        assert_eq!(following_side(64.0, &(64..=3600)), 64);
+    }
+
     /// A click outside a dialog closes it without clicking the page behind.
     #[test]
     fn a_click_outside_closes_a_dialog() {
@@ -2323,13 +2407,12 @@ mod tests {
             let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0))), events, ..Default::default() };
             let mut out = ctx.run_ui(raw, |ui| {
                 let mut at = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(Pos2::new(10.0, 10.0), vec2(150.0, CONTROL_H))));
-                let field = ValueField { id: egui::Id::new("vf"), text: text.to_owned(), unit: "", width: 150.0, hint: "", presets: presets.clone(), current: None, range: "", more: None };
+                let field = ValueField { id: egui::Id::new("vf"), text: text.to_owned(), unit: "", width: 150.0, hint: "", presets: presets.clone(), current: None, range: "" };
                 got.push(match field.show(&mut at) {
                     Typed::None => String::new(),
                     Typed::Text(t) => format!("text {t}"),
                     Typed::Preset(i) => format!("preset {i}"),
                     Typed::Secs(s) => format!("secs {s}"),
-                    Typed::More => "more".to_owned(),
                 });
             });
             out.textures_delta.clear();
