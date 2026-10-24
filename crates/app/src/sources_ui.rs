@@ -879,25 +879,6 @@ impl App {
                 });
             }
         });
-        // How the screen goes into a shape of the video's own, right where
-        // the shape's chosen (it changes while clipping too).
-        if self.video_shaped() {
-            let placed = self.settings.screen.placed.is_some();
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label(theme::text("Your screen", 12.0, W::Medium).color(pal.text2));
-                if placed {
-                    ui.label(theme::text("placed by hand on the preview", 12.0, W::Regular).color(pal.text3));
-                }
-            });
-            let was = self.arrangement();
-            if let Some(f) = crate::canvas_ui::framing_choice(ui, "size_framing", (!placed).then_some(self.settings.framing)) {
-                self.screen_framed(f);
-            }
-            if self.arrangement() != was {
-                self.keep_for_undo(was);
-            }
-        }
         ui.add_space(4.0);
         crate::ui_kit::divider(ui, 0.0);
         let size = capture::frame_size(&self.video_source(), self.settings.video_size());

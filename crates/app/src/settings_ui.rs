@@ -245,22 +245,14 @@ impl App {
                 let (_, c) = l.row(Row::new("Resolution").tip("Resolution", RESOLUTION_TIP).note(res_note.clone()).locked(lock.clone()), |ui| self.resolution_field(ui));
                 locked_click |= c;
             }
-            if f.shows(&["aspect ratio", "shape", "same as screen", "16:9", "21:9", "9:16", "ultrawide", "vertical", "crop"]) {
-                let (_, c) = l.row(Row::new("Aspect ratio").tip("Aspect ratio", SHAPE_TIP).locked(lock.clone()), |ui| self.shape_field(ui, screen));
-                locked_click |= c;
-            }
-            // How the screen goes into a shape of the video's own: what it
-            // does to the screen, said. Not set before capturing: it changes
-            // while clipping too.
-            if self.video_shaped() && f.shows(&["screen", "fill", "fit", "stretch", "black bars", "aspect ratio", "crop"]) {
+            // What a shape of the video's own does to the screen, said: how
+            // it sits in the video is the screen's, on Sources.
+            if f.shows(&["aspect ratio", "shape", "same as screen", "16:9", "21:9", "9:16", "ultrawide", "vertical", "crop", "fill", "fit", "stretch", "black bars"]) {
                 let placed = self.settings.screen.placed.is_some();
                 let what = if self.settings.screen_placement().crop.is_some() { "crop" } else { "screen" };
                 let note = self.settings.capture_shape().zip(self.screen_picture()).map_or(String::new(), |(shape, size)| framing_note((!placed).then_some(self.settings.framing), shape, size, what));
-                l.row(Row::new("Screen").tip("Screen", FRAMING_TIP).note(note), |ui| {
-                    if let Some(f) = crate::canvas_ui::framing_choice(ui, "settings_framing", (!placed).then_some(self.settings.framing)) {
-                        self.screen_framed(f);
-                    }
-                });
+                let (_, c) = l.row(Row::new("Aspect ratio").tip("Aspect ratio", SHAPE_TIP).note(note).locked(lock.clone()), |ui| self.shape_field(ui, screen));
+                locked_click |= c;
             }
             if f.shows(&["frame rate", "fps"]) {
                 let (_, c) = l.row(Row::new("Frame rate").note(fps_note.clone()).locked(lock.clone()), |ui| self.fps_field(ui));
@@ -1356,8 +1348,7 @@ fn ratio_label(w: u32, h: u32) -> String {
 }
 
 /// Aspect ratio's tip.
-const FRAMING_TIP: &str = "How your screen goes into your video's shape. Fill: its middle covers all of the video, and what's past it is cut off. Fit: all of it, as big as fits, with black bars. Stretch: all of it over all of the video, stretched or squeezed. On the Sources page you can also drag it into a box of its own.";
-const SHAPE_TIP: &str = "Record in another aspect ratio than your screen's: 16:9 out of an ultrawide screen, say, or 9:16 for phones. Every recording and clip is made in it. How your screen goes into it is under it: its middle filling it, all of it with black bars, or stretched. A custom size has a shape of its own.";
+const SHAPE_TIP: &str = "Record in another aspect ratio than your screen's: 16:9 out of an ultrawide screen, say, or 9:16 for phones. Every recording and clip is made in it. A custom size has a shape of its own. How your screen sits in it is on the Sources page: drag it on the preview to show another part of it or make it smaller (Shift stretches it), or right-click it to fill the video, fit all of it in, or stretch it.";
 
 /// The screen capture setting shows: Windows, where there's a choice.
 const SCREEN_CAPTURE: bool = cfg!(target_os = "windows");
