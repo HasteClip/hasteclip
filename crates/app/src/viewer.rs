@@ -91,6 +91,38 @@ struct Loaded {
     span: Span,
 }
 
+/// Whether opening the clip would wait on nothing: it's been probed, and so
+/// has its original (an edited clip reads both: the file, and where it sits
+/// in the recording).
+fn already_read(path: &Path) -> bool {
+    if media::probed(path).is_none() {
+        return false;
+    }
+    let target = crate::store::EditTarget::of(path);
+    target.source == path || media::probed(&target.source).is_some()
+}
+
+fn load(source: &Path) -> Result<Loaded, String> {
+    let info = media::probe(source).map_err(|e| e.to_string())?;
+    // Track 1 is the mix in our clips; in any other file it's simply the
+    // first. Playing starts with what's decoded: no waiting for the whole
+    // file to be read.
+    let tracks: Vec<usize> = info.audio.first().map(|a| a.index).into_iter().collect();
+    if crate::player::debug() {
+        eprintln!("{:>8.3} viewer: clip read", crate::player::uptime());
+    }
+    let pcm = media::pcm::decode_streaming(source, &tracks, info.duration, |_, result| {
+        if let Err(e) = result {
+            eprintln!("decoding the sound: {e:#}");
+        }
+        if crate::player::debug() {
+            eprintln!("{:>8.3} viewer: sound all decoded", crate::player::uptime());
+        }
+    });
+    let span = recording_span(source, info.duration);
+    Ok(Loaded { info, pcm, span })
+}
+
 enum State {
     /// The clip's edit is being saved: it opens once it's done (its file
     /// is about to be replaced, which an open file would block).
@@ -162,37 +194,26 @@ impl Viewer {
         if crate::player::debug() {
             eprintln!("{:>8.3} viewer: opening {}", crate::player::uptime(), clip.display());
         }
-        let (tx, rx) = mpsc::channel();
-        let src = clip.to_path_buf();
-        let repaint = ctx.clone();
-        std::thread::spawn(move || {
-            let result = (|| -> Result<Loaded, String> {
-                let info = media::probe(&src).map_err(|e| e.to_string())?;
-                // Track 1 is the mix in our clips; in any other file it's simply
-                // the first. Playing starts with what's decoded: no waiting for
-                // the whole file to be read.
-                let tracks: Vec<usize> = info.audio.first().map(|a| a.index).into_iter().collect();
-                if crate::player::debug() {
-                    eprintln!("{:>8.3} viewer: clip read", crate::player::uptime());
-                }
-                let pcm = media::pcm::decode_streaming(&src, &tracks, info.duration, move |_, result| {
-                    if let Err(e) = result {
-                        eprintln!("decoding the sound: {e:#}");
-                    }
-                    if crate::player::debug() {
-                        eprintln!("{:>8.3} viewer: sound all decoded", crate::player::uptime());
-                    }
-                });
-                let span = recording_span(&src, info.duration);
-                Ok(Loaded { info, pcm, span })
-            })();
-            if let Err(e) = &result {
-                eprintln!("couldn't open {} in the player: {e}", src.display());
+        let state = if already_read(clip) {
+            match load(clip) {
+                Ok(l) => State::Ready(Box::new(Ready::new(ctx, clip, l, resume))),
+                Err(e) => State::Failed(e),
             }
-            let _ = tx.send(result);
-            repaint.request_repaint();
-        });
-        Self { clip: clip.to_path_buf(), state: State::Loading(rx), resume }
+        } else {
+            let (tx, rx) = mpsc::channel();
+            let src = clip.to_path_buf();
+            let repaint = ctx.clone();
+            std::thread::spawn(move || {
+                let result = load(&src);
+                if let Err(e) = &result {
+                    eprintln!("couldn't open {} in the player: {e}", src.display());
+                }
+                let _ = tx.send(result);
+                repaint.request_repaint();
+            });
+            State::Loading(rx)
+        };
+        Self { clip: clip.to_path_buf(), state, resume }
     }
 
     pub fn clip(&self) -> &Path {

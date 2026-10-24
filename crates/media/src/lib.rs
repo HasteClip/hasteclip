@@ -157,7 +157,44 @@ impl AudioStream {
     }
 }
 
+/// A file's size and when it was last written: how a clip is told from the
+/// clip it replaces, so what's remembered of it can be dropped.
+pub(crate) type Stamp = (u64, Option<std::time::SystemTime>);
+
+pub(crate) fn stamp(source: &Path) -> Option<Stamp> {
+    let meta = std::fs::metadata(source).ok()?;
+    Some((meta.len(), meta.modified().ok()))
+}
+
+static PROBED: std::sync::Mutex<Vec<(PathBuf, Stamp, ClipInfo)>> = std::sync::Mutex::new(Vec::new());
+
+const PROBED_KEEP: usize = 64;
+
+pub fn probed(source: &Path) -> Option<ClipInfo> {
+    let stamp = stamp(source)?;
+    let mut read = PROBED.lock().ok()?;
+    let at = read.iter().position(|(path, at, _)| path == source && *at == stamp)?;
+    let info = read[at].2.clone();
+    // The one just read goes last: when it's full, the stalest drop first.
+    let hit = read.remove(at);
+    read.push(hit);
+    Some(info)
+}
+
+fn remember(source: &Path, info: &ClipInfo) {
+    let Some(stamp) = stamp(source) else { return };
+    let Ok(mut read) = PROBED.lock() else { return };
+    read.retain(|(path, _, _)| path != source);
+    read.push((source.to_path_buf(), stamp, info.clone()));
+    if read.len() > PROBED_KEEP {
+        read.remove(0);
+    }
+}
+
 pub fn probe(source: &Path) -> Result<ClipInfo> {
+    if let Some(info) = probed(source) {
+        return Ok(info);
+    }
     let out = ffprobe()
         .args(["-v", "error", "-show_entries"])
         .arg("format=duration:format_tags=comment:stream=index,codec_type,width,height,avg_frame_rate,r_frame_rate,bit_rate,color_space:stream_tags=title,handler_name,name")
@@ -236,7 +273,7 @@ pub fn probe(source: &Path) -> Result<ClipInfo> {
             in_mix: mix_members.as_ref().is_none_or(|m| m.contains(&index)),
         })
         .collect();
-    Ok(ClipInfo {
+    let info = ClipInfo {
         duration,
         fps,
         width: video.width.unwrap_or(0),
@@ -250,7 +287,9 @@ pub fn probe(source: &Path) -> Result<ClipInfo> {
             Some("unknown") | None => video.height.is_some_and(|h| h < 720),
             Some(_) => false,
         },
-    })
+    };
+    remember(source, &info);
+    Ok(info)
 }
 
 /// What our file comment says about a clip.
@@ -2014,6 +2053,47 @@ mod cut_render_tests {
         let sound = decode_audio(&out, 1).unwrap();
         assert!((sound.len() as f64 / 2.0 / PREVIEW_RATE as f64 - 1.0).abs() < 0.002, "the sound lasts {} s", sound.len() as f64 / 2.0 / PREVIEW_RATE as f64);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    /// A test clip, made by ffmpeg: a second long, or `secs`, on a plain tone.
+    fn clip(name: &str, secs: f64) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("hc-probe-{name}-{}.mp4", std::process::id()));
+        let ok = ffmpeg()
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+            .arg(format!("testsrc=size=64x48:rate=10:duration={secs}"))
+            .args(["-f", "lavfi", "-i"])
+            .arg(format!("sine=frequency=440:duration={secs}"))
+            .args(["-c:v", "libx264", "-c:a", "aac"])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        path
+    }
+
+    /// What a probe reads is kept, for opening the same clip again (the
+    /// player, then the editor) without spawning ffprobe; a file written over
+    /// is read again, as it must be after a render.
+    #[test]
+    fn what_a_probe_reads_is_kept() {
+        let path = clip("kept", 2.0);
+        assert!(probed(&path).is_none(), "nothing read yet");
+        let (first, again) = (probe(&path).unwrap(), probed(&path).expect("read just now"));
+        assert!((first.duration - 2.0).abs() < 0.2, "{}", first.duration);
+        assert_eq!(again.duration, first.duration);
+        assert_eq!(again.audio.len(), first.audio.len());
+
+        let shorter = clip("shorter", 1.0);
+        std::fs::rename(&shorter, &path).unwrap();
+        let replaced = probe(&path).unwrap();
+        assert!((replaced.duration - 1.0).abs() < 0.2, "read again: {} s", replaced.duration);
+        assert_eq!(probed(&path).unwrap().duration, replaced.duration);
+        std::fs::remove_file(&path).unwrap();
     }
 }
 

@@ -27,8 +27,12 @@ static DECODING: AtomicUsize = AtomicUsize::new(0);
 static RUNNING: std::sync::Mutex<Vec<(std::path::PathBuf, Arc<AtomicBool>)>> = std::sync::Mutex::new(Vec::new());
 
 /// Stop decoding `source`'s sound (it's about to be deleted: Windows won't
-/// delete a file ffmpeg has open). What's decoded stays.
+/// delete a file ffmpeg has open). What's decoded stays with whoever plays
+/// it; the cache forgets it, so a decode cut short is never a clip's sound.
 pub fn release(source: &Path) {
+    if let Ok(mut kept) = DECODED.lock() {
+        kept.retain(|s| s.path != source);
+    }
     for (path, cancel) in RUNNING.lock().unwrap().iter() {
         if path == source {
             cancel.store(true, Ordering::Relaxed);
@@ -166,15 +170,58 @@ impl Pcm {
     }
 }
 
+static DECODED: std::sync::Mutex<Vec<Shared>> = std::sync::Mutex::new(Vec::new());
+
+struct Shared {
+    path: std::path::PathBuf,
+    stamp: crate::Stamp,
+    tracks: Vec<usize>,
+    pcm: Arc<Pcm>,
+    used: std::time::Instant,
+}
+
+const KEEP: usize = 2;
+const UNUSED: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn shared(source: &Path, tracks: &[usize]) -> Option<Arc<Pcm>> {
+    let stamp = crate::stamp(source)?;
+    let mut kept = DECODED.lock().ok()?;
+    sweep(&mut kept);
+    let at = kept.iter().position(|s| s.path == source && s.stamp == stamp && s.tracks == tracks)?;
+    kept[at].used = std::time::Instant::now();
+    Some(kept[at].pcm.clone())
+}
+
+fn keep(source: &Path, tracks: &[usize], pcm: &Arc<Pcm>) {
+    let Some(stamp) = crate::stamp(source) else { return };
+    let Ok(mut kept) = DECODED.lock() else { return };
+    kept.retain(|s| !(s.path == source && s.stamp == stamp && s.tracks == tracks));
+    kept.push(Shared { path: source.to_path_buf(), stamp, tracks: tracks.to_vec(), pcm: pcm.clone(), used: std::time::Instant::now() });
+    sweep(&mut kept);
+}
+
+fn sweep(kept: &mut Vec<Shared>) {
+    let now = std::time::Instant::now();
+    kept.retain(|s| Arc::strong_count(&s.pcm) > 1 || now.duration_since(s.used) < UNUSED);
+    while kept.len() > KEEP {
+        let oldest = kept.iter().enumerate().min_by_key(|(_, s)| s.used).map_or(0, |(i, _)| i);
+        kept.remove(oldest);
+    }
+}
+
 /// Start decoding these audio streams (`indices`, as `0:a:<index>`) of a clip
 /// `duration` seconds long. Returns at once; `finished` is called (on a
-/// decoding thread) when every track is done, or one failed.
+/// decoding thread) when every track is done, or one failed - for a decode
+/// this starts: sound that's decoded already needs no finishing.
 ///
 /// One ffmpeg per track, side by side: Windows reads the file once for all of
 /// them (they go through it together), and each decodes on its own core —
 /// faster to the end than one ffmpeg decoding them all (1.9 s vs 2.6 s for a
 /// 2-minute clip on a hard drive), and the start is there as soon.
 pub fn decode_streaming(source: &Path, indices: &[usize], duration: f64, finished: impl FnOnce(&Pcm, Result<()>) + Send + 'static) -> Arc<Pcm> {
+    if let Some(pcm) = shared(source, indices) {
+        return pcm;
+    }
     // Room for the whole clip and a little more (the duration is the
     // container's, rounded); anything past it is dropped.
     let frames = ((duration.max(0.0) + 2.0) * PREVIEW_RATE as f64) as usize;
@@ -183,6 +230,7 @@ pub fn decode_streaming(source: &Path, indices: &[usize], duration: f64, finishe
         finished(&pcm, Ok(()));
         return pcm;
     }
+    keep(source, indices, &pcm);
     let (source, indices, out) = (source.to_path_buf(), indices.to_vec(), pcm.clone());
     DECODING.fetch_add(1, Ordering::Relaxed);
     let cancel = Arc::new(AtomicBool::new(false));
@@ -276,5 +324,63 @@ mod tests {
         assert_eq!(t.frame(1000), Some((back[2000], back[2001])));
         assert_eq!(t.frame(1002), None, "past what's decoded");
         assert_eq!(t.copy(2, 6), back[2..6]);
+    }
+
+    /// A clip with one tone on each of two audio streams.
+    fn clip(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("hc-pcm-{name}-{}.mp4", std::process::id()));
+        let ok = crate::ffmpeg()
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=10:duration=2"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=2"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=660:duration=2"])
+            .args(["-map", "0", "-map", "1", "-map", "2", "-c:v", "libx264", "-c:a", "aac"])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        path
+    }
+
+    fn wait(pcm: &Pcm) {
+        for _ in 0..400 {
+            if pcm.is_done() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        panic!("the sound never finished decoding");
+    }
+
+    /// The same clip's sound, opened again (swapping between the player and
+    /// the editor), is the same sound: decoded once, not read again.
+    #[test]
+    fn the_same_sound_is_shared() {
+        let path = clip("shared");
+        let first = decode_streaming(&path, &[0], 2.0, |_, _| {});
+        wait(&first);
+        let second = decode_streaming(&path, &[0], 2.0, |_, _| panic!("decoded again"));
+        assert!(Arc::ptr_eq(&first, &second), "the sound was read again");
+        assert!(second.is_done() && second.tracks()[0].len() > 0);
+        // The editor's tracks are another sound: its own decode.
+        let tracks = decode_streaming(&path, &[1], 2.0, |_, _| {});
+        assert!(!Arc::ptr_eq(&first, &tracks));
+        wait(&tracks);
+        let a = first.tracks()[0].to_vec();
+        let b = tracks.tracks()[0].to_vec();
+        assert!(a.len() > 1000 && (a[1000] - b[1000]).abs() > 0.01, "two tones, not one");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A decode cut short (its file is about to be deleted) isn't kept: the
+    /// next open reads the file again instead of playing half a clip.
+    #[test]
+    fn a_cancelled_decode_is_not_kept() {
+        let path = clip("cancelled");
+        let first = decode_streaming(&path, &[0], 2.0, |_, _| {});
+        release(&path);
+        let again = decode_streaming(&path, &[0], 2.0, |_, _| {});
+        assert!(!Arc::ptr_eq(&first, &again));
+        wait(&again);
+        std::fs::remove_file(&path).unwrap();
     }
 }

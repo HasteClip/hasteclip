@@ -64,6 +64,23 @@ struct Loaded {
     pcm: Arc<media::pcm::Pcm>,
 }
 
+fn load(source: &Path) -> Result<Loaded, String> {
+    let info = media::probe(source).map_err(|e| e.to_string())?;
+    let tracks: Vec<usize> = info.source_tracks().iter().map(|t| t.index).collect();
+    if crate::player::debug() {
+        eprintln!("{:>8.3} editor: clip read, decoding {} tracks", crate::player::uptime(), tracks.len());
+    }
+    let pcm = media::pcm::decode_streaming(source, &tracks, info.duration, |_, result| {
+        if let Err(e) = result {
+            eprintln!("decoding the sound: {e:#}");
+        }
+        if crate::player::debug() {
+            eprintln!("{:>8.3} editor: sound all decoded", crate::player::uptime());
+        }
+    });
+    Ok(Loaded { info, pcm })
+}
+
 enum State {
     Loading(Receiver<Result<Loaded, String>>),
     Failed(String),
@@ -230,32 +247,22 @@ impl Editor {
     /// every earlier decision can still be changed.
     pub fn open(ctx: &egui::Context, clip: &Path, preview_share: f32, snap: bool, from: Option<Resume>) -> Self {
         let target = EditTarget::of(clip);
-        let (tx, rx) = mpsc::channel();
-        let src = target.source.clone();
-        let repaint = ctx.clone();
-        std::thread::spawn(move || {
-            let result = (|| -> Result<Loaded, String> {
-                let info = media::probe(&src).map_err(|e| e.to_string())?;
-                // Every track at once, playable as it's decoded; the
-                // waveforms follow once it's all there.
-                let tracks: Vec<usize> = info.source_tracks().iter().map(|t| t.index).collect();
-                if crate::player::debug() {
-                    eprintln!("{:>8.3} editor: clip read, decoding {} tracks", crate::player::uptime(), tracks.len());
-                }
-                let pcm = media::pcm::decode_streaming(&src, &tracks, info.duration, |_, result| {
-                    if let Err(e) = result {
-                        eprintln!("decoding the sound: {e:#}");
-                    }
-                    if crate::player::debug() {
-                        eprintln!("{:>8.3} editor: sound all decoded", crate::player::uptime());
-                    }
-                });
-                Ok(Loaded { info, pcm })
-            })();
-            let _ = tx.send(result);
-            repaint.request_repaint();
-        });
-        Self { target, state: State::Loading(rx), preview_share, snap, from }
+        let state = if media::probed(&target.source).is_some() {
+            match load(&target.source) {
+                Ok(l) => State::Ready(Box::new(Ready::new(ctx, &target, l, snap, from))),
+                Err(e) => State::Failed(e),
+            }
+        } else {
+            let (tx, rx) = mpsc::channel();
+            let src = target.source.clone();
+            let repaint = ctx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(load(&src));
+                repaint.request_repaint();
+            });
+            State::Loading(rx)
+        };
+        Self { target, state, preview_share, snap, from }
     }
 
     /// The clip was renamed from `from` to `to`: saved under the new name.

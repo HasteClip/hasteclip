@@ -1774,8 +1774,25 @@ impl App {
             return;
         }
         self.listen_as_set();
+        Self::warm_view(&clip);
         self.editor = Some(editor::Editor::open(&self.ctx(), &clip, self.settings.editor_preview_share, self.settings.editor_snap, from));
         self.page = Page::Edit;
+    }
+
+    fn warm_edit(clip: &std::path::Path) {
+        let clip = clip.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = media::probe(&store::EditTarget::of(&clip).source);
+        });
+    }
+
+    fn warm_view(clip: &std::path::Path) {
+        let clip = clip.to_path_buf();
+        std::thread::spawn(move || {
+            if store::EditTarget::of(&clip).source != clip {
+                let _ = media::probe(&clip);
+            }
+        });
     }
 
     /// The volume and mute you listen at, as last set (the player and the
@@ -1793,6 +1810,7 @@ impl App {
 
     pub(crate) fn open_viewer_at(&mut self, clip: PathBuf, resume: Option<viewer::Resume>) {
         self.listen_as_set();
+        Self::warm_edit(&clip);
         self.viewer = Some(self.viewer_for(&clip, resume));
         self.page = Page::View;
     }
