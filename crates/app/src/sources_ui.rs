@@ -800,6 +800,21 @@ impl App {
                     self.settings.resolution = R::PRESETS.iter().copied().find(|r| r.short_side() == Some(short)).unwrap_or(R::Custom(short));
                 }
             }
+            // Cropped (on its page, or with Alt on the preview), filling the
+            // video: the crop's size, for every pixel of it as it is.
+            let video = capture::frame_size(&self.video_source(), self.settings.video_size());
+            if let Some((w, h)) = self.crop_size().filter(|m| Some(*m) != video) {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.label(theme::text(format!("Your screen's cropped to {w}×{h}"), 12.5, W::Regular).color(pal.text2));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let b = crate::ui_kit::Btn::normal("Match the crop").small().tip(format!("Make your video {w}×{h}, the crop's size: every pixel of it as it is"));
+                        if b.show(ui).clicked() {
+                            self.settings.resolution = R::Exact(w, h);
+                        }
+                    });
+                });
+            }
         });
         ui.add_space(4.0);
         crate::ui_kit::divider(ui, 0.0);
@@ -841,6 +856,15 @@ impl App {
                 ui.label(crate::theme::text(text, 12.5, crate::theme::W::Regular).color(pal.text3));
             });
         });
+    }
+
+    /// The size a video would be to show the screen's crop as it is (even,
+    /// as big as a video can be), when it's cropped and fills the video.
+    fn crop_size(&self) -> Option<(u32, u32)> {
+        let (sw, sh) = self.crop_whole()?;
+        let crop = self.settings.screen_crop.filter(|c| !c.is_none() && self.settings.screen.placed.is_none())?;
+        let [_, _, w, h] = capture::Crop::from(crop).rect(sw, sh);
+        ((w, h) != (sw & !1, sh & !1)).then(|| capture::output_size(w, h, None))
     }
 
     /// The display's own size, uncropped, when it's known.
