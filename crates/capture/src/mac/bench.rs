@@ -38,6 +38,7 @@ fn settings(fps: u32, kbps: u32) -> EncodeSettings {
         video: VideoSource::Screen { id: String::new(), hook: Default::default(), method: Default::default(), crop: None },
         away_screen: None,
         webcam: None,
+        screen: Arc::new(Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit))),
         sources: Vec::new(),
     }
 }
@@ -114,7 +115,9 @@ pub fn save_render(screen: &Path, camera: Option<&Path>, out: &Path, mode: Rende
         }
         let buf = pool.take()?;
         let ct = Instant::now();
-        gpu.compose(surface.buffer(), cam_frame.as_ref().map(|c| c.buffer()), placement.unwrap_or_else(Placement::hidden), &buf)?;
+        let (bw, bh) = super::video::size_of(surface.buffer());
+        let whole = Some(super::gpu::ScreenRects::copied(bw, bh));
+        gpu.compose(surface.buffer(), whole, false, cam_frame.as_ref().map(|c| c.buffer()), placement.unwrap_or_else(Placement::hidden), &buf)?;
         compose_time += ct.elapsed();
         if let Some(e) = &encoder {
             e.encode(&buf, p.index as i64, 60);
@@ -264,7 +267,8 @@ pub fn live(mode: LiveMode, secs: f64, camera: &str, dir: &Path, kbps: u32, cam_
     }
     let picture = Picture::start(&source, &content, &display, (w, h), fps, None, crate::Framing::Fit)?;
     let composite = if mode == LiveMode::Composited { webcam.as_ref() } else { None };
-    let mut frames = Frames::new(picture.latest.clone(), composite, w, h, 0)?;
+    let whole = Arc::new(Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit)));
+    let mut frames = Frames::new(picture.latest.clone(), composite, whole, Some(picture.ctl()), w, h, 0)?;
 
     let t0 = Arc::new(Mutex::new(0.0));
     let screen_stats = Arc::new(Mutex::new(Stats::default()));

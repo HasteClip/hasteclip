@@ -1,16 +1,17 @@
 //! The GPU side of video on macOS: frames in IOSurfaces opened as Metal
 //! textures without copying, and the compositor that draws the webcam over
-//! the screen's picture straight into the encoder's own buffers.
+//! the screen's picture (or under it) straight into the encoder's own buffers.
 //!
 //! Everything stays NV12 (studio range, BT.709) end to end: ScreenCaptureKit
 //! delivers it, cameras deliver it, VideoToolbox encodes it. The compositor
-//! never converts colour: outside the webcam's box it copies the screen's
-//! samples as they are, inside it resamples the camera's (averaging every
-//! camera pixel an output pixel covers when shrinking, bilinear when
-//! enlarging), luma and chroma each on their own grid.
+//! never converts colour: where the screen fills the frame it copies its
+//! samples as they are; in a box of its own, and inside the webcam's box,
+//! it resamples (averaging every pixel an output pixel covers when
+//! shrinking, bilinear when enlarging), luma and chroma each on their own
+//! grid.
 //!
-//! Without a webcam nothing here runs: the screen's own buffers go to the
-//! encoder.
+//! Without a webcam, while the screen fills the frame, nothing here runs:
+//! the screen's own buffers go to the encoder.
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -61,6 +62,37 @@ struct Overlay {
     _pad: u32,
 }
 
+/// Where the screen's picture is drawn from (in the stream's frame) and to
+/// (in the frame made), as x0, y0, x1, y1 in luma pixels; `copy` when it's
+/// the same place, its samples taken as they are.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ScreenRects {
+    pub src: [f32; 4],
+    pub dest: [f32; 4],
+    pub copy: bool,
+}
+
+impl ScreenRects {
+    /// All of a `w`×`h` frame, as it is.
+    pub(crate) fn copied(w: usize, h: usize) -> Self {
+        let all = [0.0, 0.0, w as f32, h as f32];
+        Self { src: all, dest: all, copy: true }
+    }
+}
+
+/// [`ScreenRects`] for the kernels, in the pixels of the plane being written.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Screen {
+    dest: [f32; 4],
+    src: [f32; 4],
+    shown: u32,
+    copy: u32,
+    /// In front of the webcam.
+    front: u32,
+    _pad: u32,
+}
+
 impl Gpu {
     pub(crate) fn new() -> Result<Self> {
         let device = MTLCreateSystemDefaultDevice().context("no Metal device")?;
@@ -73,10 +105,12 @@ impl Gpu {
         plane_texture(&self.device, buf, plane, write)
     }
 
-    /// Draw `camera` (cropped, placed and mirrored as `placement` says) over
-    /// `screen` into `out`, all NV12 the same size as `out` except the camera.
-    /// Waits for the GPU (well under a millisecond at 1440p).
-    pub(crate) fn compose(&self, screen: &CVPixelBuffer, camera: Option<&CVPixelBuffer>, placement: Placement, out: &CVPixelBuffer) -> Result<()> {
+    /// Make a frame in `out`: `screen`'s picture where `shown` says (nothing
+    /// of it when `None`), and `camera` (cropped, placed and mirrored as
+    /// `placement` says) over it, or under it when the screen's `in_front`;
+    /// black elsewhere. All NV12, `screen` and `out` the same size. Waits for
+    /// the GPU (well under a millisecond at 1440p).
+    pub(crate) fn compose(&self, screen: &CVPixelBuffer, shown: Option<ScreenRects>, in_front: bool, camera: Option<&CVPixelBuffer>, placement: Placement, out: &CVPixelBuffer) -> Result<()> {
         for b in [Some(screen), camera, Some(out)].into_iter().flatten() {
             if CVPixelBufferGetPixelFormatType(b) != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange {
                 bail!("the compositor takes NV12 frames");
@@ -97,12 +131,14 @@ impl Gpu {
             };
             // In this plane's pixels: chroma is half size both ways.
             let o = overlay.map(|o| Overlay { dest: o.dest.map(|v| v * scale), src: o.src.map(|v| v * scale), cam: o.cam.map(|v| v * scale), ..o }).unwrap_or_default();
+            let sc = shown.map_or(Screen::default(), |r| Screen { dest: r.dest.map(|v| v * scale), src: r.src.map(|v| v * scale), shown: 1, copy: u32::from(r.copy), front: u32::from(in_front), _pad: 0 });
             enc.setComputePipelineState(pipeline);
             unsafe {
                 enc.setTexture_atIndex(Some(&src), 0);
                 enc.setTexture_atIndex(Some(&cam), 1);
                 enc.setTexture_atIndex(Some(&dst), 2);
                 enc.setBytes_length_atIndex(NonNull::from(&o).cast::<c_void>(), std::mem::size_of::<Overlay>(), 0);
+                enc.setBytes_length_atIndex(NonNull::from(&sc).cast::<c_void>(), std::mem::size_of::<Screen>(), 1);
             }
             let size = MTLSize { width: dst.width(), height: dst.height(), depth: 1 };
             enc.dispatchThreads_threadsPerThreadgroup(size, MTLSize { width: 16, height: 16, depth: 1 });
@@ -222,10 +258,11 @@ fn overlay_rects(p: Placement, (cw, ch): (u32, u32), width: u32, height: u32) ->
     Some(Overlay { dest: [dx0, dy0, dx1, dy1], src: [sx0, sy0, sx1, sy1], cam, turns: (p.turns % 4) as u32, _pad: 0 })
 }
 
-/// One kernel per plane: copy the screen's sample, or inside the webcam's
-/// box resample the camera's. Shrinking averages every camera pixel the
-/// output pixel covers (up to 8×8 taps: a 1080p camera in a box a quarter of
-/// a 1440p frame is ~3× smaller); enlarging is bilinear.
+/// One kernel per plane: the screen's sample (copied, or resampled into its
+/// box), or inside the webcam's box the camera's, whichever is in front;
+/// black where neither is. Shrinking averages every pixel the output pixel
+/// covers (up to 8×8 taps: a 1080p camera in a box a quarter of a 1440p
+/// frame is ~3× smaller); enlarging is bilinear.
 const KERNELS: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -237,6 +274,19 @@ struct Overlay {
     uint turns;
     uint pad;
 };
+
+struct Screen {
+    float4 dest;
+    float4 src;
+    uint shown;
+    uint copy;
+    uint front;
+    uint pad;
+};
+
+bool inside(float2 p, float4 r) {
+    return p.x >= r.x && p.x < r.z && p.y >= r.y && p.y < r.w;
+}
 
 // A point of the turned picture, in the camera's own.
 float2 unturn(float2 p, constant Overlay& o) {
@@ -275,38 +325,53 @@ T resample(texture2d<float, access::read> cam, float2 p0, float2 p1, T zero) {
     return sum / float(n.x * n.y);
 }
 
+// The screen's sample at `p`: its own when it's copied, else resampled from
+// the part of its picture that goes in its box.
+float2 screen_at(texture2d<float, access::read> screen, constant Screen& s, float2 p, uint2 gid) {
+    if (s.copy != 0) return screen.read(gid).xy;
+    float2 scale = (s.src.zw - s.src.xy) / (s.dest.zw - s.dest.xy);
+    float2 p0 = s.src.xy + (p - s.dest.xy) * scale;
+    return resample<float2>(screen, p0, p0 + scale, float2(0));
+}
+
+// The camera's sample at `p` (inside its box).
+float2 camera_at(texture2d<float, access::read> cam, constant Overlay& o, float2 p) {
+    float2 scale = (o.src.zw - o.src.xy) / (o.dest.zw - o.dest.xy);
+    float2 p0 = o.src.xy + (p - o.dest.xy) * scale;
+    return resample<float2>(cam, unturn(p0, o), unturn(p0 + scale, o), float2(0));
+}
+
+// What goes at `p`: the screen or the camera, whichever is in front there;
+// elsewhere what's copied (black around the picture), or `black`.
+float2 sample_at(texture2d<float, access::read> screen, texture2d<float, access::read> cam, constant Overlay& o, constant Screen& s, uint2 gid, float2 black) {
+    float2 p = float2(gid);
+    bool in_cam = inside(p, o.dest);
+    bool in_scr = s.shown != 0 && inside(p, s.dest);
+    if (in_scr && (s.front != 0 || !in_cam)) return screen_at(screen, s, p, gid);
+    if (in_cam) return camera_at(cam, o, p);
+    return s.copy != 0 ? screen.read(gid).xy : black;
+}
+
 kernel void luma(texture2d<float, access::read> screen [[texture(0)]],
                  texture2d<float, access::read> cam [[texture(1)]],
                  texture2d<float, access::write> out [[texture(2)]],
                  constant Overlay& o [[buffer(0)]],
+                 constant Screen& s [[buffer(1)]],
                  uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= out.get_width() || gid.y >= out.get_height()) return;
-    float2 p = float2(gid);
-    if (p.x >= o.dest.x && p.x < o.dest.z && p.y >= o.dest.y && p.y < o.dest.w) {
-        float2 scale = (o.src.zw - o.src.xy) / (o.dest.zw - o.dest.xy);
-        float2 p0 = o.src.xy + (p - o.dest.xy) * scale;
-        float y = resample<float2>(cam, unturn(p0, o), unturn(p0 + scale, o), float2(0)).x;
-        out.write(float4(y, 0, 0, 1), gid);
-    } else {
-        out.write(screen.read(gid), gid);
-    }
+    float y = sample_at(screen, cam, o, s, gid, float2(16.0 / 255.0, 0)).x;
+    out.write(float4(y, 0, 0, 1), gid);
 }
 
 kernel void chroma(texture2d<float, access::read> screen [[texture(0)]],
                    texture2d<float, access::read> cam [[texture(1)]],
                    texture2d<float, access::write> out [[texture(2)]],
                    constant Overlay& o [[buffer(0)]],
+                   constant Screen& s [[buffer(1)]],
                    uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= out.get_width() || gid.y >= out.get_height()) return;
-    float2 p = float2(gid);
-    if (p.x >= o.dest.x && p.x < o.dest.z && p.y >= o.dest.y && p.y < o.dest.w) {
-        float2 scale = (o.src.zw - o.src.xy) / (o.dest.zw - o.dest.xy);
-        float2 p0 = o.src.xy + (p - o.dest.xy) * scale;
-        float2 cbcr = resample<float2>(cam, unturn(p0, o), unturn(p0 + scale, o), float2(0));
-        out.write(float4(cbcr, 0, 1), gid);
-    } else {
-        out.write(screen.read(gid), gid);
-    }
+    float2 cbcr = sample_at(screen, cam, o, s, gid, float2(128.0 / 255.0));
+    out.write(float4(cbcr, 0, 1), gid);
 }
 "#;
 
@@ -368,7 +433,7 @@ mod tests {
         let out = FramePool::new(640, 360).unwrap().take().unwrap();
         // A 180x320 box (the turned camera's shape) at the frame's top-left.
         let p = Placement { x: 0.0, y: 0.0, w: 180.0 / 640.0, h: 320.0 / 360.0, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 1 };
-        gpu.compose(&screen, Some(&cam), p, &out).unwrap();
+        gpu.compose(&screen, Some(ScreenRects::copied(640, 360)), false, Some(&cam), p, &out).unwrap();
         let (y, _) = planes(&out);
         assert_eq!(y[40 * 640 + 90], 20, "top half is the camera's left");
         assert_eq!(y[280 * 640 + 90], 200, "bottom half is the camera's right");
@@ -393,7 +458,7 @@ mod tests {
         let cam = fill(320, 180, 200, 50, 60);
         let out = FramePool::new(640, 360).unwrap().take().unwrap();
         let p = Placement { x: 0.5, y: 0.5, w: 0.25, h: 0.25, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0 };
-        gpu.compose(&screen, Some(&cam), p, &out).unwrap();
+        gpu.compose(&screen, Some(ScreenRects::copied(640, 360)), false, Some(&cam), p, &out).unwrap();
         let (y, c) = planes(&out);
         assert_eq!(y[10 * 640 + 10], 100);
         assert_eq!(c[(10 * 320 + 10) * 2..][..2], [110, 120]);

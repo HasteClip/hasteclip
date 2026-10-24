@@ -45,6 +45,24 @@ default: {:?}", d.inputs.iter().map(|i| &i.name).collect::<Vec<_>>(), d.default_
     let mode = if std::env::var("REPLAY").is_ok() { Mode::ReplayBuffer } else { Mode::Record };
     let mut rec = capture::default_recorder(live.clone());
     let env = |k: &str| std::env::var(k).ok();
+    let size = capture::VideoSize {
+        short_side: match env("HEIGHT").and_then(|h| h.parse().ok()) {
+            Some(0) => None,
+            Some(h) => Some(h),
+            None => Some(720),
+        },
+        shape: env("SHAPE").and_then(|s| {
+            let mut parts = s.split(':');
+            let (w, h) = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
+            let framing = match parts.next() {
+                Some("fit") => capture::Framing::Fit,
+                Some("stretch") => capture::Framing::Stretch,
+                _ => capture::Framing::Fill,
+            };
+            Some(capture::Shape { w, h, framing })
+        }),
+        exact: None,
+    };
     rec.start(mode, &EncodeSettings {
         output_dir: std::env::temp_dir().join("hc"),
         container_ext: env("EXT").unwrap_or("mp4".into()),
@@ -52,24 +70,7 @@ default: {:?}", d.inputs.iter().map(|i| &i.name).collect::<Vec<_>>(), d.default_
         blend_samples: env("BLEND").and_then(|f| f.parse().ok()).unwrap_or(1),
         blend_shape: if env("SOFT").is_some_and(|v| v == "1") { capture::BlendShape::Soft } else { capture::BlendShape::Even },
         video_bitrate_kbps: 12000,
-        size: capture::VideoSize {
-            short_side: match env("HEIGHT").and_then(|h| h.parse().ok()) {
-                Some(0) => None,
-                Some(h) => Some(h),
-                None => Some(720),
-            },
-            shape: env("SHAPE").and_then(|s| {
-                let mut parts = s.split(':');
-                let (w, h) = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
-                let framing = match parts.next() {
-                    Some("fit") => capture::Framing::Fit,
-                    Some("stretch") => capture::Framing::Stretch,
-                    _ => capture::Framing::Fill,
-                };
-                Some(capture::Shape { w, h, framing })
-            }),
-            exact: None,
-        },
+        size,
         use_hardware: env("SOFTWARE").is_none(),
         replay_seconds: 5,
         video: {
@@ -112,6 +113,16 @@ default: {:?}", d.inputs.iter().map(|i| &i.name).collect::<Vec<_>>(), d.default_
             }),
             placement: std::sync::Arc::new(std::sync::Mutex::new(capture::webcam::Placement::default_for(16.0 / 9.0, 16.0 / 9.0))),
         }),
+        // SCREEN_BOX=x,y,w,h: the screen in that box (fractions of the
+        // frame), filling it; SCREEN_FRONT=1: in front of the webcam.
+        screen: std::sync::Arc::new(std::sync::Mutex::new({
+            let rect = env("SCREEN_BOX").and_then(|b| {
+                let v: Vec<f32> = b.split(',').filter_map(|n| n.trim().parse().ok()).collect();
+                (v.len() == 4).then(|| [v[0], v[1], v[2], v[3]])
+            });
+            let framing = if rect.is_some() { capture::Framing::Fill } else { size.framing() };
+            capture::ScreenPlacement { rect: rect.unwrap_or([0.0, 0.0, 1.0, 1.0]), framing, in_front: env("SCREEN_FRONT").is_some(), hidden: false }
+        })),
         sources: sources.clone(),
     })?;
     let secs: u64 = std::env::var("SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(4);

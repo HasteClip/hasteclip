@@ -649,7 +649,6 @@ impl Session {
         crate::capture_started();
         let feed = Feed::open(&s.video, s.away_screen.as_deref())?;
         let (width, height) = feed.recorded_size(s.size);
-        let framing = s.size.framing();
         let clock = Arc::new(Clock::default());
 
         let (titles, comment, has_rest) = track_layout(&s.sources);
@@ -693,7 +692,7 @@ impl Session {
             session.mixer = Some((stop, mixer));
 
             let encoder = ffmpeg::H264::start(width, height, s, session.writer_tx.clone())?;
-            let picture = Picture::new(feed.clone(), width, height, framing, s.webcam.as_ref());
+            let picture = Picture::new(feed.clone(), width, height, s.screen.clone(), s.webcam.as_ref());
             // Frame blending is done on the graphics card.
             session.pacer = Some(if s.blend_samples > 1 && picture.gpu.is_some() {
                 blend::spawn_blend_pacer(s.fps, s.blend_samples, crate::shutter::Shutter::new(s.blend_samples, s.blend_shape), picture, encoder, clock)
@@ -739,8 +738,9 @@ impl Session {
     }
 }
 
-/// Makes the frame: the screen put into the output size (`framing`), the
-/// webcam on top. Redraws only when one of them changed.
+/// Makes the frame: the screen put where its placement says (a box in the
+/// output size, as its framing says), the webcam over it or under it.
+/// Redraws only when one of them changed.
 struct Picture {
     feed: Feed,
     width: u32,
@@ -749,11 +749,11 @@ struct Picture {
     /// screen's pictures arrive there.
     canvas: Canvas,
     gpu: Option<gpu_frame::GpuPicture>,
-    framing: crate::Framing,
+    screen: crate::SharedScreen,
     camera: Option<(camera::CameraLayer, SharedPlacement)>,
-    /// What the canvas shows: the screen picture's number, the camera picture
-    /// and where it was placed.
-    shows: Option<(u64, Option<usize>, Option<Placement>)>,
+    /// What the canvas shows: the screen picture's number and where it went,
+    /// the camera picture and where it was placed.
+    shows: Option<(u64, crate::ScreenPlacement, Option<usize>, Option<Placement>)>,
     /// The webcam picture and where it was placed, as the card's layer has it.
     camera_shown: Option<(Option<usize>, Option<Placement>)>,
     /// The canvas as NV12, made when it changes.
@@ -763,13 +763,26 @@ struct Picture {
 }
 
 impl Picture {
-    fn new(feed: Feed, width: u32, height: u32, framing: crate::Framing, webcam: Option<&crate::webcam::Webcam>) -> Self {
+    fn new(feed: Feed, width: u32, height: u32, screen: crate::SharedScreen, webcam: Option<&crate::webcam::Webcam>) -> Self {
         let camera = webcam.map(|w| (camera::CameraLayer::new(w), w.placement.clone()));
         let crop = feed.crop();
-        let gpu = screen::gpu_frames().map(|g| gpu_frame::GpuPicture::new(g, width, height, framing, crop));
+        let placed = *screen.lock().unwrap();
+        let gpu = screen::gpu_frames().map(|g| gpu_frame::GpuPicture::new(g, width, height, placed, crop));
         let mut canvas = if gpu.is_some() { Canvas::new(0, 0) } else { Canvas::new(width, height) };
         canvas.clear();
-        Self { feed, width, height, canvas, gpu, framing, camera, shows: None, camera_shown: None, nv12: Vec::new(), version: 0 }
+        Self { feed, width, height, canvas, gpu, screen, camera, shows: None, camera_shown: None, nv12: Vec::new(), version: 0 }
+    }
+
+    /// Where the screen goes now (on the card too, for the frames made
+    /// there next), and the webcam's picture and place: on the card, its
+    /// layer is drawn again if either changed.
+    fn layers(&mut self) -> (crate::ScreenPlacement, Option<Arc<CameraPicture>>, Option<Placement>) {
+        let placed = *self.screen.lock().unwrap();
+        if let Some(g) = &mut self.gpu {
+            g.set_screen(placed);
+        }
+        let (cam, place) = self.camera_layer();
+        (placed, cam, place)
     }
 
     /// On the card: draw the webcam's layer again if its picture or place
@@ -797,8 +810,8 @@ impl Picture {
         // A source that reads the screen on request (X11) reads the next one now.
         self.feed.want();
         let Some((frame, seq)) = self.feed.get() else { return false };
-        let (cam, place) = self.camera_layer();
-        let now = (seq, cam.as_ref().map(|c| Arc::as_ptr(c) as usize), place);
+        let (placed, cam, place) = self.layers();
+        let now = (seq, placed, cam.as_ref().map(|c| Arc::as_ptr(c) as usize), place);
         if self.shows.as_ref() != Some(&now) {
             match &mut self.gpu {
                 Some(g) => {
@@ -807,9 +820,19 @@ impl Picture {
                     }
                 }
                 None => {
-                    self.canvas.fill_from(&frame, self.framing, self.feed.crop());
-                    if let (Some(cam), Some(place)) = (&cam, &place) {
-                        self.canvas.draw_camera(cam, place);
+                    let crop = self.feed.crop();
+                    match (&cam, &place) {
+                        // The screen in front: the webcam first, the screen over it.
+                        (Some(cam), Some(place)) if placed.in_front => {
+                            self.canvas.clear();
+                            self.canvas.draw_camera(cam, place);
+                            self.canvas.draw_screen(&frame, &placed, crop, true);
+                        }
+                        (Some(cam), Some(place)) => {
+                            self.canvas.draw_screen(&frame, &placed, crop, false);
+                            self.canvas.draw_camera(cam, place);
+                        }
+                        _ => self.canvas.draw_screen(&frame, &placed, crop, false),
                     }
                 }
             }
@@ -962,7 +985,7 @@ pub(crate) struct PreviewCapture {
 }
 
 impl PreviewCapture {
-    pub(crate) fn start(source: VideoSource, size: crate::VideoSize, fps: u32, away_screen: Option<Arc<crate::StillImage>>, webcam: Option<crate::webcam::Webcam>) -> Self {
+    pub(crate) fn start(source: VideoSource, size: crate::VideoSize, fps: u32, away_screen: Option<Arc<crate::StillImage>>, webcam: Option<crate::webcam::Webcam>, screen: crate::SharedScreen) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let error = Arc::new(Mutex::new(None));
         let opened: Arc<Mutex<Option<Feed>>> = Default::default();
@@ -987,8 +1010,7 @@ impl PreviewCapture {
             };
             *opened2.lock().unwrap() = Some(feed.clone());
             let (width, height) = feed.recorded_size(size);
-            let framing = size.framing();
-            let mut picture = Picture::new(feed.clone(), width, height, framing, webcam.as_ref());
+            let mut picture = Picture::new(feed.clone(), width, height, screen, webcam.as_ref());
             let mut sent = Previewed::new(generation);
             // Paced like the recording would be.
             let every = 1.0 / fps.max(1) as f64;
@@ -1100,6 +1122,7 @@ mod tests {
                 format: None,
                 placement: Arc::new(Mutex::new(crate::webcam::Placement::default_for(16.0 / 9.0, 16.0 / 9.0))),
             }),
+            screen: Arc::new(Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit))),
             sources: Vec::new(),
         };
         let cpu = || {

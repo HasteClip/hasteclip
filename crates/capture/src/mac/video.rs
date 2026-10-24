@@ -5,9 +5,9 @@
 //! the window to record changes, its filter is swapped (`updateContentFilter`).
 //!
 //! The pacer asks for each frame to encode ([`Frames::next`]): the stream's
-//! newest buffer, or the away screen, as is; with a webcam, the compositor
-//! (`super::gpu`) draws it over into a buffer of its own. The same buffer
-//! feeds the Sources page's preview.
+//! newest buffer, or the away screen, as is; with a webcam, or the screen in
+//! a box of its own, the compositor (`super::gpu`) makes it in a buffer of
+//! its own. The same buffer feeds the Sources page's preview.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -253,14 +253,78 @@ pub(crate) struct Picture {
     /// The display shown while recording the whole screen (by id).
     display: String,
     size: (usize, usize),
-    /// Looks a second, and how what's recorded goes into the frame: the
-    /// stream's settings, made again for each display or window (Fill cuts
-    /// each to the frame's shape).
-    fps: u32,
-    framing: crate::Framing,
+    /// The stream's settings as they change: how what's recorded goes into
+    /// the frame, for what's shown.
+    ctl: Arc<StreamCtl>,
     /// The part of the display recorded, if not all of it (in its pixels).
     crop: Option<crate::Crop>,
     away: Option<Arc<Buffer>>,
+}
+
+/// The stream's settings that change while it runs, kept together so
+/// whoever changes one sets the stream up with the rest as they are: how
+/// what's recorded goes into the frame (the compositor asks for all of it
+/// while the screen is in a box of its own, see [`Frames`]), and what's
+/// recorded (a display and its crop, or a window). Shared by the picture,
+/// the thread that follows games and apps, and the frames.
+pub(crate) struct StreamCtl(Mutex<Ctl>);
+
+struct Ctl {
+    stream: SendStream,
+    size: (usize, usize),
+    fps: u32,
+    framing: crate::Framing,
+    /// What's recorded, in points, and the part of it used (a display's crop).
+    content: (f64, f64),
+    crop: Option<[f64; 4]>,
+    /// What's recorded, in pixels, when it's known (a display, as cropped):
+    /// where its picture is in the frame follows from it.
+    pixels: Option<(u32, u32)>,
+}
+
+impl StreamCtl {
+    /// How what's recorded goes into the frame now.
+    pub(crate) fn framing(&self) -> crate::Framing {
+        self.0.lock().unwrap().framing
+    }
+
+    /// Put what's recorded into the frame as `framing` says from now on: the
+    /// stream is set up again if that's a change (a few milliseconds).
+    pub(crate) fn set_framing(&self, framing: crate::Framing) {
+        let mut c = self.0.lock().unwrap();
+        if c.framing == framing {
+            return;
+        }
+        c.framing = framing;
+        if let Err(e) = reconfigure(&c.stream.0, c.size, c.fps, framing, c.content, c.crop) {
+            eprintln!("can't put the screen into the frame another way: {e:#}");
+        }
+    }
+
+    /// A window is recorded from now on: its picture's place isn't known.
+    fn windows(&self) {
+        self.0.lock().unwrap().pixels = None;
+    }
+
+    /// Recording `content` now (points; `crop` of it), `pixels` big when
+    /// known: the stream set up for it.
+    fn show(&self, content: (f64, f64), crop: Option<[f64; 4]>, pixels: Option<(u32, u32)>) -> Result<()> {
+        let mut c = self.0.lock().unwrap();
+        (c.content, c.crop, c.pixels) = (content, crop, pixels);
+        reconfigure(&c.stream.0, c.size, c.fps, c.framing, content, crop)
+    }
+
+    /// Where what's recorded is in the frames the stream makes, in pixels:
+    /// (left, top, width, height). All of the frame when it isn't known
+    /// (a window: whatever its shape, its picture's place is the frame).
+    pub(crate) fn picture_rect(&self) -> [u32; 4] {
+        let c = self.0.lock().unwrap();
+        let (w, h) = (c.size.0 as u32, c.size.1 as u32);
+        match c.pixels {
+            Some(px) => crate::placement(px, (w, h), c.framing).1,
+            None => [0, 0, w, h],
+        }
+    }
 }
 
 /// The games and apps a capture follows, and what to show while you're in
@@ -298,7 +362,8 @@ impl Picture {
         let out = Arc::new(Output { latest: latest.clone(), paused: AtomicBool::new(false), frames: AtomicU64::new(0) });
         let output = ScreenOutput::new(out.clone());
         let crop = crate::crop_of(source);
-        let config = stream_config(width, height, fps, framing, Some(points(display)), crop_points(display, crop));
+        let (shown, crop_at) = (points(display), crop_points(display, crop));
+        let config = stream_config(width, height, fps, framing, Some(shown), crop_at);
         // Games and apps start on the away screen (the stream shows the
         // display until a window is picked, but nothing of it is used).
         let apps = AppsConfig::of(source);
@@ -321,7 +386,15 @@ impl Picture {
             VideoSource::Apps { .. } => String::new(),
         };
         let _ = content;
-        let mut picture = Self { latest, stream, _output: output, out, follow: None, display: display_id, size: (width, height), fps, framing, crop, away };
+        let pixels = match source {
+            VideoSource::Screen { .. } => {
+                let (pw, ph) = display_pixels(display);
+                Some(crate::cropped_size(crop, (pw as u32, ph as u32)))
+            }
+            VideoSource::Apps { .. } => None,
+        };
+        let ctl = Arc::new(StreamCtl(Mutex::new(Ctl { stream: SendStream(stream.clone()), size: (width, height), fps, framing, content: shown, crop: crop_at, pixels })));
+        let mut picture = Self { latest, stream, _output: output, out, follow: None, display: display_id, size: (width, height), ctl, crop, away };
         match apps {
             None => {
                 let deadline = Instant::now() + Duration::from_secs(3);
@@ -340,11 +413,12 @@ impl Picture {
 
     /// Start following games and apps (from the away screen).
     fn start_following(&mut self, config: AppsConfig) {
+        self.ctl.windows();
         let list = Arc::new(Mutex::new(config));
         let stop = Arc::new(AtomicBool::new(false));
         let stream = SendStream(self.stream.clone());
-        let (out, latest, list2, stop2, away, size, fps, framing) = (self.out.clone(), self.latest.clone(), list.clone(), stop.clone(), self.away.clone(), self.size, self.fps, self.framing);
-        let handle = thread::spawn(move || follow_apps(stream, out, latest, list2, stop2, away, size, fps, framing));
+        let (out, latest, list2, stop2, away, size, ctl) = (self.out.clone(), self.latest.clone(), list.clone(), stop.clone(), self.away.clone(), self.size, self.ctl.clone());
+        let handle = thread::spawn(move || follow_apps(stream, out, latest, list2, stop2, away, size, ctl));
         self.follow = Some((stop, handle, list));
     }
 
@@ -381,7 +455,7 @@ impl Picture {
                     return true;
                 }
                 self.stop_following();
-                match show_display(&self.stream, id, self.size, self.fps, self.framing, self.crop) {
+                match show_display(&self.stream, &self.ctl, id, self.crop) {
                     Ok(()) => {
                         self.display = id.clone();
                         *self.latest.app.lock().unwrap() = None;
@@ -398,6 +472,11 @@ impl Picture {
         }
     }
 
+    /// The stream's settings as they change, for the frames made from it.
+    pub(crate) fn ctl(&self) -> Arc<StreamCtl> {
+        self.ctl.clone()
+    }
+
     pub(crate) fn stop(mut self) {
         self.stop_following();
         let _ = await_completion(|h| unsafe { self.stream.stopCaptureWithCompletionHandler(Some(h)) });
@@ -405,13 +484,14 @@ impl Picture {
 }
 
 /// Point the stream at a whole display (by id; the main one if it's gone),
-/// at a `size` frame, `fps`, put in as `framing` says (`crop` of it).
-fn show_display(stream: &SCStream, id: &str, size: (usize, usize), fps: u32, framing: crate::Framing, crop: Option<crate::Crop>) -> Result<()> {
+/// `crop` of it, put in as the stream's settings say.
+fn show_display(stream: &SCStream, ctl: &StreamCtl, id: &str, crop: Option<crate::Crop>) -> Result<()> {
     let content = shareable_content()?;
     let display = pick_display(&content, id).context("no display to capture")?;
     let filter = unsafe { SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), &display, &NSArray::new()) };
     await_completion(|h| unsafe { stream.updateContentFilter_completionHandler(&filter, Some(h)) }).map_err(|e| anyhow::anyhow!("{e}"))?;
-    reconfigure(stream, size, fps, framing, points(&display), crop_points(&display, crop))
+    let (pw, ph) = display_pixels(&display);
+    ctl.show(points(&display), crop_points(&display, crop), Some(crate::cropped_size(crop, (pw as u32, ph as u32))))
 }
 
 /// A display's size in points, what the stream's source rect is in.
@@ -512,8 +592,7 @@ fn follow_apps(
     stop: Arc<AtomicBool>,
     away: Option<Arc<Buffer>>,
     (width, height): (usize, usize),
-    fps: u32,
-    framing: crate::Framing,
+    ctl: Arc<StreamCtl>,
 ) {
     let stream = stream.0;
     // Filling: the size (points) of the window the stream is cut to.
@@ -604,15 +683,19 @@ fn follow_apps(
             }
         }
         // Filling the frame: the window cut to its shape, and cut again when
-        // it changes size.
-        if framing == crate::Framing::Fill
+        // it changes size (or the frame's filled again after it wasn't).
+        let filling = ctl.framing() == crate::Framing::Fill;
+        if !filling {
+            cut_to = None;
+        }
+        if filling
             && let Some((w, _)) = &current
             && let Some(win) = all.iter().find(|x| x.id == *w)
             && cut_to != Some((win.width, win.height))
         {
             // Not tried again until it changes size.
             cut_to = Some((win.width, win.height));
-            if let Err(e) = reconfigure(&stream, (width, height), fps, framing, (win.width, win.height), None) {
+            if let Err(e) = ctl.show((win.width, win.height), None, None) {
                 eprintln!("can't cut the window to the recording's shape: {e:#}");
             }
         }
@@ -716,24 +799,37 @@ fn fit(w: usize, h: usize, into_w: usize, into_h: usize) -> (usize, usize, usize
     (((into_w - fw) / 2) & !1, ((into_h - fh) / 2) & !1, fw.max(2), fh.max(2))
 }
 
-/// Turns the picture (and the webcam over it) into frames to encode, and
-/// feeds the preview.
+/// Turns the picture (and the webcam over it, or under it) into frames to
+/// encode, and feeds the preview.
 pub(crate) struct Frames {
     latest: Arc<Latest>,
-    camera: Option<(CameraLayer, SharedPlacement, Gpu, FramePool)>,
+    /// Where the screen's picture goes, and the stream's settings to ask for
+    /// all of it while it's in a box (it's cut to the box's shape here).
+    screen: crate::SharedScreen,
+    ctl: Option<Arc<StreamCtl>>,
+    camera: Option<(CameraLayer, SharedPlacement)>,
+    /// The compositor and the buffers it makes frames in.
+    gpu: Option<(Gpu, FramePool)>,
     /// The last frame made, and what it was made from (screen frame, camera
-    /// frame, placement), to repeat it when nothing changed.
-    last: Option<(Arc<Buffer>, usize, u64, crate::webcam::Placement)>,
+    /// frame, placements), to repeat it when nothing changed.
+    last: Option<(Arc<Buffer>, usize, u64, crate::webcam::Placement, crate::ScreenPlacement)>,
     preview: crate::mac::preview::Producer,
 }
 
 impl Frames {
-    pub(crate) fn new(latest: Arc<Latest>, webcam: Option<&Webcam>, width: usize, height: usize, generation: u64) -> Result<Self> {
-        let camera = match webcam {
-            Some(w) => Some((CameraLayer::new(w), w.placement.clone(), Gpu::new()?, FramePool::new(width, height)?)),
-            None => None,
+    /// `ctl`: the stream's settings, when it's ours to change.
+    pub(crate) fn new(latest: Arc<Latest>, webcam: Option<&Webcam>, screen: crate::SharedScreen, ctl: Option<Arc<StreamCtl>>, width: usize, height: usize, generation: u64) -> Result<Self> {
+        let camera = webcam.map(|w| (CameraLayer::new(w), w.placement.clone()));
+        let gpu = match Gpu::new().and_then(|g| Ok((g, FramePool::new(width, height)?))) {
+            Ok(g) => Some(g),
+            // The screen still records, as ScreenCaptureKit makes it.
+            Err(e) if camera.is_none() => {
+                eprintln!("no compositor: {e:#}");
+                None
+            }
+            Err(e) => return Err(e),
         };
-        Ok(Self { latest, camera, last: None, preview: crate::mac::preview::Producer::new(generation) })
+        Ok(Self { latest, screen, ctl, camera, gpu, last: None, preview: crate::mac::preview::Producer::new(generation) })
     }
 
     /// The frame to encode now, if there's a picture yet.
@@ -743,34 +839,49 @@ impl Frames {
     }
 
     /// The frame to encode from `screen` (the newest picture, or a blend of
-    /// several): with the webcam over it, if one shows.
+    /// several): as is when it fills the frame and no webcam shows, else
+    /// made by the compositor, the screen in its box and the webcam over it
+    /// or under it.
     pub(crate) fn make(&mut self, screen: Arc<Buffer>) -> Arc<Buffer> {
-        let frame = match &mut self.camera {
+        let placed = *self.screen.lock().unwrap();
+        // Filling the frame, ScreenCaptureKit puts the picture in as the
+        // placement says; in a box, all of it, cut to the box's shape here.
+        if let Some(ctl) = &self.ctl {
+            ctl.set_framing(if placed.is_whole() { placed.framing } else { crate::Framing::Fit });
+        }
+        let cam = self.camera.as_mut().and_then(|(layer, placement)| {
+            let p = *placement.lock().unwrap();
+            if p.is_hidden() { None } else { layer.latest().map(|c| (c, p)) }
+        });
+        let frame = match &self.gpu {
+            // Nothing to put together: the screen's own buffer.
+            _ if cam.is_none() && placed.is_whole() && !placed.hidden => {
+                self.last = None;
+                screen
+            }
             None => screen,
-            Some((layer, placement, gpu, pool)) => {
-                let p = *placement.lock().unwrap();
-                let cam = if p.is_hidden() { None } else { layer.latest() };
-                // No webcam showing: the screen's own buffer, as without one.
-                if cam.is_none() {
-                    self.last = None;
-                    self.preview.offer(&screen, self.latest.waiting.load(Ordering::Relaxed), self.latest.app.lock().unwrap().clone());
-                    return screen;
-                }
-                let key = (Arc::as_ptr(&screen) as usize, cam.as_ref().map_or(0, |c| c.seq), p);
+            Some((gpu, pool)) => {
+                let p = cam.as_ref().map_or(crate::webcam::Placement::hidden(), |(_, p)| *p);
+                let key = (Arc::as_ptr(&screen) as usize, cam.as_ref().map_or(0, |(c, _)| c.seq), p, placed);
                 match &self.last {
                     // Nothing changed: the same frame again (the encoder holds it anyway).
-                    Some((b, s, c, lp)) if (*s, *c, *lp) == key => b.clone(),
-                    _ => match pool.take().and_then(|out| gpu.compose(&screen.0, cam.as_ref().map(|c| &*c.buffer), p, &out).map(|()| out)) {
-                        Ok(out) => {
-                            let b = Arc::new(Buffer(out));
-                            self.last = Some((b.clone(), key.0, key.1, key.2));
-                            b
+                    Some((b, s, c, lp, ls)) if (*s, *c, *lp, *ls) == key => b.clone(),
+                    _ => {
+                        let (w, h) = size_of(&screen.0);
+                        let picture = self.ctl.as_ref().map_or([0, 0, w as u32, h as u32], |c| c.picture_rect());
+                        let shown = screen_rects(&placed, picture, (w as u32, h as u32));
+                        match pool.take().and_then(|out| gpu.compose(&screen.0, shown, placed.in_front, cam.as_ref().map(|(c, _)| &*c.buffer), p, &out).map(|()| out)) {
+                            Ok(out) => {
+                                let b = Arc::new(Buffer(out));
+                                self.last = Some((b.clone(), key.0, key.1, key.2, key.3));
+                                b
+                            }
+                            Err(e) => {
+                                eprintln!("compositor: {e:#}");
+                                screen
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("webcam: {e:#}");
-                            screen
-                        }
-                    },
+                    }
                 }
             }
         };
@@ -779,8 +890,24 @@ impl Frames {
     }
 }
 
-/// For tests and benches: a buffer's size.
-#[allow(dead_code)]
+/// Where the screen's picture is drawn from and to, for the compositor, in
+/// a `frame`-size frame whose stream put the picture at `picture`: as it is
+/// while it fills the frame (copied), else cut to its box's shape and drawn
+/// there. `None` when it's hidden.
+pub(crate) fn screen_rects(placed: &crate::ScreenPlacement, picture: [u32; 4], (fw, fh): (u32, u32)) -> Option<super::gpu::ScreenRects> {
+    if placed.hidden {
+        return None;
+    }
+    let edges = |[x, y, w, h]: [u32; 4]| [x as f32, y as f32, (x + w) as f32, (y + h) as f32];
+    if placed.is_whole() {
+        return Some(super::gpu::ScreenRects { src: edges(picture), dest: edges(picture), copy: true });
+    }
+    let [px, py, pw, ph] = picture;
+    let ([sx, sy, sw, sh], dest) = crate::placement_in((pw, ph), placed.rect_in(fw, fh), placed.framing);
+    Some(super::gpu::ScreenRects { src: edges([px + sx, py + sy, sw, sh]), dest: edges(dest), copy: false })
+}
+
+/// A buffer's size.
 pub(crate) fn size_of(b: &CVPixelBuffer) -> (usize, usize) {
     (CVPixelBufferGetWidth(b), CVPixelBufferGetHeight(b))
 }

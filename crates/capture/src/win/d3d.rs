@@ -730,15 +730,16 @@ impl TexturePool {
 }
 
 /// Scales and converts the latest captured image into one of its targets,
-/// fitted into the frame with black bars when its shape differs, then draws
-/// the webcam over it if there is one. Targets are NV12 frames for the
-/// encoder, or an RGB picture for the preview.
+/// put where the screen's placement says (its box, black around it), with
+/// the webcam over it or under it if there is one. Targets are NV12 frames
+/// for the encoder, or an RGB picture for the preview.
 pub(crate) struct Converter {
     gpu: Gpu,
     width: u32,
     height: u32,
-    /// How the picture goes into the frame (see `crate::placement`).
-    framing: crate::Framing,
+    /// Where the picture goes in the frame (see `crate::ScreenPlacement`),
+    /// read for each frame.
+    screen: crate::SharedScreen,
     /// The part of the picture used, if not all of it.
     crop: Option<crate::Crop>,
     video: ID3D11VideoContext,
@@ -810,6 +811,29 @@ impl Layer {
         }
     }
 
+    /// Fill `target` of target `slot` with black (the stream off: only the
+    /// background is drawn).
+    fn clear(&self, video: &ID3D11VideoContext, slot: usize, target: RECT) -> windows::core::Result<()> {
+        unsafe { video.VideoProcessorSetOutputTargetRect(&self.processor, true, Some(&target)) };
+        let stream = D3D11_VIDEO_PROCESSOR_STREAM {
+            Enable: false.into(),
+            OutputIndex: 0,
+            InputFrameOrField: 0,
+            PastFrames: 0,
+            FutureFrames: 0,
+            ppPastSurfaces: std::ptr::null_mut(),
+            pInputSurface: std::mem::ManuallyDrop::new(Some(self.input.clone())),
+            ppFutureSurfaces: std::ptr::null_mut(),
+            ppPastSurfacesRight: std::ptr::null_mut(),
+            pInputSurfaceRight: std::mem::ManuallyDrop::new(None),
+            ppFutureSurfacesRight: std::ptr::null_mut(),
+        };
+        let mut streams = [stream];
+        let result = unsafe { video.VideoProcessorBlt(&self.processor, &self.outputs[slot], 0, &streams) };
+        unsafe { std::mem::ManuallyDrop::drop(&mut streams[0].pInputSurface) };
+        result
+    }
+
     /// Draw `source_rect` of the picture into `dest` of target `slot`, leaving
     /// the rest of the target as it is (only `target` is written).
     fn draw(&self, video: &ID3D11VideoContext, slot: usize, source_rect: RECT, dest: RECT, target: RECT, mirror: (bool, bool)) -> windows::core::Result<()> {
@@ -842,9 +866,9 @@ impl Layer {
 }
 
 impl Converter {
-    /// `overlay`: the webcam's picture and where it goes, drawn over `source`.
-    /// `framing`: how `source` (`crop` of it, if any) goes into the
-    /// `width`×`height` frame.
+    /// `overlay`: the webcam's picture and where it goes, drawn over `source`
+    /// (or under it). `screen`: where `source` (`crop` of it, if any) goes
+    /// in the `width`×`height` frame.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         gpu: &Gpu,
@@ -855,7 +879,7 @@ impl Converter {
         width: u32,
         height: u32,
         fps: u32,
-        framing: crate::Framing,
+        screen: crate::SharedScreen,
         crop: Option<crate::Crop>,
     ) -> Result<Self> {
         let video: ID3D11VideoContext = gpu.context.cast()?;
@@ -864,29 +888,53 @@ impl Converter {
             Some((cam, placement)) => Some((Layer::new(gpu, &video, cam, targets, yuv, width, height, fps)?, placement)),
             None => None,
         };
-        Ok(Self { gpu: gpu.clone(), width, height, framing, crop, video, base, overlay })
+        Ok(Self { gpu: gpu.clone(), width, height, screen, crop, video, base, overlay })
     }
 
-    /// Convert the latest captured image (and the webcam over it) into target `slot`.
+    /// Convert the latest captured image (and the webcam over it, or under
+    /// it) into target `slot`.
     pub(crate) fn convert(&self, slot: usize) -> Result<()> {
+        let placed = *self.screen.lock().unwrap();
         let (cw, ch) = self.base.source.content();
         let rect = |[x, y, w, h]: [u32; 4]| RECT { left: x as i32, top: y as i32, right: (x + w) as i32, bottom: (y + h) as i32 };
-        let (source, dest) = crate::placement_cropped(self.crop, (cw, ch), (self.width, self.height), self.framing);
-        let (source, dest) = (rect(source), rect(dest));
+        let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = placed.place(self.crop, (cw, ch), (self.width, self.height));
+        let screen = (sw > 0 && sh > 0 && dw > 0 && dh > 0).then(|| (rect([sx, sy, sw, sh]), rect([dx, dy, dw, dh])));
         let full = RECT { left: 0, top: 0, right: self.width as i32, bottom: self.height as i32 };
-        let result = self.base.draw(&self.video, slot, source, dest, full, (false, false)).context("couldn't convert a screen frame");
-        if result.is_ok() {
-            if let Some((layer, placement)) = &self.overlay {
-                if layer.source.has_frame() {
-                    let p = *placement.lock().unwrap();
-                    if let Some((source, dest)) = overlay_rects(p, layer.source.content(), self.width, self.height) {
-                        if let Err(e) = layer.draw(&self.video, slot, source, dest, dest, (p.flip_h, p.flip_v)) {
-                            eprintln!("couldn't draw the webcam: {e}");
-                        }
-                    }
-                }
+        // The webcam, where it shows.
+        let cam = self.overlay.as_ref().filter(|(layer, _)| layer.source.has_frame()).and_then(|(layer, placement)| {
+            let p = *placement.lock().unwrap();
+            overlay_rects(p, layer.source.content(), self.width, self.height).map(|(source, dest)| (layer, source, dest, (p.flip_h, p.flip_v)))
+        });
+        // Only `target` is written: all of the frame (black around the
+        // picture), or just the picture's place, over what's there.
+        let draw_cam = |target: Option<RECT>| {
+            if let Some((layer, source, dest, mirror)) = &cam
+                && let Err(e) = layer.draw(&self.video, slot, *source, *dest, target.unwrap_or(*dest), *mirror)
+            {
+                eprintln!("couldn't draw the webcam: {e}");
             }
+        };
+        let result = match screen {
+            // In front of the webcam: the webcam first, then the screen over it.
+            Some((source, dest)) if placed.in_front && cam.is_some() => {
+                draw_cam(Some(full));
+                self.base.draw(&self.video, slot, source, dest, dest, (false, false))
+            }
+            Some((source, dest)) => {
+                let drawn = self.base.draw(&self.video, slot, source, dest, full, (false, false));
+                if drawn.is_ok() {
+                    draw_cam(None);
+                }
+                drawn
+            }
+            // No screen: the webcam on black, or black.
+            None if cam.is_some() => {
+                draw_cam(Some(full));
+                Ok(())
+            }
+            None => self.base.clear(&self.video, slot, full),
         }
+        .context("couldn't convert a screen frame");
         unsafe { self.gpu.context.Flush() };
         result
     }
@@ -953,7 +1001,7 @@ impl Previewer {
         recorded_width: u32,
         recorded_height: u32,
         fps: u32,
-        framing: crate::Framing,
+        screen: crate::SharedScreen,
         crop: Option<crate::Crop>,
         generation: u64,
     ) -> Result<Self> {
@@ -966,7 +1014,7 @@ impl Previewer {
             let staging = (0..Self::SLOTS)
                 .map(|_| gpu.texture(width, height, format, 0, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ.0 as u32))
                 .collect::<Result<Vec<_>>>()?;
-            let converter = Converter::new(gpu, latest, overlay.clone(), std::slice::from_ref(&target), false, width, height, fps, framing, crop)?;
+            let converter = Converter::new(gpu, latest, overlay.clone(), std::slice::from_ref(&target), false, width, height, fps, screen.clone(), crop)?;
             Ok((target, staging, converter))
         };
         let (rgba, (target, staging, converter)) = match make(DXGI_FORMAT_R8G8B8A8_UNORM) {

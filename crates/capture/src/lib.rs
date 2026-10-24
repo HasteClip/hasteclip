@@ -197,29 +197,91 @@ impl VideoSize {
     }
 }
 
-/// Where a picture of `content`'s size goes in a frame of `frame`'s, each
-/// as (left, top, width, height): the part of the picture used, and where
-/// it's drawn. Fit uses all of it, black around it (what a recording
-/// without a shape does with a window that isn't the screen's shape); Fill
-/// cuts off what's past the frame's shape; Stretch draws all of it over all
-/// of the frame. Where it's drawn is even, for the encoder's 4:2:0 colour.
-#[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
-pub(crate) fn placement((cw, ch): (u32, u32), (fw, fh): (u32, u32), framing: Framing) -> ([u32; 4], [u32; 4]) {
-    let (all, whole) = ([0, 0, cw, ch], [0, 0, fw, fh]);
-    if cw == 0 || ch == 0 || fw == 0 || fh == 0 {
+/// Where the screen's picture goes in the frame: into a box (all of the
+/// frame, unless it's been placed by hand), as `framing` says, in front of
+/// the webcam or behind it. Shared with the app ([`SharedScreen`]), which
+/// changes it as you drag the screen around the preview; the capture reads
+/// it every frame, so it moves at once, while recording too.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScreenPlacement {
+    /// The box: left, top, width, height as fractions of the frame.
+    pub rect: [f32; 4],
+    /// How the picture goes into the box.
+    pub framing: Framing,
+    /// Drawn over the webcam, instead of under it.
+    pub in_front: bool,
+    /// Not drawn at all: the webcam shows on black.
+    pub hidden: bool,
+}
+
+/// The screen's placement, shared between the app and a running capture.
+pub type SharedScreen = std::sync::Arc<std::sync::Mutex<ScreenPlacement>>;
+
+impl ScreenPlacement {
+    /// All of the frame, the picture put in as `framing` says, behind the webcam.
+    pub fn whole(framing: Framing) -> Self {
+        Self { rect: [0.0, 0.0, 1.0, 1.0], framing, in_front: false, hidden: false }
+    }
+
+    /// Whether its box is all of the frame.
+    pub fn is_whole(&self) -> bool {
+        let [x, y, w, h] = self.rect;
+        x <= 1e-4 && y <= 1e-4 && x + w >= 1.0 - 1e-4 && y + h >= 1.0 - 1e-4
+    }
+
+    /// Its box in a `fw`×`fh` frame's pixels, inside the frame: (left, top,
+    /// width, height), its edges on even pixels for the encoder's 4:2:0
+    /// colour (the frame's own edges as they are).
+    pub fn rect_in(&self, fw: u32, fh: u32) -> [u32; 4] {
+        let edge = |v: f32, n: u32| if v >= 1.0 - 1e-4 { n } else { ((v.max(0.0) * n as f32).round() as u32 & !1).min(n) };
+        let [x, y, w, h] = self.rect;
+        let (x0, y0) = (edge(x, fw), edge(y, fh));
+        let (x1, y1) = (edge(x + w, fw).max(x0), edge(y + h, fh).max(y0));
+        [x0, y0, x1 - x0, y1 - y0]
+    }
+
+    /// Where a picture of `content`'s size (`crop` of it, if any) goes in a
+    /// `frame`-size frame: see [`placement_in`]. Nothing of it when hidden.
+    #[cfg_attr(not(any(target_os = "windows", target_os = "linux", test)), allow(dead_code))]
+    pub(crate) fn place(&self, crop: Option<Crop>, content: (u32, u32), (fw, fh): (u32, u32)) -> ([u32; 4], [u32; 4]) {
+        if self.hidden {
+            return ([0; 4], [0; 4]);
+        }
+        placement_cropped_in(crop, content, self.rect_in(fw, fh), self.framing)
+    }
+}
+
+/// Where a picture of `content`'s size goes in a frame of `frame`'s: see
+/// [`placement_in`], the box being all of the frame.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(crate) fn placement(content: (u32, u32), (fw, fh): (u32, u32), framing: Framing) -> ([u32; 4], [u32; 4]) {
+    placement_in(content, [0, 0, fw, fh], framing)
+}
+
+/// Where a picture of `content`'s size goes in the box `bx` (each as left,
+/// top, width, height, the box in the frame's pixels): the part of the
+/// picture used, and where it's drawn. Fit uses all of it, with nothing
+/// around it in the box (what a recording without a shape does with a
+/// window that isn't the screen's shape); Fill cuts off what's past the
+/// box's shape; Stretch draws all of it over all of the box. Where it's
+/// drawn is even, for the encoder's 4:2:0 colour.
+#[cfg_attr(not(any(target_os = "windows", target_os = "linux", target_os = "macos")), allow(dead_code))]
+pub(crate) fn placement_in((cw, ch): (u32, u32), [bx, by, bw, bh]: [u32; 4], framing: Framing) -> ([u32; 4], [u32; 4]) {
+    let (all, whole) = ([0, 0, cw, ch], [bx, by, bw, bh]);
+    if cw == 0 || ch == 0 || bw == 0 || bh == 0 {
         return (all, whole);
     }
-    // Wider than the frame, as shapes go.
-    let wider = cw as u64 * fh as u64 > ch as u64 * fw as u64;
+    // Wider than the box, as shapes go.
+    let wider = cw as u64 * bh as u64 > ch as u64 * bw as u64;
     match framing {
         Framing::Stretch => (all, whole),
         Framing::Fit => {
-            let (w, h) = if wider { (fw, (ch as u64 * fw as u64 / cw as u64) as u32) } else { ((cw as u64 * fh as u64 / ch as u64) as u32, fh) };
+            let (w, h) = if wider { (bw, (ch as u64 * bw as u64 / cw as u64) as u32) } else { ((cw as u64 * bh as u64 / ch as u64) as u32, bh) };
             let (w, h) = (w & !1, h & !1);
-            (all, [((fw - w) / 2) & !1, ((fh - h) / 2) & !1, w, h])
+            (all, [bx + (((bw - w) / 2) & !1), by + (((bh - h) / 2) & !1), w, h])
         }
         Framing::Fill => {
-            let (w, h) = if wider { ((ch as u64 * fw as u64 / fh as u64) as u32, ch) } else { (cw, (cw as u64 * fh as u64 / fw as u64) as u32) };
+            let (w, h) = if wider { ((ch as u64 * bw as u64 / bh as u64) as u32, ch) } else { (cw, (cw as u64 * bh as u64 / bw as u64) as u32) };
             ([(cw - w) / 2, (ch - h) / 2, w, h], whole)
         }
     }
@@ -359,13 +421,13 @@ pub(crate) fn cropped_size(crop: Option<Crop>, (w, h): (u32, u32)) -> (u32, u32)
     }
 }
 
-/// [`placement`] of part of a picture: `crop` of it, if any.
-// macOS has ScreenCaptureKit cut and place it (`mac::video::stream_config`).
-#[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
-pub(crate) fn placement_cropped(crop: Option<Crop>, (cw, ch): (u32, u32), frame: (u32, u32), framing: Framing) -> ([u32; 4], [u32; 4]) {
-    let Some(c) = crop else { return placement((cw, ch), frame, framing) };
+/// [`placement_in`] of part of a picture: `crop` of it, if any.
+// macOS has ScreenCaptureKit cut it out (`mac::video::stream_config`).
+#[cfg_attr(not(any(target_os = "windows", target_os = "linux", test)), allow(dead_code))]
+pub(crate) fn placement_cropped_in(crop: Option<Crop>, (cw, ch): (u32, u32), bx: [u32; 4], framing: Framing) -> ([u32; 4], [u32; 4]) {
+    let Some(c) = crop else { return placement_in((cw, ch), bx, framing) };
     let [x, y, w, h] = c.rect(cw, ch);
-    let ([sx, sy, sw, sh], dest) = placement((w, h), frame, framing);
+    let ([sx, sy, sw, sh], dest) = placement_in((w, h), bx, framing);
     ([x + sx, y + sy, sw, sh], dest)
 }
 
@@ -1025,8 +1087,10 @@ pub struct EncodeSettings {
     /// Shown while recording games and apps and there's nothing to show (none
     /// is open, or you've tabbed out); black if `None`. Scaled to the frame.
     pub away_screen: Option<std::sync::Arc<StillImage>>,
-    /// A webcam drawn over the picture.
+    /// A webcam drawn over the picture (or under it, as `screen` says).
     pub webcam: Option<webcam::Webcam>,
+    /// Where the screen's picture goes in the frame, read every frame.
+    pub screen: SharedScreen,
     /// Audio sources, in track order. Track 1 is the mix of every source with
     /// `in_mix` (so the file sounds right in any player); each source with
     /// `own_track` follows on its own track, for rebalancing later.
@@ -1118,7 +1182,7 @@ pub trait Recorder {
 
 #[cfg(test)]
 mod size_tests {
-    use super::{Crop, Framing, Shape, VideoSize, output_size, placement, placement_cropped};
+    use super::{Crop, Framing, ScreenPlacement, Shape, VideoSize, output_size, placement, placement_cropped_in};
 
     #[test]
     fn output_size_keeps_aspect_and_even() {
@@ -1172,7 +1236,7 @@ mod size_tests {
     fn where_the_picture_goes() {
         // Cropped: the middle 1600×900 of 2560×1440, then as usual.
         let crop = Some(Crop { w: 1600, h: 900, at: None });
-        assert_eq!(placement_cropped(crop, (2560, 1440), (1600, 900), Framing::Fit), ([480, 270, 1600, 900], [0, 0, 1600, 900]));
+        assert_eq!(placement_cropped_in(crop, (2560, 1440), [0, 0, 1600, 900], Framing::Fit), ([480, 270, 1600, 900], [0, 0, 1600, 900]));
         // Placed past the edge: moved back in; odd sizes made even.
         assert_eq!(Crop { w: 1601, h: 901, at: Some((2000, 1000)) }.rect(2560, 1440), [960, 540, 1600, 900]);
         // Fill: the middle 2560 of 3440, over all of the frame.
@@ -1185,6 +1249,35 @@ mod size_tests {
         assert_eq!(placement((3440, 1440), (1920, 1080), Framing::Stretch), ([0, 0, 3440, 1440], [0, 0, 1920, 1080]));
         // Nothing to place yet.
         assert_eq!(placement((0, 0), (1920, 1080), Framing::Fit), ([0, 0, 0, 0], [0, 0, 1920, 1080]));
+    }
+
+    /// The screen in a box of its own: the box in pixels, even, inside the
+    /// frame, and the picture filling it (cut to its shape) or fitted in it.
+    #[test]
+    fn the_screen_in_a_box() {
+        let whole = ScreenPlacement::whole(Framing::Fill);
+        assert!(whole.is_whole());
+        assert_eq!(whole.rect_in(1921, 1081), [0, 0, 1921, 1081]);
+        let boxed = ScreenPlacement { rect: [0.5, 0.25, 0.25, 0.5], ..whole };
+        assert!(!boxed.is_whole());
+        assert_eq!(boxed.rect_in(1920, 1080), [960, 270, 480, 540]);
+        // Odd edges land on even pixels; past the frame, it's cut at its edge.
+        assert_eq!(ScreenPlacement { rect: [0.1, 0.1, 0.3, 0.3], ..whole }.rect_in(1000, 1000), [100, 100, 300, 300]);
+        assert_eq!(ScreenPlacement { rect: [0.1003, 0.0, 0.2, 0.2], ..whole }.rect_in(1000, 1000), [100, 0, 200, 200]);
+        assert_eq!(ScreenPlacement { rect: [0.8, 0.9, 0.4, 0.4], ..whole }.rect_in(1000, 1000), [800, 900, 200, 100]);
+        // A 16:9 screen in a square box: its middle (Fill), or all of it in a band (Fit).
+        let square = ScreenPlacement { rect: [0.0, 0.0, 0.5, 1.0], ..whole };
+        assert_eq!(square.place(None, (1920, 1080), (2160, 1080)), ([420, 0, 1080, 1080], [0, 0, 1080, 1080]));
+        let fit = ScreenPlacement { framing: Framing::Fit, ..square };
+        assert_eq!(fit.place(None, (1920, 1080), (2160, 1080)), ([0, 0, 1920, 1080], [0, 236, 1080, 606]));
+        // In a box placed further in, the picture goes where the box is.
+        let inset = ScreenPlacement { rect: [0.25, 0.5, 0.5, 0.5], framing: Framing::Fit, ..whole };
+        assert_eq!(inset.place(None, (1920, 1080), (1920, 1080)), ([0, 0, 1920, 1080], [480, 540, 960, 540]));
+        // A crop is cut out first.
+        let crop = Some(Crop { w: 1600, h: 900, at: None });
+        assert_eq!(inset.place(crop, (2560, 1440), (1920, 1080)), ([480, 270, 1600, 900], [480, 540, 960, 540]));
+        // Hidden: nothing of it anywhere.
+        assert_eq!(ScreenPlacement { hidden: true, ..whole }.place(None, (1920, 1080), (1920, 1080)), ([0; 4], [0; 4]));
     }
 }
 

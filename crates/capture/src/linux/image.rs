@@ -27,20 +27,36 @@ impl Canvas {
     /// Fill with a picture, put in as `framing` says (see `crate::placement`):
     /// its middle filling the canvas, all of it with black bars, or all of
     /// it stretched.
+    #[cfg(test)]
     pub(crate) fn fill_from(&mut self, src: &Frame, framing: crate::Framing, crop: Option<crate::Crop>) {
-        let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = crate::placement_cropped(crop, (src.width, src.height), (self.width, self.height), framing);
+        self.draw_screen(src, &crate::ScreenPlacement::whole(framing), crop, false);
+    }
+
+    /// Draw a picture where `place` puts it (its box, as its framing says;
+    /// nothing when hidden). `over` what's drawn already, the rest is left
+    /// as it is; else the rest is black.
+    pub(crate) fn draw_screen(&mut self, src: &Frame, place: &crate::ScreenPlacement, crop: Option<crate::Crop>, over: bool) {
+        let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = place.place(crop, (src.width, src.height), (self.width, self.height));
+        if dw == 0 || dh == 0 || sw == 0 || sh == 0 {
+            if !over {
+                self.clear();
+            }
+            return;
+        }
         let data = &src.data[sy as usize * src.stride + sx as usize * 4..];
         let (size, to) = ((sw as usize, sh as usize), (dw as usize, dh as usize));
         let swap = src.order == Order::Rgb;
-        if (dw, dh) == (self.width, self.height) {
+        if !over && (dx, dy, dw, dh) == (0, 0, self.width, self.height) {
             resample(data, size, src.stride, swap, &mut self.bgra, to);
             return;
         }
-        // Smaller than the canvas: scaled on its own, then put in the middle
-        // of black.
+        // Smaller than the canvas: scaled on its own, then put in its place
+        // (on black, unless it's over what's there).
         self.part.resize(dw as usize * dh as usize * 4, 0);
         resample(data, size, src.stride, swap, &mut self.part, to);
-        self.clear();
+        if !over {
+            self.clear();
+        }
         let row = dw as usize * 4;
         for (y, line) in self.part.chunks_exact(row).enumerate() {
             let at = ((dy as usize + y) * self.width as usize + dx as usize) * 4;
@@ -406,6 +422,30 @@ mod tests {
             c.fill_from(&frame(sw, sh, [250, 120, 10, 0], Order::Rgb), crate::Framing::Fit, None);
             assert!(c.bgra.chunks_exact(4).all(|p| p == [10, 120, 250, 255]), "rgb {sw}x{sh} -> {dw}x{dh}");
         }
+    }
+
+    /// The screen in a box: on black, or over what's drawn (the webcam,
+    /// when the screen's in front), which shows around it.
+    #[test]
+    fn the_screen_in_its_box() {
+        let px = |c: &Canvas, x: u32, y: u32| {
+            let at = ((y * c.width + x) * 4) as usize;
+            c.bgra[at..at + 3].to_vec()
+        };
+        let white = frame(16, 8, [255, 255, 255, 0], Order::Bgr);
+        let left = crate::ScreenPlacement { rect: [0.0, 0.0, 0.5, 1.0], ..crate::ScreenPlacement::whole(crate::Framing::Fill) };
+        let mut c = Canvas::new(16, 8);
+        c.draw_screen(&white, &left, None, false);
+        assert_eq!((px(&c, 2, 4), px(&c, 12, 4)), (vec![255, 255, 255], vec![0, 0, 0]));
+        let grey = CameraPicture { width: 4, height: 2, bgra: [40, 40, 40, 255].repeat(8) };
+        let all = Placement { x: 0.0, y: 0.0, w: 1.0, h: 1.0, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0 };
+        c.clear();
+        c.draw_camera(&grey, &all);
+        c.draw_screen(&white, &left, None, true);
+        assert_eq!((px(&c, 2, 4), px(&c, 12, 4)), (vec![255, 255, 255], vec![40, 40, 40]));
+        // Hidden: nothing of it, over the webcam or on black.
+        c.draw_screen(&white, &crate::ScreenPlacement { hidden: true, ..left }, None, false);
+        assert!(c.bgra.chunks_exact(4).all(|p| p == [0, 0, 0, 255]));
     }
 
     #[test]

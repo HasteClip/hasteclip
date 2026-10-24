@@ -286,7 +286,7 @@ impl Session {
             let picture = Picture::start(&s.video, &content, &display, (width, height), s.fps * looks, away, framing)?;
             // A webcam that can't open doesn't stop the recording: its status
             // says why, and the picture goes on without it.
-            let frames = Frames::new(picture.latest.clone(), s.webcam.as_ref(), width, height, crate::preview::new_producer())?;
+            let frames = Frames::new(picture.latest.clone(), s.webcam.as_ref(), s.screen.clone(), Some(picture.ctl()), width, height, crate::preview::new_producer())?;
             let latest = picture.latest.clone();
             session.video = Some(picture);
             session.pacer = Some(if looks > 1 {
@@ -917,7 +917,7 @@ pub(crate) fn probe_encoder(width: usize, height: usize) -> String {
     let s = EncodeSettings {
         output_dir: std::env::temp_dir(), container_ext: "mp4".into(), fps: 60, blend_samples: 1, blend_shape: Default::default(), video_bitrate_kbps: 20000, size: Default::default(),
         use_hardware: true, replay_seconds: 5, video: crate::VideoSource::Screen { id: String::new(), hook: Default::default(), method: Default::default(), crop: None },
-        away_screen: None, webcam: None, sources: Vec::new(),
+        away_screen: None, webcam: None, screen: std::sync::Arc::new(std::sync::Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit))), sources: Vec::new(),
     };
     match probe_video_format(width, height, &s) {
         Ok(_) => "ok".into(),

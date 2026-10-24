@@ -458,6 +458,9 @@ struct App {
     /// Where the webcam sits, shared with a running capture so dragging it
     /// takes effect at once. Mirrors `settings.webcam` every frame.
     webcam_placement: capture::webcam::SharedPlacement,
+    /// Where the screen's picture goes in the video, shared with the capture
+    /// like the webcam's placement (kept in step with the settings each frame).
+    pub(crate) screen_placement: capture::SharedScreen,
     pub(crate) webcam_view: webcam_ui::WebcamView,
     /// The camera last asked to stay open (it stays open while a webcam is set
     /// up, so its own settings don't reset).
@@ -600,6 +603,7 @@ impl App {
     fn new(ctx: egui::Context, instance: Option<std::net::TcpListener>) -> Self {
         add_symbol_font(&ctx);
         let settings = RecordSettings::load();
+        let screen_placement = std::sync::Arc::new(std::sync::Mutex::new(settings.screen_placement()));
         // egui keeps the window's frame in step (on Wayland, drawn by winit).
         ctx.set_theme(settings.theme.preference());
         // Dev aid: `HASTECLIP_THEME=light|dark` for this launch only.
@@ -697,6 +701,7 @@ impl App {
             capturing_replay: None,
             away_screen: away::screen(),
             webcam_placement: std::sync::Arc::new(std::sync::Mutex::new(capture::webcam::Placement::default_for(16.0 / 9.0, 16.0 / 9.0))),
+            screen_placement,
             webcam_view: Default::default(),
             kept_camera: None,
             audio: capture::audio::list_audio_devices(),
@@ -937,6 +942,7 @@ impl App {
                 format: None,
                 placement: self.webcam_placement.clone(),
             })),
+            screen: self.screen_placement.clone(),
             sources: self.capture_sources(),
         }
     }
@@ -1399,6 +1405,7 @@ impl App {
             Some(w) if w.enabled => w.placement.into(),
             _ => capture::webcam::Placement::hidden(),
         };
+        *self.screen_placement.lock().unwrap() = self.settings.screen_placement();
         // Keep the webcam open whenever one is set up and on, previewed or
         // recorded or not: closing a camera can reset its own settings. Off,
         // it's closed (its light goes out); a capture takes it up again.

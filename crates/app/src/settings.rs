@@ -174,6 +174,38 @@ impl OutputResolution {
     ];
 }
 
+/// The screen (or games and apps) as a source in the video: whether it's
+/// in it, in front of the webcam or behind it, and where it sits.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScreenCfg {
+    /// In the video (its switch). Off, the webcam shows on black.
+    pub enabled: bool,
+    /// In front of the webcam, rather than behind it.
+    pub in_front: bool,
+    /// Placed by hand: its box. `None`: it fills the video, as `framing`
+    /// (with an aspect ratio of its own) says.
+    pub placed: Option<BoxCfg>,
+}
+
+impl Default for ScreenCfg {
+    fn default() -> Self {
+        Self { enabled: true, in_front: false, placed: None }
+    }
+}
+
+/// A box in the video: left, top, width, height as fractions of the video,
+/// and the shape (width / height) of the video it was laid out in, to keep
+/// its own shape in a video of another (see [`PlacementCfg::refit`]).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BoxCfg {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub frame_aspect: f32,
+}
+
 /// What the video shows.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -715,8 +747,10 @@ pub struct RecordSettings {
     /// The games and apps list while the whole screen is recorded, so
     /// switching back to games and apps brings it back.
     pub idle_apps: Option<CaptureTarget>,
-    /// A webcam over the picture, if any.
+    /// A webcam over the picture (or under it), if any.
     pub webcam: Option<WebcamCfg>,
+    /// The screen as a source in the video: in front or behind, its box.
+    pub screen: ScreenCfg,
     /// Each camera's settings changed from its defaults (Linux: V4L2 control
     /// id to value), by camera id: put back each time it's opened, as
     /// cameras forget them when unplugged.
@@ -843,6 +877,7 @@ impl Default for RecordSettings {
             capture: CaptureTarget::Screen,
             idle_apps: None,
             webcam: None,
+            screen: ScreenCfg::default(),
             camera_controls: Default::default(),
             display_id: None,
             display_index: 0,
@@ -1025,6 +1060,20 @@ impl RecordSettings {
     /// The size recordings are made at.
     pub fn video_size(&self) -> capture::VideoSize {
         capture::VideoSize { short_side: self.resolution.short_side(), shape: self.capture_shape(), exact: self.resolution.exact() }
+    }
+
+    /// Where the screen's picture goes in the video, for the capture: its
+    /// box, filled (never stretched), when it's been placed by hand; else
+    /// all of the video, as the framing says with a shape of the video's
+    /// own (else all of the picture: a window that isn't the screen's shape
+    /// goes in whole).
+    pub fn screen_placement(&self) -> capture::ScreenPlacement {
+        let s = &self.screen;
+        let (rect, framing) = match s.placed {
+            Some(b) => ([b.x, b.y, b.w, b.h], capture::Framing::Fill),
+            None => ([0.0, 0.0, 1.0, 1.0], self.video_size().framing()),
+        };
+        capture::ScreenPlacement { rect, framing, in_front: s.in_front, hidden: !s.enabled }
     }
 
     pub fn blend_samples(&self) -> u32 {

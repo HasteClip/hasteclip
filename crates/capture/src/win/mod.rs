@@ -254,8 +254,6 @@ impl Session {
         let crop = crate::crop_of(&s.video);
         let (canvas_w, canvas_h) = crate::cropped_size(crop, canvas);
         let (width, height) = s.size.of(canvas_w, canvas_h);
-        // Without a shape, a window that isn't the screen's goes in whole.
-        let framing = s.size.framing();
         let clock = Arc::new(Clock::default());
 
         let (titles, comment, has_rest) = track_layout(&s.sources);
@@ -330,8 +328,8 @@ impl Session {
             let shutter = crate::shutter::Shutter::new(looks, s.blend_shape);
             let blend = FrameBlend::new(&gpu, &latest, looks, shutter.frames_open())?;
             latest.set_wants_queue(true);
-            let converter = d3d::Converter::new(&gpu, &blend.average, overlay.clone(), &encoder.pool.textures, true, width, height, s.fps, framing, crop)?;
-            let preview = d3d::Previewer::new(&gpu, &latest, overlay, width, height, s.fps, framing, crop, crate::preview::new_producer())?;
+            let converter = d3d::Converter::new(&gpu, &blend.average, overlay.clone(), &encoder.pool.textures, true, width, height, s.fps, s.screen.clone(), crop)?;
+            let preview = d3d::Previewer::new(&gpu, &latest, overlay, width, height, s.fps, s.screen.clone(), crop, crate::preview::new_producer())?;
             session.pacer = Some(spawn_blend_pacer(s.fps, looks, shutter, latest, blend, converter, encoder, preview, camera, clock));
             Ok(())
         })();
@@ -570,6 +568,7 @@ impl PreviewCapture {
         fps: u32,
         away: Option<Arc<crate::StillImage>>,
         webcam: Option<crate::webcam::Webcam>,
+        screen: crate::SharedScreen,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let error = Arc::new(std::sync::Mutex::new(None));
@@ -589,10 +588,9 @@ impl PreviewCapture {
                 let picture = source.open(&gpu, w, h, fps, away)?;
                 let (cw, ch) = crate::cropped_size(crop, (w, h));
                 let (width, height) = size.of(cw, ch);
-                let framing = size.framing();
                 let cam = webcam.as_ref().and_then(|wc| camera::CameraLayer::new(&gpu, wc).ok());
                 let overlay = cam.as_ref().zip(webcam.as_ref()).map(|(c, wc)| (&c.latest, wc.placement.clone()));
-                let preview = d3d::Previewer::new(&gpu, &picture.latest, overlay, width, height, fps, framing, crop, generation)?;
+                let preview = d3d::Previewer::new(&gpu, &picture.latest, overlay, width, height, fps, screen, crop, generation)?;
                 Ok((picture, preview, cam))
             })();
             let (picture, preview, mut cam) = match opened {
@@ -1828,6 +1826,7 @@ mod tests {
             video: video.clone(),
             away_screen: None,
             webcam: None,
+            screen: Arc::new(std::sync::Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fill))),
             sources: Vec::new(),
         };
         let mut rec = WinRecorder::new(Arc::new(LiveAudio::default()));

@@ -138,7 +138,7 @@ pub struct VideoPreview {
 }
 
 impl VideoPreview {
-    /// `size`, `fps`, `away_screen` and `webcam` as in
+    /// `size`, `fps`, `away_screen`, `webcam` and `screen` as in
     /// [`crate::EncodeSettings`].
     pub fn start(
         source: &VideoSource,
@@ -146,22 +146,23 @@ impl VideoPreview {
         fps: u32,
         away_screen: Option<std::sync::Arc<crate::StillImage>>,
         webcam: Option<crate::webcam::Webcam>,
+        screen: crate::SharedScreen,
     ) -> Self {
         #[cfg(target_os = "windows")]
         {
-            Self { inner: crate::win::PreviewCapture::start(source.clone(), size, fps, away_screen, webcam) }
+            Self { inner: crate::win::PreviewCapture::start(source.clone(), size, fps, away_screen, webcam, screen) }
         }
         #[cfg(target_os = "macos")]
         {
-            Self { inner: crate::mac::preview::PreviewCapture::start(source.clone(), size, fps, away_screen, webcam) }
+            Self { inner: crate::mac::preview::PreviewCapture::start(source.clone(), size, fps, away_screen, webcam, screen) }
         }
         #[cfg(target_os = "linux")]
         {
-            Self { inner: crate::linux::PreviewCapture::start(source.clone(), size, fps, away_screen, webcam) }
+            Self { inner: crate::linux::PreviewCapture::start(source.clone(), size, fps, away_screen, webcam, screen) }
         }
         #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
         {
-            let _ = (source, size, fps, away_screen, webcam);
+            let _ = (source, size, fps, away_screen, webcam, screen);
             Self {}
         }
     }
