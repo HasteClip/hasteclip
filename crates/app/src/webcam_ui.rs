@@ -15,7 +15,7 @@ use egui::{Color32, CursorIcon, Pos2, Rect, Stroke, vec2};
 
 use crate::App;
 use capture::webcam::{CameraControl, ControlKind};
-use crate::settings::{CamFit, PlacementCfg, WebcamCfg};
+use crate::settings::{PlacementCfg, WebcamCfg};
 
 /// Smallest the webcam's box gets, as a fraction of the frame.
 const MIN_SIZE: f32 = 0.03;
@@ -520,33 +520,16 @@ impl App {
                     }
                 });
             }
-            // Where it sits in the clips: in its box (set on the preview, reset
-            // here), or over all of the video, or all of it as big as fits.
+            // Where it sits in the clips: set on the preview, reset here.
             crate::ui_kit::divider(ui, 0.0);
             let was = self.arrangement();
-            row(ui, "In the video", &mut |ui| {
+            row(ui, "Position", &mut |ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 if Btn::normal("Reset").small().tip("Back to the bottom-right corner, uncropped").show(ui).clicked() {
                     self.webcam_to_corner(frame_aspect);
                 }
-                let fit = self.settings.webcam.as_ref().map_or(CamFit::Box, |w| w.placement.fit);
-                let opts = [
-                    crate::ui_kit::Seg { icon: None, label: "Fill", tip: Some("Over all of the video, its picture cut to the video's shape") },
-                    crate::ui_kit::Seg { icon: None, label: "Fit", tip: Some("All of its picture, as big as fits") },
-                ];
-                // Neither chosen while it's in its box.
-                let now = match fit {
-                    CamFit::Fill => 0,
-                    CamFit::Fit => 1,
-                    CamFit::Box => usize::MAX,
-                };
-                if let Some(i) = crate::ui_kit::segmented_opts(ui, "webcam_fit", &opts, now, None, true)
-                    && let Some(w) = self.settings.webcam.as_mut()
-                {
-                    w.placement.fit = if i == 0 { CamFit::Fill } else { CamFit::Fit };
-                }
                 ui.label(theme::text("Drag it on the preview", 12.5, W::Regular).color(pal.text3)).on_hover_text(format!(
-                    "Drag a corner or edge to resize it, and past the opposite side to flip it. Hold {} to crop, {} to stop snapping. Right-click it to mirror, flip, turn it a quarter or put it behind your screen.",
+                    "Drag a corner or edge to resize it, and past the opposite side to flip it. Hold {} to crop, {} to stop snapping. Right-click it to mirror, flip or turn it a quarter.",
                     crate::shortcuts::alt_name(),
                     crate::shortcuts::ctrl_name()
                 ));
@@ -1013,7 +996,7 @@ impl App {
                 p.y = cy - p.h / 2.0;
             }
             p.crop = c;
-            w.placement = w.placement.moved_to(contain(p), aspect);
+            w.placement = PlacementCfg::laid_out(contain(p), aspect);
         }
         // Turned or mirrored: the placement, as the preview's right-click does
         // it (a quarter turn swaps the box's sides).
@@ -1031,7 +1014,7 @@ impl App {
                 3 => p = p.turn(-1, aspect),
                 _ => {}
             }
-            w.placement = w.placement.moved_to(contain(p), aspect);
+            w.placement = PlacementCfg::laid_out(contain(p), aspect);
         }
         if back {
             self.camera_panel = None;

@@ -175,7 +175,9 @@ impl OutputResolution {
 }
 
 /// The screen (or games and apps) as a source in the video: whether it's
-/// in it, in front of the webcam or behind it, and where it sits.
+/// in it, in front of the webcam or behind it, and where it sits: over all
+/// of the video, or in a box of its own showing all of it (in its own
+/// shape, as cropped), placed on the Sources page's preview.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ScreenCfg {
@@ -183,8 +185,8 @@ pub struct ScreenCfg {
     pub enabled: bool,
     /// In front of the webcam, rather than behind it.
     pub in_front: bool,
-    /// Placed by hand: its box. `None`: it fills the video, as `framing`
-    /// (with an aspect ratio of its own) says.
+    /// Placed by hand: its box. `None`: it fills the video (its middle,
+    /// with a shape of the video's own).
     pub placed: Option<BoxCfg>,
 }
 
@@ -286,50 +288,6 @@ pub struct PlacementCfg {
     /// refitted then (`refit`), keeping its own shape in pixels.
     #[serde(default)]
     pub frame_aspect: Option<f32>,
-    /// In its box, or over all of the video, or all of the camera's picture
-    /// as big as fits (the box is kept for going back).
-    #[serde(default)]
-    pub fit: CamFit,
-}
-
-/// How the webcam sits in the video.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CamFit {
-    /// In its box, placed by hand (in the corner to begin with).
-    #[default]
-    Box,
-    /// Over all of the video, its picture cut to the video's shape.
-    Fill,
-    /// All of its picture, as big as fits, in the middle.
-    Fit,
-}
-
-impl PlacementCfg {
-    /// Where the webcam goes, for the capture and the preview: its box, all
-    /// of the video (Fill: the picture is cut to its shape), or all of the
-    /// picture as big as fits in the middle (Fit: given the video's and the
-    /// camera's shapes, the camera's as turned; all of the video until
-    /// they're known).
-    pub fn effective(&self, frame_aspect: Option<f32>, camera_aspect: Option<f32>) -> capture::webcam::Placement {
-        let p: capture::webcam::Placement = (*self).into();
-        let whole = capture::webcam::Placement { x: 0.0, y: 0.0, w: 1.0, h: 1.0, ..p };
-        match (self.fit, frame_aspect, camera_aspect) {
-            (CamFit::Box, ..) => p,
-            (CamFit::Fit, Some(fa), Some(ca)) if fa > 0.0 && ca > 0.0 => {
-                let visible = ca * (1.0 - p.crop[0] - p.crop[2]).max(0.05) / (1.0 - p.crop[1] - p.crop[3]).max(0.05);
-                let (w, h) = if visible > fa { (1.0, fa / visible) } else { (visible / fa, 1.0) };
-                capture::webcam::Placement { x: (1.0 - w) / 2.0, y: (1.0 - h) / 2.0, w, h, ..p }
-            }
-            _ => whole,
-        }
-    }
-
-    /// `p` in place of its box (laid out in a frame of shape
-    /// `frame_aspect`), filling or fitting as before.
-    pub fn moved_to(&self, p: capture::webcam::Placement, frame_aspect: f32) -> Self {
-        Self { fit: self.fit, ..Self::laid_out(p, frame_aspect) }
-    }
 }
 
 impl PlacementCfg {
@@ -394,13 +352,22 @@ impl BoxCfg {
         [self.x, self.y, self.w, self.h]
     }
 
-    /// Keep its shape in pixels in a frame of shape `frame_aspect`, at the
-    /// same place (see [`refit_box`]). Returns whether it changed.
-    pub fn refit(&mut self, frame_aspect: f32) -> bool {
-        if frame_aspect <= 0.0 || self.w <= 0.0 || self.h <= 0.0 || (self.frame_aspect - frame_aspect).abs() < 1e-3 {
+    /// Keep it right for a frame of shape `frame_aspect`: its shape in
+    /// pixels kept, at the same place (see [`refit_box`]). Its shape is the
+    /// screen's (`screen_aspect`, as cropped, when known): a box of another
+    /// shape (another display, another crop) gets it, keeping its width
+    /// and place. Returns whether it changed.
+    pub fn refit(&mut self, frame_aspect: f32, screen_aspect: Option<f32>) -> bool {
+        if frame_aspect <= 0.0 || self.w <= 0.0 || self.h <= 0.0 {
             return false;
         }
-        let box_aspect = self.w * self.frame_aspect / self.h;
+        let had = self.w * self.frame_aspect / self.h;
+        let box_aspect = match screen_aspect.filter(|&a| a > 0.0) {
+            // Off by more than rounding.
+            Some(screen) if (had / screen - 1.0).abs() > 0.02 => screen,
+            _ if (self.frame_aspect - frame_aspect).abs() < 1e-3 => return false,
+            _ => had,
+        };
         [self.x, self.y, self.w, self.h] = refit_box(self.rect(), box_aspect, frame_aspect);
         self.frame_aspect = frame_aspect;
         true
@@ -414,9 +381,9 @@ impl From<PlacementCfg> for capture::webcam::Placement {
 }
 
 impl PlacementCfg {
-    /// `p`, laid out in a frame of shape `frame_aspect`, in its box.
+    /// `p`, laid out in a frame of shape `frame_aspect`.
     pub fn laid_out(p: capture::webcam::Placement, frame_aspect: f32) -> Self {
-        Self { x: p.x, y: p.y, w: p.w, h: p.h, crop: p.crop, flip_h: p.flip_h, flip_v: p.flip_v, turns: p.turns, frame_aspect: Some(frame_aspect), fit: CamFit::Box }
+        Self { x: p.x, y: p.y, w: p.w, h: p.h, crop: p.crop, flip_h: p.flip_h, flip_v: p.flip_v, turns: p.turns, frame_aspect: Some(frame_aspect) }
     }
 }
 
@@ -850,7 +817,9 @@ pub struct RecordSettings {
     /// The shape recordings are made in, width to height, when it isn't the
     /// screen's (16:9 out of an ultrawide screen).
     pub shape: Option<[u32; 2]>,
-    /// How the screen goes into that shape.
+    /// How the screen went into that shape when Fill, Fit and Stretch were
+    /// chosen: a Fit or Stretch from then becomes a box showing all of the
+    /// screen, once (see `App::refit_boxes`). Fill (its middle) is all there is.
     pub framing: Framing,
     /// The part of the screen kept (a game at a lower resolution than the
     /// display, black around it): set on Sources. It's recorded as a display
@@ -1119,15 +1088,16 @@ impl RecordSettings {
     /// size's own, else the aspect ratio chosen.
     pub fn capture_shape(&self) -> Option<capture::Shape> {
         match self.resolution.exact() {
-            Some((w, h)) => (w > 0 && h > 0).then(|| capture::Shape { w, h, framing: self.framing.into() }),
+            Some((w, h)) => (w > 0 && h > 0).then_some(capture::Shape { w, h, framing: capture::Framing::Fill }),
             None => self.aspect_shape(),
         }
     }
 
     /// The aspect ratio chosen, if it isn't the screen's (an exact size
-    /// aside: it's what a resolution in p records in).
+    /// aside: it's what a resolution in p records in). The screen fills it,
+    /// its middle.
     pub fn aspect_shape(&self) -> Option<capture::Shape> {
-        self.shape.filter(|[w, h]| *w > 0 && *h > 0).map(|[w, h]| capture::Shape { w, h, framing: self.framing.into() })
+        self.shape.filter(|[w, h]| *w > 0 && *h > 0).map(|[w, h]| capture::Shape { w, h, framing: capture::Framing::Fill })
     }
 
     /// The size recordings are made at.
@@ -1136,14 +1106,15 @@ impl RecordSettings {
     }
 
     /// Where the screen's picture goes in the video, for the capture: its
-    /// box, filled (never stretched), when it's been placed by hand; else
-    /// all of the video, as the framing says with a shape of the video's
-    /// own (else all of the picture: a window that isn't the screen's shape
-    /// goes in whole).
+    /// box, which has its shape, when it's been placed by hand; else all of
+    /// the video, its middle with a shape of the video's own (else all of
+    /// the picture). A game's window that isn't the screen's shape goes in
+    /// whole either way.
     pub fn screen_placement(&self) -> capture::ScreenPlacement {
         let s = &self.screen;
+        let apps = matches!(self.capture, CaptureTarget::Apps { .. });
         let (rect, framing) = match s.placed {
-            Some(b) => ([b.x, b.y, b.w, b.h], capture::Framing::Fill),
+            Some(b) => ([b.x, b.y, b.w, b.h], if apps { capture::Framing::Fit } else { capture::Framing::Fill }),
             None => ([0.0, 0.0, 1.0, 1.0], self.video_size().framing()),
         };
         capture::ScreenPlacement { rect, framing, in_front: s.in_front, hidden: !s.enabled }
@@ -1291,14 +1262,17 @@ mod screen_capture_tests {
 mod shape_tests {
     use super::*;
 
-    /// No shape unless chosen; chosen, it's saved and goes to the capture.
+    /// No shape unless chosen; chosen, it's saved and goes to the capture,
+    /// the screen filling it. A Fit saved from when it was a choice is read,
+    /// to be moved into a box showing all of the screen.
     #[test]
     fn shape_is_saved_and_given_to_the_capture() {
         let s = RecordSettings::default();
         assert_eq!(s.capture_shape(), None);
         let s: RecordSettings = serde_json::from_str(r#"{"shape":[16,9],"framing":"fit"}"#).unwrap();
-        assert_eq!(s.capture_shape(), Some(capture::Shape { w: 16, h: 9, framing: capture::Framing::Fit }));
-        assert!(s.to_json().contains(r#""framing": "fit""#));
+        assert_eq!(s.capture_shape(), Some(capture::Shape { w: 16, h: 9, framing: capture::Framing::Fill }));
+        assert_eq!(s.framing, Framing::Fit);
+        assert!(s.to_json().contains(r#""shape": ["#));
     }
 
     /// An exact size is its own shape, whatever aspect ratio was chosen, and
@@ -1359,24 +1333,7 @@ mod placement_tests {
     use super::{BoxCfg, PlacementCfg};
 
     fn cfg(x: f32, y: f32, w: f32, h: f32, frame_aspect: Option<f32>) -> PlacementCfg {
-        PlacementCfg { x, y, w, h, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0, frame_aspect, fit: super::CamFit::Box }
-    }
-
-    /// Filling, the webcam covers the video; fitting, all of its picture
-    /// shows in the middle, as big as fits; its box is kept for going back.
-    #[test]
-    fn fill_and_fit() {
-        let boxed = cfg(0.75, 0.75, 0.25, 0.25, Some(16.0 / 9.0));
-        let p = super::PlacementCfg { fit: super::CamFit::Fill, ..boxed }.effective(Some(16.0 / 9.0), Some(16.0 / 9.0));
-        assert_eq!((p.x, p.y, p.w, p.h), (0.0, 0.0, 1.0, 1.0));
-        // A 16:9 camera in a 9:16 video: a band across its middle.
-        let p = super::PlacementCfg { fit: super::CamFit::Fit, ..boxed }.effective(Some(9.0 / 16.0), Some(16.0 / 9.0));
-        assert!((p.w - 1.0).abs() < 1e-5 && (p.h - 0.31640625).abs() < 1e-5 && (p.y - (1.0 - p.h) / 2.0).abs() < 1e-5, "{p:?}");
-        // Not known yet: all of the video.
-        let p = super::PlacementCfg { fit: super::CamFit::Fit, ..boxed }.effective(None, Some(16.0 / 9.0));
-        assert_eq!((p.w, p.h), (1.0, 1.0));
-        let p = boxed.effective(None, None);
-        assert_eq!((p.x, p.w), (0.75, 0.25));
+        PlacementCfg { x, y, w, h, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0, frame_aspect }
     }
 
     /// The screen's box keeps its shape in pixels when the video changes
@@ -1385,12 +1342,17 @@ mod placement_tests {
     fn the_screens_box_keeps_its_shape() {
         let wide = 16.0 / 9.0;
         let mut b = BoxCfg::new([0.6, 0.0, 0.4, 0.4], wide);
-        assert!(!b.refit(wide));
-        assert!(b.refit(9.0 / 16.0));
+        assert!(!b.refit(wide, Some(wide)));
+        assert!(b.refit(9.0 / 16.0, Some(wide)));
         let pixels = |b: &BoxCfg, frame: f32| b.w * frame / b.h;
         assert!((pixels(&b, 9.0 / 16.0) - 16.0 / 9.0).abs() < 1e-4, "{b:?}");
         assert!((b.x + b.w - 1.0).abs() < 1e-4 && b.y.abs() < 1e-4, "still top right: {b:?}");
         assert!(b.h <= 1.0 && b.w <= 1.0);
+        // Another screen (an ultrawide): its shape, the box's width and
+        // place kept.
+        let mut b = BoxCfg::new([0.6, 0.0, 0.4, 0.4], wide);
+        assert!(b.refit(wide, Some(21.0 / 9.0)));
+        assert!((pixels(&b, wide) - 21.0 / 9.0).abs() < 1e-4 && (b.w - 0.4).abs() < 1e-4, "{b:?}");
     }
 
     fn pixel_aspect(p: &PlacementCfg, frame: f32) -> f32 {

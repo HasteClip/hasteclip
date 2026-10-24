@@ -244,30 +244,18 @@ impl App {
                 let (_, c) = l.row(Row::new("Resolution").tip("Resolution", RESOLUTION_TIP).note(res_note.clone()).locked(lock.clone()), |ui| self.resolution_field(ui));
                 locked_click |= c;
             }
-            if f.shows(&["aspect ratio", "shape", "same as screen", "16:9", "21:9", "ultrawide", "black bars", "crop", "fill", "fit", "stretch"]) {
-                let exact = self.settings.resolution.exact().is_some();
-                let row = Row::new("Aspect ratio").tip("Aspect ratio", SHAPE_TIP).locked(lock.clone());
-                let row = if exact { row.note("Set by the exact size") } else { row };
-                let (_, c) = l.row(row, |ui| self.shape_field(ui, screen));
+            if f.shows(&["aspect ratio", "shape", "same as screen", "16:9", "21:9", "9:16", "ultrawide", "vertical", "crop"]) {
+                // What the shape does to the screen, said: it fills it (its
+                // middle), or it's been placed by hand on Sources.
+                let note = if self.settings.resolution.exact().is_some() {
+                    "Set by the custom size".to_owned()
+                } else if self.settings.screen.placed.is_some() {
+                    "Your screen's placed by hand on the Sources page".to_owned()
+                } else {
+                    self.settings.capture_shape().zip(screen).map_or(String::new(), |(shape, screen)| shape_note(shape, screen))
+                };
+                let (_, c) = l.row(Row::new("Aspect ratio").tip("Aspect ratio", SHAPE_TIP).note(note).locked(lock.clone()), |ui| self.shape_field(ui, screen));
                 locked_click |= c;
-                // How the screen goes in: only with a shape of the video's own,
-                // or once it's been placed by hand on Sources. Live, as there.
-                let shape = self.settings.capture_shape();
-                let placed = self.settings.screen.placed.is_some();
-                l.well("shape_well", shape.is_some() || placed, |l| {
-                    let note = if placed { "Placed by hand on the Sources page".to_owned() } else { shape.zip(screen).map_or(String::new(), |(shape, screen)| shape_note(shape, screen)) };
-                    l.row(Row::new("Screen").tip("Screen", FRAMING_TIP).kid().note(note), |ui| {
-                        if shape.is_some() {
-                            let now = if placed { usize::MAX } else { [settings::Framing::Fill, settings::Framing::Fit, settings::Framing::Stretch].iter().position(|f| *f == self.settings.framing).unwrap_or(0) };
-                            if let Some(framing) = framing_field_at(ui, now) {
-                                self.settings.framing = framing;
-                                self.settings.screen.placed = None;
-                            }
-                        } else if ui_kit::Btn::normal("Fill the video").small().show(ui).clicked() {
-                            self.settings.screen.placed = None;
-                        }
-                    });
-                });
             }
             if f.shows(&["frame rate", "fps"]) {
                 let (_, c) = l.row(Row::new("Frame rate").note(fps_note.clone()).locked(lock.clone()), |ui| self.fps_field(ui));
@@ -1402,24 +1390,9 @@ fn ratio_label(w: u32, h: u32) -> String {
     if rw <= 99 && rh <= 99 { format!("{rw}:{rh}") } else { format!("{:.2}:1", w as f64 / h.max(1) as f64) }
 }
 
-/// Aspect ratio's and its Screen's tips.
-const SHAPE_TIP: &str = "Record in another aspect ratio than your screen's: 16:9 out of an ultrawide screen, say, or 9:16 for phones. Type any other, like 21:9. Every recording and clip is made in it.";
-const FRAMING_TIP: &str = "How your screen goes into the aspect ratio. Fill: its middle, with what's past it cut off (an ultrawide screen's sides, for 16:9). Fit: all of it, with black bars. Stretch: all of it, stretched or squeezed.";
+/// Aspect ratio's tip.
+const SHAPE_TIP: &str = "Record in another aspect ratio than your screen's: 16:9 out of an ultrawide screen, say, or 9:16 for phones. Type any other, like 21:9. Every recording and clip is made in it. Your screen fills it, its middle: make it smaller on the Sources page's preview to show all of it, wherever you like.";
 
-/// Fill, Fit or Stretch, the `chosen`-th of them showing as chosen (none, past
-/// them: the screen's in a box of its own): the one clicked, if one was.
-pub(crate) fn framing_field_at(ui: &mut egui::Ui, chosen: usize) -> Option<settings::Framing> {
-    use settings::Framing;
-    const ALL: [Framing; 3] = [Framing::Fill, Framing::Fit, Framing::Stretch];
-    let opts = [
-        Seg { icon: None, label: "Fill", tip: Some("Its middle, as much as fills the aspect ratio: the edges past it are cut off") },
-        Seg { icon: None, label: "Fit", tip: Some("All of it, with black bars where the aspect ratios differ") },
-        Seg { icon: None, label: "Stretch", tip: Some("All of it, stretched or squeezed into the aspect ratio") },
-    ];
-    ui_kit::segmented_opts(ui, "framing", &opts, chosen, None, ui.is_enabled()).map(|i| ALL[i])
-}
-
-/// What recording in `shape` does to a `w`×`h` screen, in words.
 /// The screen capture setting shows: Windows, where there's a choice.
 const SCREEN_CAPTURE: bool = cfg!(target_os = "windows");
 const SCREEN_CAPTURE_WORDS: &[&str] = &["screen capture", "desktop duplication", "dxgi", "windows graphics capture", "yellow border", "capture method"];
@@ -1452,6 +1425,8 @@ fn screen_capture_note(choice: settings::ScreenCapture, apps: bool, in_use: Opti
     (note.into(), false)
 }
 
+/// What recording in `shape` does to a `w`×`h` screen filling it, in words:
+/// its middle, and what's cut off.
 fn shape_note(shape: capture::Shape, (w, h): (u32, u32)) -> String {
     let (sw, sh) = shape.of(w, h);
     let screen = w as f64 / h.max(1) as f64;
@@ -1459,12 +1434,8 @@ fn shape_note(shape: capture::Shape, (w, h): (u32, u32)) -> String {
     if (screen / wanted - 1.0).abs() < 0.01 {
         return format!("Your {w}×{h} screen is already this aspect ratio");
     }
-    let wider = screen > wanted;
-    match shape.framing {
-        capture::Framing::Fill => format!("Records the middle {sw}×{sh} of your {w}×{h} screen: its {} cut off", if wider { "sides are" } else { "top and bottom are" }),
-        capture::Framing::Fit => format!("Records all of your {w}×{h} screen, with black bars {}", if wider { "above and below" } else { "at the sides" }),
-        capture::Framing::Stretch => format!("Records all of your {w}×{h} screen, {}", if wider { "squeezed narrower" } else { "stretched wider" }),
-    }
+    let cut = if screen > wanted { "sides are" } else { "top and bottom are" };
+    format!("Records the middle {sw}×{sh} of your {w}×{h} screen: its {cut} cut off")
 }
 
 /// Even or Soft: the one clicked, if one was.

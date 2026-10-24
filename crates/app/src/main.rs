@@ -956,7 +956,8 @@ impl App {
     /// the frame, so switching to a display of another shape would stretch
     /// it into that shape (a strip on an ultrawide).
     fn refit_boxes(&mut self) {
-        if self.settings.webcam.is_none() && self.settings.screen.placed.is_none() {
+        let migrating = self.settings.framing != settings::Framing::Fill;
+        if self.settings.webcam.is_none() && self.settings.screen.placed.is_none() && !migrating {
             return;
         }
         let key = (self.video_source(), self.settings.video_size());
@@ -969,8 +970,19 @@ impl App {
             self.frame_size = Some((key, size, Instant::now()));
         }
         let Some(frame_aspect) = self.frame_aspect() else { return };
+        let screen_aspect = self.screen_picture().map(|(w, h)| w as f32 / h.max(1) as f32);
+        // Fit or Stretch, from when they were chosen: all of the screen, in
+        // a box of its own as big as fits (Stretch's nearest without
+        // stretching). Fill is all there is now.
+        if migrating && screen_aspect.is_some() {
+            if self.settings.capture_shape().is_some() && self.settings.screen.placed.is_none() {
+                let r = canvas_ui::fitted(screen_aspect.unwrap_or(frame_aspect), frame_aspect);
+                self.settings.screen.placed = Some(settings::BoxCfg::new([r.min.x, r.min.y, r.width(), r.height()], frame_aspect));
+            }
+            self.settings.framing = settings::Framing::Fill;
+        }
         if let Some(b) = self.settings.screen.placed.as_mut() {
-            b.refit(frame_aspect);
+            b.refit(frame_aspect, screen_aspect);
         }
         let camera_aspect = self.camera_size().map(|(w, h)| w as f32 / h.max(1) as f32);
         if let Some(w) = self.settings.webcam.as_mut() {
@@ -1430,9 +1442,8 @@ impl App {
         self.sync_capture_mics();
         self.sync_capture_settings();
         self.refit_boxes();
-        let camera_aspect = self.camera_size().map(|(w, h)| w as f32 / h.max(1) as f32);
         *self.webcam_placement.lock().unwrap() = match &self.settings.webcam {
-            Some(w) if w.enabled => w.placement.effective(self.frame_aspect(), camera_aspect),
+            Some(w) if w.enabled => w.placement.into(),
             _ => capture::webcam::Placement::hidden(),
         };
         *self.screen_placement.lock().unwrap() = self.settings.screen_placement();

@@ -6,16 +6,16 @@
 //! edges and middle and to the other source's edges (Ctrl to place freely).
 //!
 //! The screen fills the video until a corner makes it smaller: then it's in
-//! a box of its own (`settings::ScreenCfg::placed`), and Fill puts it back.
-//! Both placements are shared with the capture, so what's dragged is what's
-//! recorded, live.
+//! a box of its own showing all of it, in its own shape
+//! (`settings::ScreenCfg::placed`), and Reset puts it back. Both placements
+//! are shared with the capture, so what's dragged is what's recorded, live.
 
 use capture::webcam::Placement;
 use egui::{Color32, CursorIcon, Pos2, Rect, Stroke, vec2};
 use egui_phosphor::regular as icon;
 
 use crate::App;
-use crate::settings::{BoxCfg, CamFit, Framing, PlacementCfg, ScreenCfg};
+use crate::settings::{BoxCfg, PlacementCfg, ScreenCfg};
 use crate::ui_kit::Item;
 use crate::webcam_ui::{self, Handle, Lines, Mods};
 
@@ -60,49 +60,11 @@ pub(crate) struct CanvasView {
 }
 
 /// Where the sources are, as undo keeps it: the screen (its box, in front
-/// or behind), how it fills the video, and the webcam's placement.
+/// or behind) and the webcam's placement.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Arrangement {
     screen: ScreenCfg,
-    framing: Framing,
     webcam: Option<PlacementCfg>,
-}
-
-/// The ready-made arrangements of the screen and the webcam.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Layout {
-    /// The screen over all of the video, the webcam in its corner.
-    Corner,
-    /// The webcam over all of the video, the screen in a box in front.
-    CameraScreen,
-    /// Next to each other, as tall as each other (a wide video).
-    SideBySide,
-    /// The webcam above the screen, each as wide as the video (a tall one).
-    Stacked,
-}
-
-impl Layout {
-    fn label(self) -> &'static str {
-        match self {
-            Layout::Corner => "Corner camera",
-            Layout::CameraScreen => "Camera + screen",
-            Layout::SideBySide => "Side by side",
-            Layout::Stacked => "Stacked",
-        }
-    }
-
-    /// Its picture, small: the boxes (fractions of a `w`×`h` frame) of the
-    /// screen and the webcam, the back one first.
-    fn boxes(self, tall: bool) -> [(bool, [f32; 4]); 2] {
-        match (self, tall) {
-            (Layout::Corner, false) => [(false, [0.0, 0.0, 1.0, 1.0]), (true, [0.66, 0.64, 0.34, 0.36])],
-            (Layout::Corner, true) => [(false, [0.0, 0.0, 1.0, 1.0]), (true, [0.5, 0.78, 0.5, 0.22])],
-            (Layout::CameraScreen, false) => [(true, [0.0, 0.0, 1.0, 1.0]), (false, [0.52, 0.08, 0.44, 0.44])],
-            (Layout::CameraScreen, true) => [(true, [0.0, 0.0, 1.0, 1.0]), (false, [0.08, 0.62, 0.84, 0.3])],
-            (Layout::SideBySide | Layout::Stacked, false) => [(false, [0.0, 0.2, 0.64, 0.6]), (true, [0.65, 0.2, 0.35, 0.6])],
-            (Layout::SideBySide | Layout::Stacked, true) => [(true, [0.0, 0.0, 1.0, 0.39]), (false, [0.0, 0.41, 1.0, 0.59])],
-        }
-    }
 }
 
 /// What's at `p` on the preview (`to_screen` puts a box there): a handle of a
@@ -152,49 +114,11 @@ fn snapped(r: Rect, lines: &Lines) -> Vec<(bool, f32)> {
     out
 }
 
-/// A ready-made arrangement's button: its picture, small, and its name
-/// (only in its tooltip when `compact`).
-fn layout_button(ui: &mut egui::Ui, layout: Layout, tall: bool, compact: bool) -> egui::Response {
-    use crate::theme::{self, W};
-    let pal = theme::pal(ui);
-    let pic = layout_picture(tall);
-    let label = layout.label();
-    let galley = ui.painter().layout_no_wrap(if compact { String::new() } else { label.to_owned() }, theme::font(12.5, W::Medium), pal.text2);
-    let size = vec2(layout_button_width(ui, layout, tall, compact), crate::ui_kit::CONTROL_H + 2.0);
-    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
-    let resp = if compact { resp.on_hover_text(label) } else { resp };
-    crate::demo::mark(ui.ctx(), || format!("button:{label}"), rect);
-    let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered(), theme::FAST);
-    let p = ui.painter();
-    p.rect_filled(rect, 7.0, theme::mix(pal.raise, pal.control, hv));
-    // The video, then the back box and the front one; the screen grey, the
-    // webcam lighter (footage is the only colour, and this isn't footage).
-    let frame = Rect::from_min_size(Pos2::new(rect.left() + 8.0, rect.center().y - pic.y / 2.0), pic);
-    p.rect_filled(frame, 2.0, pal.stage);
-    for (webcam, [x, y, w, h]) in layout.boxes(tall) {
-        let r = Rect::from_min_size(Pos2::new(frame.left() + x * pic.x, frame.top() + y * pic.y), vec2(w * pic.x, h * pic.y));
-        let fill = if webcam { Color32::from_gray(205) } else { Color32::from_gray(105) };
-        p.rect(r.shrink(0.5), 1.0, fill, Stroke::new(1.0, pal.stage), egui::StrokeKind::Inside);
-    }
-    let text = theme::mix(pal.text2, pal.text, hv);
-    p.galley_with_override_text_color(Pos2::new(frame.right() + 7.0, rect.center().y - galley.size().y / 2.0), galley, text);
-    resp.on_hover_cursor(CursorIcon::PointingHand)
-}
-
-/// The size of a layout's small picture.
-fn layout_picture(tall: bool) -> egui::Vec2 {
-    if tall { vec2(15.0, 24.0) } else { vec2(28.0, 16.0) }
-}
-
-/// How wide a layout's button is: its picture, and its name unless `compact`.
-fn layout_button_width(ui: &egui::Ui, layout: Layout, tall: bool, compact: bool) -> f32 {
-    use crate::theme::{self, W};
-    let pic = layout_picture(tall).x;
-    if compact {
-        return 8.0 + pic + 8.0;
-    }
-    let text = ui.painter().layout_no_wrap(layout.label().to_owned(), theme::font(12.5, W::Medium), Color32::PLACEHOLDER).size().x;
-    8.0 + pic + 7.0 + text + 10.0
+/// Where a picture of shape `picture_aspect` goes in a frame of shape
+/// `frame_aspect` as big as fits, in the middle (fractions of the frame).
+pub(crate) fn fitted(picture_aspect: f32, frame_aspect: f32) -> Rect {
+    let size = if picture_aspect > frame_aspect { vec2(1.0, frame_aspect / picture_aspect) } else { vec2(picture_aspect / frame_aspect, 1.0) };
+    Rect::from_center_size(Pos2::new(0.5, 0.5), size)
 }
 
 /// The screen's box after dragging `handle` by `(dx, dy)` (fractions of the
@@ -220,7 +144,7 @@ pub(crate) fn screen_drag(start: Rect, handle: Handle, dx: f32, dy: f32, snap: b
 impl App {
     /// The screen's picture's size: what's kept of it (the main display's,
     /// for games and apps), asked for now and then.
-    fn screen_picture(&mut self) -> Option<(u32, u32)> {
+    pub(crate) fn screen_picture(&mut self) -> Option<(u32, u32)> {
         let source = self.video_source();
         if self.canvas.picture.as_ref().is_none_or(|(s, _, at)| *s != source || at.elapsed() > std::time::Duration::from_secs(2)) {
             let size = capture::frame_size(&source, Default::default());
@@ -241,19 +165,11 @@ impl App {
             return whole;
         }
         let Some((w, h)) = self.screen_picture() else { return whole };
-        let a = w as f32 / h.max(1) as f32;
-        let size = if a > frame_aspect { vec2(1.0, frame_aspect / a) } else { vec2(a / frame_aspect, 1.0) };
-        Rect::from_center_size(Pos2::new(0.5, 0.5), size)
+        fitted(w as f32 / h.max(1) as f32, frame_aspect)
     }
 
     pub(crate) fn arrangement(&self) -> Arrangement {
-        Arrangement { screen: self.settings.screen, framing: self.settings.framing, webcam: self.settings.webcam.as_ref().map(|w| w.placement) }
-    }
-
-    /// Before the sources are arranged differently: so it can be undone.
-    pub(crate) fn save_arrangement(&mut self) {
-        let now = self.arrangement();
-        self.keep_for_undo(now);
+        Arrangement { screen: self.settings.screen, webcam: self.settings.webcam.as_ref().map(|w| w.placement) }
     }
 
     /// `was` (how the sources were before a change just made) can be gone
@@ -270,7 +186,6 @@ impl App {
 
     fn arrange(&mut self, a: Arrangement) {
         self.settings.screen = a.screen;
-        self.settings.framing = a.framing;
         if let (Some(w), Some(p)) = (self.settings.webcam.as_mut(), a.webcam) {
             w.placement = p;
         }
@@ -294,120 +209,34 @@ impl App {
         }
     }
 
-    /// Arrange the screen and the webcam as `layout` says, in a video of
-    /// shape `aspect`. The webcam keeps its turn and mirror; in a box of
-    /// another shape than its picture, its picture is cut to the box's.
-    pub(crate) fn apply_layout(&mut self, layout: Layout, aspect: f32) {
-        self.save_arrangement();
-        // Sizes in a frame 1 tall and `aspect` wide; a margin of 3% of its short side.
-        let (fw, fh) = (aspect, 1.0f32);
-        let m = 0.03 * fw.min(fh);
-        let screen_aspect = self.screen_picture().map_or(aspect, |(w, h)| w as f32 / h.max(1) as f32);
-        let frac = |x: f32, y: f32, w: f32, h: f32| [x / fw, y / fh, w / fw, h / fh];
-        let cam = self.camera_size();
-        // The webcam in a box (pixels of that frame), its picture cut to the box's shape.
-        let webcam_in = |this: &mut Self, r: [f32; 4]| {
-            if let Some(w) = this.settings.webcam.as_mut() {
-                let mut p: Placement = w.placement.into();
-                [p.x, p.y, p.w, p.h] = r;
-                p.crop = [0.0; 4];
-                if let Some(cam) = cam {
-                    p.crop = p.fill_crop(cam, ((1000.0 * aspect).round() as u32, 1000));
-                }
-                w.placement = PlacementCfg::laid_out(p, aspect);
-            }
-        };
-        match layout {
-            Layout::Corner => {
-                self.settings.screen.placed = None;
-                self.settings.screen.in_front = false;
-                self.webcam_to_corner(aspect);
-            }
-            Layout::CameraScreen => {
-                let (w, h) = if aspect >= 1.0 {
-                    let w = 0.42 * fw;
-                    (w, w / screen_aspect)
-                } else {
-                    let w = fw - 2.0 * m;
-                    (w, w / screen_aspect)
-                };
-                let (x, y) = if aspect >= 1.0 { (fw - m - w, m) } else { (m, fh - m - h) };
-                self.settings.screen.placed = Some(BoxCfg::new(frac(x, y, w, h), aspect));
-                self.settings.screen.in_front = true;
-                if let Some(c) = self.settings.webcam.as_mut() {
-                    c.placement.fit = CamFit::Fill;
-                }
-            }
-            Layout::SideBySide => {
-                let mut w1 = 0.64 * fw;
-                let mut h = w1 / screen_aspect;
-                if h > fh {
-                    h = fh;
-                    w1 = h * screen_aspect;
-                }
-                let y = (fh - h) / 2.0;
-                self.settings.screen.placed = Some(BoxCfg::new(frac(0.0, y, w1, h), aspect));
-                webcam_in(self, frac(w1, y, fw - w1, h));
-            }
-            Layout::Stacked => {
-                let top = 0.4 * fh;
-                webcam_in(self, frac(0.0, 0.0, fw, top));
-                self.settings.screen.placed = Some(BoxCfg::new(frac(0.0, top, fw, fh - top), aspect));
-            }
-        }
-    }
-
-    /// Under the preview, with a webcam in the video: the ready-made
-    /// arrangements (for the video's shape), and undo and redo.
-    pub(crate) fn layouts_row(&mut self, ui: &mut egui::Ui, aspect: f32) {
-        use crate::theme::{self, W};
-        let webcam_on = self.settings.webcam.as_ref().is_some_and(|w| w.enabled) && self.settings.screen.enabled;
-        if !webcam_on && self.canvas.undo.is_empty() && self.canvas.redo.is_empty() {
+    /// Undo and redo, over the preview: shown once there's something to
+    /// undo (or redo), ready for a change that went wrong.
+    pub(crate) fn undo_buttons(&mut self, ui: &mut egui::Ui) {
+        use crate::ui_kit::{Btn, Kind};
+        if self.canvas.undo.is_empty() && self.canvas.redo.is_empty() {
             return;
         }
-        let pal = theme::pal(ui);
-        let tall = aspect < 1.0;
-        let layouts = if tall { [Layout::Corner, Layout::CameraScreen, Layout::Stacked] } else { [Layout::Corner, Layout::CameraScreen, Layout::SideBySide] };
-        // Their names too where they fit on the line, with undo and redo.
-        let label = ui.painter().layout_no_wrap("Layouts".to_owned(), theme::font(12.5, W::Regular), pal.text3).size().x;
-        let named: f32 = layouts.iter().map(|l| layout_button_width(ui, *l, tall, false) + 6.0).sum::<f32>() + label + 6.0 + 2.0 * 30.0;
-        let compact = named > ui.available_width();
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
-            if webcam_on {
-                ui.label(theme::text("Layouts", 12.5, W::Regular).color(pal.text3));
-                for layout in layouts {
-                    if layout_button(ui, layout, tall, compact).clicked() {
-                        self.apply_layout(layout, aspect);
-                    }
-                }
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                let redo = crate::ui_kit::Btn::icon(crate::ui_kit::Kind::Ghost, icon::ARROW_CLOCKWISE).small().enabled(!self.canvas.redo.is_empty()).tip(format!("Redo  ({}+Shift+Z)", crate::shortcuts::ctrl_name()));
-                if redo.show(ui).clicked() {
-                    self.redo_arrangement();
-                }
-                let undo = crate::ui_kit::Btn::icon(crate::ui_kit::Kind::Ghost, icon::ARROW_COUNTER_CLOCKWISE).small().enabled(!self.canvas.undo.is_empty()).tip(format!("Undo  ({}+Z)", crate::shortcuts::ctrl_name()));
-                if undo.show(ui).clicked() {
-                    self.undo_arrangement();
-                }
-            });
-        });
+        let ctrl = crate::shortcuts::ctrl_name();
+        let redo = Btn::icon(Kind::Ghost, icon::ARROW_CLOCKWISE).small().enabled(!self.canvas.redo.is_empty()).tip(format!("Redo  ({ctrl}+Shift+Z)"));
+        if redo.show(ui).clicked() {
+            self.redo_arrangement();
+        }
+        let undo = Btn::icon(Kind::Ghost, icon::ARROW_COUNTER_CLOCKWISE).small().enabled(!self.canvas.undo.is_empty()).tip(format!("Undo where your sources are  ({ctrl}+Z)"));
+        if undo.show(ui).clicked() {
+            self.undo_arrangement();
+        }
     }
 
-    /// Where the webcam goes in a video of shape `frame_aspect`: its box, or
-    /// filling or fitting the video (see `PlacementCfg::effective`).
-    fn webcam_placement(&self, frame_aspect: f32) -> Option<Placement> {
-        let camera_aspect = self.camera_size().map(|(w, h)| w as f32 / h.max(1) as f32);
-        self.settings.webcam.as_ref().map(|w| w.placement.effective(Some(frame_aspect), camera_aspect))
+    /// Where the webcam goes.
+    fn webcam_placement(&self) -> Option<Placement> {
+        self.settings.webcam.as_ref().map(|w| w.placement.into())
     }
 
     /// The sources in the video, front first, and where each is (fractions
     /// of the video).
     fn layers(&mut self, frame_aspect: f32) -> Vec<(Layer, Rect)> {
         let screen = self.settings.screen.enabled.then(|| (Layer::Screen, self.screen_rect(frame_aspect)));
-        let webcam = self.webcam_placement(frame_aspect).filter(|_| self.settings.webcam.as_ref().is_some_and(|w| w.enabled)).map(|p| (Layer::Webcam, Rect::from_min_size(Pos2::new(p.x, p.y), vec2(p.w, p.h))));
+        let webcam = self.webcam_placement().filter(|_| self.settings.webcam.as_ref().is_some_and(|w| w.enabled)).map(|p| (Layer::Webcam, Rect::from_min_size(Pos2::new(p.x, p.y), vec2(p.w, p.h))));
         let order = if self.settings.screen.in_front { [screen, webcam] } else { [webcam, screen] };
         order.into_iter().flatten().collect()
     }
@@ -433,18 +262,8 @@ impl App {
             if let Some(((layer, handle), from)) = origin.and_then(|p| hit(&layers, &to_screen, p).map(|h| (h, p))) {
                 let was = self.arrangement();
                 let drag = match layer {
-                    Layer::Webcam => self.take_webcam(handle, from, aspect),
-                    Layer::Screen => {
-                        let r = layers.iter().find(|(l, _)| *l == Layer::Screen).map_or(Rect::NOTHING, |(_, r)| *r);
-                        if self.settings.screen.placed.is_none() && fills(r) && handle == Handle::Move {
-                            Drag::Stuck(Layer::Screen)
-                        } else {
-                            // Made smaller, or moved from where Fit put it:
-                            // from now on it's in a box of its own.
-                            self.settings.screen.placed.get_or_insert(BoxCfg::new([r.min.x, r.min.y, r.width(), r.height()], aspect));
-                            Drag::Screen(handle, from, r)
-                        }
-                    }
+                    Layer::Webcam => Drag::Webcam(handle, from, self.webcam_placement().unwrap_or_else(Placement::hidden)),
+                    Layer::Screen => self.take_screen(handle, from, aspect, &layers),
                 };
                 // Something that moves can be put back (one held that can't, can't).
                 if !matches!(drag, Drag::Stuck(_)) {
@@ -528,7 +347,7 @@ impl App {
         let Some(rect) = layers.iter().find(|(l, _)| *l == active).map(|(_, r)| *r) else { return };
         let bx = to_screen(rect);
         let painter = ui.painter().clone();
-        let webcam: Option<Placement> = (active == Layer::Webcam).then(|| self.webcam_placement(aspect)).flatten();
+        let webcam: Option<Placement> = (active == Layer::Webcam).then(|| self.webcam_placement()).flatten();
         let cropping = modifiers.alt && webcam.is_some() && handle.is_some_and(|h| h != Handle::Move);
 
         // Cropping: where the whole camera picture would be, dashed, so it's
@@ -610,68 +429,56 @@ impl App {
         painter.galley(pill.center() - galley.size() / 2.0, galley, Color32::WHITE);
     }
 
-    /// Take hold of the webcam: in its box as it is; filling or fitting the
-    /// video, from where it is now into a box of its own (filling, its
-    /// picture cut to the video's shape from now on, so the box keeps that
-    /// shape). Filling, it has nowhere to move: held in the middle, it stays.
-    fn take_webcam(&mut self, handle: Handle, from: Pos2, aspect: f32) -> Drag {
-        let Some(mut p) = self.webcam_placement(aspect) else { return Drag::Stuck(Layer::Webcam) };
-        let fit = self.settings.webcam.as_ref().map_or(CamFit::Box, |w| w.placement.fit);
-        match fit {
-            CamFit::Box => return Drag::Webcam(handle, from, p),
-            CamFit::Fill if handle == Handle::Move => return Drag::Stuck(Layer::Webcam),
-            CamFit::Fill => {
-                let frame = self.frame_size.as_ref().and_then(|(_, s, _)| *s);
-                if let (Some(cam), Some(frame)) = (self.camera_size(), frame) {
-                    p.crop = p.fill_crop(cam, frame);
-                }
-            }
-            CamFit::Fit => {}
+    /// Take hold of the screen: in its box as it is; filling the video, from
+    /// all of it in its own shape, as big as fits, into a box of its own
+    /// (the same place, when it's the video's shape). Filling the video in
+    /// its own shape, it has nowhere to move: held in the middle, it stays.
+    fn take_screen(&mut self, handle: Handle, from: Pos2, aspect: f32, layers: &[(Layer, Rect)]) -> Drag {
+        if let Some(b) = self.settings.screen.placed {
+            return Drag::Screen(handle, from, Rect::from_min_size(Pos2::new(b.x, b.y), vec2(b.w, b.h)));
         }
-        if let Some(w) = self.settings.webcam.as_mut() {
-            w.placement = PlacementCfg::laid_out(p, aspect);
+        let all = self.screen_picture().map_or_else(|| layers.iter().find(|(l, _)| *l == Layer::Screen).map_or(Rect::NOTHING, |(_, r)| *r), |(w, h)| fitted(w as f32 / h.max(1) as f32, aspect));
+        if fills(all) && handle == Handle::Move {
+            return Drag::Stuck(Layer::Screen);
         }
-        Drag::Webcam(handle, from, p)
+        self.settings.screen.placed = Some(BoxCfg::new([all.min.x, all.min.y, all.width(), all.height()], aspect));
+        Drag::Screen(handle, from, all)
     }
 
-    /// How the screen sits in the video, on Sources: filling it (as Fill,
-    /// Fit or Stretch say, with a shape of the video's own) or in a box
-    /// placed by hand on the preview; and whether it's in front of the
-    /// webcam. Changes apply at once, while clipping too.
+    /// The screen back over all of the video (Reset).
+    pub(crate) fn screen_to_whole(&mut self) {
+        self.settings.screen.placed = None;
+    }
+
+    /// The screen's place, on Sources: over all of the video, or in a box
+    /// placed on the preview (Reset puts it back); and whether it's in
+    /// front of the webcam. Changes apply at once, while clipping too.
     pub(crate) fn screen_place_card(&mut self, ui: &mut egui::Ui) {
         use crate::theme::{self, W};
         let pal = theme::pal(ui);
-        let own_shape = self.settings.capture_shape().is_some();
         let placed = self.settings.screen.placed.is_some();
         let webcam_on = self.settings.webcam.as_ref().is_some_and(|w| w.enabled);
-        let row = |ui: &mut egui::Ui, label: &str, tip: &str, add: &mut dyn FnMut(&mut egui::Ui)| {
+        let row = |ui: &mut egui::Ui, label: &str, add: &mut dyn FnMut(&mut egui::Ui)| {
             ui.horizontal(|ui| {
                 ui.set_min_height(crate::sources_ui::GROUP_ROW_H);
-                ui.label(theme::text(label, 13.5, W::Regular).color(pal.text)).on_hover_text(tip);
+                ui.label(theme::text(label, 13.5, W::Regular).color(pal.text));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| add(ui));
             });
         };
         let was = self.arrangement();
         crate::sources_ui::group_rows(ui, "screen_place", |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            row(ui, "In the video", "How your screen sits in the video: filling it, or in a box you place on the preview", &mut |ui| {
+            row(ui, "Position", &mut |ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
-                if own_shape {
-                    // None chosen while it's in a box of its own.
-                    let now = if placed { usize::MAX } else { [Framing::Fill, Framing::Fit, Framing::Stretch].iter().position(|f| *f == self.settings.framing).unwrap_or(0) };
-                    if let Some(framing) = crate::settings_ui::framing_field_at(ui, now) {
-                        self.settings.framing = framing;
-                        self.settings.screen.placed = None;
-                    }
-                } else if placed && crate::ui_kit::Btn::normal("Fill the video").small().tip("Your screen over all of the video again").show(ui).clicked() {
-                    self.settings.screen.placed = None;
+                if crate::ui_kit::Btn::normal("Reset").small().enabled(placed).tip("Over all of the video again").show(ui).clicked() {
+                    self.screen_to_whole();
                 }
-                let state = if placed { "Placed by hand" } else if own_shape { "" } else { "Fills it · drag a corner to make it smaller" };
+                let state = if placed { "Placed by hand · drag it on the preview" } else { "Over all of the video · drag a corner to make it smaller" };
                 ui.label(theme::text(state, 12.5, W::Regular).color(pal.text3));
             });
             if webcam_on && self.settings.screen.enabled {
                 crate::ui_kit::divider(ui, 0.0);
-                row(ui, "In front of the webcam", "Your screen over your webcam where they overlap. Off, the webcam's in front.", &mut |ui| {
+                row(ui, "In front of the webcam", &mut |ui| {
                     crate::ui_kit::switch(ui, &mut self.settings.screen.in_front);
                 });
             }
@@ -681,50 +488,25 @@ impl App {
         }
     }
 
-    /// A source's right-click menu: how the screen sits in the video, or the
-    /// webcam's turns and flips; and which is in front.
+    /// A source's right-click menu: its place back as it was, the webcam's
+    /// turns and flips, and which is in front.
     fn layer_menu(&mut self, ui: &mut egui::Ui, layer: Layer, aspect: f32) {
         match layer {
             Layer::Screen => {
-                // Fill, Fit and Stretch differ only when the video has a shape
-                // of its own; else filling is all there is.
-                let own_shape = self.settings.capture_shape().is_some();
-                let whole = self.settings.screen.placed.is_none();
-                let ways: &[(&str, &str, Framing)] = if own_shape {
-                    &[("Fill the video", icon::CORNERS_OUT, Framing::Fill), ("Fit in the video", icon::FRAME_CORNERS, Framing::Fit), ("Stretch to the video", icon::ARROWS_OUT_LINE_HORIZONTAL, Framing::Stretch)]
-                } else {
-                    &[("Fill the video", icon::CORNERS_OUT, Framing::Fill)]
-                };
-                for &(label, ic, framing) in ways {
-                    let on = whole && (!own_shape || self.settings.framing == framing);
-                    if Item::new(label).icon(ic).check(on).show(ui).clicked() {
-                        self.settings.screen.placed = None;
-                        if own_shape {
-                            self.settings.framing = framing;
-                        }
-                        ui.close();
-                    }
+                if Item::new("Reset position").icon(icon::ARROWS_OUT).enabled(self.settings.screen.placed.is_some()).tip("Over all of the video again").show(ui).clicked() {
+                    self.screen_to_whole();
+                    ui.close();
                 }
             }
             Layer::Webcam => {
-                let fit = self.settings.webcam.as_ref().map_or(CamFit::Box, |w| w.placement.fit);
-                for (label, ic, way) in [("Fill the video", icon::CORNERS_OUT, CamFit::Fill), ("Fit in the video", icon::FRAME_CORNERS, CamFit::Fit)] {
-                    if Item::new(label).icon(ic).check(fit == way).show(ui).clicked() {
-                        if let Some(w) = self.settings.webcam.as_mut() {
-                            w.placement.fit = way;
-                        }
-                        ui.close();
-                    }
-                }
-                if Item::new("Back to the corner").icon(icon::ARROWS_IN).tip("In the bottom-right corner, uncropped").show(ui).clicked() {
+                if Item::new("Reset position").icon(icon::ARROWS_IN).tip("Back to the bottom-right corner, uncropped").show(ui).clicked() {
                     self.webcam_to_corner(aspect);
                     ui.close();
                 }
                 crate::ui_kit::menu_sep(ui);
-                // Turned or flipped, it fills or fits as it did.
                 let change = |this: &mut Self, f: &dyn Fn(Placement) -> Placement| {
                     if let Some(w) = this.settings.webcam.as_mut() {
-                        w.placement = w.placement.moved_to(f(w.placement.into()), aspect);
+                        w.placement = PlacementCfg::laid_out(f(w.placement.into()), aspect);
                     }
                 };
                 if Item::new("Turn clockwise").icon(icon::ARROW_CLOCKWISE).show(ui).clicked() {
@@ -736,7 +518,7 @@ impl App {
                     ui.close();
                 }
                 crate::ui_kit::menu_sep(ui);
-                let p: Option<Placement> = self.settings.webcam.as_ref().map(|w| w.placement.into());
+                let p: Option<Placement> = self.webcam_placement();
                 if Item::new("Mirror").icon(icon::FLIP_HORIZONTAL).check(p.is_some_and(|p| p.flip_h)).tip("Flip left to right").show(ui).clicked() {
                     change(self, &|p| Placement { flip_h: !p.flip_h, ..p });
                     ui.close();

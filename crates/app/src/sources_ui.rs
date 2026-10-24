@@ -381,7 +381,10 @@ impl App {
         // it will be (the button stays, and its choices stay open).
         let size = frame.as_ref().map(|f| f.recorded).or_else(|| capture::frame_size(&self.video_source(), self.settings.video_size()));
         let size_text = size.map_or_else(|| format!("{} fps", self.settings.fps), |(w, h)| format!("{w}×{h} at {} fps", self.settings.fps));
-        column_head(ui, "Picture", |ui| self.size_button(ui, &size_text));
+        column_head(ui, "Picture", |ui| {
+            self.size_button(ui, &size_text);
+            self.undo_buttons(ui);
+        });
 
         // What to record: changes right away, while capturing too (the clip
         // switches mid-way; nothing restarts), except the display, which
@@ -408,10 +411,6 @@ impl App {
         }
 
         self.preview_picture(ui, frame.as_deref());
-        if let Some(f) = frame.as_deref() {
-            crate::ui_kit::gap(ui, 8.0);
-            self.layouts_row(ui, f.width as f32 / f.height.max(1) as f32);
-        }
         crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
 
         match self.settings.capture.clone() {
