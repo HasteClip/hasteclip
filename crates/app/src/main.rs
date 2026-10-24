@@ -11,6 +11,7 @@ mod app_icons;
 mod archive;
 mod autostart;
 mod away;
+mod canvas_ui;
 mod clips;
 mod collections;
 mod crop_ui;
@@ -462,6 +463,8 @@ struct App {
     /// like the webcam's placement (kept in step with the settings each frame).
     pub(crate) screen_placement: capture::SharedScreen,
     pub(crate) webcam_view: webcam_ui::WebcamView,
+    /// The picture's sources on the Sources page's preview: dragging them.
+    pub(crate) canvas: canvas_ui::CanvasView,
     /// The camera last asked to stay open (it stays open while a webcam is set
     /// up, so its own settings don't reset).
     kept_camera: Option<(String, Option<capture::webcam::Format>)>,
@@ -703,6 +706,7 @@ impl App {
             webcam_placement: std::sync::Arc::new(std::sync::Mutex::new(capture::webcam::Placement::default_for(16.0 / 9.0, 16.0 / 9.0))),
             screen_placement,
             webcam_view: Default::default(),
+            canvas: Default::default(),
             kept_camera: None,
             audio: capture::audio::list_audio_devices(),
             live_audio,
@@ -947,13 +951,12 @@ impl App {
         }
     }
 
-    /// What the video shows, for the capture backend.
-    /// The webcam, for the capture backend.
-    /// Keep the webcam's box its own shape in the frame being recorded: the
-    /// box is fractions of the frame, so switching to a display of another
-    /// shape would stretch it into that shape (a strip on an ultrawide).
-    fn refit_webcam(&mut self) {
-        if self.settings.webcam.is_none() {
+    /// Keep the webcam's box, and the screen's when it's placed by hand,
+    /// their own shape in the frame being recorded: a box is fractions of
+    /// the frame, so switching to a display of another shape would stretch
+    /// it into that shape (a strip on an ultrawide).
+    fn refit_boxes(&mut self) {
+        if self.settings.webcam.is_none() && self.settings.screen.placed.is_none() {
             return;
         }
         let key = (self.video_source(), self.settings.video_size());
@@ -965,16 +968,30 @@ impl App {
             let size = capture::frame_size(&key.0, key.1);
             self.frame_size = Some((key, size, Instant::now()));
         }
-        let Some((_, Some((fw, fh)), _)) = &self.frame_size else { return };
-        let frame_aspect = *fw as f32 / (*fh).max(1) as f32;
-        let turned = self.settings.webcam.as_ref().is_some_and(|w| w.placement.turns % 2 == 1);
-        let camera_aspect = match capture::webcam::status() {
-            capture::webcam::Status::Live { width, height } if turned => Some(height as f32 / width.max(1) as f32),
-            capture::webcam::Status::Live { width, height } => Some(width as f32 / height.max(1) as f32),
-            _ => None,
-        };
+        let Some(frame_aspect) = self.frame_aspect() else { return };
+        if let Some(b) = self.settings.screen.placed.as_mut() {
+            b.refit(frame_aspect);
+        }
+        let camera_aspect = self.camera_size().map(|(w, h)| w as f32 / h.max(1) as f32);
         if let Some(w) = self.settings.webcam.as_mut() {
             w.placement.refit(frame_aspect, camera_aspect);
+        }
+    }
+
+    /// The shape (width / height) of the frame being recorded, when it's
+    /// known (see `refit_boxes`).
+    pub(crate) fn frame_aspect(&self) -> Option<f32> {
+        let (_, size, _) = self.frame_size.as_ref()?;
+        size.map(|(w, h)| w as f32 / h.max(1) as f32)
+    }
+
+    /// The webcam's picture size as it's turned, once it's live.
+    pub(crate) fn camera_size(&self) -> Option<(u32, u32)> {
+        let turned = self.settings.webcam.as_ref().is_some_and(|w| w.placement.turns % 2 == 1);
+        match capture::webcam::status() {
+            capture::webcam::Status::Live { width, height } if turned => Some((height, width)),
+            capture::webcam::Status::Live { width, height } => Some((width, height)),
+            _ => None,
         }
     }
 
@@ -1400,9 +1417,10 @@ impl App {
         self.sync_capture_video();
         self.sync_capture_mics();
         self.sync_capture_settings();
-        self.refit_webcam();
+        self.refit_boxes();
+        let camera_aspect = self.camera_size().map(|(w, h)| w as f32 / h.max(1) as f32);
         *self.webcam_placement.lock().unwrap() = match &self.settings.webcam {
-            Some(w) if w.enabled => w.placement.into(),
+            Some(w) if w.enabled => w.placement.effective(self.frame_aspect(), camera_aspect),
             _ => capture::webcam::Placement::hidden(),
         };
         *self.screen_placement.lock().unwrap() = self.settings.screen_placement();

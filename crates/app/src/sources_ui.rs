@@ -112,6 +112,17 @@ impl App {
             self.screen_crop_page(ui);
             return;
         }
+        // Where the sources are, undone and done again from the keyboard (not
+        // while typing, or with a menu open).
+        if !ui.ctx().egui_wants_keyboard_input() && !crate::ui_kit::overlay_open(ui.ctx()) {
+            let (redo, undo) = ui.input_mut(|i| (i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z), i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)));
+            if undo {
+                self.undo_arrangement();
+            }
+            if redo {
+                self.redo_arrangement();
+            }
+        }
         self.page_head(ui, "Sources", |_, _| {});
         crate::ui_kit::arrive(ui, |ui| crate::ui_kit::scroll(ui, "sources_page", |ui| {
             // The headings' tops level with the other pages' first heading
@@ -399,6 +410,10 @@ impl App {
         }
 
         self.preview_picture(ui, frame.as_deref());
+        if let Some(f) = frame.as_deref() {
+            crate::ui_kit::gap(ui, 8.0);
+            self.layouts_row(ui, f.width as f32 / f.height.max(1) as f32);
+        }
         crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
 
         match self.settings.capture.clone() {
@@ -462,6 +477,8 @@ impl App {
                 }
             }
         }
+        crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
+        self.screen_place_card(ui);
     }
 
     /// The Crop row: what's kept of the screen, and a way to its page.
@@ -790,6 +807,7 @@ impl App {
         let w = ui.available_width().min(max_h * aspect);
         ui.vertical_centered(|ui| {
             let (rect, response) = ui.allocate_exact_size(egui::vec2(w, w / aspect), Sense::click_and_drag());
+            crate::demo::mark(ui.ctx(), || "preview".into(), rect);
             let p = ui.painter();
             p.rect_filled(rect, 6.0, crate::theme::pal(ui).stage);
             let message = |text: &str| {
@@ -804,8 +822,8 @@ impl App {
                 None if !drawn => message("Starting preview…"),
                 None => {}
             }
-            if self.settings.webcam.is_some() && frame.is_some() {
-                self.webcam_on_preview(ui, rect, &response);
+            if frame.is_some() {
+                self.canvas_on_preview(ui, rect, &response);
             }
         });
     }

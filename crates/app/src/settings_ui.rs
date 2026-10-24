@@ -250,15 +250,23 @@ impl App {
                 let row = if exact { row.note("Set by the exact size") } else { row };
                 let (_, c) = l.row(row, |ui| self.shape_field(ui, screen));
                 locked_click |= c;
+                // How the screen goes in: only with a shape of the video's own,
+                // or once it's been placed by hand on Sources. Live, as there.
                 let shape = self.settings.capture_shape();
-                l.well("shape_well", shape.is_some(), |l| {
-                    let note = shape.zip(screen).map_or(String::new(), |(shape, screen)| shape_note(shape, screen));
-                    let (_, c) = l.row(Row::new("Screen").tip("Screen", FRAMING_TIP).kid().note(note).locked(lock.clone()), |ui| {
-                        if let Some(framing) = framing_field(ui, self.settings.framing) {
-                            self.settings.framing = framing;
+                let placed = self.settings.screen.placed.is_some();
+                l.well("shape_well", shape.is_some() || placed, |l| {
+                    let note = if placed { "Placed by hand on the Sources page".to_owned() } else { shape.zip(screen).map_or(String::new(), |(shape, screen)| shape_note(shape, screen)) };
+                    l.row(Row::new("Screen").tip("Screen", FRAMING_TIP).kid().note(note), |ui| {
+                        if shape.is_some() {
+                            let now = if placed { usize::MAX } else { [settings::Framing::Fill, settings::Framing::Fit, settings::Framing::Stretch].iter().position(|f| *f == self.settings.framing).unwrap_or(0) };
+                            if let Some(framing) = framing_field_at(ui, now) {
+                                self.settings.framing = framing;
+                                self.settings.screen.placed = None;
+                            }
+                        } else if ui_kit::Btn::normal("Fill the video").small().show(ui).clicked() {
+                            self.settings.screen.placed = None;
                         }
                     });
-                    locked_click |= c;
                 });
             }
             if f.shows(&["frame rate", "fps"]) {
@@ -1398,8 +1406,9 @@ fn ratio_label(w: u32, h: u32) -> String {
 const SHAPE_TIP: &str = "Record in another aspect ratio than your screen's: 16:9 out of an ultrawide screen, say, or 9:16 for phones. Type any other, like 21:9. Every recording and clip is made in it.";
 const FRAMING_TIP: &str = "How your screen goes into the aspect ratio. Fill: its middle, with what's past it cut off (an ultrawide screen's sides, for 16:9). Fit: all of it, with black bars. Stretch: all of it, stretched or squeezed.";
 
-/// Fill, Fit or Stretch: the one clicked, if one was.
-fn framing_field(ui: &mut egui::Ui, now: settings::Framing) -> Option<settings::Framing> {
+/// Fill, Fit or Stretch, the `chosen`-th of them showing as chosen (none, past
+/// them: the screen's in a box of its own): the one clicked, if one was.
+pub(crate) fn framing_field_at(ui: &mut egui::Ui, chosen: usize) -> Option<settings::Framing> {
     use settings::Framing;
     const ALL: [Framing; 3] = [Framing::Fill, Framing::Fit, Framing::Stretch];
     let opts = [
@@ -1407,7 +1416,6 @@ fn framing_field(ui: &mut egui::Ui, now: settings::Framing) -> Option<settings::
         Seg { icon: None, label: "Fit", tip: Some("All of it, with black bars where the aspect ratios differ") },
         Seg { icon: None, label: "Stretch", tip: Some("All of it, stretched or squeezed into the aspect ratio") },
     ];
-    let chosen = ALL.iter().position(|f| *f == now).unwrap_or(0);
     ui_kit::segmented_opts(ui, "framing", &opts, chosen, None, ui.is_enabled()).map(|i| ALL[i])
 }
 

@@ -286,6 +286,50 @@ pub struct PlacementCfg {
     /// refitted then (`refit`), keeping its own shape in pixels.
     #[serde(default)]
     pub frame_aspect: Option<f32>,
+    /// In its box, or over all of the video, or all of the camera's picture
+    /// as big as fits (the box is kept for going back).
+    #[serde(default)]
+    pub fit: CamFit,
+}
+
+/// How the webcam sits in the video.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CamFit {
+    /// In its box, placed by hand (in the corner to begin with).
+    #[default]
+    Box,
+    /// Over all of the video, its picture cut to the video's shape.
+    Fill,
+    /// All of its picture, as big as fits, in the middle.
+    Fit,
+}
+
+impl PlacementCfg {
+    /// Where the webcam goes, for the capture and the preview: its box, all
+    /// of the video (Fill: the picture is cut to its shape), or all of the
+    /// picture as big as fits in the middle (Fit: given the video's and the
+    /// camera's shapes, the camera's as turned; all of the video until
+    /// they're known).
+    pub fn effective(&self, frame_aspect: Option<f32>, camera_aspect: Option<f32>) -> capture::webcam::Placement {
+        let p: capture::webcam::Placement = (*self).into();
+        let whole = capture::webcam::Placement { x: 0.0, y: 0.0, w: 1.0, h: 1.0, ..p };
+        match (self.fit, frame_aspect, camera_aspect) {
+            (CamFit::Box, ..) => p,
+            (CamFit::Fit, Some(fa), Some(ca)) if fa > 0.0 && ca > 0.0 => {
+                let visible = ca * (1.0 - p.crop[0] - p.crop[2]).max(0.05) / (1.0 - p.crop[1] - p.crop[3]).max(0.05);
+                let (w, h) = if visible > fa { (1.0, fa / visible) } else { (visible / fa, 1.0) };
+                capture::webcam::Placement { x: (1.0 - w) / 2.0, y: (1.0 - h) / 2.0, w, h, ..p }
+            }
+            _ => whole,
+        }
+    }
+
+    /// `p` in place of its box (laid out in a frame of shape
+    /// `frame_aspect`), filling or fitting as before.
+    pub fn moved_to(&self, p: capture::webcam::Placement, frame_aspect: f32) -> Self {
+        Self { fit: self.fit, ..Self::laid_out(p, frame_aspect) }
+    }
 }
 
 impl PlacementCfg {
@@ -316,20 +360,49 @@ impl PlacementCfg {
             (None, Some(wanted)) => wanted,
             (None, None) => return false, // wait for the camera's shape
         };
-        // From 0 against the left or top edge to 1 against the other.
-        let along = |at: f32, size: f32| if size < 1.0 - 1e-4 { (at / (1.0 - size)).clamp(0.0, 1.0) } else { 0.5 };
-        let (ax, ay) = (along(self.x, self.w), along(self.y, self.h));
-        let mut w = self.w.min(1.0);
-        let mut h = w * frame_aspect / box_aspect;
-        if h > 1.0 {
-            w *= 1.0 / h;
-            h = 1.0;
-        }
-        self.w = w;
-        self.h = h;
-        self.x = ax * (1.0 - w);
-        self.y = ay * (1.0 - h);
+        [self.x, self.y, self.w, self.h] = refit_box([self.x, self.y, self.w, self.h], box_aspect, frame_aspect);
         self.frame_aspect = Some(frame_aspect);
+        true
+    }
+}
+
+/// A box (left, top, width, height as fractions of the frame) of shape
+/// `box_aspect` in pixels, in a frame of shape `frame_aspect`: as wide a
+/// share of the frame (narrower if that won't fit), at the same place in the
+/// room it has to move in (so a box in a corner stays in it).
+fn refit_box([x, y, w, h]: [f32; 4], box_aspect: f32, frame_aspect: f32) -> [f32; 4] {
+    // From 0 against the left or top edge to 1 against the other.
+    let along = |at: f32, size: f32| if size < 1.0 - 1e-4 { (at / (1.0 - size)).clamp(0.0, 1.0) } else { 0.5 };
+    let (ax, ay) = (along(x, w), along(y, h));
+    let mut w = w.min(1.0);
+    let mut h = w * frame_aspect / box_aspect;
+    if h > 1.0 {
+        w *= 1.0 / h;
+        h = 1.0;
+    }
+    [ax * (1.0 - w), ay * (1.0 - h), w, h]
+}
+
+impl BoxCfg {
+    /// `rect` (left, top, width, height as fractions of the frame), laid out
+    /// in a frame of shape `frame_aspect`.
+    pub fn new([x, y, w, h]: [f32; 4], frame_aspect: f32) -> Self {
+        Self { x, y, w, h, frame_aspect }
+    }
+
+    pub fn rect(&self) -> [f32; 4] {
+        [self.x, self.y, self.w, self.h]
+    }
+
+    /// Keep its shape in pixels in a frame of shape `frame_aspect`, at the
+    /// same place (see [`refit_box`]). Returns whether it changed.
+    pub fn refit(&mut self, frame_aspect: f32) -> bool {
+        if frame_aspect <= 0.0 || self.w <= 0.0 || self.h <= 0.0 || (self.frame_aspect - frame_aspect).abs() < 1e-3 {
+            return false;
+        }
+        let box_aspect = self.w * self.frame_aspect / self.h;
+        [self.x, self.y, self.w, self.h] = refit_box(self.rect(), box_aspect, frame_aspect);
+        self.frame_aspect = frame_aspect;
         true
     }
 }
@@ -341,9 +414,9 @@ impl From<PlacementCfg> for capture::webcam::Placement {
 }
 
 impl PlacementCfg {
-    /// `p`, laid out in a frame of shape `frame_aspect`.
+    /// `p`, laid out in a frame of shape `frame_aspect`, in its box.
     pub fn laid_out(p: capture::webcam::Placement, frame_aspect: f32) -> Self {
-        Self { x: p.x, y: p.y, w: p.w, h: p.h, crop: p.crop, flip_h: p.flip_h, flip_v: p.flip_v, turns: p.turns, frame_aspect: Some(frame_aspect) }
+        Self { x: p.x, y: p.y, w: p.w, h: p.h, crop: p.crop, flip_h: p.flip_h, flip_v: p.flip_v, turns: p.turns, frame_aspect: Some(frame_aspect), fit: CamFit::Box }
     }
 }
 
@@ -1283,10 +1356,41 @@ mod noise_reduction_tests {
 
 #[cfg(test)]
 mod placement_tests {
-    use super::PlacementCfg;
+    use super::{BoxCfg, PlacementCfg};
 
     fn cfg(x: f32, y: f32, w: f32, h: f32, frame_aspect: Option<f32>) -> PlacementCfg {
-        PlacementCfg { x, y, w, h, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0, frame_aspect }
+        PlacementCfg { x, y, w, h, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0, frame_aspect, fit: super::CamFit::Box }
+    }
+
+    /// Filling, the webcam covers the video; fitting, all of its picture
+    /// shows in the middle, as big as fits; its box is kept for going back.
+    #[test]
+    fn fill_and_fit() {
+        let boxed = cfg(0.75, 0.75, 0.25, 0.25, Some(16.0 / 9.0));
+        let p = super::PlacementCfg { fit: super::CamFit::Fill, ..boxed }.effective(Some(16.0 / 9.0), Some(16.0 / 9.0));
+        assert_eq!((p.x, p.y, p.w, p.h), (0.0, 0.0, 1.0, 1.0));
+        // A 16:9 camera in a 9:16 video: a band across its middle.
+        let p = super::PlacementCfg { fit: super::CamFit::Fit, ..boxed }.effective(Some(9.0 / 16.0), Some(16.0 / 9.0));
+        assert!((p.w - 1.0).abs() < 1e-5 && (p.h - 0.31640625).abs() < 1e-5 && (p.y - (1.0 - p.h) / 2.0).abs() < 1e-5, "{p:?}");
+        // Not known yet: all of the video.
+        let p = super::PlacementCfg { fit: super::CamFit::Fit, ..boxed }.effective(None, Some(16.0 / 9.0));
+        assert_eq!((p.w, p.h), (1.0, 1.0));
+        let p = boxed.effective(None, None);
+        assert_eq!((p.x, p.w), (0.75, 0.25));
+    }
+
+    /// The screen's box keeps its shape in pixels when the video changes
+    /// shape, in its corner; the same video leaves it alone.
+    #[test]
+    fn the_screens_box_keeps_its_shape() {
+        let wide = 16.0 / 9.0;
+        let mut b = BoxCfg::new([0.6, 0.0, 0.4, 0.4], wide);
+        assert!(!b.refit(wide));
+        assert!(b.refit(9.0 / 16.0));
+        let pixels = |b: &BoxCfg, frame: f32| b.w * frame / b.h;
+        assert!((pixels(&b, 9.0 / 16.0) - 16.0 / 9.0).abs() < 1e-4, "{b:?}");
+        assert!((b.x + b.w - 1.0).abs() < 1e-4 && b.y.abs() < 1e-4, "still top right: {b:?}");
+        assert!(b.h <= 1.0 && b.w <= 1.0);
     }
 
     fn pixel_aspect(p: &PlacementCfg, frame: f32) -> f32 {

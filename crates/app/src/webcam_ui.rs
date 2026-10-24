@@ -1,8 +1,9 @@
-//! The webcam on the Sources page: picking a camera, and placing it on the live preview the way OBS does — drag
+//! The webcam on the Sources page: picking a camera, and how it's placed on
+//! the live preview the way OBS does (`canvas_ui` takes the pointer) — drag
 //! to move, any handle to resize (always keeping its shape: it's never
 //! stretched), past the opposite side to flip it, Alt with a handle to crop,
-//! right-click to flip or turn it a quarter. Moves snap to the frame's edges and centre (Ctrl to place
-//! freely).
+//! right-click to flip or turn it a quarter. Moves snap to the frame's edges
+//! and centre (Ctrl to place freely).
 //!
 //! Placement is fractions of the frame (see `capture::webcam::Placement`); it's
 //! shared with the capture, so what you drag is what's recorded, live. So is
@@ -14,25 +15,17 @@ use egui::{Color32, CursorIcon, Pos2, Rect, Stroke, vec2};
 
 use crate::App;
 use capture::webcam::{CameraControl, ControlKind};
-/// The webcam's box outline on the preview.
-const ACCENT: Color32 = Color32::WHITE;
-use crate::settings::{PlacementCfg, WebcamCfg};
+use crate::settings::{CamFit, PlacementCfg, WebcamCfg};
 
 /// Smallest the webcam's box gets, as a fraction of the frame.
 const MIN_SIZE: f32 = 0.03;
 /// Snap distance, as a fraction of the frame.
 const SNAP: f32 = 0.012;
-/// Handle size, in points.
-const HANDLE: f32 = 8.0;
-/// OBS-ish crop colour.
-const CROP: Color32 = Color32::from_rgb(80, 220, 120);
 
 #[derive(Default)]
 pub(crate) struct WebcamView {
     /// Cameras for the picker, refreshed when it opens.
     cameras: Vec<capture::Device>,
-    /// A drag in progress: what's held, where it started, and the placement then.
-    drag: Option<(Handle, Pos2, Placement)>,
     /// Just added, or a new camera or format: size its box to the camera's
     /// shape once the camera delivers it.
     fit_pending: bool,
@@ -40,8 +33,6 @@ pub(crate) struct WebcamView {
     /// camera is still the old one (it takes a moment to reopen), and fitting
     /// to it would shape the box for the format just left.
     fit_from: Option<(u32, u32)>,
-    /// The right-click menu is open (it was opened on the box).
-    menu: bool,
 }
 
 impl WebcamView {
@@ -70,10 +61,10 @@ pub(crate) enum Handle {
 }
 
 impl Handle {
-    const ALL: [Handle; 8] = [Handle::NW, Handle::N, Handle::NE, Handle::E, Handle::SE, Handle::S, Handle::SW, Handle::W];
+    pub(crate) const ALL: [Handle; 8] = [Handle::NW, Handle::N, Handle::NE, Handle::E, Handle::SE, Handle::S, Handle::SW, Handle::W];
 
     /// Which sides it moves: left, top, right, bottom.
-    fn sides(self) -> [bool; 4] {
+    pub(crate) fn sides(self) -> [bool; 4] {
         match self {
             Handle::Move => [false; 4],
             Handle::N => [false, true, false, false],
@@ -88,14 +79,14 @@ impl Handle {
     }
 
     /// Where it sits on a box.
-    fn pos(self, r: Rect) -> Pos2 {
+    pub(crate) fn pos(self, r: Rect) -> Pos2 {
         let [l, t, rr, b] = self.sides();
         let x = if l { r.left() } else if rr { r.right() } else { r.center().x };
         let y = if t { r.top() } else if b { r.bottom() } else { r.center().y };
         Pos2::new(x, y)
     }
 
-    fn cursor(self) -> CursorIcon {
+    pub(crate) fn cursor(self) -> CursorIcon {
         match self {
             Handle::Move => CursorIcon::Grab,
             Handle::N | Handle::S => CursorIcon::ResizeVertical,
@@ -117,8 +108,17 @@ pub(crate) struct Mods {
     pub keep: bool,
 }
 
+/// More lines a move snaps to besides the frame's edges and centre: the
+/// other sources' edges and middles, as fractions of the frame across (`xs`)
+/// and down (`ys`).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Lines {
+    pub xs: Vec<f32>,
+    pub ys: Vec<f32>,
+}
+
 /// The placement after dragging `handle` by `(dx, dy)` (fractions of the
-/// frame) from where it was at `start`.
+/// frame) from where it was at `start`, moves snapping to `lines` too.
 ///
 /// Resizing never stretches: every handle scales the whole picture, from the
 /// opposite corner or edge (an edge handle keeps the other axis centred).
@@ -126,14 +126,14 @@ pub(crate) struct Mods {
 ///
 /// The box stays inside the frame: moving stops at its edges, and so does
 /// growing (what's not wanted of the picture is cropped instead).
-pub(crate) fn drag(start: Placement, handle: Handle, dx: f32, dy: f32, mods: Mods) -> Placement {
+pub(crate) fn drag(start: Placement, handle: Handle, dx: f32, dy: f32, mods: Mods, lines: &Lines) -> Placement {
     let mut p = start;
     if handle == Handle::Move {
         p.x = start.x + dx;
         p.y = start.y + dy;
         if mods.snap {
-            p.x += snap_offset(&[p.x, p.x + p.w], p.x + p.w / 2.0);
-            p.y += snap_offset(&[p.y, p.y + p.h], p.y + p.h / 2.0);
+            p.x += snap_offset(&[p.x, p.x + p.w], p.x + p.w / 2.0, &lines.xs);
+            p.y += snap_offset(&[p.y, p.y + p.h], p.y + p.h / 2.0, &lines.ys);
         }
         p.x = p.x.clamp(0.0, (1.0 - p.w).max(0.0));
         p.y = p.y.clamp(0.0, (1.0 - p.h).max(0.0));
@@ -303,8 +303,8 @@ pub(crate) fn contain(mut p: Placement) -> Placement {
 }
 
 /// How far to move so the nearest of `edges` (to 0 or 1) or `center` (to 0.5)
-/// lands on it, if one is close enough.
-fn snap_offset(edges: &[f32], center: f32) -> f32 {
+/// lands on it, or any of them on one of `lines`, if one is close enough.
+pub(crate) fn snap_offset(edges: &[f32], center: f32, lines: &[f32]) -> f32 {
     let mut best: Option<f32> = None;
     let mut consider = |d: f32| {
         if d.abs() < SNAP && best.is_none_or(|b| d.abs() < b.abs()) {
@@ -316,6 +316,11 @@ fn snap_offset(edges: &[f32], center: f32) -> f32 {
         consider(1.0 - e);
     }
     consider(0.5 - center);
+    for &l in lines {
+        for &e in edges.iter().chain([&center]) {
+            consider(l - e);
+        }
+    }
     best.unwrap_or(0.0)
 }
 
@@ -515,193 +520,52 @@ impl App {
                     }
                 });
             }
-            // Where it sits in the clips: set on the preview, reset here.
+            // Where it sits in the clips: in its box (set on the preview, reset
+            // here), or over all of the video, or all of it as big as fits.
             crate::ui_kit::divider(ui, 0.0);
-            row(ui, "Position", &mut |ui| {
+            let was = self.arrangement();
+            row(ui, "In the video", &mut |ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 if Btn::normal("Reset").small().tip("Back to the bottom-right corner, uncropped").show(ui).clicked() {
-                    let camera_aspect = match status {
-                        Status::Live { width, height } => width as f32 / height.max(1) as f32,
-                        _ => 16.0 / 9.0,
-                    };
-                    if let Some(w) = self.settings.webcam.as_mut() {
-                        w.placement = PlacementCfg::laid_out(Placement::default_for(camera_aspect, frame_aspect), frame_aspect);
-                    }
+                    self.webcam_to_corner(frame_aspect);
+                }
+                let fit = self.settings.webcam.as_ref().map_or(CamFit::Box, |w| w.placement.fit);
+                let opts = [
+                    crate::ui_kit::Seg { icon: None, label: "Fill", tip: Some("Over all of the video, its picture cut to the video's shape") },
+                    crate::ui_kit::Seg { icon: None, label: "Fit", tip: Some("All of its picture, as big as fits") },
+                ];
+                // Neither chosen while it's in its box.
+                let now = match fit {
+                    CamFit::Fill => 0,
+                    CamFit::Fit => 1,
+                    CamFit::Box => usize::MAX,
+                };
+                if let Some(i) = crate::ui_kit::segmented_opts(ui, "webcam_fit", &opts, now, None, true)
+                    && let Some(w) = self.settings.webcam.as_mut()
+                {
+                    w.placement.fit = if i == 0 { CamFit::Fill } else { CamFit::Fit };
                 }
                 ui.label(theme::text("Drag it on the preview", 12.5, W::Regular).color(pal.text3)).on_hover_text(format!(
-                    "Drag a corner or edge to resize it, and past the opposite side to flip it. Hold {} to crop, {} to stop snapping. Right-click it to mirror, flip or turn it a quarter.",
+                    "Drag a corner or edge to resize it, and past the opposite side to flip it. Hold {} to crop, {} to stop snapping. Right-click it to mirror, flip, turn it a quarter or put it behind your screen.",
                     crate::shortcuts::alt_name(),
                     crate::shortcuts::ctrl_name()
                 ));
             });
+            if self.arrangement() != was {
+                self.keep_for_undo(was);
+            }
         });
     }
 
-    /// The webcam's box on the preview, its handles, and dragging them.
-    pub(crate) fn webcam_on_preview(&mut self, ui: &mut egui::Ui, frame_rect: Rect, response: &egui::Response) {
-        let Some(cam) = self.settings.webcam.as_ref().filter(|c| c.enabled) else { return };
-        let p: Placement = cam.placement.into();
-        let to_screen = |x: f32, y: f32| Pos2::new(frame_rect.left() + x * frame_rect.width(), frame_rect.top() + y * frame_rect.height());
-        let bx = Rect::from_min_max(to_screen(p.x, p.y), to_screen(p.x + p.w, p.y + p.h));
-        let modifiers = ui.input(|i| i.modifiers);
-        let pointer = ui.input(|i| i.pointer.hover_pos());
-
-        // What's under the pointer: a handle, else the box itself.
-        let hit = |at: Pos2| -> Option<Handle> {
-            Handle::ALL
-                .into_iter()
-                .find(|h| h.pos(bx).distance(at) <= HANDLE)
-                .or_else(|| bx.expand(2.0).contains(at).then_some(Handle::Move))
+    /// The webcam back in the bottom-right corner, in its box, uncropped.
+    pub(crate) fn webcam_to_corner(&mut self, frame_aspect: f32) {
+        let camera_aspect = match capture::webcam::status() {
+            Status::Live { width, height } => width as f32 / height.max(1) as f32,
+            _ => 16.0 / 9.0,
         };
-
-        // A drag only starts once the pointer has moved a little, so what was
-        // grabbed is judged by where the button went down, not where it is now.
-        if response.drag_started() {
-            let origin = ui.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos());
-            if let Some((h, at)) = origin.and_then(|at| hit(at).map(|h| (h, at))) {
-                self.webcam_view.drag = Some((h, at, p));
-            }
+        if let Some(w) = self.settings.webcam.as_mut() {
+            w.placement = PlacementCfg::laid_out(Placement::default_for(camera_aspect, frame_aspect), frame_aspect);
         }
-        if let Some((handle, from, start)) = self.webcam_view.drag {
-            if response.dragged() {
-                if let Some(now) = response.interact_pointer_pos() {
-                    let mods = Mods { crop: modifiers.alt, snap: !modifiers.ctrl, keep: modifiers.shift };
-                    let (dx, dy) = ((now.x - from.x) / frame_rect.width(), (now.y - from.y) / frame_rect.height());
-                    let moved = drag(start, handle, dx, dy, mods);
-                    let aspect = frame_rect.width() / frame_rect.height().max(1.0);
-                    if let Some(w) = self.settings.webcam.as_mut() {
-                        w.placement = PlacementCfg::laid_out(moved, aspect);
-                    }
-                }
-                ui.ctx().set_cursor_icon(if handle == Handle::Move { CursorIcon::Grabbing } else { handle.cursor() });
-            }
-            if response.drag_stopped() || !response.dragged() && !ui.input(|i| i.pointer.any_down()) {
-                self.webcam_view.drag = None;
-            }
-        } else if let Some(h) = pointer.filter(|at| frame_rect.expand(HANDLE).contains(*at)).and_then(hit) {
-            ui.ctx().set_cursor_icon(h.cursor());
-        }
-
-        // Right-click on it: flip or turn it. The menu stays tied to a click
-        // that landed on the box.
-        if response.secondary_clicked() && ui.input(|i| i.pointer.interact_pos()).is_some_and(|at| hit(at).is_some()) {
-            self.webcam_view.menu = true;
-        }
-        if self.webcam_view.menu {
-            let mut keep = false;
-            response.context_menu(|ui| {
-                keep = true;
-                let aspect = frame_rect.width() / frame_rect.height().max(1.0);
-                let mut change = |f: &dyn Fn(Placement) -> Placement| {
-                    if let Some(w) = self.settings.webcam.as_mut() {
-                        w.placement = PlacementCfg::laid_out(f(w.placement.into()), aspect);
-                    }
-                };
-                if ui.button("Turn clockwise").clicked() {
-                    change(&|p| contain(p.turn(1, aspect)));
-                    ui.close();
-                }
-                if ui.button("Turn anticlockwise").clicked() {
-                    change(&|p| contain(p.turn(-1, aspect)));
-                    ui.close();
-                }
-                ui.separator();
-                if ui.button("Mirror").on_hover_text("Flip left to right").clicked() {
-                    change(&|p| Placement { flip_h: !p.flip_h, ..p });
-                    ui.close();
-                }
-                if ui.button("Flip upside down").clicked() {
-                    change(&|p| Placement { flip_v: !p.flip_v, ..p });
-                    ui.close();
-                }
-            });
-            self.webcam_view.menu = keep;
-        }
-
-        // The box and its handles, over the picture. Not clipped to the
-        // picture: a box against its edge keeps all of its outline.
-        let p: Placement = self.settings.webcam.as_ref().map_or(p, |c| c.placement.into());
-        let bx = Rect::from_min_max(to_screen(p.x, p.y), to_screen(p.x + p.w, p.y + p.h));
-        let painter = ui.painter().clone();
-        let dragging = self.webcam_view.drag.map(|(h, _, _)| h);
-        let cropping = modifiers.alt && dragging != Some(Handle::Move);
-        // Outlined only while it's held or the pointer is over it.
-        let bx_hit = |at: Pos2| Handle::ALL.iter().any(|h| h.pos(bx).distance(at) <= HANDLE) || bx.expand(2.0).contains(at);
-        let hovered = pointer.is_some_and(|at| frame_rect.expand(HANDLE).contains(at) && bx_hit(at));
-        if dragging.is_none() && !hovered {
-            return;
-        }
-        let shadow = Stroke::new(3.0, Color32::from_black_alpha(110));
-
-        // Cropping: where the whole camera picture would be, dashed, so it's
-        // clear what's cut off and how far it can grow back.
-        if cropping {
-            let sx = p.w / (1.0 - p.crop[0] - p.crop[2]).max(0.01);
-            let sy = p.h / (1.0 - p.crop[1] - p.crop[3]).max(0.01);
-            let (cl, cr) = if p.flip_h { (p.crop[2], p.crop[0]) } else { (p.crop[0], p.crop[2]) };
-            let (ct, cb) = if p.flip_v { (p.crop[3], p.crop[1]) } else { (p.crop[1], p.crop[3]) };
-            let whole = Rect::from_min_max(to_screen(p.x - cl * sx, p.y - ct * sy), to_screen(p.x + p.w + cr * sx, p.y + p.h + cb * sy));
-            if whole != bx {
-                let ghost = Stroke::new(1.0, CROP.gamma_multiply(0.8));
-                let c = [whole.left_top(), whole.right_top(), whole.right_bottom(), whole.left_bottom(), whole.left_top()];
-                painter.extend(egui::Shape::dashed_line(&c, ghost, 4.0, 3.0));
-            }
-        }
-
-        // Moved onto the frame's middle (snapped): a guide across it.
-        if dragging == Some(Handle::Move) && !modifiers.ctrl {
-            let guide = Stroke::new(1.0, ACCENT.gamma_multiply(0.6));
-            if ((p.x + p.w / 2.0) - 0.5).abs() < 1e-4 {
-                let x = frame_rect.center().x;
-                painter.extend(egui::Shape::dashed_line(&[Pos2::new(x, frame_rect.top()), Pos2::new(x, frame_rect.bottom())], guide, 5.0, 4.0));
-            }
-            if ((p.y + p.h / 2.0) - 0.5).abs() < 1e-4 {
-                let y = frame_rect.center().y;
-                painter.extend(egui::Shape::dashed_line(&[Pos2::new(frame_rect.left(), y), Pos2::new(frame_rect.right(), y)], guide, 5.0, 4.0));
-            }
-        }
-
-        // The outline, just inside the box, over a soft dark edge so it shows
-        // on a bright picture. The camera's own sides, as they show (a
-        // mirrored picture's left is the camera's right), are green if cropped.
-        let [cl, ct, cr, cb] = p.crop.map(|c| c > 0.0);
-        let (left, right) = if p.flip_h { (cr, cl) } else { (cl, cr) };
-        let (top, bottom) = if p.flip_v { (cb, ct) } else { (ct, cb) };
-        let line = bx.shrink(1.0);
-        painter.rect_stroke(bx.shrink(0.5), 0.0, shadow, egui::StrokeKind::Middle);
-        let side = |cropped: bool| Stroke::new(2.0, if cropped || cropping { CROP } else { ACCENT });
-        painter.line_segment([line.left_top(), line.right_top()], side(top));
-        painter.line_segment([line.left_bottom(), line.right_bottom()], side(bottom));
-        painter.line_segment([line.left_top(), line.left_bottom()], side(left));
-        painter.line_segment([line.right_top(), line.right_bottom()], side(right));
-
-        // Handles: round, white, green while Alt is held (they'll crop); the
-        // one held or under the pointer a little bigger.
-        let under = dragging.or_else(|| pointer.and_then(|at| Handle::ALL.into_iter().find(|h| h.pos(bx).distance(at) <= HANDLE)));
-        for h in Handle::ALL {
-            let r = if Some(h) == under { HANDLE * 0.65 } else { HANDLE * 0.5 };
-            let c = h.pos(line);
-            painter.circle(c, r, if modifiers.alt { CROP } else { Color32::WHITE }, Stroke::new(1.0, Color32::from_black_alpha(140)));
-        }
-
-        // What the keys do, along the picture's foot (or top, if the box is
-        // down there).
-        // (Alt is Option on a Mac, Ctrl Control: the keys as they're named there.)
-        let (alt, ctrl) = (crate::shortcuts::alt_name(), crate::shortcuts::ctrl_name());
-        let hint = match dragging {
-            Some(Handle::Move) => format!("{ctrl}: place freely"),
-            Some(_) if modifiers.alt && modifiers.shift => "Cropping, keeping the shape".to_owned(),
-            Some(_) if modifiers.alt => "Cropping · Shift keeps the shape".to_owned(),
-            Some(_) => format!("{alt}: crop · past the other side: flip"),
-            None if self.webcam_view.menu => return,
-            None => format!("Drag to move · {alt} + handle to crop · right-click to turn or flip"),
-        };
-        let galley = painter.layout_no_wrap(hint, egui::FontId::proportional(11.5), Color32::from_gray(235));
-        let size = galley.size() + vec2(14.0, 6.0);
-        let y = if bx.center().y > frame_rect.center().y { frame_rect.top() + 8.0 + size.y / 2.0 } else { frame_rect.bottom() - 8.0 - size.y / 2.0 };
-        let pill = Rect::from_center_size(Pos2::new(frame_rect.center().x, y), size);
-        painter.rect_filled(pill, pill.height() / 2.0, Color32::from_black_alpha(170));
-        painter.galley(pill.center() - galley.size() / 2.0, galley, Color32::WHITE);
     }
 }
 
@@ -721,13 +585,13 @@ mod tests {
 
     #[test]
     fn move_and_snap() {
-        let p = drag(at(0.5, 0.5, 0.2, 0.2), Handle::Move, 0.1, -0.1, PLAIN);
+        let p = drag(at(0.5, 0.5, 0.2, 0.2), Handle::Move, 0.1, -0.1, PLAIN, &Lines::default());
         assert!(close(p.x, 0.6) && close(p.y, 0.4) && close(p.w, 0.2));
         // Right edge lands 0.005 from the frame's edge: snaps onto it.
-        let p = drag(at(0.5, 0.5, 0.2, 0.2), Handle::Move, 0.295, 0.0, Mods { snap: true, ..PLAIN });
+        let p = drag(at(0.5, 0.5, 0.2, 0.2), Handle::Move, 0.295, 0.0, Mods { snap: true, ..PLAIN }, &Lines::default());
         assert!(close(p.x + p.w, 1.0));
         // Centre near the middle: snaps to it.
-        let p = drag(at(0.0, 0.0, 0.2, 0.2), Handle::Move, 0.405, 0.0, Mods { snap: true, ..PLAIN });
+        let p = drag(at(0.0, 0.0, 0.2, 0.2), Handle::Move, 0.405, 0.0, Mods { snap: true, ..PLAIN }, &Lines::default());
         assert!(close(p.x + p.w / 2.0, 0.5));
     }
 
@@ -736,21 +600,21 @@ mod tests {
     #[test]
     fn stays_inside_the_frame() {
         let in_frame = |p: Placement| p.x >= -1e-4 && p.y >= -1e-4 && p.x + p.w <= 1.0 + 1e-4 && p.y + p.h <= 1.0 + 1e-4;
-        let p = drag(at(0.7, 0.7, 0.2, 0.2), Handle::Move, 0.5, -0.9, PLAIN);
+        let p = drag(at(0.7, 0.7, 0.2, 0.2), Handle::Move, 0.5, -0.9, PLAIN, &Lines::default());
         assert!(in_frame(p) && close(p.x, 0.8) && close(p.y, 0.0));
         // From the top-left, the bottom-right corner can only grow to the frame's corner.
-        let p = drag(at(0.6, 0.7, 0.2, 0.1), Handle::SE, 0.9, 0.9, PLAIN);
+        let p = drag(at(0.6, 0.7, 0.2, 0.1), Handle::SE, 0.9, 0.9, PLAIN, &Lines::default());
         assert!(in_frame(p) && close(p.x, 0.6) && close(p.y, 0.7) && close(p.w / p.h, 2.0));
         assert!(close(p.x + p.w, 1.0) || close(p.y + p.h, 1.0));
         // An edge handle grows both ways about the middle, as far as the nearer edge.
-        let p = drag(at(0.1, 0.4, 0.2, 0.2), Handle::E, 0.9, 0.0, PLAIN);
+        let p = drag(at(0.1, 0.4, 0.2, 0.2), Handle::E, 0.9, 0.0, PLAIN, &Lines::default());
         assert!(in_frame(p), "{p:?}");
         // Flipped past its anchor, toward the left edge: only as far as it.
-        let p = drag(at(0.3, 0.3, 0.2, 0.2), Handle::E, -0.9, 0.0, PLAIN);
+        let p = drag(at(0.3, 0.3, 0.2, 0.2), Handle::E, -0.9, 0.0, PLAIN, &Lines::default());
         assert!(in_frame(p) && p.flip_h, "{p:?}");
         // Uncropping the left side stops at the frame's left edge.
         let cropped = Placement { crop: [0.5, 0.0, 0.0, 0.0], ..at(0.05, 0.5, 0.2, 0.2) };
-        let p = drag(cropped, Handle::W, -0.5, 0.0, Mods { crop: true, ..PLAIN });
+        let p = drag(cropped, Handle::W, -0.5, 0.0, Mods { crop: true, ..PLAIN }, &Lines::default());
         assert!(in_frame(p) && close(p.x, 0.0) && p.crop[0] > 0.0, "{p:?}");
         // Turned near the edge, a tall box is moved back in.
         let p = contain(at(0.8, 0.0, 0.3, 1.2));
@@ -760,20 +624,20 @@ mod tests {
     #[test]
     fn every_handle_keeps_the_shape() {
         let start = at(0.5, 0.5, 0.2, 0.1);
-        let p = drag(start, Handle::SE, 0.1, 0.05, PLAIN);
+        let p = drag(start, Handle::SE, 0.1, 0.05, PLAIN, &Lines::default());
         assert!(close(p.w, 0.3) && close(p.h, 0.15) && close(p.x, 0.5) && close(p.y, 0.5));
         // Off the diagonal, its nearest place on it: no jump when the pointer
         // crosses from mostly across to mostly down.
-        let (a, b) = (drag(start, Handle::SE, 0.1, 0.049, PLAIN), drag(start, Handle::SE, 0.1, 0.051, PLAIN));
+        let (a, b) = (drag(start, Handle::SE, 0.1, 0.049, PLAIN, &Lines::default()), drag(start, Handle::SE, 0.1, 0.051, PLAIN, &Lines::default()));
         assert!((a.w - b.w).abs() < 0.002, "{a:?} {b:?}");
         // From the top-left corner: the bottom-right stays put.
-        let p = drag(start, Handle::NW, -0.1, 0.0, PLAIN);
+        let p = drag(start, Handle::NW, -0.1, 0.0, PLAIN, &Lines::default());
         assert!(close(p.x + p.w, 0.7) && close(p.y + p.h, 0.6) && close(p.w / p.h, 2.0));
         // An edge scales the whole picture too, from the opposite edge, centred
         // on the other axis.
-        let p = drag(start, Handle::E, 0.1, 0.3, PLAIN);
+        let p = drag(start, Handle::E, 0.1, 0.3, PLAIN, &Lines::default());
         assert!(close(p.w, 0.3) && close(p.h, 0.15) && close(p.x, 0.5) && close(p.y + p.h / 2.0, 0.55));
-        let p = drag(start, Handle::N, 0.0, -0.05, PLAIN);
+        let p = drag(start, Handle::N, 0.0, -0.05, PLAIN, &Lines::default());
         assert!(close(p.h, 0.15) && close(p.w, 0.3) && close(p.y + p.h, 0.6) && close(p.x + p.w / 2.0, 0.6));
         assert!(!p.flip_h && !p.flip_v);
     }
@@ -782,17 +646,17 @@ mod tests {
     fn dragging_past_the_other_side_flips() {
         let start = at(0.5, 0.5, 0.2, 0.1);
         // Right edge dragged 0.3 left: past the left edge, the same size, mirrored.
-        let p = drag(start, Handle::E, -0.4, 0.0, PLAIN);
+        let p = drag(start, Handle::E, -0.4, 0.0, PLAIN, &Lines::default());
         assert!(p.flip_h && !p.flip_v);
         assert!(close(p.w, 0.2) && close(p.x + p.w, 0.5));
         // Bottom-right corner up past the top only: flipped vertically.
-        let p = drag(start, Handle::SE, 0.0, -0.2, PLAIN);
+        let p = drag(start, Handle::SE, 0.0, -0.2, PLAIN, &Lines::default());
         assert!(p.flip_v && !p.flip_h && close(p.y + p.h, 0.5));
         // Past both: both.
-        let p = drag(start, Handle::SE, -0.4, -0.2, PLAIN);
+        let p = drag(start, Handle::SE, -0.4, -0.2, PLAIN, &Lines::default());
         assert!(p.flip_h && p.flip_v);
         // Flipping back undoes it.
-        let back = drag(p, Handle::NW, 0.4, 0.2, PLAIN);
+        let back = drag(p, Handle::NW, 0.4, 0.2, PLAIN, &Lines::default());
         assert!(!back.flip_h && !back.flip_v);
     }
 
@@ -801,16 +665,16 @@ mod tests {
         // Box 0.2 wide shows the whole camera: frame fraction 0.2 per camera width.
         let start = at(0.5, 0.5, 0.2, 0.2);
         let crop = Mods { crop: true, ..PLAIN };
-        let p = drag(start, Handle::W, 0.05, 0.0, crop);
+        let p = drag(start, Handle::W, 0.05, 0.0, crop, &Lines::default());
         assert!(close(p.crop[0], 0.25) && close(p.x, 0.55) && close(p.w, 0.15));
         // Dragging the right edge outward past the uncropped size doesn't uncrop
         // beyond the picture.
-        let p = drag(start, Handle::E, 0.1, 0.0, crop);
+        let p = drag(start, Handle::E, 0.1, 0.0, crop, &Lines::default());
         assert!(close(p.crop[2], 0.0) && close(p.w, 0.2));
         // Crop the right, then pull it back: the box grows back.
-        let cropped = drag(start, Handle::E, -0.05, 0.0, crop);
+        let cropped = drag(start, Handle::E, -0.05, 0.0, crop, &Lines::default());
         assert!(close(cropped.crop[2], 0.25) && close(cropped.w, 0.15));
-        let back = drag(cropped, Handle::E, 0.05, 0.0, crop);
+        let back = drag(cropped, Handle::E, 0.05, 0.0, crop, &Lines::default());
         assert!(close(back.crop[2], 0.0) && close(back.w, 0.2));
     }
 
@@ -819,10 +683,10 @@ mod tests {
         let start = at(0.4, 0.4, 0.2, 0.1);
         let keep = Mods { crop: true, keep: true, ..PLAIN };
         // The right edge in: the box keeps 2:1, cropped top and bottom alike.
-        let p = drag(start, Handle::E, -0.05, 0.0, keep);
+        let p = drag(start, Handle::E, -0.05, 0.0, keep, &Lines::default());
         assert!(close(p.w / p.h, 2.0) && close(p.w, 0.15) && close(p.crop[1], p.crop[3]) && p.crop[1] > 0.0, "{p:?}");
         // A corner: the opposite corner stays put.
-        let p = drag(start, Handle::SE, -0.1, -0.05, keep);
+        let p = drag(start, Handle::SE, -0.1, -0.05, keep, &Lines::default());
         assert!(close(p.w / p.h, 2.0) && close(p.x, 0.4) && close(p.y, 0.4) && close(p.w, 0.1), "{p:?}");
     }
 
@@ -830,7 +694,7 @@ mod tests {
     fn crop_follows_a_flipped_picture() {
         // Mirrored: the visible left side is the camera's right side.
         let start = Placement { flip_h: true, ..at(0.5, 0.5, 0.2, 0.2) };
-        let p = drag(start, Handle::W, 0.05, 0.0, Mods { crop: true, ..PLAIN });
+        let p = drag(start, Handle::W, 0.05, 0.0, Mods { crop: true, ..PLAIN }, &Lines::default());
         assert!(close(p.crop[2], 0.25) && close(p.crop[0], 0.0) && close(p.x, 0.55));
     }
 }
@@ -1149,7 +1013,7 @@ impl App {
                 p.y = cy - p.h / 2.0;
             }
             p.crop = c;
-            w.placement = PlacementCfg::laid_out(contain(p), aspect);
+            w.placement = w.placement.moved_to(contain(p), aspect);
         }
         // Turned or mirrored: the placement, as the preview's right-click does
         // it (a quarter turn swaps the box's sides).
@@ -1167,7 +1031,7 @@ impl App {
                 3 => p = p.turn(-1, aspect),
                 _ => {}
             }
-            w.placement = PlacementCfg::laid_out(contain(p), aspect);
+            w.placement = w.placement.moved_to(contain(p), aspect);
         }
         if back {
             self.camera_panel = None;
