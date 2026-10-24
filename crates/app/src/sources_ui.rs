@@ -74,7 +74,7 @@ pub(crate) struct SourcesView {
 
 /// What a preview shows: the picture, its height and shape, the frame rate
 /// and the webcam.
-pub(crate) type PreviewSetup = (capture::VideoSource, (Option<u32>, Option<capture::Shape>), u32, Option<capture::webcam::Webcam>);
+pub(crate) type PreviewSetup = (capture::VideoSource, capture::VideoSize, u32, Option<capture::webcam::Webcam>);
 
 
 impl App {
@@ -494,7 +494,7 @@ impl App {
     /// The display's own size, uncropped, when it's known.
     fn crop_whole(&self) -> Option<(u32, u32)> {
         match self.video_source() {
-            capture::VideoSource::Screen { id, hook, method, .. } => capture::frame_size(&capture::VideoSource::Screen { id, hook, method, crop: None }, None, None),
+            capture::VideoSource::Screen { id, hook, method, .. } => capture::frame_size(&capture::VideoSource::Screen { id, hook, method, crop: None }, Default::default()),
             capture::VideoSource::Apps { .. } => None,
         }
     }
@@ -1016,8 +1016,8 @@ impl App {
         // the crop's set: all of the screen as it is, to crop on.
         let webcam = self.webcam_source();
         let wanted = match self.video_source() {
-            capture::VideoSource::Screen { id, hook, method, .. } if self.sources_view.crop_open => (capture::VideoSource::Screen { id, hook, method, crop: None }, (None, None), self.settings.fps, None),
-            source => (source, (self.settings.resolution.height(), self.settings.capture_shape()), self.settings.fps, webcam.clone()),
+            capture::VideoSource::Screen { id, hook, method, .. } if self.sources_view.crop_open => (capture::VideoSource::Screen { id, hook, method, crop: None }, Default::default(), self.settings.fps, None),
+            source => (source, self.settings.video_size(), self.settings.fps, webcam.clone()),
         };
         let webcam = wanted.3.clone();
         // A changed app list reaches the running preview without a restart,
@@ -1028,17 +1028,17 @@ impl App {
         if let Some((have, preview)) = &mut self.video_preview {
             if *have != wanted
                 && (&have.1, have.2, &have.3) == (&wanted.1, wanted.2, &wanted.3)
-                && capture::frame_size(&have.0, have.1.0, have.1.1) == capture::frame_size(&wanted.0, wanted.1.0, wanted.1.1)
+                && capture::frame_size(&have.0, have.1) == capture::frame_size(&wanted.0, wanted.1)
                 && preview.update(&wanted.0)
             {
                 have.0 = wanted.0.clone();
             }
         }
         if self.video_preview.as_ref().is_none_or(|(w, _)| *w != wanted) {
-            let (source, (height, shape), fps, _) = &wanted;
+            let (source, size, fps, _) = &wanted;
             // Both happen in the background: the old capture closes as the new
             // one opens, and only the new one's frames are shown.
-            let preview = capture::preview::VideoPreview::start(source, *height, *shape, *fps, Some(self.away_screen.clone()), webcam);
+            let preview = capture::preview::VideoPreview::start(source, *size, *fps, Some(self.away_screen.clone()), webcam);
             self.video_preview = Some((wanted, preview));
         }
     }

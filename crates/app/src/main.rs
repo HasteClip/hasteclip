@@ -439,7 +439,7 @@ struct App {
     /// The recording's frame size for (what's recorded, resolution), cached:
     /// for keeping the webcam's box its shape. Kept while capturing; cleared
     /// when a capture starts or stops.
-    frame_size: Option<((capture::VideoSource, Option<u32>, Option<capture::Shape>), Option<(u32, u32)>, Instant)>,
+    frame_size: Option<((capture::VideoSource, capture::VideoSize), Option<(u32, u32)>, Instant)>,
     /// Apps with a window, for the games-and-apps list: to add, and to show
     /// which are open. Refreshed while the Sources page shows.
     pub(crate) windowed_apps: Vec<capture::Device>,
@@ -925,8 +925,7 @@ impl App {
             blend_samples: self.settings.blend_samples(),
             blend_shape: self.settings.blend_shape.into(),
             video_bitrate_kbps: self.settings.video_bitrate_mbps * 1000,
-            target_height: self.settings.resolution.height(),
-            shape: self.settings.capture_shape(),
+            size: self.settings.video_size(),
             use_hardware: self.settings.encoder != Encoder::Software,
             replay_seconds: self.settings.replay_seconds,
             video: self.video_source(),
@@ -951,13 +950,13 @@ impl App {
         if self.settings.webcam.is_none() {
             return;
         }
-        let key = (self.video_source(), self.settings.resolution.height(), self.settings.capture_shape());
+        let key = (self.video_source(), self.settings.video_size());
         // Asked again now and then too: a display's mode can change, or it
         // can be plugged in, under the same choice. Not while capturing: its
         // frame stays the size it started at, whatever's chosen meanwhile.
         let capturing = self.rec_state != RecState::Idle;
         if self.frame_size.as_ref().is_none_or(|(k, _, at)| !capturing && (*k != key || at.elapsed() > Duration::from_secs(2))) {
-            let size = capture::frame_size(&key.0, key.1, key.2);
+            let size = capture::frame_size(&key.0, key.1);
             self.frame_size = Some((key, size, Instant::now()));
         }
         let Some((_, Some((fw, fh)), _)) = &self.frame_size else { return };

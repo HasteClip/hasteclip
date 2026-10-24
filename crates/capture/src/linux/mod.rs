@@ -495,11 +495,10 @@ impl Feed {
     }
 
     /// The size it's recorded at: the screen's (or the main display's), or
-    /// what's kept of it when it's cropped, as `target_height` and `shape`
-    /// make it.
-    fn recorded_size(&self, target_height: Option<u32>, shape: Option<crate::Shape>) -> (u32, u32) {
+    /// what's kept of it when it's cropped, as `size` makes it.
+    fn recorded_size(&self, size: crate::VideoSize) -> (u32, u32) {
         let (w, h) = crate::cropped_size(self.crop(), self.size());
-        crate::recorded_size(w, h, target_height, shape)
+        size.of(w, h)
     }
 
     fn source(&self) -> std::sync::RwLockReadGuard<'_, Source> {
@@ -649,8 +648,8 @@ impl Session {
         // How it keeps up (the warnings by the recorder) counts from here.
         crate::capture_started();
         let feed = Feed::open(&s.video, s.away_screen.as_deref())?;
-        let (width, height) = feed.recorded_size(s.target_height, s.shape);
-        let framing = s.shape.map_or(crate::Framing::Fit, |shape| shape.framing);
+        let (width, height) = feed.recorded_size(s.size);
+        let framing = s.size.framing();
         let clock = Arc::new(Clock::default());
 
         let (titles, comment, has_rest) = track_layout(&s.sources);
@@ -963,7 +962,7 @@ pub(crate) struct PreviewCapture {
 }
 
 impl PreviewCapture {
-    pub(crate) fn start(source: VideoSource, target_height: Option<u32>, shape: Option<crate::Shape>, fps: u32, away_screen: Option<Arc<crate::StillImage>>, webcam: Option<crate::webcam::Webcam>) -> Self {
+    pub(crate) fn start(source: VideoSource, size: crate::VideoSize, fps: u32, away_screen: Option<Arc<crate::StillImage>>, webcam: Option<crate::webcam::Webcam>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let error = Arc::new(Mutex::new(None));
         let opened: Arc<Mutex<Option<Feed>>> = Default::default();
@@ -987,8 +986,8 @@ impl PreviewCapture {
                 }
             };
             *opened2.lock().unwrap() = Some(feed.clone());
-            let (width, height) = feed.recorded_size(target_height, shape);
-            let framing = shape.map_or(crate::Framing::Fit, |shape| shape.framing);
+            let (width, height) = feed.recorded_size(size);
+            let framing = size.framing();
             let mut picture = Picture::new(feed.clone(), width, height, framing, webcam.as_ref());
             let mut sent = Previewed::new(generation);
             // Paced like the recording would be.
@@ -1090,8 +1089,7 @@ mod tests {
             blend_samples: std::env::var("HASTECLIP_BLEND").ok().and_then(|s| s.parse().ok()).unwrap_or(1),
             blend_shape: if std::env::var_os("HASTECLIP_SOFT").is_some() { crate::BlendShape::Soft } else { crate::BlendShape::Even },
             video_bitrate_kbps: 8000,
-            target_height: Some(1080),
-            shape: None,
+            size: crate::VideoSize { short_side: Some(1080), ..Default::default() },
             use_hardware: true,
             replay_seconds: 5,
             video: video.clone(),

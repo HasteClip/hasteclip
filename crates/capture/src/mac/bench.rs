@@ -32,8 +32,7 @@ fn settings(fps: u32, kbps: u32) -> EncodeSettings {
         blend_samples: 1,
         blend_shape: Default::default(),
         video_bitrate_kbps: kbps,
-        target_height: None,
-        shape: None,
+        size: Default::default(),
         use_hardware: true,
         replay_seconds: 60,
         video: VideoSource::Screen { id: String::new(), hook: Default::default(), method: Default::default(), crop: None },
@@ -248,7 +247,7 @@ fn spawn_sampler(stop: Arc<AtomicBool>) -> thread::JoinHandle<(Vec<f64>, Vec<f64
 /// files in `dir`, and report what it cost.
 pub fn live(mode: LiveMode, secs: f64, camera: &str, dir: &Path, kbps: u32, cam_kbps: u32, target_height: Option<u32>) -> Result<()> {
     let source = VideoSource::Screen { id: String::new(), hook: Default::default(), method: Default::default(), crop: None };
-    let (content, display, (w, h)) = super::video::plan(&source, target_height, None)?;
+    let (content, display, (w, h)) = super::video::plan(&source, crate::VideoSize { short_side: target_height, ..Default::default() })?;
     let fps = 60;
     let s = settings(fps, kbps);
     let webcam = (mode != LiveMode::Screen).then(|| {

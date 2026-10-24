@@ -52,21 +52,24 @@ default: {:?}", d.inputs.iter().map(|i| &i.name).collect::<Vec<_>>(), d.default_
         blend_samples: env("BLEND").and_then(|f| f.parse().ok()).unwrap_or(1),
         blend_shape: if env("SOFT").is_some_and(|v| v == "1") { capture::BlendShape::Soft } else { capture::BlendShape::Even },
         video_bitrate_kbps: 12000,
-        target_height: match env("HEIGHT").and_then(|h| h.parse().ok()) {
-            Some(0) => None,
-            Some(h) => Some(h),
-            None => Some(720),
+        size: capture::VideoSize {
+            short_side: match env("HEIGHT").and_then(|h| h.parse().ok()) {
+                Some(0) => None,
+                Some(h) => Some(h),
+                None => Some(720),
+            },
+            shape: env("SHAPE").and_then(|s| {
+                let mut parts = s.split(':');
+                let (w, h) = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
+                let framing = match parts.next() {
+                    Some("fit") => capture::Framing::Fit,
+                    Some("stretch") => capture::Framing::Stretch,
+                    _ => capture::Framing::Fill,
+                };
+                Some(capture::Shape { w, h, framing })
+            }),
+            exact: None,
         },
-        shape: env("SHAPE").and_then(|s| {
-            let mut parts = s.split(':');
-            let (w, h) = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
-            let framing = match parts.next() {
-                Some("fit") => capture::Framing::Fit,
-                Some("stretch") => capture::Framing::Stretch,
-                _ => capture::Framing::Fill,
-            };
-            Some(capture::Shape { w, h, framing })
-        }),
         use_hardware: env("SOFTWARE").is_none(),
         replay_seconds: 5,
         video: {

@@ -92,8 +92,13 @@ pub enum RateControl {
     Cqp,
 }
 
+/// What [`RecordSettings::size_version`] is for settings saved now.
+pub const SIZE_VERSION: u32 = 1;
+
 /// Output resolution. `Native` records at the capture source's resolution;
-/// the others downscale on encode (never up: a smaller display stays its size).
+/// the p ones bring its short side down to that many pixels on encode (never
+/// up: a smaller display stays its size), so 1080p is 1920×1080 widescreen
+/// and 1080×1920 upright. `Exact` is that size whatever the display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OutputResolution {
     Native,
@@ -103,8 +108,10 @@ pub enum OutputResolution {
     P1080,
     P1440,
     P2160,
-    /// Any height, in pixels (the width follows the display's shape).
+    /// Any short side, in pixels (the other follows the recording's shape).
     Custom(u32),
+    /// Exactly this width and height.
+    Exact(u32, u32),
 }
 
 impl OutputResolution {
@@ -113,7 +120,8 @@ impl OutputResolution {
             OutputResolution::Native => "Native".into(),
             OutputResolution::P2160 => "2160p (4K)".into(),
             OutputResolution::Custom(h) => format!("{h}p (custom)"),
-            r => format!("{}p", r.height().unwrap_or(0)),
+            OutputResolution::Exact(w, h) => format!("{w}×{h}"),
+            r => format!("{}p", r.short_side().unwrap_or(0)),
         }
     }
 
@@ -127,14 +135,15 @@ impl OutputResolution {
             OutputResolution::P900 => "",
             OutputResolution::P720 => "small files, quick to upload",
             OutputResolution::P480 => "smallest files",
-            OutputResolution::Custom(_) => "",
+            OutputResolution::Custom(_) | OutputResolution::Exact(..) => "",
         }
     }
 
-    /// Target height in pixels, or `None` for native (no rescale).
-    pub fn height(self) -> Option<u32> {
+    /// The short side to bring the recording down to, in pixels; `None` for
+    /// native (no rescale) and for an exact size.
+    pub fn short_side(self) -> Option<u32> {
         match self {
-            OutputResolution::Native => None,
+            OutputResolution::Native | OutputResolution::Exact(..) => None,
             OutputResolution::P480 => Some(480),
             OutputResolution::P720 => Some(720),
             OutputResolution::P900 => Some(900),
@@ -142,6 +151,14 @@ impl OutputResolution {
             OutputResolution::P1440 => Some(1440),
             OutputResolution::P2160 => Some(2160),
             OutputResolution::Custom(h) => Some(h),
+        }
+    }
+
+    /// The exact size asked for, if it's one.
+    pub fn exact(self) -> Option<(u32, u32)> {
+        match self {
+            OutputResolution::Exact(w, h) => Some((w, h)),
+            _ => None,
         }
     }
 
@@ -719,6 +736,10 @@ pub struct RecordSettings {
     /// How the looks in a blended frame are weighed.
     pub blend_shape: BlendShape,
     pub resolution: OutputResolution,
+    /// What `resolution`'s p means in this file: 0 from before it was the
+    /// short side (it was the height), 1 since. Read once, on load.
+    #[serde(default)]
+    pub size_version: u32,
     /// The shape recordings are made in, width to height, when it isn't the
     /// screen's (16:9 out of an ultrawide screen).
     pub shape: Option<[u32; 2]>,
@@ -829,6 +850,7 @@ impl Default for RecordSettings {
             blend_fps: 0,
             blend_shape: BlendShape::Even,
             resolution: OutputResolution::Native,
+            size_version: SIZE_VERSION,
             shape: None,
             framing: Framing::Fill,
             screen_crop: None,
@@ -985,9 +1007,24 @@ pub const MAX_BLEND: u32 = 2000;
 impl RecordSettings {
     /// Looks at the screen per recorded frame: the blend rate over the frame
     /// rate, 1 (no blending) when off or no longer a multiple above it.
-    /// The shape recordings are made in, if it isn't the screen's.
+    /// The shape recordings are made in, if it isn't the screen's: an exact
+    /// size's own, else the aspect ratio chosen.
     pub fn capture_shape(&self) -> Option<capture::Shape> {
+        match self.resolution.exact() {
+            Some((w, h)) => (w > 0 && h > 0).then(|| capture::Shape { w, h, framing: self.framing.into() }),
+            None => self.aspect_shape(),
+        }
+    }
+
+    /// The aspect ratio chosen, if it isn't the screen's (an exact size
+    /// aside: it's what a resolution in p records in).
+    pub fn aspect_shape(&self) -> Option<capture::Shape> {
         self.shape.filter(|[w, h]| *w > 0 && *h > 0).map(|[w, h]| capture::Shape { w, h, framing: self.framing.into() })
+    }
+
+    /// The size recordings are made at.
+    pub fn video_size(&self) -> capture::VideoSize {
+        capture::VideoSize { short_side: self.resolution.short_side(), shape: self.capture_shape(), exact: self.resolution.exact() }
     }
 
     pub fn blend_samples(&self) -> u32 {
@@ -1045,6 +1082,7 @@ impl RecordSettings {
         s.upgrade_capture();
         s.upgrade_save_sound();
         s.upgrade_noise_reduction();
+        s.upgrade_sizes();
         if let Some(old) = s.audio_tracks.take() {
             s.audio_sources = migrate(&old);
             // Persist now: sources get fresh ids, and their volumes key on them.
@@ -1069,6 +1107,20 @@ impl RecordSettings {
         let s = &self.save_sound.sound;
         if !s.starts_with("file:") && !crate::sound::BUILTIN.iter().any(|(id, _)| id == s) {
             self.save_sound.sound = SaveSound::default().sound;
+        }
+    }
+
+    /// A resolution from when p was the height keeps making clips the same
+    /// size now it's the short side: upright, 1080p was 608×1080, so it's
+    /// 608p now (wider shapes' height is their short side already).
+    fn upgrade_sizes(&mut self) {
+        if self.size_version >= SIZE_VERSION {
+            return;
+        }
+        self.size_version = SIZE_VERSION;
+        if let (Some([w, h]), Some(p)) = (self.shape.filter(|[w, h]| *w > 0 && w < h), self.resolution.short_side()) {
+            let short = ((p as f64 * w as f64 / h as f64 / 2.0).round() as u32 * 2).max(2);
+            self.resolution = OutputResolution::PRESETS.iter().copied().find(|r| r.short_side() == Some(short)).unwrap_or(OutputResolution::Custom(short));
         }
     }
 
@@ -1125,6 +1177,40 @@ mod shape_tests {
         let s: RecordSettings = serde_json::from_str(r#"{"shape":[16,9],"framing":"fit"}"#).unwrap();
         assert_eq!(s.capture_shape(), Some(capture::Shape { w: 16, h: 9, framing: capture::Framing::Fit }));
         assert!(s.to_json().contains(r#""framing": "fit""#));
+    }
+
+    /// An exact size is its own shape, whatever aspect ratio was chosen, and
+    /// is kept as it is.
+    #[test]
+    fn an_exact_size_is_the_shape() {
+        let s: RecordSettings = serde_json::from_str(r#"{"shape":[4,3],"resolution":{"Exact":[1080,1350]}}"#).unwrap();
+        assert_eq!(s.capture_shape(), Some(capture::Shape { w: 1080, h: 1350, framing: capture::Framing::Fill }));
+        assert_eq!(s.video_size().of(2560, 1440), (1080, 1350));
+        assert!(s.to_json().contains(r#""Exact": ["#));
+    }
+
+    /// From when 1080p was the height, an upright recording keeps its size
+    /// (1080p 9:16 was 608×1080); wider ones, new settings and settings
+    /// already moved over aren't touched.
+    #[test]
+    fn old_upright_resolutions_keep_their_size() {
+        let load = |json: &str| {
+            let mut s: RecordSettings = serde_json::from_str(json).unwrap();
+            s.upgrade_sizes();
+            s
+        };
+        let s = load(r#"{"shape":[9,16],"resolution":"P1080"}"#);
+        assert_eq!(s.resolution, OutputResolution::Custom(608));
+        assert_eq!(s.size_version, SIZE_VERSION);
+        assert_eq!(s.video_size().of(2560, 1440), (608, 1080));
+        assert_eq!(load(r#"{"shape":[9,16],"resolution":"P1440"}"#).resolution, OutputResolution::Custom(810));
+        assert_eq!(load(r#"{"shape":[3,4],"resolution":"P1440"}"#).resolution, OutputResolution::P1080);
+        assert_eq!(load(r#"{"shape":[9,16],"resolution":"Native"}"#).resolution, OutputResolution::Native);
+        assert_eq!(load(r#"{"shape":[21,9],"resolution":"P1080"}"#).resolution, OutputResolution::P1080);
+        assert_eq!(load(r#"{"shape":[9,16],"resolution":"P1080","size_version":1}"#).resolution, OutputResolution::P1080);
+        let mut fresh = RecordSettings { shape: Some([9, 16]), resolution: OutputResolution::P1080, ..Default::default() };
+        fresh.upgrade_sizes();
+        assert_eq!(fresh.resolution, OutputResolution::P1080);
     }
 }
 

@@ -227,7 +227,7 @@ pub(crate) fn display_pixels(display: &SCDisplay) -> (usize, usize) {
 /// What to record and the frame size: a display's own (in `shape`, if
 /// there is one), or for games and apps the main display's (so it can't
 /// change mid-file, whatever the windows do).
-pub(crate) fn plan(source: &VideoSource, target_height: Option<u32>, shape: Option<crate::Shape>) -> Result<(Retained<SCShareableContent>, Retained<SCDisplay>, (usize, usize))> {
+pub(crate) fn plan(source: &VideoSource, size: crate::VideoSize) -> Result<(Retained<SCShareableContent>, Retained<SCDisplay>, (usize, usize))> {
     let content = shareable_content()?;
     let id = match source {
         VideoSource::Screen { id, .. } => id.as_str(),
@@ -237,7 +237,7 @@ pub(crate) fn plan(source: &VideoSource, target_height: Option<u32>, shape: Opti
     let (w, h) = display_pixels(&display);
     // Cropped: what's kept, recorded as a display that size.
     let (w, h) = crate::cropped_size(crate::crop_of(source), (w as u32, h as u32));
-    let (w, h) = crate::recorded_size(w, h, target_height, shape);
+    let (w, h) = size.of(w, h);
     Ok((content, display, (w as usize, h as usize)))
 }
 

@@ -215,10 +215,11 @@ impl App {
         let lock = self.lock();
         let mut said = false;
         let size = self.recorded_size();
-        let native = capture::frame_size(&self.video_source(), None, self.settings.capture_shape());
-        let screen = capture::frame_size(&self.video_source(), None, None);
+        let native = capture::frame_size(&self.video_source(), capture::VideoSize { shape: self.settings.capture_shape(), ..Default::default() });
+        let screen = capture::frame_size(&self.video_source(), Default::default());
         let res_note = match (size, native) {
-            (Some((w, h)), Some((_, nh))) if self.settings.resolution.height().is_some_and(|t| t > nh) => format!("Records at {w}×{h}: your display's size, it isn't made bigger"),
+            (Some((w, h)), _) if self.settings.resolution.exact().is_some() => format!("Records at exactly {w}×{h}"),
+            (Some((w, h)), Some((nw, nh))) if self.settings.resolution.short_side().is_some_and(|t| t > nw.min(nh)) => format!("Records at {w}×{h}: your display's size, it isn't made bigger"),
             (Some((w, h)), _) => format!("Records at {w}×{h}"),
             _ => String::new(),
         };
@@ -240,11 +241,14 @@ impl App {
         let mut locked_click = false;
         ui_kit::list(ui, "video", |l| {
             if f.shows(&["resolution", "height", "size", "native"]) {
-                let (_, c) = l.row(Row::new("Resolution").tip("Resolution", "Lower makes smaller files that are quicker to share. Native keeps every pixel of your display.").note(res_note.clone()).locked(lock.clone()), |ui| self.resolution_field(ui));
+                let (_, c) = l.row(Row::new("Resolution").tip("Resolution", RESOLUTION_TIP).note(res_note.clone()).locked(lock.clone()), |ui| self.resolution_field(ui));
                 locked_click |= c;
             }
             if f.shows(&["aspect ratio", "shape", "same as screen", "16:9", "21:9", "ultrawide", "black bars", "crop", "fill", "fit", "stretch"]) {
-                let (_, c) = l.row(Row::new("Aspect ratio").tip("Aspect ratio", SHAPE_TIP).locked(lock.clone()), |ui| self.shape_field(ui, screen));
+                let exact = self.settings.resolution.exact().is_some();
+                let row = Row::new("Aspect ratio").tip("Aspect ratio", SHAPE_TIP).locked(lock.clone());
+                let row = if exact { row.note("Set by the exact size") } else { row };
+                let (_, c) = l.row(row, |ui| self.shape_field(ui, screen));
                 locked_click |= c;
                 let shape = self.settings.capture_shape();
                 l.well("shape_well", shape.is_some(), |l| {
@@ -734,6 +738,11 @@ impl App {
     /// in its own box.
     fn shape_field(&mut self, ui: &mut egui::Ui, screen: Option<(u32, u32)>) {
         let pal = theme::pal(ui);
+        // An exact size is its own shape: shown, not picked.
+        if let Some((w, h)) = self.settings.resolution.exact() {
+            ui.add_enabled_ui(false, |ui| ui_kit::select(ui, &ratio_label(w, h), 150.0)).inner.on_disabled_hover_text("The exact size sets it. Pick a resolution in p to choose one.");
+            return;
+        }
         let custom_id = egui::Id::new("aspect_custom");
         let shape = self.settings.shape;
         // Custom: picked from the menu, or a ratio that isn't a common one.
@@ -787,7 +796,9 @@ impl App {
 
     fn resolution_field(&mut self, ui: &mut egui::Ui) {
         let r = self.settings.resolution;
-        let native = capture::frame_size(&self.video_source(), None, self.settings.capture_shape());
+        // Native in the aspect ratio chosen (an exact size isn't one).
+        let aspect = capture::VideoSize { shape: self.settings.aspect_shape(), ..Default::default() };
+        let native = capture::frame_size(&self.video_source(), aspect);
         let presets: Vec<(String, String, String)> = OutputResolution::PRESETS
             .iter()
             .map(|p| {
@@ -795,27 +806,22 @@ impl App {
                     (OutputResolution::Native, Some((w, h))) => format!("{w}×{h}"),
                     _ => p.note().to_owned(),
                 };
-                (p.label(), p.height().map_or("Native".into(), |h| h.to_string()), note)
+                (p.label(), p.short_side().map_or("Native".into(), |h| h.to_string()), note)
             })
             .collect();
-        let current = OutputResolution::PRESETS.iter().position(|p| *p == r || (p.height() == r.height()));
-        let text = r.height().map_or("Native".to_owned(), |h| h.to_string());
-        let field = ValueField { id: egui::Id::new("vf_res"), text, unit: if r.height().is_some() { "p" } else { "" }, width: 116.0, hint: "Type any height from 144 to 4320, or Native", presets, current, range: "144–4320" };
+        let current = if r.exact().is_some() { None } else { OutputResolution::PRESETS.iter().position(|p| *p == r || (p.short_side() == r.short_side())) };
+        let (text, unit) = match (r.exact(), r.short_side()) {
+            (Some((w, h)), _) => (format!("{w}×{h}"), ""),
+            (None, Some(h)) => (h.to_string(), "p"),
+            (None, None) => ("Native".to_owned(), ""),
+        };
+        let field = ValueField { id: egui::Id::new("vf_res"), text, unit, width: 116.0, hint: "Type a resolution like 1080, an exact size like 1920×1080, or Native", presets, current, range: "1080 or 1920×1080" };
         match field.show(ui) {
             Typed::Preset(i) => self.settings.resolution = OutputResolution::PRESETS[i],
-            Typed::Text(t) => {
-                let t = t.trim().trim_end_matches(['p', 'P']).trim();
-                if t.to_lowercase().starts_with('n') {
-                    self.settings.resolution = OutputResolution::Native;
-                } else {
-                    match t.parse::<u32>() {
-                        Ok(h) if (144..=4320).contains(&h) => {
-                            self.settings.resolution = OutputResolution::PRESETS.iter().copied().find(|p| p.height() == Some(h)).unwrap_or(OutputResolution::Custom(h));
-                        }
-                        _ => self.toast_error(format!("“{t}” isn't a height from 144 to 4320")),
-                    }
-                }
-            }
+            Typed::Text(t) => match parse_resolution(&t) {
+                Some(r) => self.settings.resolution = r,
+                None => self.toast_error(format!("“{}” isn't a resolution from 144p to 4320p, or a size like 1920×1080", t.trim())),
+            },
             Typed::None | Typed::Secs(_) => {}
         }
     }
@@ -989,7 +995,7 @@ impl App {
     /// The size recordings come out at with the chosen resolution, when the
     /// display is known.
     fn recorded_size(&self) -> Option<(u32, u32)> {
-        capture::frame_size(&self.video_source(), self.settings.resolution.height(), self.settings.capture_shape())
+        capture::frame_size(&self.video_source(), self.settings.video_size())
     }
 
     /// A bitrate that looks good for the recorded size and frame rate, in
@@ -1356,6 +1362,38 @@ pub const BLEND_TIP: &str = "How the pictures in each frame are weighed. Even: a
 pub const BLEND_EVEN_TIP: &str = "Every picture counts the same: each frame's trail ends sharply";
 pub const BLEND_SOFT_TIP: &str = "The middle of each frame counts most, fading into the frames either side: smoother, a little blurrier";
 
+/// Resolution's tip.
+const RESOLUTION_TIP: &str = "Lower makes smaller files that are quicker to share. Native keeps every pixel of your display. 1080p is 1920×1080 widescreen and 1080×1920 upright. Type a size like 1920×1080 to record at exactly that size.";
+
+/// A resolution typed: a short side ("1080", "1080p"), Native, or an exact
+/// size ("1920×1080", "1920x1080", "1920 1080"). `None` if it's none of them.
+fn parse_resolution(t: &str) -> Option<OutputResolution> {
+    let t = t.trim().to_lowercase();
+    if t.starts_with('n') {
+        return Some(OutputResolution::Native);
+    }
+    let numbers: Vec<u32> = t.split(|c: char| !c.is_ascii_digit()).filter(|n| !n.is_empty()).map(|n| n.parse().ok()).collect::<Option<_>>()?;
+    match numbers[..] {
+        [h] if (144..=4320).contains(&h) => Some(OutputResolution::PRESETS.iter().copied().find(|p| p.short_side() == Some(h)).unwrap_or(OutputResolution::Custom(h))),
+        [w, h] if (144..=capture::MAX_SIDE).contains(&w) && (144..=capture::MAX_SIDE).contains(&h) => Some(OutputResolution::Exact(w & !1, h & !1)),
+        _ => None,
+    }
+}
+
+/// An exact size's shape, as a ratio when it's a readable one ("16:9",
+/// "64:27"), else to two places ("1.78:1").
+fn ratio_label(w: u32, h: u32) -> String {
+    let gcd = |mut a: u32, mut b: u32| {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a.max(1)
+    };
+    let g = gcd(w, h);
+    let (rw, rh) = (w / g, h / g);
+    if rw <= 99 && rh <= 99 { format!("{rw}:{rh}") } else { format!("{:.2}:1", w as f64 / h.max(1) as f64) }
+}
+
 /// Aspect ratio's and its Screen's tips.
 const SHAPE_TIP: &str = "Record in another aspect ratio than your screen's: 16:9 out of an ultrawide screen, say, or 9:16 for phones. Type any other, like 21:9. Every recording and clip is made in it.";
 const FRAMING_TIP: &str = "How your screen goes into the aspect ratio. Fill: its middle, with what's past it cut off (an ultrawide screen's sides, for 16:9). Fit: all of it, with black bars. Stretch: all of it, stretched or squeezed.";
@@ -1511,6 +1549,32 @@ mod ratio_tests {
         assert_eq!(kept_ratio([21, 9]), [21, 9]);
         assert_eq!(kept_ratio([99, 1]), [4, 1]);
         assert_eq!(kept_ratio([1, 99]), [1, 4]);
+    }
+
+    #[test]
+    fn exact_sizes_name_their_shape() {
+        assert_eq!(ratio_label(1920, 1080), "16:9");
+        assert_eq!(ratio_label(1080, 1350), "4:5");
+        assert_eq!(ratio_label(2560, 1080), "64:27");
+        assert_eq!(ratio_label(1366, 768), "1.78:1");
+    }
+
+    /// A resolution is typed as a short side, Native, or an exact size,
+    /// however it's written.
+    #[test]
+    fn typed_resolutions() {
+        use settings::OutputResolution::*;
+        assert_eq!(parse_resolution("1080"), Some(P1080));
+        assert_eq!(parse_resolution(" 1080p "), Some(P1080));
+        assert_eq!(parse_resolution("1200"), Some(Custom(1200)));
+        assert_eq!(parse_resolution("n"), Some(Native));
+        assert_eq!(parse_resolution("1920×1080"), Some(Exact(1920, 1080)));
+        assert_eq!(parse_resolution("1920x1080"), Some(Exact(1920, 1080)));
+        assert_eq!(parse_resolution("1081 x 1351"), Some(Exact(1080, 1350)));
+        assert_eq!(parse_resolution("100"), None);
+        assert_eq!(parse_resolution("8000x1000"), None);
+        assert_eq!(parse_resolution("big"), None);
+        assert_eq!(parse_resolution("1920x1080x3"), None);
     }
 }
 

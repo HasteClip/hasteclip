@@ -112,14 +112,15 @@ impl Recorder for Unsupported {
 /// `examples/vt_limits`), as do NVENC, AMF, Quick Sync and VA-API for H.264.
 pub const MAX_SIDE: u32 = 4096;
 
-/// The recording's size for a source `w`×`h`: downscaled to `target_height`
-/// if that's smaller, and to fit [`MAX_SIDE`] (a 5K2K ultrawide, 6720×2836
-/// natively, records at 4096×1728). Keeps the shape; even dimensions, as
-/// H.264 4:2:0 requires.
-pub fn output_size(w: u32, h: u32, target_height: Option<u32>) -> (u32, u32) {
+/// The recording's size for a source `w`×`h`: its short side downscaled to
+/// `short_side` if that's smaller (1080 makes a 16:9 picture 1920×1080 and
+/// a 9:16 one 1080×1920), and to fit [`MAX_SIDE`] (a 5K2K ultrawide,
+/// 6720×2836 natively, records at 4096×1728). Keeps the shape; even
+/// dimensions, as H.264 4:2:0 requires.
+pub fn output_size(w: u32, h: u32, short_side: Option<u32>) -> (u32, u32) {
     let (w, h) = (w.max(2) as f64, h.max(2) as f64);
-    let mut scale = target_height.map_or(1.0, |t| (t as f64 / h).min(1.0));
-    scale = scale.min(MAX_SIDE as f64 / (w * scale).max(1.0)).min(1.0).min(MAX_SIDE as f64 / h);
+    let fits = (MAX_SIDE as f64 / w.max(h)).min(1.0);
+    let scale = short_side.map_or(1.0, |t| (t as f64 / w.min(h)).min(1.0)).min(fits);
     let even = |v: f64| ((v.round() as u32) & !1).max(2);
     (even(w * scale), even(h * scale))
 }
@@ -164,11 +165,36 @@ impl Shape {
     }
 }
 
-/// The size a `w`×`h` screen is recorded at: in `shape` if there is one,
-/// then as [`output_size`] makes it.
-pub fn recorded_size(w: u32, h: u32, target_height: Option<u32>, shape: Option<Shape>) -> (u32, u32) {
-    let (w, h) = shape.map_or((w, h), |s| s.of(w, h));
-    output_size(w, h, target_height)
+/// The size recordings are made at, whatever size the screen turns out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VideoSize {
+    /// The short side brought down to this (never up): 1080 is "1080p", a
+    /// 9:16 recording's too. `None` keeps the screen's own size.
+    pub short_side: Option<u32>,
+    /// A shape to record in, when it isn't the screen's.
+    pub shape: Option<Shape>,
+    /// Exactly this size, whatever the screen's: `short_side` and the size
+    /// `shape` gives don't apply (its framing still does).
+    pub exact: Option<(u32, u32)>,
+}
+
+impl VideoSize {
+    /// The size a `w`×`h` screen (what's kept of it, when it's cropped) is
+    /// recorded at: exactly the size asked for, or in `shape` if there is
+    /// one, then as [`output_size`] makes it.
+    pub fn of(&self, w: u32, h: u32) -> (u32, u32) {
+        if let Some((w, h)) = self.exact {
+            return output_size(w, h, None);
+        }
+        let (w, h) = self.shape.map_or((w, h), |s| s.of(w, h));
+        output_size(w, h, self.short_side)
+    }
+
+    /// How the picture goes into the frame: as the shape says, else all of
+    /// it (a window that isn't the screen's shape goes in whole).
+    pub fn framing(&self) -> Framing {
+        self.shape.map_or(Framing::Fit, |s| s.framing)
+    }
 }
 
 /// Where a picture of `content`'s size goes in a frame of `frame`'s, each
@@ -203,7 +229,7 @@ pub(crate) fn placement((cw, ch): (u32, u32), (fw, fh): (u32, u32), framing: Fra
 /// (cheap: asks the system for display sizes). Games and apps record at the
 /// main display's size. `None` if the display isn't known (on Linux, until
 /// the screen has been picked in the system's dialog once).
-pub fn frame_size(source: &VideoSource, target_height: Option<u32>, shape: Option<Shape>) -> Option<(u32, u32)> {
+pub fn frame_size(source: &VideoSource, size: VideoSize) -> Option<(u32, u32)> {
     let id = match source {
         VideoSource::Screen { id, .. } => Some(id.as_str()),
         VideoSource::Apps { .. } => None,
@@ -220,7 +246,7 @@ pub fn frame_size(source: &VideoSource, target_height: Option<u32>, shape: Optio
         None
     };
     // Cropped: what's kept, as a display that size.
-    native.map(|size| cropped_size(crop_of(source), size)).map(|(w, h)| recorded_size(w, h, target_height, shape))
+    native.map(|native| cropped_size(crop_of(source), native)).map(|(w, h)| size.of(w, h))
 }
 
 /// The fastest a recording of `source` can look at the screen for frame
@@ -988,10 +1014,8 @@ pub struct EncodeSettings {
     /// How the looks in a blended frame are weighed.
     pub blend_shape: BlendShape,
     pub video_bitrate_kbps: u32,
-    /// Downscale target height, or `None` to keep native resolution.
-    pub target_height: Option<u32>,
-    /// A shape to record in, when not the screen's.
-    pub shape: Option<Shape>,
+    /// The size to record at.
+    pub size: VideoSize,
     /// Use a hardware encoder (VideoToolbox, or the GPU's Media Foundation
     /// encoder on Windows) vs. software.
     pub use_hardware: bool,
@@ -1094,7 +1118,7 @@ pub trait Recorder {
 
 #[cfg(test)]
 mod size_tests {
-    use super::{Crop, Framing, Shape, output_size, placement, placement_cropped, recorded_size};
+    use super::{Crop, Framing, Shape, VideoSize, output_size, placement, placement_cropped};
 
     #[test]
     fn output_size_keeps_aspect_and_even() {
@@ -1102,6 +1126,8 @@ mod size_tests {
         assert_eq!(output_size(2560, 1440, Some(1080)), (1920, 1080));
         assert_eq!(output_size(1920, 1080, Some(1440)), (1920, 1080));
         assert_eq!(output_size(3440, 1440, Some(721)), (1722, 720));
+        // The short side: upright, it's the width.
+        assert_eq!(output_size(1440, 2560, Some(1080)), (1080, 1920));
     }
 
     #[test]
@@ -1109,6 +1135,8 @@ mod size_tests {
         assert_eq!(output_size(6720, 2836, None), (4096, 1728));
         assert_eq!(output_size(7680, 4320, Some(2160)), (3840, 2160));
         assert_eq!(output_size(5120, 2880, None), (4096, 2304));
+        // Asked for more than fits: still no wider than it takes.
+        assert_eq!(output_size(7680, 4320, Some(2592)), (4096, 2304));
         // Portrait.
         assert_eq!(output_size(2160, 7680, None), (1152, 4096));
         assert_eq!(output_size(4096, 2304, None), (4096, 2304));
@@ -1117,14 +1145,27 @@ mod size_tests {
     /// An ultrawide screen recorded 16:9 three ways, and at 1080p.
     #[test]
     fn shapes() {
-        let wide = |framing| Some(Shape { w: 16, h: 9, framing });
-        assert_eq!(recorded_size(3440, 1440, None, wide(Framing::Fill)), (2560, 1440));
-        assert_eq!(recorded_size(3440, 1440, None, wide(Framing::Fit)), (3440, 1934));
-        assert_eq!(recorded_size(3440, 1440, None, wide(Framing::Stretch)), (2560, 1440));
-        assert_eq!(recorded_size(3440, 1440, Some(1080), wide(Framing::Fill)), (1920, 1080));
-        // Upright from a 16:9 screen: its middle.
-        assert_eq!(recorded_size(1920, 1080, None, Some(Shape { w: 9, h: 16, framing: Framing::Fill })), (608, 1080));
-        assert_eq!(recorded_size(3440, 1440, None, None), (3440, 1440));
+        let wide = |framing| VideoSize { shape: Some(Shape { w: 16, h: 9, framing }), ..Default::default() };
+        assert_eq!(wide(Framing::Fill).of(3440, 1440), (2560, 1440));
+        assert_eq!(wide(Framing::Fit).of(3440, 1440), (3440, 1934));
+        assert_eq!(wide(Framing::Stretch).of(3440, 1440), (2560, 1440));
+        assert_eq!(VideoSize { short_side: Some(1080), ..wide(Framing::Fill) }.of(3440, 1440), (1920, 1080));
+        // Upright from a 16:9 screen: its middle, 1080p on its short side.
+        let upright = VideoSize { shape: Some(Shape { w: 9, h: 16, framing: Framing::Fill }), ..Default::default() };
+        assert_eq!(upright.of(1920, 1080), (608, 1080));
+        assert_eq!(VideoSize { short_side: Some(480), ..upright }.of(1920, 1080), (480, 852));
+        assert_eq!(VideoSize::default().of(3440, 1440), (3440, 1440));
+    }
+
+    /// An exact size is kept whatever the screen, made even and small
+    /// enough for the encoder.
+    #[test]
+    fn exact_sizes() {
+        let exact = |w, h| VideoSize { exact: Some((w, h)), short_side: Some(720), shape: None };
+        assert_eq!(exact(1920, 1080).of(3440, 1440), (1920, 1080));
+        assert_eq!(exact(1080, 1920).of(2560, 1440), (1080, 1920));
+        assert_eq!(exact(1281, 721).of(2560, 1440), (1280, 720));
+        assert_eq!(exact(8192, 4096).of(2560, 1440), (4096, 2048));
     }
 
     #[test]

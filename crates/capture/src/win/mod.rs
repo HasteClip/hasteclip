@@ -253,9 +253,9 @@ impl Session {
         // Cropped: what's kept, recorded as a screen that size.
         let crop = crate::crop_of(&s.video);
         let (canvas_w, canvas_h) = crate::cropped_size(crop, canvas);
-        let (width, height) = crate::recorded_size(canvas_w, canvas_h, s.target_height, s.shape);
+        let (width, height) = s.size.of(canvas_w, canvas_h);
         // Without a shape, a window that isn't the screen's goes in whole.
-        let framing = s.shape.map_or(crate::Framing::Fit, |shape| shape.framing);
+        let framing = s.size.framing();
         let clock = Arc::new(Clock::default());
 
         let (titles, comment, has_rest) = track_layout(&s.sources);
@@ -566,8 +566,7 @@ pub(crate) struct PreviewCapture {
 impl PreviewCapture {
     pub(crate) fn start(
         source: VideoSource,
-        target_height: Option<u32>,
-        shape: Option<crate::Shape>,
+        size: crate::VideoSize,
         fps: u32,
         away: Option<Arc<crate::StillImage>>,
         webcam: Option<crate::webcam::Webcam>,
@@ -589,8 +588,8 @@ impl PreviewCapture {
                 }
                 let picture = source.open(&gpu, w, h, fps, away)?;
                 let (cw, ch) = crate::cropped_size(crop, (w, h));
-                let (width, height) = crate::recorded_size(cw, ch, target_height, shape);
-                let framing = shape.map_or(crate::Framing::Fit, |shape| shape.framing);
+                let (width, height) = size.of(cw, ch);
+                let framing = size.framing();
                 let cam = webcam.as_ref().and_then(|wc| camera::CameraLayer::new(&gpu, wc).ok());
                 let overlay = cam.as_ref().zip(webcam.as_ref()).map(|(c, wc)| (&c.latest, wc.placement.clone()));
                 let preview = d3d::Previewer::new(&gpu, &picture.latest, overlay, width, height, fps, framing, crop, generation)?;
@@ -1823,8 +1822,7 @@ mod tests {
             blend_samples: 1,
             blend_shape: crate::BlendShape::Even,
             video_bitrate_kbps: 4000,
-            target_height: Some(720),
-            shape: Some(crate::Shape { w: 1, h: 1, framing: crate::Framing::Fill }),
+            size: crate::VideoSize { short_side: Some(720), shape: Some(crate::Shape { w: 1, h: 1, framing: crate::Framing::Fill }), exact: None },
             use_hardware: true,
             replay_seconds: 5,
             video: video.clone(),

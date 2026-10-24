@@ -67,8 +67,7 @@ pub(crate) struct PreviewCapture {
 impl PreviewCapture {
     pub(crate) fn start(
         source: VideoSource,
-        target_height: Option<u32>,
-        shape: Option<crate::Shape>,
+        size: crate::VideoSize,
         fps: u32,
         away: Option<Arc<StillImage>>,
         webcam: Option<crate::webcam::Webcam>,
@@ -81,14 +80,13 @@ impl PreviewCapture {
         let apps = matches!(source, VideoSource::Apps { .. });
         thread::spawn(move || {
             let opened = (|| -> Result<(Picture, Frames)> {
-                let (content, display, size) = video::plan(&source, target_height, shape)?;
+                let (content, display, frame) = video::plan(&source, size)?;
                 let away = match &away {
-                    Some(img) => Some(Arc::new(video::still_buffer(Some(img), size.0, size.1)?)),
+                    Some(img) => Some(Arc::new(video::still_buffer(Some(img), frame.0, frame.1)?)),
                     None => None,
                 };
-                let framing = shape.map_or(crate::Framing::Fit, |shape| shape.framing);
-                let picture = Picture::start(&source, &content, &display, size, fps, away, framing)?;
-                let frames = Frames::new(picture.latest.clone(), webcam.as_ref(), size.0, size.1, generation)?;
+                let picture = Picture::start(&source, &content, &display, frame, fps, away, size.framing())?;
+                let frames = Frames::new(picture.latest.clone(), webcam.as_ref(), frame.0, frame.1, generation)?;
                 Ok((picture, frames))
             })();
             let (mut picture, mut frames) = match opened {
