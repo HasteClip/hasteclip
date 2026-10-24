@@ -329,7 +329,9 @@ impl Latest {
         let mut queue = self.queue.lock().unwrap();
         queue.push_back(Queued { texture, view, size, at });
         while queue.len() > QUEUE_MAX {
+            // Frame blending fell behind: that picture missed its frame.
             queue.pop_front();
+            crate::count_missed(1);
         }
         Ok(())
     }

@@ -349,6 +349,11 @@ struct FeedState {
     /// Converted frames; `out_base` is the output frame index of the first one.
     out: VecDeque<[f32; 2]>,
     out_base: i64,
+    /// The output frame just past the newest audio pushed. Not `out_base +
+    /// out.len()`: the mixer moves `out_base` on through a source that's gone
+    /// quiet, which made one that sent nothing look up to date, and the
+    /// meters waited for it forever.
+    heard: i64,
     /// Output frames still to discard: resampler delay, or audio that arrived
     /// after the mixer had already moved past it.
     skip_out: i64,
@@ -379,6 +384,7 @@ impl SourceFeed {
                 pending: [Vec::new(), Vec::new()],
                 out: VecDeque::new(),
                 out_base: 0,
+                heard: 0,
                 skip_out: 0,
                 mono: None,
                 denoise: None,
@@ -458,6 +464,7 @@ impl SourceFeed {
             })
             .unzip();
         st.feed(&l, &r);
+        st.heard = st.out_base + st.out.len() as i64;
     }
 
     /// The output frame just past the newest audio that has arrived (in this
@@ -465,7 +472,7 @@ impl SourceFeed {
     pub(crate) fn arrived(&self) -> Option<i64> {
         let own = {
             let st = self.st.lock().unwrap();
-            st.next_in.map(|_| st.out_base + st.out.len() as i64)
+            st.next_in.map(|_| st.heard)
         };
         self.children.lock().unwrap().iter().filter_map(|c| c.arrived()).chain(own).max()
     }
@@ -1151,6 +1158,17 @@ mod tests {
         assert!(feed.peek(240, 480)[..240].iter().all(|f| f[0] == 0.5), "still there");
         assert!(feed.peek(240, 480)[240..].iter().all(|f| f[0] == 0.0), "silence past what arrived");
         assert!(feed.take(0, 480).iter().all(|f| f[0] == 0.5), "peeking took nothing");
+    }
+
+    /// A source gone quiet stays where its sound ended while the mixer moves
+    /// on through it, so the meters stop waiting for it.
+    #[test]
+    fn quiet_source_stays_where_it_ended() {
+        let feed = SourceFeed::new(RATE, clock_at_zero());
+        feed.push(1000.0, &vec![0.5; 960], 2); // 10 ms
+        assert_eq!(feed.arrived(), Some(480));
+        feed.take(0, 4800);
+        assert_eq!(feed.arrived(), Some(480), "the mixer reading on isn't sound arriving");
     }
 
     #[test]

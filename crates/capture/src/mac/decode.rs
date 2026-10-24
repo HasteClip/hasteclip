@@ -307,10 +307,14 @@ impl Decoder {
     /// and playback do). Decoded on from where the decoder is when that's
     /// close, else from the keyframe before it. `None` past the end.
     pub fn frame(&mut self, index: u64) -> Result<Option<Picture>> {
-        // The last frame (presentation order) starting before the slot ends;
-        // before the first frame, the first one shows.
-        let end = self.time_of(index + 1) - 1e-9;
-        let pos = self.by_pts.partition_point(|&i| self.pts_sec(i) < end).saturating_sub(1);
+        // The last frame (presentation order) numbered at or before the slot,
+        // numbered as frames are handed out (`index_of`); before the first
+        // frame, the first one shows. (Cut at the slot's end in seconds
+        // instead, a frame starting a hair before the next slot came out
+        // for this one numbered as the next: in a recording with a dropped
+        // frame or two, frame 0 came out as frame 1, and the scrub engine
+        // asked for frame 0 again and again. As on Linux.)
+        let pos = self.by_pts.partition_point(|&i| self.index_of(self.pts_sec(i)) <= index).saturating_sub(1);
         self.at(pos)
     }
 
@@ -465,11 +469,6 @@ impl Decoder {
     /// read a hair early (else a frame takes the previous one's number).
     fn index_of(&self, secs: f64) -> u64 {
         ((secs - self.start()) * self.fps + 1e-3).floor().max(0.0) as u64
-    }
-
-    /// Frame `index`'s start, in seconds on the file's clock.
-    fn time_of(&self, index: u64) -> f64 {
-        index as f64 / self.fps + self.start()
     }
 
     /// The first frame's time: frame 0.

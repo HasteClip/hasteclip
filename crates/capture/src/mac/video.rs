@@ -92,7 +92,9 @@ impl Latest {
         let seq = a.seq;
         if let Some(q) = a.queue.as_mut() {
             if q.len() >= MAX_QUEUED {
+                // Frame blending fell behind: that picture missed its frame.
                 q.pop_front();
+                crate::count_missed(1);
             }
             q.push_back(Arrival { at, seq, buffer: b });
         }

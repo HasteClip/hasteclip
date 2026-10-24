@@ -215,7 +215,35 @@ impl Decoder {
     /// Feeds the decoder directly when it can (see `direct`), else through the
     /// file reader; `HASTECLIP_NO_DIRECT_DECODE=1` always uses the reader.
     pub fn open(path: &Path, width: u32, share_on: Option<u64>) -> Result<Self> {
-        Self::open_with(path, width, share_on, std::env::var_os("HASTECLIP_NO_DIRECT_DECODE").is_none())
+        Self::open_with(path, width, share_on, std::env::var_os("HASTECLIP_NO_DIRECT_DECODE").is_none(), None)
+    }
+
+    /// [`Self::open_direct`] at the video's own size, frames shared on
+    /// `share_on` in a pool of their own holding about `bytes` of them (16
+    /// to 2048 frames) instead of playback's few dozen: for the scrub
+    /// engine, which keeps hundreds. (A decoder whose textures are all held
+    /// waits for one to come free.)
+    pub fn open_direct_pooled(path: &Path, share_on: u64, bytes: u64) -> Result<Self> {
+        let d = Self::open_with(path, u32::MAX, Some(share_on), true, Some(bytes))?;
+        if d.way() != "direct" {
+            bail!("this file can't be decoded directly");
+        }
+        Ok(d)
+    }
+
+    /// The dedicated memory of the graphics card with this LUID, in bytes:
+    /// none if it isn't found (one that shares the system's memory has
+    /// little).
+    pub fn video_memory(luid: u64) -> Option<u64> {
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+        unsafe {
+            let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+            (0..).map_while(|i| factory.EnumAdapters1(i).ok()).find_map(|a| {
+                let d = a.GetDesc1().ok()?;
+                let id = (d.AdapterLuid.HighPart as u32 as u64) << 32 | d.AdapterLuid.LowPart as u64;
+                (id == luid).then_some(d.DedicatedVideoMemory as u64)
+            })
+        }
     }
 
     /// The default graphics card's LUID (to share frames on it, as the app
@@ -233,7 +261,7 @@ impl Decoder {
     /// [`Self::open`], feeding the decoder directly; an error if the file
     /// can't be read that way.
     pub fn open_direct(path: &Path, width: u32, share_on: Option<u64>) -> Result<Self> {
-        let d = Self::open_with(path, width, share_on, true)?;
+        let d = Self::open_with(path, width, share_on, true, None)?;
         if d.way() != "direct" {
             bail!("this file can't be decoded directly");
         }
@@ -243,7 +271,7 @@ impl Decoder {
     /// [`Self::open`], always through Media Foundation's file reader (to
     /// compare with the direct way).
     pub fn open_file_reader(path: &Path, width: u32, share_on: Option<u64>) -> Result<Self> {
-        Self::open_with(path, width, share_on, false)
+        Self::open_with(path, width, share_on, false, None)
     }
 
     /// Which way frames come: "direct" or "file reader".
@@ -254,7 +282,8 @@ impl Decoder {
         }
     }
 
-    fn open_with(path: &Path, width: u32, share_on: Option<u64>, direct: bool) -> Result<Self> {
+    /// `pool_bytes`: the shared pool's size in memory, instead of playback's.
+    fn open_with(path: &Path, width: u32, share_on: Option<u64>, direct: bool, pool_bytes: Option<u64>) -> Result<Self> {
         com_init();
         mf_startup()?;
         let gpu = match share_on {
@@ -321,7 +350,7 @@ impl Decoder {
             let width = width.min(sw).max(2) / 2 * 2;
             let height = even_height(width, (sw, sh));
 
-            let (pool, convert) = outputs(&gpu, share_on.is_some(), (sw, sh), (width, height), fps, bt601)?;
+            let (pool, convert) = outputs(&gpu, share_on.is_some(), (sw, sh), (width, height), fps, bt601, pool_bytes)?;
             let mut d = Self {
                 src,
                 _manager: manager,
@@ -669,16 +698,21 @@ fn even_height(width: u32, source: (u32, u32)) -> u32 {
 /// and the conversion pass into them, if they're converted. Shared at the
 /// video's own size, they stay NV12 when the graphics card can share that:
 /// a copy instead of a conversion, and 1.5 bytes a pixel instead of 4.
-/// `HASTECLIP_RGBA_FRAMES=1` always converts.
-fn outputs(gpu: &Gpu, shared: bool, source: (u32, u32), size: (u32, u32), fps: f64, bt601: bool) -> Result<(Option<Arc<Surfaces>>, Option<Convert>)> {
+/// `HASTECLIP_RGBA_FRAMES=1` always converts. `pool_bytes`: how much the
+/// shared pool holds (16 to 2048 frames), instead of playback's few dozen.
+fn outputs(gpu: &Gpu, shared: bool, source: (u32, u32), size: (u32, u32), fps: f64, bt601: bool, pool_bytes: Option<u64>) -> Result<(Option<Arc<Surfaces>>, Option<Convert>)> {
+    let count = |bytes_per_pixel: f64| match pool_bytes {
+        Some(bytes) => (bytes as f64 / (size.0 as f64 * size.1 as f64 * bytes_per_pixel).max(1.0)).clamp(16.0, 2048.0) as usize,
+        None => pool_count(size, bytes_per_pixel),
+    };
     let nv12 = shared && size == source && size.0 % 2 == 0 && size.1 % 2 == 0 && shares_nv12(gpu) && std::env::var_os("HASTECLIP_RGBA_FRAMES").is_none();
     if nv12 {
-        match surfaces(gpu, size.0, size.1, SurfaceFormat::Nv12 { bt601 }, pool_count(size, 1.5), false) {
+        match surfaces(gpu, size.0, size.1, SurfaceFormat::Nv12 { bt601 }, count(1.5), false) {
             Ok(pool) => return Ok((Some(Arc::new(pool)), None)),
             Err(e) => eprintln!("decoder: can't share NV12 frames, converting them: {e:#}"),
         }
     }
-    let pool = if shared { Some(Arc::new(surfaces(gpu, size.0, size.1, SurfaceFormat::Rgba, pool_count(size, 4.0), true)?)) } else { None };
+    let pool = if shared { Some(Arc::new(surfaces(gpu, size.0, size.1, SurfaceFormat::Rgba, count(4.0), true)?)) } else { None };
     let targets: Vec<ID3D11Texture2D> = match &pool {
         Some(p) => p.textures.clone(),
         None => vec![gpu.texture(size.0, size.1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_RENDER_TARGET.0 as u32, D3D11_USAGE_DEFAULT, 0)?],

@@ -111,19 +111,20 @@ impl BlendPacer {
         let mut frame = self.encoder.buffer();
         g.nv12(&mut frame);
         self.picture.version += 1;
-        if !self.encoder.encode(frame, k) {
-            self.skipped += 1;
-            if self.skipped.is_power_of_two() {
-                eprintln!("video encoder is behind: {} frames skipped so far", self.skipped);
-            }
+        if self.encoder.encode(frame, k) {
+            super::encoded();
+        } else {
+            super::skipped(&mut self.skipped, 1);
         }
     }
 
     /// A new picture came up at `at`: the looks before it saw the one
     /// before. Then the looks move toward halfway between pictures.
     fn arrive(&mut self, at: f64, frame: &Frame, id: u64) {
+        crate::count_picture();
         if at < self.look_time(self.next - 1) {
             self.stats.late += 1;
+            crate::count_missed(1);
         }
         self.look_until(at);
         // Pictures belong on whole steps of the looks (halfway between two).
@@ -196,6 +197,7 @@ pub(super) fn spawn_blend_pacer(fps: u32, looks: u32, shutter: Shutter, mut pict
         .name("blend pacer".into())
         .spawn(move || {
             let mut sent = Previewed::new(crate::preview::new_producer());
+            crate::blending(fps, looks);
             let t0 = host_now();
             clock.set(t0);
             let mut p = BlendPacer {

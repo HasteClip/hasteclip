@@ -64,7 +64,7 @@ impl HoverPlay {
                     Ok(Some(info)) => {
                         let duration = info.duration;
                         // No sound: the clock runs on, silent.
-                        let mut player = Player::new(ctx, &self.clip, info, media::pcm::Pcm::from_tracks(Vec::new()), Vec::new());
+                        let mut player = Player::preview(ctx, &self.clip, info, media::pcm::Pcm::from_tracks(Vec::new()), Vec::new());
                         player.play(duration);
                         self.state = State::Playing(Box::new(player), duration);
                     }

@@ -245,8 +245,7 @@ struct Session {
 
 impl Session {
     fn start(s: &EncodeSettings, target: Target, live: &Arc<LiveAudio>, mov: bool) -> Result<Self> {
-        crate::FRAMES_SKIPPED.store(0, Ordering::Relaxed);
-        crate::FRAMES_ENCODED.store(0, Ordering::Relaxed);
+        crate::capture_started();
         system::com_init();
         system::mf_startup()?;
         let gpu = d3d::Gpu::new()?;
@@ -1564,8 +1563,10 @@ impl BlendPacer {
     /// A new picture came up at `at`: the looks before it saw the one before.
     /// Then the looks move toward halfway between pictures.
     fn arrive(&mut self, at: f64, picture: Option<d3d::Queued>, latest: &d3d::Latest) {
+        crate::count_picture();
         if at < self.look_time(self.next - 1) {
             self.stats.late += 1;
+            crate::count_missed(1);
         }
         self.look_until(at);
         // Pictures belong on whole steps of the looks (halfway between two).
@@ -1659,6 +1660,7 @@ fn spawn_blend_pacer(
     let stop2 = stop.clone();
     let handle = thread::spawn(move || {
         system::multimedia_thread("Capture");
+        crate::blending(fps, looks);
         let t0 = host_now();
         clock.set(t0);
         let mut p = BlendPacer {
@@ -1713,7 +1715,7 @@ fn spawn_blend_pacer(
 
 /// A frame went to the encoder: counted for the UI (the share skipped).
 fn encoded() {
-    crate::FRAMES_ENCODED.fetch_add(1, Ordering::Relaxed);
+    crate::count_encoded();
 }
 
 /// The encoder can't keep up (no free frame for it, or its queue is full),
@@ -1723,7 +1725,7 @@ fn encoded() {
 fn skipped(dropped: &mut u64, n: u64) {
     let before = *dropped;
     *dropped += n;
-    crate::FRAMES_SKIPPED.fetch_add(n, Ordering::Relaxed);
+    crate::count_skipped(n);
     if n > 0 && (before == 0 || dropped.ilog2() > before.ilog2()) {
         eprintln!("video is behind: {dropped} frames skipped");
     }

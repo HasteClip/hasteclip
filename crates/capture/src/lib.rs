@@ -756,22 +756,206 @@ pub struct Devices {
     pub apps: Vec<Device>,
 }
 
-static FRAMES_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static FRAMES_ENCODED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// How the running capture keeps up, second by second: kept this many
+/// seconds back (an hour: the longest a clip reaches).
+const HEALTH_SECONDS: usize = 3600;
 
-/// How many frames the running capture has handed to the video encoder (to
-/// tell what share [`frames_skipped`] is). Starts from 0 with each capture;
-/// only counted on Windows so far.
-pub fn frames_encoded() -> u64 {
-    FRAMES_ENCODED.load(std::sync::atomic::Ordering::Relaxed)
+/// One second of the running capture: frames handed to the video encoder
+/// and frames skipped, and (frame blending) the screen's pictures blended and
+/// those that missed their frame.
+#[derive(Clone, Copy, Default)]
+struct Second {
+    encoded: u32,
+    skipped: u32,
+    pictures: u32,
+    missed: u32,
 }
 
-/// How many frames the running capture has left out because the video
-/// encoder, or the graphics card making the frames, couldn't keep up (the
-/// file shows the previous one longer). Starts from 0 with each capture; only
-/// counted on Windows so far.
-pub fn frames_skipped() -> u64 {
-    FRAMES_SKIPPED.load(std::sync::atomic::Ordering::Relaxed)
+/// The running capture's seconds, from its start.
+struct History {
+    started: Option<std::time::Instant>,
+    /// Frame blending: looks at the screen a second, and per frame (none: it
+    /// doesn't blend).
+    rate: u32,
+    looks: u32,
+    /// Second `first` (counted from the start) onward, the newest last.
+    first: u64,
+    seconds: std::collections::VecDeque<Second>,
+}
+
+impl History {
+    const NONE: Self = Self { started: None, rate: 0, looks: 0, first: 0, seconds: std::collections::VecDeque::new() };
+
+    /// The second under way (those that went by with nothing counted are
+    /// added, empty); none between captures.
+    fn now(&mut self) -> Option<&mut Second> {
+        let at = self.started?.elapsed().as_secs();
+        let end = self.first + self.seconds.len() as u64;
+        if at >= end + HEALTH_SECONDS as u64 {
+            self.seconds.clear();
+            self.first = at;
+        }
+        while self.first + (self.seconds.len() as u64) <= at {
+            self.seconds.push_back(Second::default());
+            if self.seconds.len() > HEALTH_SECONDS {
+                self.seconds.pop_front();
+                self.first += 1;
+            }
+        }
+        self.seconds.back_mut()
+    }
+}
+
+static HISTORY: std::sync::Mutex<History> = std::sync::Mutex::new(History::NONE);
+
+/// Count toward the second under way.
+fn count(add: impl FnOnce(&mut Second)) {
+    if let Some(s) = HISTORY.lock().unwrap().now() {
+        add(s);
+    }
+}
+
+/// A capture starts: how it keeps up is counted from nothing (not blending
+/// until its pacer says so).
+pub(crate) fn capture_started() {
+    *HISTORY.lock().unwrap() = History { started: Some(std::time::Instant::now()), ..History::NONE };
+}
+
+/// The capture blends `looks` looks at the screen into each frame, `fps` frames a second.
+pub(crate) fn blending(fps: u32, looks: u32) {
+    let mut h = HISTORY.lock().unwrap();
+    h.rate = fps.saturating_mul(looks);
+    h.looks = looks;
+}
+
+/// A frame handed to the video encoder.
+pub(crate) fn count_encoded() {
+    count(|s| s.encoded += 1);
+}
+
+/// `n` frames skipped: the encoder couldn't keep up (or the pacer fell far
+/// behind), and the file shows the one before them longer.
+pub(crate) fn count_skipped(n: u64) {
+    count(|s| s.skipped = s.skipped.saturating_add(n.min(u32::MAX as u64) as u32));
+}
+
+/// Frame blending got one of the screen's pictures.
+pub(crate) fn count_picture() {
+    count(|s| s.pictures += 1);
+}
+
+/// `n` of the screen's pictures missed their frame: one came too late for it,
+/// or was let go of waiting while frame blending fell behind.
+pub(crate) fn count_missed(n: u64) {
+    count(|s| s.missed = s.missed.saturating_add(n.min(u32::MAX as u64) as u32));
+}
+
+/// How the running capture kept up over its last `span` ([`health`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CaptureHealth {
+    /// Frames handed to the video encoder, and frames skipped because it (or
+    /// the graphics card making them) couldn't keep up: the file shows the one
+    /// before a skipped frame longer.
+    pub encoded: u64,
+    pub skipped: u64,
+    /// Frame blending, if the capture blends.
+    pub blend: Option<BlendHealth>,
+}
+
+/// How frame blending kept up ([`CaptureHealth::blend`]).
+#[derive(Debug, Clone, Copy)]
+pub struct BlendHealth {
+    /// Looks at the screen a second, and per frame.
+    pub rate: u32,
+    pub looks: u32,
+    /// The screen's new pictures in the busiest whole second (none until
+    /// one has gone by): the screen only sends one when something changes.
+    pub busiest: Option<u32>,
+    /// Pictures that missed their frame (came too late for it, or were let
+    /// go of waiting): those frames reused the picture before.
+    pub missed: u64,
+}
+
+/// How the running capture kept up over its last `span`, counted each second
+/// from its start (the second under way counts toward the sums, not the
+/// busiest second). None before a capture starts.
+pub fn health(span: std::time::Duration) -> Option<CaptureHealth> {
+    HISTORY.lock().unwrap().summary(span)
+}
+
+impl History {
+    /// [`health`] of this history.
+    fn summary(&mut self, span: std::time::Duration) -> Option<CaptureHealth> {
+        self.now()?;
+        let whole = (span.as_secs().max(1) as usize).min(self.seconds.len().saturating_sub(1));
+        let mut out = CaptureHealth::default();
+        let (mut missed, mut busiest) = (0u64, None::<u32>);
+        // The second under way, then the span's whole seconds before it.
+        for (k, s) in self.seconds.iter().rev().take(whole + 1).enumerate() {
+            out.encoded += s.encoded as u64;
+            out.skipped += s.skipped as u64;
+            missed += s.missed as u64;
+            if k > 0 {
+                busiest = Some(busiest.unwrap_or(0).max(s.pictures));
+            }
+        }
+        out.blend = (self.rate > 0).then_some(BlendHealth { rate: self.rate, looks: self.looks, busiest, missed });
+        Some(out)
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A capture that started `secs` seconds ago.
+    fn started(secs: u64) -> History {
+        History { started: Some(Instant::now() - Duration::from_secs(secs)), ..History::NONE }
+    }
+
+    /// Counts go to the second they happened in; a span sums its seconds
+    /// and the one under way, and the busiest second is a whole one.
+    #[test]
+    fn a_span_counts_its_seconds() {
+        let mut h = started(0);
+        assert!(h.summary(Duration::from_secs(60)).is_some_and(|s| s.blend.is_none()), "not blending");
+        h.rate = 540;
+        h.looks = 9;
+        // Three seconds in: 500 pictures in second 0, 530 in second 1, 40 so far in second 2.
+        h.started = Some(Instant::now() - Duration::from_millis(2500));
+        h.seconds = [500u32, 530, 40].iter().map(|&p| Second { encoded: 60, skipped: 0, pictures: p, missed: 0 }).collect();
+        h.seconds[1].skipped = 3;
+        h.seconds[2].missed = 2;
+        let s = h.summary(Duration::from_secs(60)).unwrap();
+        assert_eq!((s.encoded, s.skipped), (180, 3));
+        let b = s.blend.unwrap();
+        assert_eq!((b.rate, b.looks, b.busiest, b.missed), (540, 9, Some(530), 2), "the second under way isn't the busiest");
+        // A one-second span: the last whole second and the one under way.
+        let s = h.summary(Duration::from_secs(1)).unwrap();
+        assert_eq!((s.encoded, s.skipped, s.blend.unwrap().busiest), (120, 3, Some(530)));
+    }
+
+    /// Seconds with nothing counted still go by: a span reaches only as far
+    /// back as it says, and the first second has no busiest yet.
+    #[test]
+    fn quiet_seconds_go_by() {
+        let mut h = started(0);
+        h.rate = 540;
+        h.looks = 9;
+        h.now().unwrap().missed = 5;
+        assert_eq!(h.summary(Duration::from_secs(60)).unwrap().blend.unwrap().busiest, None, "no whole second yet");
+        // Ten seconds later, nothing more counted: the missed ones are outside a 5 s span.
+        h.started = Some(Instant::now() - Duration::from_secs(10));
+        let b = h.summary(Duration::from_secs(5)).unwrap().blend.unwrap();
+        assert_eq!((b.missed, b.busiest), (0, Some(0)));
+        assert_eq!(h.summary(Duration::from_secs(60)).unwrap().blend.unwrap().missed, 5);
+        // Over an hour later: only the last hour is kept.
+        h.started = Some(Instant::now() - Duration::from_secs(5000));
+        h.summary(Duration::from_secs(60));
+        assert!(h.seconds.len() <= HEALTH_SECONDS + 1);
+        assert_eq!(h.summary(Duration::from_secs(4000)).unwrap().blend.unwrap().missed, 0);
+    }
 }
 
 /// AAC bitrate per audio track, bits per second.

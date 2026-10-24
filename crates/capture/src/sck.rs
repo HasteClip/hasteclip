@@ -221,6 +221,8 @@ struct Session {
 
 impl Session {
     fn start(s: &EncodeSettings, target: Target, live: &Arc<LiveAudio>) -> Result<Self> {
+        // How it keeps up (the warnings by the recorder) counts from here.
+        crate::capture_started();
         let (content, display, (width, height)) = video::plan(&s.video, s.target_height, s.shape)?;
         // The away screen, converted once (recording the whole screen too:
         // it can switch to games and apps while it runs).
@@ -696,6 +698,7 @@ fn spawn_pacer(fps: u32, mut frames: Frames, encoder: Encoder, clock: Arc<Clock>
         let mut note = |n: i64| {
             let before = skipped;
             skipped += n as u64;
+            crate::count_skipped(n as u64);
             // Once per doubling, so a long session doesn't flood the log.
             if before.checked_ilog2() != skipped.checked_ilog2() {
                 eprintln!("video encoder is behind: {skipped} frames skipped so far");
@@ -709,7 +712,9 @@ fn spawn_pacer(fps: u32, mut frames: Frames, encoder: Encoder, clock: Arc<Clock>
                     note(due - next);
                 }
                 if let Some(frame) = frames.next() {
-                    if !encoder.0.encode(&frame.0, due, fps) {
+                    if encoder.0.encode(&frame.0, due, fps) {
+                        crate::count_encoded();
+                    } else {
                         note(1);
                     }
                 }

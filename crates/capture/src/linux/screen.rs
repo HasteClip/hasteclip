@@ -190,7 +190,9 @@ impl Latest {
             let mut q = self.arrivals.lock().unwrap();
             if let Some(q) = q.as_mut() {
                 if q.len() >= ARRIVALS_KEPT {
+                    // Frame blending fell behind: that picture missed its frame.
                     q.pop_front();
+                    crate::count_missed(1);
                 }
                 q.push_back(Arrival { at: super::host_now(), frame, seq });
             }

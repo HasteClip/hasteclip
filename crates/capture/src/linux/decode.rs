@@ -19,7 +19,7 @@
 //! Frames are numbered by time from the start of the clip (as the editor
 //! counts them), on the grid of the app's frame rate.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -149,7 +149,20 @@ pub struct Decoder {
     handed: i64,
     /// The next frame to hand out (position in `by_pts`), when reading on.
     next_out: Option<usize>,
+    /// Frame buffers given back ([`Self::recycle`]), used again for the
+    /// next frames out: no fresh memory to map and fault in per frame.
+    spare: Vec<Vec<u8>>,
+    /// Times of frames the decoder turned down (damaged) since it last
+    /// started over: not waited for.
+    rejected: HashSet<i64>,
 }
+
+/// Buffers kept for reuse, at most.
+const SPARE: usize = 4;
+
+/// A frame not out this many frames after it went in never will be (H.264
+/// holds back at most 16 for reordering, and frame threading a few more).
+const GIVE_UP: usize = 48;
 
 // The decoder is used from one thread at a time, which owns it.
 unsafe impl Send for Decoder {}
@@ -164,6 +177,14 @@ impl Drop for Decoder {
 impl Decoder {
     /// Open `path`, frames coming out as `output` says.
     pub fn open(path: &Path, output: Output) -> Result<Self> {
+        // Thumbnails are made in the background: two threads are plenty.
+        Self::open_threads(path, output, if output == Output::Screen { THREADS } else { 2 })
+    }
+
+    /// [`Self::open`] on `threads` decoding threads. On one, a frame comes
+    /// out as soon as it goes in (nothing waits on frames after it): for
+    /// several decoders at once, each on its own stretch of the video.
+    pub fn open_threads(path: &Path, output: Output, threads: c_int) -> Result<Self> {
         load()?;
         let index = Index::read(path)?;
         ensure!(!index.samples.is_empty(), "no video frames");
@@ -181,8 +202,6 @@ impl Decoder {
         };
         // BT.601 only when the file says so, as other players do.
         let bt601 = matches!(index.matrix, Some(5 | 6));
-        // Thumbnails are made in the background: two threads are plenty.
-        let threads = if output == Output::Screen { THREADS } else { 2 };
         let mut err = [0 as c_char; 512];
         // SAFETY: the setup bytes and the error buffer are valid for the call.
         let dec = unsafe { hcav_open(index.avcc.as_ptr(), index.avcc.len() as c_int, threads, err.as_mut_ptr(), err.len() as c_int) };
@@ -213,7 +232,24 @@ impl Decoder {
             keep_from: i64::MIN,
             handed: i64::MIN,
             next_out: Some(0),
+            spare: Vec::new(),
+            rejected: HashSet::new(),
         })
+    }
+
+    /// A frame's buffer (as `Surface::nv12` holds it) no longer needed:
+    /// the next frame decoded goes into it. Keeping frames by the hundred
+    /// and dropping them as fast, every frame got fresh memory from the
+    /// system and gave it back, which cost more than the decoding.
+    pub fn recycle(&mut self, buf: Vec<u8>) {
+        if self.spare.len() < SPARE && buf.len() == media_frame_bytes(self.source) as usize {
+            self.spare.push(buf);
+        }
+    }
+
+    /// Buffers it has for the next frames (up to 4 are kept).
+    pub fn spare(&self) -> usize {
+        self.spare.len()
     }
 
     /// Frames at `width` wide, as RGBA (thumbnails).
@@ -230,6 +266,8 @@ impl Decoder {
     pub fn keyframes(&self) -> Vec<u64> {
         let mut k: Vec<u64> = self.keys.iter().map(|&i| self.index_of(self.pts_sec(i))).collect();
         k.sort_unstable();
+        // Two on one slot (an uneven frame rate) count once.
+        k.dedup();
         k
     }
 
@@ -282,10 +320,14 @@ impl Decoder {
     /// does). Decoded on from where the decoder is when that's close, else
     /// from the keyframe before it. `None` past the end.
     pub fn frame(&mut self, index: u64) -> Result<Option<Picture>> {
-        // The last frame (presentation order) starting before the slot ends;
-        // before the first frame, the first one shows.
-        let end = self.time_of(index + 1) - 1e-9;
-        let pos = self.by_pts.partition_point(|&i| self.pts_sec(i) < end).saturating_sub(1);
+        // The last frame (presentation order) numbered at or before the slot,
+        // numbered as frames are handed out (`index_of`); before the first
+        // frame, the first one shows. (Cut at the slot's end in seconds
+        // instead, a frame starting a hair before the next slot came out
+        // for this one numbered as the next: in a recording with a dropped
+        // frame or two, frame 0 came out as frame 1, and the scrub engine
+        // asked for frame 0 again and again.)
+        let pos = self.by_pts.partition_point(|&i| self.index_of(self.pts_sec(i)) <= index).saturating_sub(1);
         self.at(pos)
     }
 
@@ -320,6 +362,17 @@ impl Decoder {
             self.collect()?;
             if let Some(buf) = self.decoded.remove(&pts) {
                 return self.finish(pos, buf).map(Some);
+            }
+            // Never coming (the decoder turned it down, or it's long overdue):
+            // its slot shows the next frame that came out, as for a dropped
+            // frame. (Waiting for it, every frame up to the end of the file
+            // was decoded and kept, gigabytes of them.)
+            if self.rejected.contains(&pts) || self.next_feed > sample + GIVE_UP {
+                if let Some((&later, _)) = self.decoded.range(pts..).next() {
+                    let buf = self.decoded.remove(&later).expect("just found");
+                    let at = self.by_pts.partition_point(|&i| self.index.samples[i].pts < later);
+                    return self.finish(at, buf).map(Some);
+                }
             }
             if self.next_feed < self.index.samples.len() && !self.draining {
                 self.feed(self.next_feed)?;
@@ -362,7 +415,9 @@ impl Decoder {
             match unsafe { hcav_receive(self.dec, &mut pts, &mut code) } {
                 FRAME if pts > self.handed && pts >= self.keep_from => {
                     let (w, h) = self.source;
-                    let mut buf = vec![0u8; media_frame_bytes(self.source) as usize];
+                    // A buffer given back, else a new one (every byte of
+                    // either is written below).
+                    let mut buf = self.spare.pop().unwrap_or_else(|| vec![0u8; media_frame_bytes(self.source) as usize]);
                     // SAFETY: `buf` holds a whole frame of that size.
                     let r = unsafe { hcav_take_nv12(self.dec, buf.as_mut_ptr(), w as c_int, h as c_int) };
                     ensure!(r == 0, "a decoded frame isn't {w}×{h}, 8-bit 4:2:0");
@@ -398,8 +453,11 @@ impl Decoder {
                 // Full: take frames out, then again.
                 AGAIN => self.collect()?,
                 // A damaged frame: skipped (the ones after it show as best
-                // they can, as in any player).
-                _ => return Ok(()),
+                // they can, as in any player), and not waited for.
+                _ => {
+                    self.rejected.insert(s.pts);
+                    return Ok(());
+                }
             }
         }
     }
@@ -409,6 +467,7 @@ impl Decoder {
         // SAFETY: the decoder is open.
         unsafe { hcav_flush(self.dec) };
         self.decoded.clear();
+        self.rejected.clear();
         self.draining = false;
         self.keep_from = i64::MIN;
         self.handed = i64::MIN;
@@ -423,11 +482,6 @@ impl Decoder {
     /// read a hair early (else a frame takes the previous one's number).
     fn index_of(&self, secs: f64) -> u64 {
         ((secs - self.start()) * self.fps + 1e-3).floor().max(0.0) as u64
-    }
-
-    /// Frame `index`'s start, in seconds on the file's clock.
-    fn time_of(&self, index: u64) -> f64 {
-        index as f64 / self.fps + self.start()
     }
 
     /// The first frame's time: frame 0.
@@ -574,6 +628,41 @@ mod tests {
             println!("frame {i}: {} in {:.1} ms", if same { "same as ffmpeg" } else { "DIFFERENT" }, took.as_secs_f64() * 1000.0);
             assert!(same, "frame {i} differs");
         }
+    }
+
+    /// A recording with a dropped frame in over a thousand runs a hair
+    /// slower than its rate on average, which put frame 1 inside frame 0's
+    /// slot as the slot was cut by time: frame(0) handed out frame 1, so
+    /// frame 0 could never be had. Each slot's frame is now the one
+    /// numbered for it.
+    #[test]
+    fn a_dropped_frame_leaves_every_frame_reachable() {
+        if let Err(e) = load() {
+            eprintln!("skipped: {e:#}");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("hc-avdec-drop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("dropped.mp4");
+        // 20 s at 60 fps with frame 600 left out, its gap kept in the times
+        // (one in 1200: the average rate is within a thousandth of 60).
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=64x36:r=60:d=20"])
+            .args(["-vf", "select='not(eq(n\\,600))'", "-fps_mode", "passthrough"])
+            .args(["-c:v", "libx264", "-preset", "ultrafast", "-g", "60", "-bf", "0", "-pix_fmt", "yuv420p"])
+            .arg(&clip)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let mut dec = Decoder::open(&clip, Output::Screen).unwrap();
+        assert!(dec.fps < 60.0, "the average rate is under 60 ({})", dec.fps);
+        assert_eq!(dec.keyframes().first(), Some(&0));
+        for i in [0, 1, 2, 60, 61, 599, 601, 1100] {
+            let p = dec.frame(i).unwrap().unwrap();
+            assert!(p.index <= i, "frame({i}) handed out frame {}", p.index);
+        }
+        assert_eq!(dec.frame(0).unwrap().unwrap().index, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A grey and a red come back as themselves, shrunk.
