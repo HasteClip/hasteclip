@@ -1878,7 +1878,10 @@ impl App {
             viewer::ViewerOutcome::Edit => {
                 let clip = v.clip().to_path_buf();
                 self.reveal_clip = Some(clip.clone());
-                let handoff = self.viewer.take().and_then(viewer::Viewer::into_player);
+                let (handoff, strip) = self.viewer.take().map_or((None, None), viewer::Viewer::into_handoff);
+                if let Some(strip) = strip {
+                    filmstrip::Filmstrip::hand_over(strip);
+                }
                 self.page = Page::Clips;
                 self.open_editor_at(clip.clone(), from, handoff);
                 if self.page == Page::Edit {
@@ -1973,12 +1976,15 @@ impl App {
         let clip = ed.clip().to_path_buf();
         // Where its playhead is, to put the player there too.
         let resume = ed.resume();
-        let handoff = ed.into_player();
+        let (handoff, strip) = ed.into_handoff();
         self.page = Page::Clips;
         self.refresh_clips();
         // Opened from the player: back to it, on this clip (renamed meanwhile,
         // it's the new name). While its edit saves, the player waits for it.
         if self.edit_return.take().is_some() {
+            if let Some(strip) = strip {
+                filmstrip::Filmstrip::hand_over(strip);
+            }
             self.open_viewer_at(clip, resume, handoff);
         }
     }

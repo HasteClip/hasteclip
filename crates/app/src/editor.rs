@@ -267,12 +267,14 @@ impl Editor {
         Self { target, state, preview_share, snap, from, handoff }
     }
 
-    pub fn into_player(self) -> Option<Player> {
-        let State::Ready(mut r) = self.state else { return None };
-        if r.player.size().is_none() && r.curtain.as_ref().is_some_and(|c| c.size().is_some()) {
-            return r.curtain.take();
-        }
-        Some(r.player)
+    pub fn into_handoff(self) -> (Option<Player>, Option<Filmstrip>) {
+        let State::Ready(mut r) = self.state else { return (None, None) };
+        let player = if r.player.size().is_none() && r.curtain.as_ref().is_some_and(|c| c.size().is_some()) {
+            r.curtain.take()
+        } else {
+            Some(r.player)
+        };
+        (player, Some(r.strip))
     }
 
     /// The clip was renamed from `from` to `to`: saved under the new name.
@@ -390,7 +392,7 @@ impl Ready {
         }
 
         let full = l.info.duration.max(1e-6);
-        let strip = Filmstrip::build(ctx, source, &l.info);
+        let strip = Filmstrip::for_clip(ctx, source, &l.info);
         Self {
             info: l.info,
             player,

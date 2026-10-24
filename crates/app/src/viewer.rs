@@ -218,12 +218,14 @@ impl Viewer {
         Self { clip: clip.to_path_buf(), state, resume, handoff }
     }
 
-    pub fn into_player(self) -> Option<Player> {
-        let State::Ready(mut r) = self.state else { return None };
-        if r.player.size().is_none() && r.curtain.as_ref().is_some_and(|c| c.size().is_some()) {
-            return r.curtain.take();
-        }
-        Some(r.player)
+    pub fn into_handoff(self) -> (Option<Player>, Option<Filmstrip>) {
+        let State::Ready(mut r) = self.state else { return (None, None) };
+        let player = if r.player.size().is_none() && r.curtain.as_ref().is_some_and(|c| c.size().is_some()) {
+            r.curtain.take()
+        } else {
+            Some(r.player)
+        };
+        (player, Some(r.strip))
     }
 
     pub fn clip(&self) -> &Path {
@@ -533,7 +535,7 @@ impl Ready {
             player.play_taken(l.info.duration, taken);
         }
         let r = Self {
-            strip: Filmstrip::build(ctx, clip, &l.info),
+            strip: Filmstrip::for_clip(ctx, clip, &l.info),
             info: l.info,
             player,
             curtain,

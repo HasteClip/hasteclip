@@ -17,7 +17,8 @@
 //! clip's keyframes, from `media::keyframe_strip`: the ones to show are
 //! decided before any is decoded, so each appears once.
 
-use std::path::Path;
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 
 use egui::{Color32, Pos2, Rect, Vec2};
@@ -28,54 +29,86 @@ const HEIGHT: u32 = 112;
 /// At most this many keyframe thumbnails, however long the clip.
 const MAX_THUMBS: usize = 160;
 
-pub enum Filmstrip {
+pub struct Filmstrip {
+    source: PathBuf,
+    stamp: Option<media::Stamp>,
+    kind: Kind,
+}
+
+enum Kind {
     #[cfg(hw_decode)]
     Exact(exact::Exact),
     Keys(Keys),
 }
 
+thread_local! {
+    static HANDED_OVER: RefCell<Option<Filmstrip>> = const { RefCell::new(None) };
+}
+
 impl Filmstrip {
     pub fn build(ctx: &egui::Context, source: &Path, info: &ClipInfo) -> Self {
+        let kind = Self::kind(ctx, source, info);
+        Self { source: source.to_path_buf(), stamp: media::stamp(source), kind }
+    }
+
+    fn kind(ctx: &egui::Context, source: &Path, info: &ClipInfo) -> Kind {
         #[cfg(hw_decode)]
         if std::env::var_os("HASTECLIP_NO_HW_DECODE").is_none() {
-            return Self::Exact(exact::Exact::open(ctx, source, info));
+            return Kind::Exact(exact::Exact::open(ctx, source, info));
         }
         let _ = info;
-        Self::Keys(Keys::build(ctx, source))
+        Kind::Keys(Keys::build(ctx, source))
+    }
+
+    pub fn for_clip(ctx: &egui::Context, source: &Path, info: &ClipInfo) -> Self {
+        match HANDED_OVER.with(|h| h.borrow_mut().take()) {
+            Some(strip) if strip.source.as_path() == source && strip.unchanged() => strip,
+            _ => Self::build(ctx, source, info),
+        }
+    }
+
+    pub fn hand_over(strip: Filmstrip) {
+        HANDED_OVER.with(|h| *h.borrow_mut() = Some(strip));
+    }
+
+    fn unchanged(&self) -> bool {
+        self.stamp.is_some() && self.stamp == media::stamp(&self.source)
     }
 
     /// Paint into `lane`, which shows `from..to` seconds of a clip `dur` long.
     pub fn paint(&mut self, ui: &egui::Ui, lane: Rect, from: f64, to: f64, dur: f64) {
         // The decoder couldn't open the clip: keyframes instead.
         #[cfg(hw_decode)]
-        if let Self::Exact(e) = self {
+        if let Kind::Exact(e) = &self.kind {
             if e.failed() {
-                *self = Self::Keys(Keys::build(ui.ctx(), &e.source));
+                self.kind = Kind::Keys(Keys::build(ui.ctx(), &e.source));
             }
         }
-        match self {
+        match &mut self.kind {
             #[cfg(hw_decode)]
-            Self::Exact(e) => e.paint(ui, lane, from, to, dur),
-            Self::Keys(k) => k.paint(ui, lane, from, to, dur),
+            Kind::Exact(e) => e.paint(ui, lane, from, to, dur),
+            Kind::Keys(k) => k.paint(ui, lane, from, to, dur),
         }
     }
 
     /// The clip's file was renamed: the open decoder keeps reading it; only
     /// a fallback that opens it again needs the new name.
     pub fn renamed(&mut self, to: &Path) {
-        match self {
+        self.source = to.to_path_buf();
+        self.stamp = media::stamp(to);
+        match &mut self.kind {
             #[cfg(hw_decode)]
-            Self::Exact(e) => e.source = to.to_path_buf(),
-            Self::Keys(_) => {}
+            Kind::Exact(e) => e.source = to.to_path_buf(),
+            Kind::Keys(_) => {}
         }
     }
 
     /// The decoded thumbnail nearest `t`, if any (a rough hover preview).
     pub fn near(&self, t: f64) -> Option<&egui::TextureHandle> {
-        match self {
+        match &self.kind {
             #[cfg(hw_decode)]
-            Self::Exact(e) => e.near(t),
-            Self::Keys(k) => k.near(t),
+            Kind::Exact(e) => e.near(t),
+            Kind::Keys(k) => k.near(t),
         }
     }
 }
