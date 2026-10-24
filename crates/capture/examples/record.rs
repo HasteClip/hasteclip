@@ -95,7 +95,6 @@ default: {:?}", d.inputs.iter().map(|i| &i.name).collect::<Vec<_>>(), d.default_
                         Some("wgc") => capture::ScreenCapture::Wgc,
                         _ => capture::ScreenCapture::Auto,
                     },
-                    crop: None,
                 },
             }
         },
@@ -114,14 +113,19 @@ default: {:?}", d.inputs.iter().map(|i| &i.name).collect::<Vec<_>>(), d.default_
             placement: std::sync::Arc::new(std::sync::Mutex::new(capture::webcam::Placement::default_for(16.0 / 9.0, 16.0 / 9.0))),
         }),
         // SCREEN_BOX=x,y,w,h: the screen in that box (fractions of the
-        // frame), filling it; SCREEN_FRONT=1: in front of the webcam.
+        // frame), filling it; SCREEN_FRONT=1: in front of the webcam;
+        // CROP=WxH: the middle that big of the screen.
         screen: std::sync::Arc::new(std::sync::Mutex::new({
             let rect = env("SCREEN_BOX").and_then(|b| {
                 let v: Vec<f32> = b.split(',').filter_map(|n| n.trim().parse().ok()).collect();
                 (v.len() == 4).then(|| [v[0], v[1], v[2], v[3]])
             });
+            let crop = env("CROP").and_then(|c| {
+                let (w, h) = c.split_once('x')?;
+                Some(capture::Crop { w: w.parse().ok()?, h: h.parse().ok()?, at: None })
+            });
             let framing = if rect.is_some() { capture::Framing::Fill } else { size.framing() };
-            capture::ScreenPlacement { rect: rect.unwrap_or([0.0, 0.0, 1.0, 1.0]), framing, in_front: env("SCREEN_FRONT").is_some(), hidden: false }
+            capture::ScreenPlacement { rect: rect.unwrap_or([0.0, 0.0, 1.0, 1.0]), framing, in_front: env("SCREEN_FRONT").is_some(), hidden: false, crop }
         })),
         sources: sources.clone(),
     })?;

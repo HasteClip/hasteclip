@@ -440,7 +440,7 @@ struct App {
     /// The recording's frame size for (what's recorded, resolution), cached:
     /// for keeping the webcam's box its shape. Kept while capturing; cleared
     /// when a capture starts or stops.
-    frame_size: Option<((capture::VideoSource, capture::VideoSize), Option<(u32, u32)>, Instant)>,
+    pub(crate) frame_size: Option<((capture::VideoSource, capture::VideoSize), Option<(u32, u32)>, Instant)>,
     /// Apps with a window, for the games-and-apps list: to add, and to show
     /// which are open. Refreshed while the Sources page shows.
     pub(crate) windowed_apps: Vec<capture::Device>,
@@ -1030,13 +1030,13 @@ impl App {
                 away_when_unfocused: *away_screen,
                 hook: self.game_hook(),
             },
-            _ => capture::VideoSource::Screen {
-                id: self.screens.get(self.display_at()).map(|d| d.id.clone()).unwrap_or_else(|| "0".to_owned()),
-                hook: self.game_hook(),
-                method: self.settings.screen_capture.into(),
-                crop: self.settings.screen_crop.filter(|c| capture::SCREEN_CROP && !c.is_none()).map(Into::into),
-            },
+            _ => self.display_source(&self.screens.get(self.display_at()).map(|d| d.id.clone()).unwrap_or_else(|| "0".to_owned())),
         }
+    }
+
+    /// Recording the display `id`.
+    pub(crate) fn display_source(&self, id: &str) -> capture::VideoSource {
+        capture::VideoSource::Screen { id: id.to_owned(), hook: self.game_hook(), method: self.settings.screen_capture.into() }
     }
 
     /// When to use the game capture hook: the setting, and the games with

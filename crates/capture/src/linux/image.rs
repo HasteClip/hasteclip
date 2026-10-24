@@ -28,15 +28,15 @@ impl Canvas {
     /// its middle filling the canvas, all of it with black bars, or all of
     /// it stretched.
     #[cfg(test)]
-    pub(crate) fn fill_from(&mut self, src: &Frame, framing: crate::Framing, crop: Option<crate::Crop>) {
-        self.draw_screen(src, &crate::ScreenPlacement::whole(framing), crop, false);
+    pub(crate) fn fill_from(&mut self, src: &Frame, framing: crate::Framing) {
+        self.draw_screen(src, &crate::ScreenPlacement::whole(framing), false);
     }
 
-    /// Draw a picture where `place` puts it (its box, as its framing says;
-    /// nothing when hidden). `over` what's drawn already, the rest is left
-    /// as it is; else the rest is black.
-    pub(crate) fn draw_screen(&mut self, src: &Frame, place: &crate::ScreenPlacement, crop: Option<crate::Crop>, over: bool) {
-        let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = place.place(crop, (src.width, src.height), (self.width, self.height));
+    /// Draw a picture where `place` puts it (its crop, into its box as its
+    /// framing says; nothing when hidden). `over` what's drawn already, the
+    /// rest is left as it is; else the rest is black.
+    pub(crate) fn draw_screen(&mut self, src: &Frame, place: &crate::ScreenPlacement, over: bool) {
+        let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = place.place((src.width, src.height), (self.width, self.height));
         if dw == 0 || dh == 0 || sw == 0 || sh == 0 {
             if !over {
                 self.clear();
@@ -417,9 +417,9 @@ mod tests {
     fn flat_colours_survive_scaling() {
         for (sw, sh, dw, dh) in [(64, 36, 64, 36), (64, 36, 32, 18), (96, 54, 64, 36), (40, 30, 64, 48)] {
             let mut c = Canvas::new(dw, dh);
-            c.fill_from(&frame(sw, sh, [10, 120, 250, 0], Order::Bgr), crate::Framing::Fit, None);
+            c.fill_from(&frame(sw, sh, [10, 120, 250, 0], Order::Bgr), crate::Framing::Fit);
             assert!(c.bgra.chunks_exact(4).all(|p| p == [10, 120, 250, 255]), "{sw}x{sh} -> {dw}x{dh}");
-            c.fill_from(&frame(sw, sh, [250, 120, 10, 0], Order::Rgb), crate::Framing::Fit, None);
+            c.fill_from(&frame(sw, sh, [250, 120, 10, 0], Order::Rgb), crate::Framing::Fit);
             assert!(c.bgra.chunks_exact(4).all(|p| p == [10, 120, 250, 255]), "rgb {sw}x{sh} -> {dw}x{dh}");
         }
     }
@@ -435,16 +435,16 @@ mod tests {
         let white = frame(16, 8, [255, 255, 255, 0], Order::Bgr);
         let left = crate::ScreenPlacement { rect: [0.0, 0.0, 0.5, 1.0], ..crate::ScreenPlacement::whole(crate::Framing::Fill) };
         let mut c = Canvas::new(16, 8);
-        c.draw_screen(&white, &left, None, false);
+        c.draw_screen(&white, &left, false);
         assert_eq!((px(&c, 2, 4), px(&c, 12, 4)), (vec![255, 255, 255], vec![0, 0, 0]));
         let grey = CameraPicture { width: 4, height: 2, bgra: [40, 40, 40, 255].repeat(8) };
         let all = Placement { x: 0.0, y: 0.0, w: 1.0, h: 1.0, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0 };
         c.clear();
         c.draw_camera(&grey, &all);
-        c.draw_screen(&white, &left, None, true);
+        c.draw_screen(&white, &left, true);
         assert_eq!((px(&c, 2, 4), px(&c, 12, 4)), (vec![255, 255, 255], vec![40, 40, 40]));
         // Hidden: nothing of it, over the webcam or on black.
-        c.draw_screen(&white, &crate::ScreenPlacement { hidden: true, ..left }, None, false);
+        c.draw_screen(&white, &crate::ScreenPlacement { hidden: true, ..left }, false);
         assert!(c.bgra.chunks_exact(4).all(|p| p == [0, 0, 0, 255]));
     }
 
@@ -458,7 +458,7 @@ mod tests {
             }
         }
         let mut c = Canvas::new(2, 1);
-        c.fill_from(&f, crate::Framing::Stretch, None);
+        c.fill_from(&f, crate::Framing::Stretch);
         assert!(c.bgra.chunks_exact(4).all(|p| (127..=128).contains(&p[0])), "{:?}", c.bgra);
     }
 
@@ -479,12 +479,12 @@ mod tests {
             c.bgra[at..at + 3].to_vec()
         };
         let mut c = Canvas::new(4, 4);
-        c.fill_from(&f, crate::Framing::Fill, None);
+        c.fill_from(&f, crate::Framing::Fill);
         assert!((0..4).all(|x| px(&c, x, 0) == [0, 255, 0]), "the green middle: {:?}", c.bgra);
-        c.fill_from(&f, crate::Framing::Stretch, None);
+        c.fill_from(&f, crate::Framing::Stretch);
         assert_eq!((px(&c, 0, 2), px(&c, 3, 2)), (vec![0, 0, 255], vec![255, 0, 0]));
         let mut c = Canvas::new(12, 12);
-        c.fill_from(&f, crate::Framing::Fit, None);
+        c.fill_from(&f, crate::Framing::Fit);
         assert_eq!((px(&c, 0, 0), px(&c, 0, 6), px(&c, 11, 6)), (vec![0, 0, 0], vec![0, 0, 255], vec![255, 0, 0]));
     }
 

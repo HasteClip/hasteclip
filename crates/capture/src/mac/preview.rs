@@ -86,7 +86,8 @@ impl PreviewCapture {
                     Some(img) => Some(Arc::new(video::still_buffer(Some(img), frame.0, frame.1)?)),
                     None => None,
                 };
-                let picture = Picture::start(&source, &content, &display, frame, fps, away, size.framing())?;
+                let placed = *screen.lock().unwrap();
+                let picture = Picture::start(&source, &content, &display, frame, fps, away, placed)?;
                 let frames = Frames::new(picture.latest.clone(), webcam.as_ref(), screen.clone(), Some(picture.ctl()), frame.0, frame.1, generation)?;
                 Ok((picture, frames))
             })();
@@ -94,6 +95,7 @@ impl PreviewCapture {
                 Ok(p) => p,
                 Err(e) => {
                     *error2.lock().unwrap() = Some(format!("{e:#}"));
+                    crate::preview::clear(generation);
                     return;
                 }
             };

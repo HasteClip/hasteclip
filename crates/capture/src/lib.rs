@@ -179,9 +179,9 @@ pub struct VideoSize {
 }
 
 impl VideoSize {
-    /// The size a `w`×`h` screen (what's kept of it, when it's cropped) is
-    /// recorded at: exactly the size asked for, or in `shape` if there is
-    /// one, then as [`output_size`] makes it.
+    /// The size a `w`×`h` screen is recorded at (all of it, cropped or not):
+    /// exactly the size asked for, or in `shape` if there is one, then as
+    /// [`output_size`] makes it.
     pub fn of(&self, w: u32, h: u32) -> (u32, u32) {
         if let Some((w, h)) = self.exact {
             return output_size(w, h, None);
@@ -199,9 +199,10 @@ impl VideoSize {
 
 /// Where the screen's picture goes in the frame: into a box (all of the
 /// frame, unless it's been placed by hand), as `framing` says, in front of
-/// the webcam or behind it. Shared with the app ([`SharedScreen`]), which
-/// changes it as you drag the screen around the preview; the capture reads
-/// it every frame, so it moves at once, while recording too.
+/// the webcam or behind it, and the part of it shown. Shared with the app
+/// ([`SharedScreen`]), which changes it as you drag the screen around the
+/// preview or crop it; the capture reads it every frame, so it changes at
+/// once, while recording too. None of it changes the frame's size.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScreenPlacement {
     /// The box: left, top, width, height as fractions of the frame.
@@ -212,6 +213,10 @@ pub struct ScreenPlacement {
     pub in_front: bool,
     /// Not drawn at all: the webcam shows on black.
     pub hidden: bool,
+    /// The part of a display shown, in its pixels, if not all of it (a game
+    /// at a lower resolution than the display, black around it): it goes
+    /// into the box as all of the picture would. Never a window's.
+    pub crop: Option<Crop>,
 }
 
 /// The screen's placement, shared between the app and a running capture.
@@ -220,7 +225,7 @@ pub type SharedScreen = std::sync::Arc<std::sync::Mutex<ScreenPlacement>>;
 impl ScreenPlacement {
     /// All of the frame, the picture put in as `framing` says, behind the webcam.
     pub fn whole(framing: Framing) -> Self {
-        Self { rect: [0.0, 0.0, 1.0, 1.0], framing, in_front: false, hidden: false }
+        Self { rect: [0.0, 0.0, 1.0, 1.0], framing, in_front: false, hidden: false, crop: None }
     }
 
     /// Whether its box is all of the frame.
@@ -240,14 +245,14 @@ impl ScreenPlacement {
         [x0, y0, x1 - x0, y1 - y0]
     }
 
-    /// Where a picture of `content`'s size (`crop` of it, if any) goes in a
+    /// Where a picture of `content`'s size (its crop, if any) goes in a
     /// `frame`-size frame: see [`placement_in`]. Nothing of it when hidden.
     #[cfg_attr(not(any(target_os = "windows", target_os = "linux", test)), allow(dead_code))]
-    pub(crate) fn place(&self, crop: Option<Crop>, content: (u32, u32), (fw, fh): (u32, u32)) -> ([u32; 4], [u32; 4]) {
+    pub(crate) fn place(&self, content: (u32, u32), (fw, fh): (u32, u32)) -> ([u32; 4], [u32; 4]) {
         if self.hidden {
             return ([0; 4], [0; 4]);
         }
-        placement_cropped_in(crop, content, self.rect_in(fw, fh), self.framing)
+        placement_cropped_in(self.crop, content, self.rect_in(fw, fh), self.framing)
     }
 }
 
@@ -288,9 +293,10 @@ pub(crate) fn placement_in((cw, ch): (u32, u32), [bx, by, bw, bh]: [u32; 4], fra
 }
 
 /// The size a recording of `source` will be, without starting anything
-/// (cheap: asks the system for display sizes). Games and apps record at the
-/// main display's size. `None` if the display isn't known (on Linux, until
-/// the screen has been picked in the system's dialog once).
+/// (cheap: asks the system for display sizes): `size` of the display's
+/// (a crop doesn't change it). Games and apps record at the main display's
+/// size. `None` if the display isn't known (on Linux, until the screen has
+/// been picked in the system's dialog once).
 pub fn frame_size(source: &VideoSource, size: VideoSize) -> Option<(u32, u32)> {
     let id = match source {
         VideoSource::Screen { id, .. } => Some(id.as_str()),
@@ -307,8 +313,7 @@ pub fn frame_size(source: &VideoSource, size: VideoSize) -> Option<(u32, u32)> {
         let _ = id;
         None
     };
-    // Cropped: what's kept, as a display that size.
-    native.map(|native| cropped_size(crop_of(source), native)).map(|(w, h)| size.of(w, h))
+    native.map(|(w, h)| size.of(w, h))
 }
 
 /// The fastest a recording of `source` can look at the screen for frame
@@ -397,21 +402,11 @@ impl Crop {
     }
 }
 
-/// Whether a screen can be cropped ([`VideoSource::Screen`]'s `crop`) here.
+/// Whether a screen can be cropped ([`ScreenPlacement`]'s `crop`) here.
 pub const SCREEN_CROP: bool = cfg!(any(target_os = "linux", target_os = "windows", target_os = "macos"));
 
-/// The part of a screen `video` records, if it's cropped.
-#[cfg_attr(not(any(target_os = "windows", target_os = "linux", target_os = "macos")), allow(dead_code))]
-pub(crate) fn crop_of(video: &VideoSource) -> Option<Crop> {
-    match video {
-        VideoSource::Screen { crop, .. } => *crop,
-        VideoSource::Apps { .. } => None,
-    }
-}
-
 /// A `w`×`h` picture's size once `crop` is cut out of it.
-#[cfg_attr(not(any(target_os = "windows", target_os = "linux", target_os = "macos")), allow(dead_code))]
-pub(crate) fn cropped_size(crop: Option<Crop>, (w, h): (u32, u32)) -> (u32, u32) {
+pub fn cropped_size(crop: Option<Crop>, (w, h): (u32, u32)) -> (u32, u32) {
     match crop {
         Some(c) => {
             let [_, _, w, h] = c.rect(w, h);
@@ -438,10 +433,8 @@ pub enum VideoSource {
     /// A whole display, by backend id (see [`list_screens`]), captured the
     /// way `method` says (Windows). A game that needs the game capture hook,
     /// fullscreen and in focus on it, is recorded through the hook while it is.
-    /// `crop`: its sides cut off, the rest recorded as a display that size
-    /// would be (a game running at a lower resolution than the display,
-    /// black around it).
-    Screen { id: String, hook: GameHook, method: ScreenCapture, crop: Option<Crop> },
+    /// The part of it shown is its placement's (see [`ScreenPlacement`]).
+    Screen { id: String, hook: GameHook, method: ScreenCapture },
     /// Games and apps, by executable name (see [`list_windowed_apps`]): records
     /// whichever of them was last in focus, for as long as it's showing, even
     /// while you click into something else. When it stops showing (minimized,
@@ -1267,17 +1260,17 @@ mod size_tests {
         assert_eq!(ScreenPlacement { rect: [0.8, 0.9, 0.4, 0.4], ..whole }.rect_in(1000, 1000), [800, 900, 200, 100]);
         // A 16:9 screen in a square box: its middle (Fill), or all of it in a band (Fit).
         let square = ScreenPlacement { rect: [0.0, 0.0, 0.5, 1.0], ..whole };
-        assert_eq!(square.place(None, (1920, 1080), (2160, 1080)), ([420, 0, 1080, 1080], [0, 0, 1080, 1080]));
+        assert_eq!(square.place((1920, 1080), (2160, 1080)), ([420, 0, 1080, 1080], [0, 0, 1080, 1080]));
         let fit = ScreenPlacement { framing: Framing::Fit, ..square };
-        assert_eq!(fit.place(None, (1920, 1080), (2160, 1080)), ([0, 0, 1920, 1080], [0, 236, 1080, 606]));
+        assert_eq!(fit.place((1920, 1080), (2160, 1080)), ([0, 0, 1920, 1080], [0, 236, 1080, 606]));
         // In a box placed further in, the picture goes where the box is.
         let inset = ScreenPlacement { rect: [0.25, 0.5, 0.5, 0.5], framing: Framing::Fit, ..whole };
-        assert_eq!(inset.place(None, (1920, 1080), (1920, 1080)), ([0, 0, 1920, 1080], [480, 540, 960, 540]));
+        assert_eq!(inset.place((1920, 1080), (1920, 1080)), ([0, 0, 1920, 1080], [480, 540, 960, 540]));
         // A crop is cut out first.
         let crop = Some(Crop { w: 1600, h: 900, at: None });
-        assert_eq!(inset.place(crop, (2560, 1440), (1920, 1080)), ([480, 270, 1600, 900], [480, 540, 960, 540]));
+        assert_eq!(ScreenPlacement { crop, ..inset }.place((2560, 1440), (1920, 1080)), ([480, 270, 1600, 900], [480, 540, 960, 540]));
         // Hidden: nothing of it anywhere.
-        assert_eq!(ScreenPlacement { hidden: true, ..whole }.place(None, (1920, 1080), (1920, 1080)), ([0; 4], [0; 4]));
+        assert_eq!(ScreenPlacement { hidden: true, ..whole }.place((1920, 1080), (1920, 1080)), ([0; 4], [0; 4]));
     }
 }
 

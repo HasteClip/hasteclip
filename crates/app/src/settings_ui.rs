@@ -251,7 +251,8 @@ impl App {
                 let note = if self.settings.screen.placed.is_some() {
                     "Your screen's placed by hand on the Sources page".to_owned()
                 } else {
-                    self.settings.capture_shape().zip(screen).map_or(String::new(), |(shape, screen)| shape_note(shape, screen))
+                    let what = if self.settings.screen_placement().crop.is_some() { "crop" } else { "screen" };
+                    self.settings.capture_shape().zip(self.screen_picture()).map_or(String::new(), |(shape, size)| shape_note(shape, size, what))
                 };
                 let (_, c) = l.row(Row::new("Aspect ratio").tip("Aspect ratio", SHAPE_TIP).note(note).locked(lock.clone()), |ui| self.shape_field(ui, screen));
                 locked_click |= c;
@@ -1506,15 +1507,15 @@ fn even_side(new: u32, was: u32) -> u32 {
 
 /// What recording in `shape` does to a `w`×`h` screen filling it, in words:
 /// its middle, and what's cut off.
-fn shape_note(shape: capture::Shape, (w, h): (u32, u32)) -> String {
+fn shape_note(shape: capture::Shape, (w, h): (u32, u32), what: &str) -> String {
     let (sw, sh) = shape.of(w, h);
     let screen = w as f64 / h.max(1) as f64;
     let wanted = shape.w as f64 / shape.h.max(1) as f64;
     if (screen / wanted - 1.0).abs() < 0.01 {
-        return format!("Your {w}×{h} screen is already this aspect ratio");
+        return format!("Your {w}×{h} {what} is already this aspect ratio");
     }
     let cut = if screen > wanted { "sides are" } else { "top and bottom are" };
-    format!("Records the middle {sw}×{sh} of your {w}×{h} screen: its {cut} cut off")
+    format!("Records the middle {sw}×{sh} of your {w}×{h} {what}: its {cut} cut off")
 }
 
 /// Even or Soft: the one clicked, if one was.

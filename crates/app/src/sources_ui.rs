@@ -80,9 +80,9 @@ pub(crate) struct SourcesView {
     reorder: Option<(crate::canvas_ui::Layer, f32, crate::canvas_ui::Arrangement)>,
 }
 
-/// What a preview shows: the picture, its height and shape, the frame rate
-/// and the webcam.
-pub(crate) type PreviewSetup = (capture::VideoSource, capture::VideoSize, u32, Option<capture::webcam::Webcam>);
+/// What a preview shows: the picture, its height and shape, the frame rate,
+/// the webcam, and whether it's all of the screen, uncropped (to crop on).
+pub(crate) type PreviewSetup = (capture::VideoSource, capture::VideoSize, u32, Option<capture::webcam::Webcam>, bool);
 
 
 impl App {
@@ -593,8 +593,8 @@ impl App {
             });
         };
         // What to record: changes right away, while capturing too (the clip
-        // switches mid-way; nothing restarts), except the display, which
-        // sets the recording's size (see below; where the desktop's dialog
+        // switches mid-way; nothing restarts), but for a display that would
+        // make the video another size (see below; where the desktop's dialog
         // picks the screen, that waits too).
         if capture::app_capture() {
             ui.add_space(8.0);
@@ -636,38 +636,40 @@ impl App {
             _ => {
                 let names: Vec<String> = self.screens.iter().map(|d| d.name.clone()).collect();
                 let at = self.display_at();
-                let stop_first = self.stop_first();
-                let mut locked_click = false;
+                // While clipping, the video stays the size it started at: a
+                // display that would make it another size (it's the size of
+                // the display, in p or Native) waits until clipping stops.
+                // Any other is shown in it as the one before was.
+                let recording = self.frame_size.as_ref().and_then(|(_, size, _)| *size).filter(|_| !idle);
+                let sized: Vec<Option<(u32, u32)>> = match recording {
+                    Some(_) => self.screens.iter().map(|d| capture::frame_size(&self.display_source(&d.id), self.settings.video_size())).collect(),
+                    None => Vec::new(),
+                };
+                let waits = |i: usize| recording.is_some_and(|now| sized.get(i).copied().flatten().is_some_and(|size| size != now));
+                let stop = if self.rec_state == crate::RecState::Recording { "Stop recording" } else { "Stop clipping" };
                 row(ui, &mut |ui| {
-                    ui.label(crate::theme::text("Display", 13.5, crate::theme::W::Regular).color(if idle { pal.text } else { pal.text2 }));
-                    // Set before capturing: the recording is its size, so
-                    // another display mid-way came out boxed in black at
-                    // the first one's. Locked, as the crop is.
-                    if !idle {
-                        ui.label(crate::theme::ic(egui_phosphor::regular::LOCK_SIMPLE, 12.5).color(pal.text3)).on_hover_text(stop_first);
-                    }
+                    ui.label(crate::theme::text("Display", 13.5, crate::theme::W::Regular).color(pal.text));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let current = names.get(at).cloned().unwrap_or_else(|| "Main display".to_owned());
-                        let r = ui.add_enabled_ui(idle, |ui| crate::ui_kit::select(ui, &current, 180.0)).inner;
-                        locked_click = !idle && ui.input(|i| i.pointer.primary_clicked()) && r.contains_pointer();
-                        if idle {
-                            crate::ui_kit::menu_popup(&r, false, 240.0, |ui| {
-                                for (i, name) in names.iter().enumerate() {
-                                    if crate::ui_kit::Item::new(name.clone()).check(at == i).show(ui).clicked() {
-                                        self.settings.display_id = Some(self.screens[i].id.clone());
-                                        self.settings.display_index = i;
-                                    }
+                        let r = crate::ui_kit::select(ui, &current, 180.0);
+                        crate::ui_kit::menu_popup(&r, false, 240.0, |ui| {
+                            for (i, name) in names.iter().enumerate() {
+                                let mut item = crate::ui_kit::Item::new(name.clone()).check(at == i);
+                                if waits(i) {
+                                    let (w, h) = sized[i].unwrap_or_default();
+                                    item = item.enabled(false).value("Stop clipping first").tip(format!("It would make your video {w}×{h}, and its size is set when clipping starts. {stop} to switch, or give your video a size of its own."));
                                 }
-                            });
-                        }
+                                if item.show(ui).clicked() {
+                                    self.settings.display_id = Some(self.screens[i].id.clone());
+                                    self.settings.display_index = i;
+                                }
+                            }
+                        });
                     });
                 });
                 if capture::SCREEN_CROP {
                     crate::ui_kit::divider(ui, 0.0);
-                    self.crop_row(ui, idle);
-                }
-                if locked_click {
-                    self.toast_icon(egui_phosphor::regular::LOCK_SIMPLE, stop_first.trim_end_matches('.'));
+                    self.crop_row(ui);
                 }
             }
         }
@@ -814,23 +816,17 @@ impl App {
     }
 
     /// The Crop row: what's kept of the screen, and a way to its page.
-    fn crop_row(&mut self, ui: &mut egui::Ui, idle: bool) {
+    fn crop_row(&mut self, ui: &mut egui::Ui) {
         use crate::ui_kit::Btn;
         let pal = crate::theme::pal(ui);
         let kept = self.crop_whole().zip(self.settings.screen_crop.filter(|c| !c.is_none())).map(|((w, h), c)| capture::Crop::from(c).rect(w, h));
-        let stop_first = self.stop_first();
         ui.horizontal(|ui| {
             ui.set_min_height(GROUP_ROW_H);
             ui.spacing_mut().item_spacing.x = 5.0;
-            ui.label(crate::theme::text("Crop", 13.5, crate::theme::W::Regular).color(if idle { pal.text } else { pal.text2 }));
-            // Set before capturing (it's the recording's size): locked, as
-            // Settings' rows are, while capturing.
-            if !idle {
-                ui.label(crate::theme::ic(egui_phosphor::regular::LOCK_SIMPLE, 12.5).color(pal.text3)).on_hover_text(stop_first);
-            }
+            ui.label(crate::theme::text("Crop", 13.5, crate::theme::W::Regular).color(pal.text));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
-                let b = Btn::normal("Adjust").trail(egui_phosphor::regular::CARET_RIGHT).small().tip("Record only part of the screen: a game at a lower resolution than your display, with black around it");
+                let b = Btn::normal("Adjust").trail(egui_phosphor::regular::CARET_RIGHT).small().tip("Show only part of your screen: a game at a lower resolution than your display, with black around it");
                 if b.show(ui).clicked() {
                     self.sources_view.crop_open = true;
                 }
@@ -841,9 +837,9 @@ impl App {
     }
 
     /// The display's own size, uncropped, when it's known.
-    fn crop_whole(&self) -> Option<(u32, u32)> {
+    pub(crate) fn crop_whole(&self) -> Option<(u32, u32)> {
         match self.video_source() {
-            capture::VideoSource::Screen { id, hook, method, .. } => capture::frame_size(&capture::VideoSource::Screen { id, hook, method, crop: None }, Default::default()),
+            source @ capture::VideoSource::Screen { .. } => capture::frame_size(&source, Default::default()),
             capture::VideoSource::Apps { .. } => None,
         }
     }
@@ -851,6 +847,8 @@ impl App {
     /// The crop's page, in Sources' place: all of the screen with what's
     /// kept drawn on it to drag, and its size and place as numbers. It starts
     /// centred, and stays so as its size changes, until it's put somewhere.
+    /// It's only what's shown of the screen, so it changes while clipping
+    /// too; the video's size can be made the crop's, for every pixel of it.
     fn screen_crop_page(&mut self, ui: &mut egui::Ui) {
         use crate::settings::ScreenCrop;
         use crate::theme::{self, W};
@@ -862,10 +860,6 @@ impl App {
             self.sources_view.crop_open = false;
             return;
         }
-        // It's the recording's size: set before capturing, locked meanwhile
-        // (as in Settings), showing what's recorded.
-        let lock = (self.rec_state != crate::RecState::Idle).then(|| self.stop_first().to_owned());
-        let locked = lock.is_some();
         let keep = self.sources_view.crop_keep_shape.is_some();
         let mut back = false;
         self.page_head(ui, "", |_, ui| {
@@ -889,6 +883,13 @@ impl App {
         let [x, y, w, h] = capture::Crop::from(crop).rect(sw, sh);
         let centred = crop.at.is_none();
         let mut set: Option<ScreenCrop> = None;
+        // What the video does with it, when it fills the video: the video's
+        // size, the crop's (as a video can be), and why that can't change now.
+        let video = capture::frame_size(&self.video_source(), self.settings.video_size());
+        let matched = capture::output_size(w, h, None);
+        let filling = self.settings.screen.placed.is_none() && (w, h) != (sw & !1, sh & !1);
+        let size_lock = (self.rec_state != crate::RecState::Idle).then(|| "Stop clipping to change your video's size: it's set when clipping starts".to_owned());
+        let mut match_crop = false;
         // The least kept each way.
         let least = 64u32;
 
@@ -900,25 +901,14 @@ impl App {
                 let p = ui.painter();
                 p.rect_filled(rect, 6.0, pal.stage);
                 // Only a picture of the whole screen is cropped on (one of
-                // the cropped picture shows for a moment as the preview
-                // starts over). Capturing, there's only what's recorded:
-                // shown where it is on the screen, without handles.
+                // the video shows for a moment as the preview starts over).
                 let whole = frame.as_ref().is_some_and(|f| (f.recorded.0 as f32 / f.recorded.1.max(1) as f32 - aspect).abs() < 0.01);
-                let to = |px: f32, py: f32| egui::pos2(rect.left() + px / sw as f32 * rect.width(), rect.top() + py / sh as f32 * rect.height());
-                let kept_on_screen = egui::Rect::from_min_max(to(x as f32, y as f32), to((x + w) as f32, (y + h) as f32));
-                // Without a frame, what's held is an older capture's picture.
-                let drawn = if locked { frame.is_some() && this.paint_preview(p, kept_on_screen) } else { whole && this.paint_preview(p, rect) };
-                if !drawn {
+                if !(whole && this.paint_preview(p, rect)) {
                     let text = match this.video_preview.as_ref().and_then(|(_, v)| v.error()) {
                         Some(e) => format!("No preview: {e}"),
                         None => "Starting preview…".to_owned(),
                     };
                     p.text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(13.0), Color32::from_gray(170));
-                }
-                // Locked: where it is, outlined as when it's set, without grips.
-                if locked {
-                    crate::webcam_ui::crop_outline(p, kept_on_screen, false);
-                    return;
                 }
                 let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(sw as f32, sh as f32));
                 let kept = egui::Rect::from_min_size(egui::pos2(x as f32, y as f32), egui::vec2(w as f32, h as f32));
@@ -930,9 +920,7 @@ impl App {
             });
             ui.add_space(8.0);
             ui.vertical_centered(|ui| {
-                let hint = if locked {
-                    "Stop clipping to change the crop: it's the size of what's recorded."
-                } else if keep {
+                let hint = if keep {
                     "Drag the edges or corners (the shape's kept), or the middle to move it."
                 } else {
                     "Drag the edges or corners (Shift keeps the shape), or the middle to move it."
@@ -942,7 +930,7 @@ impl App {
         };
         let mut locked_click = false;
         let mut keep_now = self.sources_view.crop_keep_shape;
-        let numbers = |ui: &mut egui::Ui, set: &mut Option<ScreenCrop>, locked_click: &mut bool, keep: &mut Option<f64>| {
+        let numbers = |ui: &mut egui::Ui, set: &mut Option<ScreenCrop>, locked_click: &mut bool, keep: &mut Option<f64>, match_crop: &mut bool| {
             let small = |ui: &mut egui::Ui, t: &str| ui.label(theme::text(t, 12.5, W::Regular).color(pal.text3));
             // Laid out left to right at the row's end, so Tab goes through
             // them in reading order: `width` across, made by `add`.
@@ -958,7 +946,7 @@ impl App {
                 // middle; else its top-left corner stays put. With the shape
                 // kept, one follows the other.
                 let even = |v: f64| ((v / 2.0).round() as u32 * 2).max(least);
-                let (_, c) = l.row(Row::new("Size").note("The game's resolution, like 1600 × 900").locked(lock.clone()), |ui| {
+                let (_, c) = l.row(Row::new("Size").note("The game's resolution, like 1600 × 900"), |ui| {
                     boxes(ui, BOX * 2.0 + 28.0 + 16.0 + 6.0 * 3.0, &mut |ui| {
                         if let Some(v) = crate::ui_kit::number_box(ui, egui::Id::new("screen_crop_w"), w, least..=sw, BOX) {
                             let h = keep.map_or(h, |shape| even(v as f64 / shape).min(sh));
@@ -987,7 +975,7 @@ impl App {
                 *locked_click |= c;
                 // Where it is: its top-left corner, or the middle.
                 let note = if centred { "Centred on the screen".to_owned() } else { "Its top-left corner, from the screen's".to_owned() };
-                let (_, c) = l.row(Row::new("Position").note(note).locked(lock.clone()), |ui| {
+                let (_, c) = l.row(Row::new("Position").note(note), |ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
                     let b = Btn::normal("Centre").small().enabled(!centred).tip("Put it in the middle of the screen, and keep it there");
                     if b.show(ui).clicked() {
@@ -1005,14 +993,45 @@ impl App {
                     });
                 });
                 *locked_click |= c;
+                // The video: as big as the crop, every pixel as it is; else
+                // what it does to it, and a way to make it the crop's size.
+                if let (true, Some((vw, vh))) = (filling, video) {
+                    let note = if (vw, vh) == matched {
+                        "The crop's size: every pixel as it is".to_owned()
+                    } else {
+                        let (crop_shape, video_shape) = (w as f32 / h.max(1) as f32, vw as f32 / vh.max(1) as f32);
+                        let scale = vh as f32 / capture::Shape { w: vw, h: vh, framing: capture::Framing::Fill }.of(w, h).1.max(1) as f32;
+                        let does = if (crop_shape / video_shape - 1.0).abs() > 0.01 {
+                            if crop_shape > video_shape { "the crop's sides are cut off to fit it" } else { "the crop's top and bottom are cut off to fit it" }
+                        } else if scale > 1.01 {
+                            "the crop is made bigger to fill it, a little softer"
+                        } else if scale < 0.99 {
+                            "the crop is made smaller to fit it"
+                        } else {
+                            "about the crop's size"
+                        };
+                        format!("{vw}×{vh}: {does}")
+                    };
+                    let lock = size_lock.clone().filter(|_| (vw, vh) != matched);
+                    let (_, c) = l.row(Row::new("Video size").note(note).locked(lock), |ui| {
+                        if (vw, vh) != matched {
+                            let (mw, mh) = matched;
+                            let b = Btn::normal("Match the crop").small().tip(format!("Make your video {mw}×{mh}, the crop's size: every pixel of it as it is"));
+                            *match_crop = b.show(ui).clicked();
+                        } else {
+                            ui.label(theme::ic(egui_phosphor::regular::CHECK, 14.0).color(pal.text3));
+                        }
+                    });
+                    *locked_click |= c;
+                }
             });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.add_space(2.0);
-                let what = if (w, h) == (sw, sh) { format!("All of the screen, {sw}×{sh}") } else { format!("{w}×{h} of {sw}×{sh}, recorded like a display that size") };
+                let what = if (w, h) == (sw, sh) { format!("All of the screen, {sw}×{sh}") } else { format!("{w}×{h} of {sw}×{sh}") };
                 ui.label(theme::text(what, 12.5, W::Regular).color(pal.text3));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if (w, h) != (sw, sh) && Btn::ghost("Reset").small().enabled(!locked).tip("All of the screen again").show(ui).clicked() {
+                    if (w, h) != (sw, sh) && Btn::ghost("Reset").small().tip("All of the screen again").show(ui).clicked() {
                         *set = Some(ScreenCrop::default());
                     }
                 });
@@ -1033,21 +1052,24 @@ impl App {
                 });
                 ui.allocate_ui_with_layout(egui::vec2(col, avail_h), egui::Layout::top_down(egui::Align::Min), |ui| {
                     ui.set_width(col);
-                    numbers(ui, &mut set, &mut locked_click, &mut keep_now);
+                    numbers(ui, &mut set, &mut locked_click, &mut keep_now, &mut match_crop);
                 });
             });
         } else {
             crate::ui_kit::scroll(ui, "screen_crop_page", |ui| {
                 picture(ui, self, avail_h * 0.4, &mut set);
                 ui.add_space(16.0);
-                numbers(ui, &mut set, &mut locked_click, &mut keep_now);
+                numbers(ui, &mut set, &mut locked_click, &mut keep_now, &mut match_crop);
             });
         }
         self.sources_view.crop_keep_shape = keep_now;
-        if locked_click && let Some(why) = &lock {
-            self.toast_icon(egui_phosphor::regular::LOCK_SIMPLE, why.trim_end_matches('.').to_owned());
+        if locked_click && let Some(why) = &size_lock {
+            self.toast_icon(egui_phosphor::regular::LOCK_SIMPLE, why.clone());
         }
-        if let Some(c) = set.filter(|_| !locked) {
+        if match_crop && size_lock.is_none() {
+            self.settings.resolution = crate::settings::OutputResolution::Exact(matched.0, matched.1);
+        }
+        if let Some(c) = set {
             let all = c.is_none() || capture::Crop::from(c).rect(sw, sh) == [0, 0, sw & !1, sh & !1];
             self.settings.screen_crop = (!all).then_some(c);
         }
@@ -1350,7 +1372,9 @@ impl App {
             self.sources_view.preview_gpu = None;
             self.sources_view.preview_frames = Default::default();
         }
-        let want = capture::preview::AVAILABLE && self.wants_sources_capture() && self.rec_state == crate::RecState::Idle;
+        // While clipping, the capture shows what it records; the crop's page
+        // has one of its own, of all of the screen (shown over it till it closes).
+        let want = capture::preview::AVAILABLE && self.wants_sources_capture() && (self.rec_state == crate::RecState::Idle || self.sources_view.crop_open);
         if !want {
             self.video_preview = None;
             return;
@@ -1365,8 +1389,8 @@ impl App {
         // the crop's set: all of the screen as it is, to crop on.
         let webcam = self.webcam_source();
         let wanted = match self.video_source() {
-            capture::VideoSource::Screen { id, hook, method, .. } if self.sources_view.crop_open => (capture::VideoSource::Screen { id, hook, method, crop: None }, Default::default(), self.settings.fps, None),
-            source => (source, self.settings.video_size(), self.settings.fps, webcam.clone()),
+            source @ capture::VideoSource::Screen { .. } if self.sources_view.crop_open => (source, Default::default(), self.settings.fps, None, true),
+            source => (source, self.settings.video_size(), self.settings.fps, webcam.clone(), false),
         };
         let webcam = wanted.3.clone();
         // A changed app list reaches the running preview without a restart,
@@ -1376,7 +1400,7 @@ impl App {
         // in a frame of the wrong shape (until clipping started a new capture).
         if let Some((have, preview)) = &mut self.video_preview {
             if *have != wanted
-                && (&have.1, have.2, &have.3) == (&wanted.1, wanted.2, &wanted.3)
+                && (&have.1, have.2, &have.3, have.4) == (&wanted.1, wanted.2, &wanted.3, wanted.4)
                 && capture::frame_size(&have.0, have.1) == capture::frame_size(&wanted.0, wanted.1)
                 && preview.update(&wanted.0)
             {
@@ -1384,10 +1408,12 @@ impl App {
             }
         }
         if self.video_preview.as_ref().is_none_or(|(w, _)| *w != wanted) {
-            let (source, size, fps, _) = &wanted;
+            let (source, size, fps, _, whole) = &wanted;
+            // All of the screen: placed on its own, filling the picture.
+            let screen = if *whole { std::sync::Arc::new(std::sync::Mutex::new(capture::ScreenPlacement::whole(capture::Framing::Fit))) } else { self.screen_placement.clone() };
             // Both happen in the background: the old capture closes as the new
             // one opens, and only the new one's frames are shown.
-            let preview = capture::preview::VideoPreview::start(source, *size, *fps, Some(self.away_screen.clone()), webcam, self.screen_placement.clone());
+            let preview = capture::preview::VideoPreview::start(source, *size, *fps, Some(self.away_screen.clone()), webcam, screen);
             self.video_preview = Some((wanted, preview));
         }
     }

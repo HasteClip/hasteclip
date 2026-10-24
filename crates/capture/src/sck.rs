@@ -282,8 +282,8 @@ impl Session {
             // With blending, the screen is looked at faster than the frame
             // rate, never faster than the display shows new pictures.
             let looks = blend_looks(s);
-            let framing = s.size.framing();
-            let picture = Picture::start(&s.video, &content, &display, (width, height), s.fps * looks, away, framing)?;
+            let placed = *s.screen.lock().unwrap();
+            let picture = Picture::start(&s.video, &content, &display, (width, height), s.fps * looks, away, placed)?;
             // A webcam that can't open doesn't stop the recording: its status
             // says why, and the picture goes on without it.
             let frames = Frames::new(picture.latest.clone(), s.webcam.as_ref(), s.screen.clone(), Some(picture.ctl()), width, height, crate::preview::new_producer())?;
@@ -916,7 +916,7 @@ fn is_keyframe(sample: &CMSampleBuffer) -> bool {
 pub(crate) fn probe_encoder(width: usize, height: usize) -> String {
     let s = EncodeSettings {
         output_dir: std::env::temp_dir(), container_ext: "mp4".into(), fps: 60, blend_samples: 1, blend_shape: Default::default(), video_bitrate_kbps: 20000, size: Default::default(),
-        use_hardware: true, replay_seconds: 5, video: crate::VideoSource::Screen { id: String::new(), hook: Default::default(), method: Default::default(), crop: None },
+        use_hardware: true, replay_seconds: 5, video: crate::VideoSource::Screen { id: String::new(), hook: Default::default(), method: Default::default() },
         away_screen: None, webcam: None, screen: std::sync::Arc::new(std::sync::Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit))), sources: Vec::new(),
     };
     match probe_video_format(width, height, &s) {

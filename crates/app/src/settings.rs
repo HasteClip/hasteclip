@@ -1129,7 +1129,7 @@ impl RecordSettings {
     /// box, which has its shape, when it's been placed by hand; else all of
     /// the video, its middle with a shape of the video's own (else all of
     /// the picture). A game's window that isn't the screen's shape goes in
-    /// whole either way.
+    /// whole either way. A display's crop, if it's cropped.
     pub fn screen_placement(&self) -> capture::ScreenPlacement {
         let s = &self.screen;
         let apps = matches!(self.capture, CaptureTarget::Apps { .. });
@@ -1137,7 +1137,8 @@ impl RecordSettings {
             Some(b) => ([b.x, b.y, b.w, b.h], if apps { capture::Framing::Fit } else { capture::Framing::Fill }),
             None => ([0.0, 0.0, 1.0, 1.0], self.video_size().framing()),
         };
-        capture::ScreenPlacement { rect, framing, in_front: s.in_front, hidden: !s.enabled }
+        let crop = self.screen_crop.filter(|c| capture::SCREEN_CROP && !apps && !c.is_none()).map(Into::into);
+        capture::ScreenPlacement { rect, framing, in_front: s.in_front, hidden: !s.enabled, crop }
     }
 
     pub fn blend_samples(&self) -> u32 {
@@ -1257,8 +1258,11 @@ impl RecordSettings {
     }
 
     /// The video's size from a version before it was its own, making clips
-    /// the size they were: p was the height, so upright, 1080p was 608×1080,
-    /// and it's 608p now (wider shapes' height is their short side already).
+    /// the size they were:
+    /// - p was the height: upright, 1080p was 608×1080, so it's 608p now
+    ///   (wider shapes' height is their short side already).
+    /// - A crop was recorded as a display that size: the video is the size
+    ///   that made, now the crop is only what's shown of the screen.
     fn upgrade_sizes(&mut self) {
         if self.size_version < 1
             && let (Some([w, h]), Some(p)) = (self.shape.filter(|[w, h]| *w > 0 && w < h), self.resolution.short_side())
@@ -1267,6 +1271,12 @@ impl RecordSettings {
             self.resolution = OutputResolution::PRESETS.iter().copied().find(|r| r.short_side() == Some(short)).unwrap_or(OutputResolution::Custom(short));
         }
         self.size_version = SIZE_VERSION;
+        let screen = matches!(self.capture, CaptureTarget::Screen) && capture::SCREEN_CROP;
+        if let Some(c) = self.screen_crop.filter(|c| screen && !c.is_none() && self.resolution.exact().is_none()) {
+            let shape = self.shape.filter(|[w, h]| *w > 0 && *h > 0).map(|[w, h]| capture::Shape { w, h, framing: self.framing.into() });
+            let (w, h) = capture::VideoSize { short_side: self.resolution.short_side(), shape, exact: None }.of(c.w & !1, c.h & !1);
+            self.resolution = OutputResolution::Exact(w, h);
+        }
     }
 
     /// `resolution` and `shape` as versions from before they changed read
@@ -1374,6 +1384,25 @@ mod shape_tests {
         let mut fresh = RecordSettings { shape: Some([9, 16]), resolution: OutputResolution::P1080, ..Default::default() };
         fresh.upgrade_sizes();
         assert_eq!(fresh.resolution, OutputResolution::P1080);
+    }
+
+    /// A crop was recorded as a display that size: the video keeps being
+    /// that size (in the shape and resolution it was in), now a crop
+    /// doesn't change it. Not for games and apps, which weren't cropped, or
+    /// a size of its own.
+    #[test]
+    fn a_crop_keeps_its_clips_size() {
+        let load = |json: &str| RecordSettings::from_json(json.as_bytes()).unwrap().resolution;
+        let crop = r#""screen_crop":{"w":1600,"h":900,"at":null}"#;
+        assert_eq!(load(&format!(r#"{{{crop},"resolution":"Native"}}"#)), OutputResolution::Exact(1600, 900));
+        assert_eq!(load(&format!(r#"{{{crop},"resolution":"P720"}}"#)), OutputResolution::Exact(1280, 720));
+        // A 4:3 game in a 16:9 recording: its middle (Fill), or all of it with bars (Fit).
+        let four_three = r#""screen_crop":{"w":1440,"h":1080,"at":[240,0]},"shape":[16,9]"#;
+        assert_eq!(load(&format!(r#"{{{four_three},"resolution":"P1080"}}"#)), OutputResolution::Exact(1440, 810));
+        assert_eq!(load(&format!(r#"{{{four_three},"resolution":"P1080","framing":"fit"}}"#)), OutputResolution::Exact(1920, 1080));
+        assert_eq!(load(&format!(r#"{{{crop},"resolution":"Native","capture":{{"type":"apps","apps":[]}}}}"#)), OutputResolution::Native);
+        assert_eq!(load(&format!(r#"{{{crop},"resolution":{{"Exact":[1920,1080]}},"size_version":1}}"#)), OutputResolution::Exact(1920, 1080));
+        assert_eq!(load(r#"{"resolution":"Native"}"#), OutputResolution::Native);
     }
 
     /// Saved and read again, the size is as it was.

@@ -147,15 +147,16 @@ pub(crate) fn screen_drag(start: Rect, handle: Handle, dx: f32, dy: f32, snap: b
 }
 
 impl App {
-    /// The screen's picture's size: what's kept of it (the main display's,
-    /// for games and apps), asked for now and then.
+    /// The screen's picture's size: what's kept of it, cropped (the main
+    /// display's, for games and apps). The display's is asked for now and then.
     pub(crate) fn screen_picture(&mut self) -> Option<(u32, u32)> {
         let source = self.video_source();
         if self.canvas.picture.as_ref().is_none_or(|(s, _, at)| *s != source || at.elapsed() > std::time::Duration::from_secs(2)) {
             let size = capture::frame_size(&source, Default::default());
             self.canvas.picture = Some((source, size, std::time::Instant::now()));
         }
-        self.canvas.picture.as_ref().and_then(|(_, size, _)| *size)
+        let crop = self.settings.screen_placement().crop;
+        self.canvas.picture.as_ref().and_then(|(_, size, _)| *size).map(|size| capture::cropped_size(crop, size))
     }
 
     /// Where the screen's picture is in the video (fractions of it): its box

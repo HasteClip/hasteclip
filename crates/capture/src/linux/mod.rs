@@ -446,9 +446,6 @@ struct Switchable {
     /// Every picture is kept as it arrives (`queue_arrivals`): the next
     /// source too.
     queuing: AtomicBool,
-    /// The part of a screen recorded, for as long as it runs (it sets the
-    /// recording's size).
-    crop: Option<crate::Crop>,
 }
 
 enum Source {
@@ -486,18 +483,13 @@ impl Feed {
             base: Default::default(),
             last: Default::default(),
             queuing: AtomicBool::new(false),
-            crop: crate::crop_of(video),
         })))
     }
 
-    fn crop(&self) -> Option<crate::Crop> {
-        self.0.crop
-    }
-
-    /// The size it's recorded at: the screen's (or the main display's), or
-    /// what's kept of it when it's cropped, as `size` makes it.
+    /// The size it's recorded at: the screen's (or the main display's), as
+    /// `size` makes it.
     fn recorded_size(&self, size: crate::VideoSize) -> (u32, u32) {
-        let (w, h) = crate::cropped_size(self.crop(), self.size());
+        let (w, h) = self.size();
         size.of(w, h)
     }
 
@@ -519,9 +511,6 @@ impl Feed {
         if let (Source::Apps(a), VideoSource::Apps { ids, away_when_unfocused, .. }) = (&*self.source(), video) {
             a.set(ids, *away_when_unfocused);
             return Ok(());
-        }
-        if crate::crop_of(video) != self.crop() {
-            bail!("another crop makes the recording another size");
         }
         let new = Source::open(video, away_screen)?;
         let queuing = self.0.queuing.load(Ordering::Relaxed);
@@ -765,9 +754,8 @@ struct Picture {
 impl Picture {
     fn new(feed: Feed, width: u32, height: u32, screen: crate::SharedScreen, webcam: Option<&crate::webcam::Webcam>) -> Self {
         let camera = webcam.map(|w| (camera::CameraLayer::new(w), w.placement.clone()));
-        let crop = feed.crop();
         let placed = *screen.lock().unwrap();
-        let gpu = screen::gpu_frames().map(|g| gpu_frame::GpuPicture::new(g, width, height, placed, crop));
+        let gpu = screen::gpu_frames().map(|g| gpu_frame::GpuPicture::new(g, width, height, placed));
         let mut canvas = if gpu.is_some() { Canvas::new(0, 0) } else { Canvas::new(width, height) };
         canvas.clear();
         Self { feed, width, height, canvas, gpu, screen, camera, shows: None, camera_shown: None, nv12: Vec::new(), version: 0 }
@@ -819,22 +807,19 @@ impl Picture {
                         return false;
                     }
                 }
-                None => {
-                    let crop = self.feed.crop();
-                    match (&cam, &place) {
-                        // The screen in front: the webcam first, the screen over it.
-                        (Some(cam), Some(place)) if placed.in_front => {
-                            self.canvas.clear();
-                            self.canvas.draw_camera(cam, place);
-                            self.canvas.draw_screen(&frame, &placed, crop, true);
-                        }
-                        (Some(cam), Some(place)) => {
-                            self.canvas.draw_screen(&frame, &placed, crop, false);
-                            self.canvas.draw_camera(cam, place);
-                        }
-                        _ => self.canvas.draw_screen(&frame, &placed, crop, false),
+                None => match (&cam, &place) {
+                    // The screen in front: the webcam first, the screen over it.
+                    (Some(cam), Some(place)) if placed.in_front => {
+                        self.canvas.clear();
+                        self.canvas.draw_camera(cam, place);
+                        self.canvas.draw_screen(&frame, &placed, true);
                     }
-                }
+                    (Some(cam), Some(place)) => {
+                        self.canvas.draw_screen(&frame, &placed, false);
+                        self.canvas.draw_camera(cam, place);
+                    }
+                    _ => self.canvas.draw_screen(&frame, &placed, false),
+                },
             }
             self.shows = Some(now);
             self.nv12.clear();
@@ -1005,6 +990,7 @@ impl PreviewCapture {
                 Ok(f) => f,
                 Err(e) => {
                     *error2.lock().unwrap() = Some(format!("{e:#}"));
+                    crate::preview::clear(generation);
                     return;
                 }
             };
@@ -1035,6 +1021,7 @@ impl PreviewCapture {
             opened2.lock().unwrap().take();
             drop(picture);
             feed.release();
+            crate::preview::clear(sent.generation);
         });
         Self { stop, error, feed: opened, away_screen }
     }
@@ -1100,7 +1087,7 @@ mod tests {
     #[ignore = "records the screen: cargo test -p capture records_the_screen -- --ignored"]
     fn records_the_screen() {
         let screen = list_screens().into_iter().next().expect("a screen");
-        let video = VideoSource::Screen { id: screen.id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() }, method: Default::default(), crop: None };
+        let video = VideoSource::Screen { id: screen.id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() }, method: Default::default() };
         let dir = std::env::temp_dir().join("hc-record-test");
         let _ = std::fs::remove_dir_all(&dir);
         let settings = EncodeSettings {
@@ -1226,7 +1213,7 @@ mod tests {
     #[ignore = "captures the screen: cargo test -p capture screenshot_of_the_screen -- --ignored"]
     fn screenshot_of_the_screen() {
         let screen = list_screens().into_iter().next().expect("a screen");
-        let video = VideoSource::Screen { id: screen.id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() }, method: Default::default(), crop: None };
+        let video = VideoSource::Screen { id: screen.id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() }, method: Default::default() };
         let mut rec = LinuxRecorder::new(Arc::new(LiveAudio::default()));
         let t = Instant::now();
         let img = rec.screenshot(&video).unwrap().finish().unwrap();

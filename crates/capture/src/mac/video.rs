@@ -226,7 +226,7 @@ pub(crate) fn display_pixels(display: &SCDisplay) -> (usize, usize) {
 
 /// What to record and the frame size: a display's own (in `shape`, if
 /// there is one), or for games and apps the main display's (so it can't
-/// change mid-file, whatever the windows do).
+/// change mid-file, whatever the windows do). A crop doesn't change it.
 pub(crate) fn plan(source: &VideoSource, size: crate::VideoSize) -> Result<(Retained<SCShareableContent>, Retained<SCDisplay>, (usize, usize))> {
     let content = shareable_content()?;
     let id = match source {
@@ -235,10 +235,16 @@ pub(crate) fn plan(source: &VideoSource, size: crate::VideoSize) -> Result<(Reta
     };
     let display = pick_display(&content, id).context("no display to capture")?;
     let (w, h) = display_pixels(&display);
-    // Cropped: what's kept, recorded as a display that size.
-    let (w, h) = crate::cropped_size(crate::crop_of(source), (w as u32, h as u32));
-    let (w, h) = size.of(w, h);
+    let (w, h) = size.of(w as u32, h as u32);
     Ok((content, display, (w as usize, h as usize)))
+}
+
+/// How the stream puts what it records into the frame for the screen placed
+/// as `placed` says, and the part of a display it records: filling the
+/// frame, as the placement says; in a box, all of it (it's cut to the box's
+/// shape by the compositor, see [`Frames`]).
+pub(crate) fn stream_view(placed: &crate::ScreenPlacement) -> (crate::Framing, Option<crate::Crop>) {
+    (if placed.is_whole() { placed.framing } else { crate::Framing::Fit }, placed.crop)
 }
 
 /// One running capture: its stream, and for games and apps the thread that
@@ -256,8 +262,6 @@ pub(crate) struct Picture {
     /// The stream's settings as they change: how what's recorded goes into
     /// the frame, for what's shown.
     ctl: Arc<StreamCtl>,
-    /// The part of the display recorded, if not all of it (in its pixels).
-    crop: Option<crate::Crop>,
     away: Option<Arc<Buffer>>,
 }
 
@@ -265,8 +269,8 @@ pub(crate) struct Picture {
 /// whoever changes one sets the stream up with the rest as they are: how
 /// what's recorded goes into the frame (the compositor asks for all of it
 /// while the screen is in a box of its own, see [`Frames`]), and what's
-/// recorded (a display and its crop, or a window). Shared by the picture,
-/// the thread that follows games and apps, and the frames.
+/// recorded (a display and the part of it shown, or a window). Shared by
+/// the picture, the thread that follows games and apps, and the frames.
 pub(crate) struct StreamCtl(Mutex<Ctl>);
 
 struct Ctl {
@@ -274,12 +278,32 @@ struct Ctl {
     size: (usize, usize),
     fps: u32,
     framing: crate::Framing,
-    /// What's recorded, in points, and the part of it used (a display's crop).
+    /// What's recorded, in points.
     content: (f64, f64),
-    crop: Option<[f64; 4]>,
-    /// What's recorded, in pixels, when it's known (a display, as cropped):
-    /// where its picture is in the frame follows from it.
-    pixels: Option<(u32, u32)>,
+    /// While a display is recorded (not a window): its size in pixels, and
+    /// the part of it shown (in them).
+    display: Option<(u32, u32)>,
+    crop: Option<crate::Crop>,
+    /// When the stream was last set up: a crop that keeps changing (dragged)
+    /// waits a moment, so the stream isn't set up again for every frame.
+    set_at: Option<Instant>,
+}
+
+impl Ctl {
+    /// The stream set up again for what it's asked for now.
+    fn reconfigure(&mut self) -> Result<()> {
+        self.set_at = Some(Instant::now());
+        let crop = self.display.and_then(|px| crop_points(self.content, px, self.crop));
+        reconfigure(&self.stream.0, self.size, self.fps, self.framing, self.content, crop)
+    }
+}
+
+/// `crop` of a display `pixels` big, in its points (it's `content` points
+/// big): (left, top, width, height).
+fn crop_points(content: (f64, f64), (pw, ph): (u32, u32), crop: Option<crate::Crop>) -> Option<[f64; 4]> {
+    let [x, y, cw, ch] = crop?.rect(pw, ph);
+    let (sx, sy) = (content.0 / pw.max(1) as f64, content.1 / ph.max(1) as f64);
+    Some([x as f64 * sx, y as f64 * sy, cw as f64 * sx, ch as f64 * sy])
 }
 
 impl StreamCtl {
@@ -288,30 +312,44 @@ impl StreamCtl {
         self.0.lock().unwrap().framing
     }
 
-    /// Put what's recorded into the frame as `framing` says from now on: the
-    /// stream is set up again if that's a change (a few milliseconds).
-    pub(crate) fn set_framing(&self, framing: crate::Framing) {
+    /// Put what's recorded into the frame as `framing` says from now on,
+    /// showing `crop` of a display: the stream is set up again if that's a
+    /// change (a few milliseconds). Called for every frame: a crop that
+    /// keeps changing (dragged) is set at most every 50 ms, the last one
+    /// on a frame after it stops.
+    pub(crate) fn set_view(&self, framing: crate::Framing, crop: Option<crate::Crop>) {
         let mut c = self.0.lock().unwrap();
-        if c.framing == framing {
+        if c.framing == framing && c.crop == crop {
             return;
         }
-        c.framing = framing;
-        if let Err(e) = reconfigure(&c.stream.0, c.size, c.fps, framing, c.content, c.crop) {
+        if c.framing == framing && c.set_at.is_some_and(|t| t.elapsed() < Duration::from_millis(50)) {
+            return;
+        }
+        (c.framing, c.crop) = (framing, crop);
+        if let Err(e) = c.reconfigure() {
             eprintln!("can't put the screen into the frame another way: {e:#}");
         }
     }
 
-    /// A window is recorded from now on: its picture's place isn't known.
-    fn windows(&self) {
-        self.0.lock().unwrap().pixels = None;
+    /// A window is recorded from now on, `content` points big: its
+    /// picture's place isn't known.
+    fn show_window(&self, content: (f64, f64)) -> Result<()> {
+        let mut c = self.0.lock().unwrap();
+        (c.content, c.display) = (content, None);
+        c.reconfigure()
     }
 
-    /// Recording `content` now (points; `crop` of it), `pixels` big when
-    /// known: the stream set up for it.
-    fn show(&self, content: (f64, f64), crop: Option<[f64; 4]>, pixels: Option<(u32, u32)>) -> Result<()> {
+    /// From now on a window is recorded (set up when it's found).
+    fn windows(&self) {
+        self.0.lock().unwrap().display = None;
+    }
+
+    /// Recording a display now, `content` points and `pixels` big, the part
+    /// of it shown as before: the stream set up for it.
+    fn show_display(&self, content: (f64, f64), pixels: (u32, u32)) -> Result<()> {
         let mut c = self.0.lock().unwrap();
-        (c.content, c.crop, c.pixels) = (content, crop, pixels);
-        reconfigure(&c.stream.0, c.size, c.fps, c.framing, content, crop)
+        (c.content, c.display) = (content, Some(pixels));
+        c.reconfigure()
     }
 
     /// Where what's recorded is in the frames the stream makes, in pixels:
@@ -320,8 +358,8 @@ impl StreamCtl {
     pub(crate) fn picture_rect(&self) -> [u32; 4] {
         let c = self.0.lock().unwrap();
         let (w, h) = (c.size.0 as u32, c.size.1 as u32);
-        match c.pixels {
-            Some(px) => crate::placement(px, (w, h), c.framing).1,
+        match c.display {
+            Some(px) => crate::placement(crate::cropped_size(c.crop, px), (w, h), c.framing).1,
             None => [0, 0, w, h],
         }
     }
@@ -346,9 +384,9 @@ impl AppsConfig {
 
 impl Picture {
     /// Start capturing `source` at `width`×`height`, `fps`, put into the
-    /// frame as `framing` says. For a display, waits for its first frame (so
-    /// a capture that can't see the screen fails visibly, not with an empty
-    /// file).
+    /// frame for the screen placed as `placed` says (see [`stream_view`]).
+    /// For a display, waits for its first frame (so a capture that can't see
+    /// the screen fails visibly, not with an empty file).
     pub(crate) fn start(
         source: &VideoSource,
         content: &SCShareableContent,
@@ -356,14 +394,21 @@ impl Picture {
         (width, height): (usize, usize),
         fps: u32,
         away: Option<Arc<Buffer>>,
-        framing: crate::Framing,
+        placed: crate::ScreenPlacement,
     ) -> Result<Self> {
         let latest = Arc::new(Latest::default());
         let out = Arc::new(Output { latest: latest.clone(), paused: AtomicBool::new(false), frames: AtomicU64::new(0) });
         let output = ScreenOutput::new(out.clone());
-        let crop = crate::crop_of(source);
-        let (shown, crop_at) = (points(display), crop_points(display, crop));
-        let config = stream_config(width, height, fps, framing, Some(shown), crop_at);
+        let (framing, crop) = stream_view(&placed);
+        let pixels = match source {
+            VideoSource::Screen { .. } => {
+                let (pw, ph) = display_pixels(display);
+                Some((pw as u32, ph as u32))
+            }
+            VideoSource::Apps { .. } => None,
+        };
+        let shown = points(display);
+        let config = stream_config(width, height, fps, framing, Some(shown), pixels.and_then(|px| crop_points(shown, px, crop)));
         // Games and apps start on the away screen (the stream shows the
         // display until a window is picked, but nothing of it is used).
         let apps = AppsConfig::of(source);
@@ -386,15 +431,9 @@ impl Picture {
             VideoSource::Apps { .. } => String::new(),
         };
         let _ = content;
-        let pixels = match source {
-            VideoSource::Screen { .. } => {
-                let (pw, ph) = display_pixels(display);
-                Some(crate::cropped_size(crop, (pw as u32, ph as u32)))
-            }
-            VideoSource::Apps { .. } => None,
-        };
-        let ctl = Arc::new(StreamCtl(Mutex::new(Ctl { stream: SendStream(stream.clone()), size: (width, height), fps, framing, content: shown, crop: crop_at, pixels })));
-        let mut picture = Self { latest, stream, _output: output, out, follow: None, display: display_id, size: (width, height), ctl, crop, away };
+        let ctl = Ctl { stream: SendStream(stream.clone()), size: (width, height), fps, framing, content: shown, display: pixels, crop, set_at: None };
+        let ctl = Arc::new(StreamCtl(Mutex::new(ctl)));
+        let mut picture = Self { latest, stream, _output: output, out, follow: None, display: display_id, size: (width, height), ctl, away };
         match apps {
             None => {
                 let deadline = Instant::now() + Duration::from_secs(3);
@@ -433,10 +472,6 @@ impl Picture {
     /// apps, another display, or the whole screen instead of games and apps
     /// (or the other way round). False if it couldn't.
     pub(crate) fn update(&mut self, source: &VideoSource) -> bool {
-        // Another crop is another size: that's a new recording.
-        if crate::crop_of(source) != self.crop {
-            return false;
-        }
         match (AppsConfig::of(source), &self.follow) {
             (Some(config), Some((_, _, list))) => {
                 *list.lock().unwrap() = config;
@@ -455,7 +490,7 @@ impl Picture {
                     return true;
                 }
                 self.stop_following();
-                match show_display(&self.stream, &self.ctl, id, self.crop) {
+                match show_display(&self.stream, &self.ctl, id) {
                     Ok(()) => {
                         self.display = id.clone();
                         *self.latest.app.lock().unwrap() = None;
@@ -484,30 +519,19 @@ impl Picture {
 }
 
 /// Point the stream at a whole display (by id; the main one if it's gone),
-/// `crop` of it, put in as the stream's settings say.
-fn show_display(stream: &SCStream, ctl: &StreamCtl, id: &str, crop: Option<crate::Crop>) -> Result<()> {
+/// the part of it shown as before, put in as the stream's settings say.
+fn show_display(stream: &SCStream, ctl: &StreamCtl, id: &str) -> Result<()> {
     let content = shareable_content()?;
     let display = pick_display(&content, id).context("no display to capture")?;
     let filter = unsafe { SCContentFilter::initWithDisplay_excludingWindows(SCContentFilter::alloc(), &display, &NSArray::new()) };
     await_completion(|h| unsafe { stream.updateContentFilter_completionHandler(&filter, Some(h)) }).map_err(|e| anyhow::anyhow!("{e}"))?;
     let (pw, ph) = display_pixels(&display);
-    ctl.show(points(&display), crop_points(&display, crop), Some(crate::cropped_size(crop, (pw as u32, ph as u32))))
+    ctl.show_display(points(&display), (pw as u32, ph as u32))
 }
 
 /// A display's size in points, what the stream's source rect is in.
 fn points(display: &SCDisplay) -> (f64, f64) {
     unsafe { (display.width() as f64, display.height() as f64) }
-}
-
-/// A crop (in the display's pixels) in its points, as (left, top, width,
-/// height).
-fn crop_points(display: &SCDisplay, crop: Option<crate::Crop>) -> Option<[f64; 4]> {
-    let c = crop?;
-    let (pw, ph) = display_pixels(display);
-    let (w, h) = points(display);
-    let [x, y, cw, ch] = c.rect(pw as u32, ph as u32);
-    let (sx, sy) = (w / pw.max(1) as f64, h / ph.max(1) as f64);
-    Some([x as f64 * sx, y as f64 * sy, cw as f64 * sx, ch as f64 * sy])
 }
 
 /// Set the stream up again for what it now shows, `content` points big
@@ -695,7 +719,7 @@ fn follow_apps(
         {
             // Not tried again until it changes size.
             cut_to = Some((win.width, win.height));
-            if let Err(e) = ctl.show((win.width, win.height), None, None) {
+            if let Err(e) = ctl.show_window((win.width, win.height)) {
                 eprintln!("can't cut the window to the recording's shape: {e:#}");
             }
         }
@@ -846,8 +870,10 @@ impl Frames {
         let placed = *self.screen.lock().unwrap();
         // Filling the frame, ScreenCaptureKit puts the picture in as the
         // placement says; in a box, all of it, cut to the box's shape here.
+        // It cuts out the crop either way.
         if let Some(ctl) = &self.ctl {
-            ctl.set_framing(if placed.is_whole() { placed.framing } else { crate::Framing::Fit });
+            let (framing, crop) = stream_view(&placed);
+            ctl.set_view(framing, crop);
         }
         let cam = self.camera.as_mut().and_then(|(layer, placement)| {
             let p = *placement.lock().unwrap();
