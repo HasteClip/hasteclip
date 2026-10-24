@@ -139,6 +139,7 @@ pub struct Viewer {
     clip: PathBuf,
     state: State,
     resume: Option<Resume>,
+    handoff: Option<Player>,
 }
 
 /// A player opening again: the moment to carry on at (the recording's time),
@@ -152,6 +153,7 @@ pub struct Resume {
 struct Ready {
     info: ClipInfo,
     player: Player,
+    curtain: Option<Player>,
     strip: Filmstrip,
     /// The mix's waveform, growing as the sound is decoded.
     wave: Arc<crate::waveform::Live>,
@@ -187,16 +189,16 @@ struct Ready {
 }
 
 impl Viewer {
-    pub fn open(ctx: &egui::Context, clip: &Path, resume: Option<Resume>) -> Self {
+    pub fn open(ctx: &egui::Context, clip: &Path, resume: Option<Resume>, mut handoff: Option<Player>) -> Self {
         if crate::clips::is_image(clip) {
-            return Self { clip: clip.to_path_buf(), state: State::LoadingPicture(crate::picture::load(ctx, clip)), resume: None };
+            return Self { clip: clip.to_path_buf(), state: State::LoadingPicture(crate::picture::load(ctx, clip)), resume: None, handoff: None };
         }
         if crate::player::debug() {
             eprintln!("{:>8.3} viewer: opening {}", crate::player::uptime(), clip.display());
         }
         let state = if already_read(clip) {
             match load(clip) {
-                Ok(l) => State::Ready(Box::new(Ready::new(ctx, clip, l, resume))),
+                Ok(l) => State::Ready(Box::new(Ready::new(ctx, clip, l, resume, handoff.take()))),
                 Err(e) => State::Failed(e),
             }
         } else {
@@ -213,7 +215,15 @@ impl Viewer {
             });
             State::Loading(rx)
         };
-        Self { clip: clip.to_path_buf(), state, resume }
+        Self { clip: clip.to_path_buf(), state, resume, handoff }
+    }
+
+    pub fn into_player(self) -> Option<Player> {
+        let State::Ready(mut r) = self.state else { return None };
+        if r.player.size().is_none() && r.curtain.as_ref().is_some_and(|c| c.size().is_some()) {
+            return r.curtain.take();
+        }
+        Some(r.player)
     }
 
     pub fn clip(&self) -> &Path {
@@ -234,7 +244,7 @@ impl Viewer {
     /// The clip, while its edit is being saved: the app opens it with
     /// [`Viewer::open`] when that's done.
     pub fn saving(clip: &Path, resume: Option<Resume>) -> Self {
-        Self { clip: clip.to_path_buf(), state: State::Saving, resume }
+        Self { clip: clip.to_path_buf(), state: State::Saving, resume, handoff: None }
     }
 
     pub fn is_saving(&self) -> bool {
@@ -257,7 +267,7 @@ impl Viewer {
             // On screen already: nothing reads it again.
             State::Picture(_) => {}
             // Still loading from the old name: start again.
-            _ => *self = Self::open(ctx, to, self.resume),
+            _ => *self = Self::open(ctx, to, self.resume, None),
         }
     }
 
@@ -265,7 +275,7 @@ impl Viewer {
         if let State::Loading(rx) = &self.state {
             if let Ok(result) = rx.try_recv() {
                 self.state = match result {
-                    Ok(l) => State::Ready(Box::new(Ready::new(ui.ctx(), &self.clip, l, self.resume))),
+                    Ok(l) => State::Ready(Box::new(Ready::new(ui.ctx(), &self.clip, l, self.resume, self.handoff.take()))),
                     Err(e) => State::Failed(e),
                 };
             }
@@ -502,9 +512,9 @@ impl Viewer {
 }
 
 impl Ready {
-    fn new(ctx: &egui::Context, clip: &Path, l: Loaded, resume: Option<Resume>) -> Self {
+    fn new(ctx: &egui::Context, clip: &Path, l: Loaded, resume: Option<Resume>, handoff: Option<Player>) -> Self {
         let wave = crate::waveform::follow(l.pcm.clone(), 0, ctx);
-        let mut player = Player::new(ctx, clip, l.info.clone(), l.pcm, Vec::new());
+        let (mut player, curtain, taken) = Player::handed_over(ctx, clip, &l.info, l.pcm, Vec::new(), handoff);
         // Dev aid: `HASTECLIP_START_AT=<seconds>` starts there (to check a
         // stretch of a clip without scrubbing to it).
         if let Some(t) = std::env::var("HASTECLIP_START_AT").ok().and_then(|s| s.parse::<f64>().ok()) {
@@ -513,17 +523,20 @@ impl Ready {
         if let Some(r) = resume
             && let Some(at) = media::output_time(&l.span.parts, r.at)
         {
-            player.seek(at.min(l.info.duration));
+            if !taken {
+                player.seek(at.min(l.info.duration));
+            }
             if r.playing {
-                player.play(l.info.duration);
+                player.play_taken(l.info.duration, taken);
             }
         } else {
-            player.play(l.info.duration);
+            player.play_taken(l.info.duration, taken);
         }
         let r = Self {
             strip: Filmstrip::build(ctx, clip, &l.info),
             info: l.info,
             player,
+            curtain,
             wave,
             dragging: None,
             scrolled: None,
@@ -640,8 +653,21 @@ impl Ready {
         let reach = (12.0 * self.info.duration / preview.width().max(1.0) as f64).min(0.5);
         self.player.set_landing(scrubbing.then_some(reach));
         let size = self.player.update(&ctx, scrubbing);
+        if size.is_some() {
+            self.curtain = None;
+        }
+        let curtain = self.curtain.as_ref().filter(|_| size.is_none());
+        let size = curtain.and_then(Player::size).or(size);
         let player = &self.player;
-        let picture = crate::transport::stage(ui, preview, size, |p, cover| player.paint_glow(p, cover, egui::Id::new("viewer_stage")), |r| player.paint(ui.painter(), r));
+        let stage = egui::Id::new("viewer_stage");
+        let glow = |p: &egui::Painter, cover: Rect| match curtain {
+            Some(c) => c.paint_glow(p, cover, stage),
+            None => player.paint_glow(p, cover, stage),
+        };
+        let picture = crate::transport::stage(ui, preview, size, glow, |r| match curtain {
+            Some(c) => c.paint(ui.painter(), r),
+            None => player.paint(ui.painter(), r),
+        });
         // As loud as you listen, in the editor too (they share it).
         self.player.set_listening(crate::transport::listening_gain(&ctx));
         if let Some(picture) = picture.filter(|_| self.player.is_playing()) {

@@ -206,6 +206,7 @@ struct Shared {
     /// Where playback stops (in stereo frames).
     end: AtomicU64,
     mix: Mutex<Mix>,
+    pcm: Mutex<Arc<Pcm>>,
     /// When the audio callback last moved `pos` ([`uptime`], µs), and how
     /// much it moves it each time (µs of sound): the clock only moves in
     /// those steps, so this says when the next frame can come up.
@@ -253,13 +254,14 @@ impl Skip {
 }
 
 impl Shared {
-    fn new(mix: Mix) -> Self {
+    fn new(mix: Mix, pcm: Arc<Pcm>) -> Self {
         Self {
             pos: AtomicU64::new(0),
             playing: AtomicBool::new(false),
             scrubbing: AtomicBool::new(false),
             end: AtomicU64::new(u64::MAX),
             mix: Mutex::new(mix),
+            pcm: Mutex::new(pcm),
             moved_at_us: AtomicU64::new(0),
             step_us: AtomicU64::new(0),
             speed: AtomicU32::new(1.0f32.to_bits()),
@@ -305,6 +307,7 @@ impl Shared {
 
 pub struct Player {
     source: PathBuf,
+    stamp: Option<media::Stamp>,
     info: ClipInfo,
     shared: Arc<Shared>,
     _stream: Option<cpal::Stream>,
@@ -490,12 +493,7 @@ impl Player {
     }
 
     fn with_pcm(ctx: &egui::Context, source: &Path, info: ClipInfo, pcm: Arc<Pcm>, gains: Vec<TrackEdit>, scrubs: bool) -> Self {
-        let n = pcm.len();
-        let shared = Arc::new(Shared::new(Mix { tracks: gains, track_levels: vec![(0.0, 0.0); n], master_level: (0.0, 0.0), master_stereo: Default::default() }));
-        let (stream, audio_error) = match start_audio(shared.clone(), pcm.clone()) {
-            Ok(s) => (Some(s), None),
-            Err(e) => (None, Some(e)),
-        };
+        let (shared, stream, audio_error) = sound(pcm, gains);
 
         let (still_tx, still_rx) = still_worker(ctx, source, nv12_size(&info));
 
@@ -512,6 +510,7 @@ impl Player {
         let _ = scrubs;
         Self {
             source: source.to_path_buf(),
+            stamp: media::stamp(source),
             info,
             shared,
             _stream: stream,
@@ -566,7 +565,62 @@ impl Player {
     /// reloads, nothing stops.
     pub fn renamed(&mut self, ctx: &egui::Context, to: &Path) {
         self.source = to.to_path_buf();
+        self.stamp = media::stamp(to);
         (self.still_tx, self.still_rx) = still_worker(ctx, to, nv12_size(&self.info));
+    }
+
+    pub fn unchanged(&self) -> bool {
+        self.stamp.is_some() && self.stamp == media::stamp(&self.source)
+    }
+
+    pub fn adopt(&mut self, source: &Path, pcm: Arc<Pcm>, gains: Vec<TrackEdit>) -> bool {
+        if self.source != source || !self.unchanged() {
+            return false;
+        }
+        let n = pcm.len();
+        if let Ok(mut playing) = self.shared.pcm.lock() {
+            *playing = pcm;
+        }
+        if let Ok(mut mix) = self.shared.mix.lock() {
+            mix.tracks = gains;
+            mix.track_levels = vec![(0.0, 0.0); n];
+        }
+        self.shared.speed.store(1.0f32.to_bits(), Ordering::Relaxed);
+        self.shared.scrubbing.store(false, Ordering::Relaxed);
+        self.landing = None;
+        self.stepping = false;
+        self.set_cuts(&[]);
+        true
+    }
+
+    pub fn hush(&mut self) {
+        self.pause();
+        self._stream = None;
+        self.stepping = false;
+    }
+
+    pub fn handed_over(
+        ctx: &egui::Context,
+        source: &Path,
+        info: &ClipInfo,
+        pcm: Arc<Pcm>,
+        gains: Vec<TrackEdit>,
+        handoff: Option<Self>,
+    ) -> (Self, Option<Self>, bool) {
+        let mut handoff = handoff;
+        let taken = handoff.as_mut().is_some_and(|p| p.adopt(source, pcm.clone(), gains.clone()));
+        if taken {
+            return (handoff.expect("just taken over"), None, true);
+        }
+        let curtain = handoff.filter(|p| p.size().is_some()).map(|mut p| {
+            p.hush();
+            p
+        });
+        (Self::new(ctx, source, info.clone(), pcm, gains), curtain, false)
+    }
+
+    pub fn size(&self) -> Option<egui::Vec2> {
+        self.display.as_ref().map(Display::size)
     }
 
     pub fn time(&self) -> f64 {
@@ -638,6 +692,14 @@ impl Player {
             return;
         }
         self.shared.playing.store(true, Ordering::Relaxed);
+    }
+
+    pub fn play_taken(&mut self, until: f64, taken: bool) {
+        if taken && self.is_playing() {
+            self.shared.end.store((until * PREVIEW_RATE as f64) as u64, Ordering::Relaxed);
+        } else {
+            self.play(until);
+        }
     }
 
     /// How fast it plays: 1.0 as recorded, 0.5 half speed.
@@ -870,7 +932,7 @@ impl Player {
             }
         }
         self.note_scrub(scrubbing);
-        self.display.as_ref().map(Display::size)
+        self.size()
     }
 
     /// A key held to step back frame by frame (see `stepping`).
@@ -1715,8 +1777,18 @@ impl Scrub {
     }
 }
 
+fn sound(pcm: Arc<Pcm>, gains: Vec<TrackEdit>) -> (Arc<Shared>, Option<cpal::Stream>, Option<String>) {
+    let n = pcm.len();
+    let shared = Arc::new(Shared::new(Mix { tracks: gains, track_levels: vec![(0.0, 0.0); n], master_level: (0.0, 0.0), master_stereo: Default::default() }, pcm));
+    let (stream, audio_error) = match start_audio(shared.clone()) {
+        Ok(s) => (Some(s), None),
+        Err(e) => (None, Some(e)),
+    };
+    (shared, stream, audio_error)
+}
+
 /// Opens the default output device and mixes the tracks into it.
-fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, String> {
+fn start_audio(shared: Arc<Shared>) -> Result<cpal::Stream, String> {
     let device = cpal::default_host().default_output_device().ok_or("no audio output device")?;
     let supported = device.default_output_config().map_err(|e| e.to_string())?;
     let channels = supported.channels() as usize;
@@ -1726,7 +1798,6 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
     // device runs at 48 kHz).
     let base_step = PREVIEW_RATE as f64 / out_rate;
     let mut frac = 0.0f64;
-    let n_tracks = pcm.len();
     let mut was_playing = false;
     let mut scrub = Scrub::new(out_rate);
     let listen = shared.clone();
@@ -1734,6 +1805,11 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
 
     let mut mix = move |out: &mut [f32], info: &cpal::OutputCallbackInfo| {
         out.fill(0.0);
+        let pcm = match shared.pcm.lock() {
+            Ok(p) => p.clone(),
+            Err(_) => return,
+        };
+        let n_tracks = pcm.len();
         let playing = shared.playing.load(Ordering::Relaxed);
         if playing != was_playing {
             was_playing = playing;
@@ -1930,8 +2006,8 @@ impl SoundPlayer {
     /// `pcm`'s one track is stereo at [`PREVIEW_RATE`], `duration` seconds long.
     pub fn new(pcm: Arc<Pcm>, duration: f64) -> Self {
         let tracks = vec![TrackEdit { index: 0, gain: 1.0, muted: false, points: Vec::new() }];
-        let shared = Arc::new(Shared::new(Mix { tracks, track_levels: vec![(0.0, 0.0)], master_level: (0.0, 0.0), master_stereo: Default::default() }));
-        let (stream, error) = match start_audio(shared.clone(), pcm) {
+        let shared = Arc::new(Shared::new(Mix { tracks, track_levels: vec![(0.0, 0.0)], master_level: (0.0, 0.0), master_stereo: Default::default() }, pcm));
+        let (stream, error) = match start_audio(shared.clone()) {
             Ok(s) => (Some(s), None),
             Err(e) => (None, Some(e)),
         };

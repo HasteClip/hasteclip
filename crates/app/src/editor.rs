@@ -90,6 +90,7 @@ enum State {
 struct Ready {
     info: ClipInfo,
     player: Player,
+    curtain: Option<Player>,
     edit: Edit,
     /// What was last saved, to know whether there are unsaved changes.
     saved: Edit,
@@ -240,16 +241,17 @@ pub struct Editor {
     /// Where the player was when the editor was opened from it (the clip
     /// preview), to start the timeline there.
     from: Option<Resume>,
+    handoff: Option<Player>,
 }
 
 impl Editor {
     /// Edit the clip at `clip`. An edited clip is decoded from its original, so
     /// every earlier decision can still be changed.
-    pub fn open(ctx: &egui::Context, clip: &Path, preview_share: f32, snap: bool, from: Option<Resume>) -> Self {
+    pub fn open(ctx: &egui::Context, clip: &Path, preview_share: f32, snap: bool, from: Option<Resume>, mut handoff: Option<Player>) -> Self {
         let target = EditTarget::of(clip);
         let state = if media::probed(&target.source).is_some() {
             match load(&target.source) {
-                Ok(l) => State::Ready(Box::new(Ready::new(ctx, &target, l, snap, from))),
+                Ok(l) => State::Ready(Box::new(Ready::new(ctx, &target, l, snap, from, handoff.take()))),
                 Err(e) => State::Failed(e),
             }
         } else {
@@ -262,7 +264,15 @@ impl Editor {
             });
             State::Loading(rx)
         };
-        Self { target, state, preview_share, snap, from }
+        Self { target, state, preview_share, snap, from, handoff }
+    }
+
+    pub fn into_player(self) -> Option<Player> {
+        let State::Ready(mut r) = self.state else { return None };
+        if r.player.size().is_none() && r.curtain.as_ref().is_some_and(|c| c.size().is_some()) {
+            return r.curtain.take();
+        }
+        Some(r.player)
     }
 
     /// The clip was renamed from `from` to `to`: saved under the new name.
@@ -284,7 +294,7 @@ impl Editor {
                 r.player.renamed(ctx, to);
                 r.strip.renamed(to);
             }
-            _ => *self = Self::open(ctx, to, self.preview_share, self.snap(), self.from),
+            _ => *self = Self::open(ctx, to, self.preview_share, self.snap(), self.from, None),
         }
     }
 
@@ -318,7 +328,7 @@ impl Editor {
         if let State::Loading(rx) = &self.state {
             if let Ok(result) = rx.try_recv() {
                 self.state = match result {
-                    Ok(l) => State::Ready(Box::new(Ready::new(ui.ctx(), &self.target, l, self.snap, self.from))),
+                    Ok(l) => State::Ready(Box::new(Ready::new(ui.ctx(), &self.target, l, self.snap, self.from, self.handoff.take()))),
                     Err(e) => State::Failed(e),
                 };
             }
@@ -357,7 +367,7 @@ impl Editor {
 }
 
 impl Ready {
-    fn new(ctx: &egui::Context, target: &EditTarget, l: Loaded, snap: bool, from: Option<Resume>) -> Self {
+    fn new(ctx: &egui::Context, target: &EditTarget, l: Loaded, snap: bool, from: Option<Resume>, handoff: Option<Player>) -> Self {
         let source = &target.source;
         let mut edit = store::load_edit(target).unwrap_or_else(|| Edit::new(&l.info));
         // Sidecar from an older layout or a hand-edited file: make it fit.
@@ -369,12 +379,14 @@ impl Ready {
         let n = l.pcm.len();
         let waves = (0..n).map(|i| crate::waveform::follow(l.pcm.clone(), i, ctx)).collect();
         let playhead = from.map_or(edit.start, |r| settle(&edit.kept(), r.at, l.info.frame_duration()));
-        let mut player = Player::new(ctx, source, l.info.clone(), l.pcm, gains);
-        player.seek(playhead);
+        let (mut player, curtain, taken) = Player::handed_over(ctx, source, &l.info, l.pcm.clone(), gains, handoff);
+        if !taken {
+            player.seek(playhead);
+        }
         if from.is_some_and(|r| r.playing) {
             player.set_cuts(&edit.kept());
             player.set_listening(crate::transport::listening_gain(ctx));
-            player.play(edit.end);
+            player.play_taken(edit.end, taken);
         }
 
         let full = l.info.duration.max(1e-6);
@@ -382,6 +394,7 @@ impl Ready {
         Self {
             info: l.info,
             player,
+            curtain,
             saved: edit.clone(),
             edit,
             waves,
@@ -628,11 +641,19 @@ impl Ready {
         let free = matches!(self.dragging, Some(Drag::Playhead)) && !self.playhead_snapped;
         self.player.set_landing(free.then_some(reach));
         let size = self.player.update(&ctx, self.dragging.is_some());
+        if size.is_some() {
+            self.curtain = None;
+        }
+        let curtain = self.curtain.as_ref().filter(|_| size.is_none());
+        let size = curtain.and_then(Player::size).or(size);
         let player = &self.player;
         let frame = (self.info.width, self.info.height);
         if let Some(tool) = &mut self.crop_tool {
             let before = self.edit.clone();
-            let did = tool.ui(ui, preview_rect, size, frame, &mut self.edit.output.crop, |painter, r| player.paint(painter, r));
+            let did = tool.ui(ui, preview_rect, size, frame, &mut self.edit.output.crop, |painter, r| match curtain {
+                Some(c) => c.paint(painter, r),
+                None => player.paint(painter, r),
+            });
             if did.took_hold {
                 self.before_drag = Some(before.clone());
             }
@@ -650,11 +671,17 @@ impl Ready {
             }
         } else {
             // Just the part kept, as the saved clip will be.
-            let crop = self.crop();
+            let crop = self.crop().filter(|_| curtain.is_none());
             let shown = size.map(|s| crop.map_or(s, |c| crate::crop_ui::cropped_size(s, &c, frame)));
-            let picture = crate::transport::stage(ui, preview_rect, shown, |p, cover| player.paint_glow(p, cover, egui::Id::new("editor_stage")), |r| match crop {
-                Some(c) => crate::crop_ui::paint_cropped(ui, r, &c, frame, |painter, whole| player.paint(painter, whole)),
-                None => player.paint(ui.painter(), r),
+            let stage = egui::Id::new("editor_stage");
+            let glow = |p: &egui::Painter, cover: Rect| match curtain {
+                Some(c) => c.paint_glow(p, cover, stage),
+                None => player.paint_glow(p, cover, stage),
+            };
+            let picture = crate::transport::stage(ui, preview_rect, shown, glow, |r| match (curtain, crop) {
+                (Some(c), _) => c.paint(ui.painter(), r),
+                (None, Some(c)) => crate::crop_ui::paint_cropped(ui, r, &c, frame, |painter, whole| player.paint(painter, whole)),
+                (None, None) => player.paint(ui.painter(), r),
             });
             if let Some(picture) = picture.filter(|_| self.player.is_playing()) {
                 crate::transport::muted_note(ui, picture);

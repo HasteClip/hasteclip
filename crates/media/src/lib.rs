@@ -158,10 +158,9 @@ impl AudioStream {
 }
 
 /// A file's size and when it was last written: how a clip is told from the
-/// clip it replaces, so what's remembered of it can be dropped.
-pub(crate) type Stamp = (u64, Option<std::time::SystemTime>);
+pub type Stamp = (u64, Option<std::time::SystemTime>);
 
-pub(crate) fn stamp(source: &Path) -> Option<Stamp> {
+pub fn stamp(source: &Path) -> Option<Stamp> {
     let meta = std::fs::metadata(source).ok()?;
     Some((meta.len(), meta.modified().ok()))
 }
