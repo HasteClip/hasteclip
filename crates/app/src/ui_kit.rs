@@ -638,7 +638,7 @@ impl<'a> Btn<'a> {
             // Not usable now, it keeps its shape, dimmed: still a button, not
             // text (a quiet one has no fill to keep).
             let fg = if usable { fg } else { theme::fade(fg, 0.38) };
-            let fill = if usable { fill } else { theme::fade(fill, 0.45) };
+            let fill = if usable { fill } else { theme::fade(fill, 0.6) };
             let rect_d = if pressed { rect.shrink(0.5) } else { rect };
             ui.painter().rect_filled(rect_d, self.corners, fill);
             // Content: centred when it fits, clipped when the width is still
