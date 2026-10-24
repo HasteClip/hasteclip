@@ -465,8 +465,8 @@ impl App {
     }
 
     /// One source's card: its handle (`movable`: with others to go in front
-    /// of or behind), what it is and its state on one line (with the
-    /// webcam's switch), its settings below when it's open.
+    /// of or behind), what it is and its state on one line (with its
+    /// switch), its settings below when it's open.
     fn layer_card(&mut self, ui: &mut egui::Ui, layer: crate::canvas_ui::Layer, movable: bool, frame: Option<&capture::preview::PreviewFrame>, aspect: f32) {
         use crate::canvas_ui::Layer;
         use crate::theme::{self, W};
@@ -493,7 +493,7 @@ impl App {
                         None => display,
                     }
                 };
-                (if apps { icon::APP_WINDOW } else { icon::MONITOR }, if apps { "Games and apps" } else { "Screen" }, line, None, true)
+                (if apps { icon::APP_WINDOW } else { icon::MONITOR }, if apps { "Games and apps" } else { "Screen" }, line, None, self.settings.screen.enabled)
             }
             Layer::Webcam => {
                 let (state, warn) = self.webcam_state();
@@ -544,7 +544,14 @@ impl App {
                 && let Some(w) = self.settings.webcam.as_mut()
             {
                 let tip = if w.enabled { "Turn the webcam off: it leaves your clips, and its place, size, crop and format are kept" } else { "Put your webcam back in your clips" };
-                crate::ui_kit::switch(&mut rui, &mut w.enabled).on_hover_text(tip);
+                let r = crate::ui_kit::switch(&mut rui, &mut w.enabled).on_hover_text(tip);
+                crate::demo::mark(ui.ctx(), || format!("switch:{name}"), r.rect);
+            }
+            if layer == Layer::Screen {
+                let what = if name == "Screen" { "your screen" } else { "your games and apps" };
+                let tip = if self.settings.screen.enabled { format!("Turn {what} off: it leaves your clips, and its place and crop are kept") } else { format!("Put {what} back in your clips") };
+                let r = crate::ui_kit::switch(&mut rui, &mut self.settings.screen.enabled).on_hover_text(tip);
+                crate::demo::mark(ui.ctx(), || format!("switch:{name}"), r.rect);
             }
             rui.add_space(-4.0);
             let more = crate::ui_kit::Btn::icon(crate::ui_kit::Kind::Ghost, icon::DOTS_THREE).small().tip(if layer == Layer::Webcam { "Turn, flip, put in front or behind, remove" } else { "Reset, put in front or behind" }).show(&mut rui);
@@ -1170,10 +1177,12 @@ impl App {
             let drawn = self.paint_preview(p, rect);
             // While a new preview starts (another frame rate, size, webcam)
             // the last picture stays up; the message is only for when there's
-            // none to show.
+            // none to show. With every source off, the video is black: said.
+            let webcam_on = self.settings.webcam.as_ref().is_some_and(|w| w.enabled);
             match self.video_preview.as_ref().and_then(|(_, p)| p.error()) {
                 Some(e) => message(&format!("No preview: {e}")),
                 None if !drawn => message("Starting preview…"),
+                None if !self.settings.screen.enabled && !webcam_on => message("Nothing's in your video: turn a source on below"),
                 None => {}
             }
             if frame.is_some() {
