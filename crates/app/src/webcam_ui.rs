@@ -285,6 +285,18 @@ pub(crate) fn resize_within(start: Rect, [l, t, r, b]: [bool; 4], d: egui::Vec2,
     Rect::from_min_size(Pos2::new(x, y), vec2(nw, nh))
 }
 
+/// All of a cropped picture: its box where the whole picture is now (at the
+/// same scale, what showed where it was), then kept inside the frame.
+pub(crate) fn uncrop(p: Placement) -> Placement {
+    let c = p.crop;
+    let sx = p.w / (1.0 - c[0] - c[2]).max(0.01);
+    let sy = p.h / (1.0 - c[1] - c[3]).max(0.01);
+    // The sides as they show: a mirrored picture's left is its right.
+    let left = if p.flip_h { c[2] } else { c[0] };
+    let top = if p.flip_v { c[3] } else { c[1] };
+    contain(Placement { x: p.x - left * sx, y: p.y - top * sy, w: sx, h: sy, crop: [0.0; 4], ..p })
+}
+
 /// The box inside the frame: shrunk about its centre if it's bigger than the
 /// frame (keeping its shape), then moved in. For a box that may have left it
 /// (turned a quarter, which swaps its sides).
@@ -505,12 +517,13 @@ impl App {
                 }
             });
         }
-        // Where it sits in the clips: set on the preview, reset here.
+        // Where it sits in the clips: set on the preview, reset here (named
+        // as the screen's is).
         crate::ui_kit::divider(ui, 0.0);
         let was = self.arrangement();
-        row(ui, "Position", &mut |ui| {
+        row(ui, "In the video", &mut |ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
-            if Btn::normal("Reset").small().tip("Back to the bottom-right corner, uncropped").show(ui).clicked() {
+            if Btn::normal("Reset").small().tip("Back to the bottom-right corner").show(ui).clicked() {
                 self.webcam_to_corner(frame_aspect);
             }
             ui.label(theme::text("Drag it on the preview", 12.5, W::Regular).color(pal.text3)).on_hover_text(format!(
@@ -524,14 +537,29 @@ impl App {
         }
     }
 
-    /// The webcam back in the bottom-right corner, in its box, uncropped.
+    /// The webcam back in the bottom-right corner, a quarter of the video
+    /// wide, as it's cropped, turned and mirrored.
     pub(crate) fn webcam_to_corner(&mut self, frame_aspect: f32) {
-        let camera_aspect = match capture::webcam::status() {
-            Status::Live { width, height } => width as f32 / height.max(1) as f32,
-            _ => 16.0 / 9.0,
+        let Some(w) = self.settings.webcam.as_mut() else { return };
+        let p: Placement = w.placement.into();
+        // Its shape: what's shown of the camera's picture (its box's, in pixels).
+        let shape = if p.w > 0.0 && p.h > 0.0 {
+            p.w * frame_aspect / p.h
+        } else {
+            match capture::webcam::status() {
+                Status::Live { width, height } => width as f32 / height.max(1) as f32,
+                _ => 16.0 / 9.0,
+            }
         };
+        let corner = Placement { crop: p.crop, flip_h: p.flip_h, flip_v: p.flip_v, turns: p.turns, ..Placement::default_for(shape, frame_aspect) };
+        w.placement = PlacementCfg::laid_out(contain(corner), frame_aspect);
+    }
+
+    /// All of the webcam's picture again: its box grows back around what
+    /// showed, at the same scale, kept in the video.
+    pub(crate) fn webcam_uncropped(&mut self, frame_aspect: f32) {
         if let Some(w) = self.settings.webcam.as_mut() {
-            w.placement = PlacementCfg::laid_out(Placement::default_for(camera_aspect, frame_aspect), frame_aspect);
+            w.placement = PlacementCfg::laid_out(uncrop(w.placement.into()), frame_aspect);
         }
     }
 }
@@ -655,6 +683,22 @@ mod tests {
         // A corner: the opposite corner stays put.
         let p = drag(start, Handle::SE, -0.1, -0.05, keep, &Lines::default());
         assert!(close(p.w / p.h, 2.0) && close(p.x, 0.4) && close(p.y, 0.4) && close(p.w, 0.1), "{p:?}");
+    }
+
+    /// Uncropped, the picture keeps its scale and what showed stays where it
+    /// was; too big for the frame, it's made smaller and moved in.
+    #[test]
+    fn uncropping_keeps_the_scale() {
+        let p = Placement { crop: [0.5, 0.0, 0.0, 0.25], ..at(0.6, 0.1, 0.2, 0.3) };
+        let u = uncrop(p);
+        assert!(close(u.w, 0.4) && close(u.h, 0.4) && close(u.x, 0.4) && close(u.y, 0.1), "{u:?}");
+        assert_eq!(u.crop, [0.0; 4]);
+        // Mirrored: the camera's left shows on the right.
+        let u = uncrop(Placement { flip_h: true, ..p });
+        assert!(close(u.x, 0.6) && close(u.w, 0.4), "{u:?}");
+        // Past the frame's edge: moved in.
+        let u = uncrop(Placement { crop: [0.0, 0.0, 0.5, 0.0], ..at(0.8, 0.0, 0.2, 0.2) });
+        assert!(close(u.x, 0.6) && close(u.w, 0.4), "{u:?}");
     }
 
     #[test]

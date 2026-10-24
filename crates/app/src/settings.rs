@@ -836,9 +836,10 @@ pub struct RecordSettings {
     /// and leave it out when they save.
     #[serde(rename = "video_size", skip_serializing_if = "Option::is_none")]
     saved_size: Option<SizeCfg>,
-    /// How the screen went into that shape when Fill, Fit and Stretch were
-    /// chosen: a Fit or Stretch from then becomes a box showing all of the
-    /// screen, once (see `App::refit_boxes`). Fill (its middle) is all there is.
+    /// How the screen goes into a video of a shape of its own (an aspect
+    /// ratio, or a size of its own) while it isn't placed by hand: its
+    /// middle covering it, all of it with bars, or all of it stretched. In
+    /// the screen's own shape, all of it goes in (a window too).
     pub framing: Framing,
     /// The part of the screen kept (a game at a lower resolution than the
     /// display, black around it): set on Sources. It's recorded as a display
@@ -1126,16 +1127,17 @@ impl RecordSettings {
     }
 
     /// Where the screen's picture goes in the video, for the capture: its
-    /// box, which has its shape, when it's been placed by hand; else all of
-    /// the video, its middle with a shape of the video's own (else all of
-    /// the picture). A game's window that isn't the screen's shape goes in
-    /// whole either way. A display's crop, if it's cropped.
+    /// box, which has its shape, when it's been placed by hand (a game's
+    /// window, whatever its shape, all of it); else all of the video, as
+    /// `framing` says in a shape of the video's own (else all of the
+    /// picture). A display's crop, if it's cropped.
     pub fn screen_placement(&self) -> capture::ScreenPlacement {
         let s = &self.screen;
         let apps = matches!(self.capture, CaptureTarget::Apps { .. });
         let (rect, framing) = match s.placed {
             Some(b) => ([b.x, b.y, b.w, b.h], if apps { capture::Framing::Fit } else { capture::Framing::Fill }),
-            None => ([0.0, 0.0, 1.0, 1.0], self.video_size().framing()),
+            None if self.capture_shape().is_some() => ([0.0, 0.0, 1.0, 1.0], self.framing.into()),
+            None => ([0.0, 0.0, 1.0, 1.0], capture::Framing::Fit),
         };
         let crop = self.screen_crop.filter(|c| capture::SCREEN_CROP && !apps && !c.is_none()).map(Into::into);
         capture::ScreenPlacement { rect, framing, in_front: s.in_front, hidden: !s.enabled, crop }
@@ -1347,9 +1349,8 @@ mod screen_capture_tests {
 mod shape_tests {
     use super::*;
 
-    /// No shape unless chosen; chosen, it's saved and goes to the capture,
-    /// the screen filling it. A Fit saved from when it was a choice is read,
-    /// to be moved into a box showing all of the screen.
+    /// No shape unless chosen; chosen, it's saved and goes to the capture
+    /// (its size), with how the screen goes into it, which is saved too.
     #[test]
     fn shape_is_saved_and_given_to_the_capture() {
         let s = RecordSettings::default();
@@ -1357,7 +1358,22 @@ mod shape_tests {
         let s: RecordSettings = serde_json::from_str(r#"{"shape":[16,9],"framing":"fit"}"#).unwrap();
         assert_eq!(s.capture_shape(), Some(capture::Shape { w: 16, h: 9, framing: capture::Framing::Fill }));
         assert_eq!(s.framing, Framing::Fit);
-        assert!(s.to_json().contains(r#""shape": ["#));
+        assert!(s.to_json().contains(r#""shape": ["#) && s.to_json().contains(r#""framing": "fit""#));
+    }
+
+    /// The screen goes into a video of its own shape as Fill, Fit or Stretch
+    /// say, unless it's placed by hand; in the screen's own shape, all of it.
+    #[test]
+    fn how_the_screen_goes_in() {
+        let framed = |shape: Option<[u32; 2]>, framing, placed: bool| {
+            let screen = ScreenCfg { placed: placed.then(|| BoxCfg::new([0.1, 0.1, 0.5, 0.5], 16.0 / 9.0)), ..Default::default() };
+            RecordSettings { shape, framing, screen, ..Default::default() }.screen_placement()
+        };
+        assert_eq!(framed(Some([4, 3]), Framing::Stretch, false).framing, capture::Framing::Stretch);
+        assert_eq!(framed(Some([4, 3]), Framing::Fit, false).framing, capture::Framing::Fit);
+        assert_eq!(framed(None, Framing::Fill, false).framing, capture::Framing::Fit);
+        let boxed = framed(Some([4, 3]), Framing::Stretch, true);
+        assert_eq!((boxed.framing, boxed.rect), (capture::Framing::Fill, [0.1, 0.1, 0.5, 0.5]));
     }
 
     /// An exact size is its own shape, whatever aspect ratio was chosen, and

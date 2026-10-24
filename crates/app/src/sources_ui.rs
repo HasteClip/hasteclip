@@ -674,19 +674,31 @@ impl App {
                 }
             }
         }
-        // Where it sits in the clips: set on the preview, reset here.
+        // How it sits in the video: as Fill, Fit or Stretch say, in a video
+        // of a shape of its own (else all of it); or placed by hand on the
+        // preview, when picking one puts it back.
         crate::ui_kit::divider(ui, 0.0);
         let placed = self.settings.screen.placed.is_some();
+        let shaped = self.video_shaped();
         let was = self.arrangement();
         row(ui, &mut |ui| {
-            ui.label(crate::theme::text("Position", 13.5, crate::theme::W::Regular).color(pal.text));
+            ui.label(crate::theme::text("In the video", 13.5, crate::theme::W::Regular).color(pal.text));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
-                if crate::ui_kit::Btn::normal("Reset").small().enabled(placed).tip("Over all of the video again").show(ui).clicked() {
-                    self.screen_to_whole();
+                if shaped {
+                    if let Some(f) = crate::canvas_ui::framing_choice(ui, "screen_card_framing", (!placed).then_some(self.settings.framing)) {
+                        self.screen_framed(f);
+                    }
+                    if placed {
+                        ui.label(crate::theme::text("Placed by hand", 12.5, crate::theme::W::Regular).color(pal.text3));
+                    }
+                } else {
+                    if crate::ui_kit::Btn::normal("Reset").small().enabled(placed).tip("Over all of the video again").show(ui).clicked() {
+                        self.screen_to_whole();
+                    }
+                    let state = if placed { "Placed by hand on the preview" } else { "All of it" };
+                    ui.label(crate::theme::text(state, 12.5, crate::theme::W::Regular).color(pal.text3));
                 }
-                let state = if placed { "Drag it on the preview" } else { "Over all of the video · drag a corner to make it smaller" };
-                ui.label(crate::theme::text(state, 12.5, crate::theme::W::Regular).color(pal.text3));
             });
         });
         if self.arrangement() != was {
@@ -808,6 +820,25 @@ impl App {
                 });
             }
         });
+        // How the screen goes into a shape of the video's own, right where
+        // the shape's chosen (it changes while clipping too).
+        if self.video_shaped() {
+            let placed = self.settings.screen.placed.is_some();
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(theme::text("Your screen", 12.0, W::Medium).color(pal.text2));
+                if placed {
+                    ui.label(theme::text("placed by hand on the preview", 12.0, W::Regular).color(pal.text3));
+                }
+            });
+            let was = self.arrangement();
+            if let Some(f) = crate::canvas_ui::framing_choice(ui, "size_framing", (!placed).then_some(self.settings.framing)) {
+                self.screen_framed(f);
+            }
+            if self.arrangement() != was {
+                self.keep_for_undo(was);
+            }
+        }
         ui.add_space(4.0);
         crate::ui_kit::divider(ui, 0.0);
         let size = capture::frame_size(&self.video_source(), self.settings.video_size());

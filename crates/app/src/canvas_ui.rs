@@ -19,12 +19,29 @@ use egui::{Color32, CursorIcon, Pos2, Rect, Stroke, vec2};
 use egui_phosphor::regular as icon;
 
 use crate::App;
-use crate::settings::{BoxCfg, PlacementCfg, ScreenCfg, ScreenCrop};
+use crate::settings::{BoxCfg, Framing, PlacementCfg, ScreenCfg, ScreenCrop};
 use crate::ui_kit::Item;
 use crate::webcam_ui::{self, Handle, Lines, Mods};
 
 /// Handle size, in points.
 const HANDLE: f32 = 8.0;
+
+/// How the screen can fill a video of another shape: the choices, as
+/// they're named side by side and in a menu, and what each does.
+pub(crate) const FRAMINGS: [(Framing, &str, &str, &str); 3] = [
+    (Framing::Fill, "Fill", "Fill the video", "Its middle covers all of the video: what's past the video's shape is cut off"),
+    (Framing::Fit, "Fit", "Fit in the video", "All of it, as big as fits, with black bars where the shapes differ"),
+    (Framing::Stretch, "Stretch", "Stretch to the video", "All of it over all of the video, stretched or squeezed to its shape"),
+];
+
+/// Fill, Fit or Stretch, side by side: the one clicked. None is lit while
+/// the screen's placed by hand (`now` is `None`).
+pub(crate) fn framing_choice(ui: &mut egui::Ui, id: &str, now: Option<Framing>) -> Option<Framing> {
+    let opts: Vec<crate::ui_kit::Seg> = FRAMINGS.iter().map(|(_, label, _, tip)| crate::ui_kit::Seg { icon: None, label, tip: Some(tip) }).collect();
+    let chosen = now.and_then(|f| FRAMINGS.iter().position(|(g, ..)| *g == f)).unwrap_or(usize::MAX);
+    let enabled = ui.is_enabled();
+    crate::ui_kit::segmented_opts(ui, id, &opts, chosen, None, enabled).map(|i| FRAMINGS[i].0)
+}
 /// A source's outline on the preview.
 const ACCENT: Color32 = Color32::WHITE;
 /// OBS-ish crop colour.
@@ -69,11 +86,12 @@ pub(crate) struct CanvasView {
     pub(crate) card_hover: Option<Layer>,
 }
 
-/// Where the sources are, as undo keeps it: the screen (its box, in front
-/// or behind, its crop) and the webcam's placement.
+/// Where the sources are, as undo keeps it: the screen (its box or how it
+/// fills the video, in front or behind, its crop) and the webcam's placement.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Arrangement {
     screen: ScreenCfg,
+    framing: Framing,
     crop: Option<ScreenCrop>,
     webcam: Option<PlacementCfg>,
 }
@@ -204,7 +222,7 @@ impl App {
     }
 
     pub(crate) fn arrangement(&self) -> Arrangement {
-        Arrangement { screen: self.settings.screen, crop: self.settings.screen_crop, webcam: self.settings.webcam.as_ref().map(|w| w.placement) }
+        Arrangement { screen: self.settings.screen, framing: self.settings.framing, crop: self.settings.screen_crop, webcam: self.settings.webcam.as_ref().map(|w| w.placement) }
     }
 
     /// `was` (how the sources were before a change just made) can be gone
@@ -226,7 +244,7 @@ impl App {
     /// The sources where `a` has them (each one on or off as it is now).
     fn arrange(&mut self, a: Arrangement) {
         self.settings.screen = ScreenCfg { enabled: self.settings.screen.enabled, ..a.screen };
-        self.settings.screen_crop = a.crop;
+        (self.settings.framing, self.settings.screen_crop) = (a.framing, a.crop);
         if let (Some(w), Some(p)) = (self.settings.webcam.as_mut(), a.webcam) {
             w.placement = p;
         }
@@ -564,13 +582,34 @@ impl App {
         self.settings.screen.placed = None;
     }
 
+    /// Whether the video has a shape of its own (an aspect ratio, or a size
+    /// of its own): then the screen fills it as Fill, Fit or Stretch say.
+    pub(crate) fn video_shaped(&self) -> bool {
+        self.settings.capture_shape().is_some()
+    }
+
+    /// The screen over all of the video again, put in as `framing` says.
+    pub(crate) fn screen_framed(&mut self, framing: Framing) {
+        self.settings.framing = framing;
+        self.settings.screen.placed = None;
+    }
+
     /// A source's menu (right-click it on the preview, or its card's ⋯):
     /// its place back as it was, the webcam's turns and flips, which is in
     /// front, and taking the webcam out.
     pub(crate) fn layer_menu(&mut self, ui: &mut egui::Ui, layer: Layer, aspect: f32) {
         match layer {
             Layer::Screen => {
-                if Item::new("Reset position").icon(icon::ARROWS_OUT).enabled(self.settings.screen.placed.is_some()).tip("Over all of the video again").show(ui).clicked() {
+                // How it fills a video of its own shape; else back over all of it.
+                if self.video_shaped() {
+                    let now = self.settings.screen.placed.is_none().then_some(self.settings.framing);
+                    for (framing, _, label, tip) in FRAMINGS {
+                        if Item::new(label).check(now == Some(framing)).tip(tip).show(ui).clicked() {
+                            self.screen_framed(framing);
+                            ui.close();
+                        }
+                    }
+                } else if Item::new("Reset position").icon(icon::ARROWS_OUT).enabled(self.settings.screen.placed.is_some()).tip("Over all of the video again").show(ui).clicked() {
                     self.screen_to_whole();
                     ui.close();
                 }
@@ -583,8 +622,13 @@ impl App {
                 }
             }
             Layer::Webcam => {
-                if Item::new("Reset position").icon(icon::ARROWS_IN).tip("Back to the bottom-right corner, uncropped").show(ui).clicked() {
+                if Item::new("Reset position").icon(icon::ARROWS_IN).tip("Back to the bottom-right corner").show(ui).clicked() {
                     self.webcam_to_corner(aspect);
+                    ui.close();
+                }
+                let cropped = self.webcam_placement().is_some_and(|p| p.crop.iter().any(|c| *c > 0.0));
+                if Item::new("Reset crop").icon(icon::CROP).enabled(cropped).tip("All of the camera's picture again").show(ui).clicked() {
+                    self.webcam_uncropped(aspect);
                     ui.close();
                 }
                 crate::ui_kit::menu_sep(ui);

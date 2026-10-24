@@ -246,16 +246,21 @@ impl App {
                 locked_click |= c;
             }
             if f.shows(&["aspect ratio", "shape", "same as screen", "16:9", "21:9", "9:16", "ultrawide", "vertical", "crop"]) {
-                // What the shape does to the screen, said: it fills it (its
-                // middle), or it's been placed by hand on Sources.
-                let note = if self.settings.screen.placed.is_some() {
-                    "Your screen's placed by hand on the Sources page".to_owned()
-                } else {
-                    let what = if self.settings.screen_placement().crop.is_some() { "crop" } else { "screen" };
-                    self.settings.capture_shape().zip(self.screen_picture()).map_or(String::new(), |(shape, size)| shape_note(shape, size, what))
-                };
-                let (_, c) = l.row(Row::new("Aspect ratio").tip("Aspect ratio", SHAPE_TIP).note(note).locked(lock.clone()), |ui| self.shape_field(ui, screen));
+                let (_, c) = l.row(Row::new("Aspect ratio").tip("Aspect ratio", SHAPE_TIP).locked(lock.clone()), |ui| self.shape_field(ui, screen));
                 locked_click |= c;
+            }
+            // How the screen goes into a shape of the video's own: what it
+            // does to the screen, said. Not set before capturing: it changes
+            // while clipping too.
+            if self.video_shaped() && f.shows(&["screen", "fill", "fit", "stretch", "black bars", "aspect ratio", "crop"]) {
+                let placed = self.settings.screen.placed.is_some();
+                let what = if self.settings.screen_placement().crop.is_some() { "crop" } else { "screen" };
+                let note = self.settings.capture_shape().zip(self.screen_picture()).map_or(String::new(), |(shape, size)| framing_note((!placed).then_some(self.settings.framing), shape, size, what));
+                l.row(Row::new("Screen").tip("Screen", FRAMING_TIP).note(note), |ui| {
+                    if let Some(f) = crate::canvas_ui::framing_choice(ui, "settings_framing", (!placed).then_some(self.settings.framing)) {
+                        self.screen_framed(f);
+                    }
+                });
             }
             if f.shows(&["frame rate", "fps"]) {
                 let (_, c) = l.row(Row::new("Frame rate").note(fps_note.clone()).locked(lock.clone()), |ui| self.fps_field(ui));
@@ -1351,7 +1356,8 @@ fn ratio_label(w: u32, h: u32) -> String {
 }
 
 /// Aspect ratio's tip.
-const SHAPE_TIP: &str = "Record in another aspect ratio than your screen's: 16:9 out of an ultrawide screen, say, or 9:16 for phones. Every recording and clip is made in it. Your screen fills it, its middle: make it smaller on the Sources page's preview to show all of it, wherever you like.";
+const FRAMING_TIP: &str = "How your screen goes into your video's shape. Fill: its middle covers all of the video, and what's past it is cut off. Fit: all of it, as big as fits, with black bars. Stretch: all of it over all of the video, stretched or squeezed. On the Sources page you can also drag it into a box of its own.";
+const SHAPE_TIP: &str = "Record in another aspect ratio than your screen's: 16:9 out of an ultrawide screen, say, or 9:16 for phones. Every recording and clip is made in it. How your screen goes into it is under it: its middle filling it, all of it with black bars, or stretched. A custom size has a shape of its own.";
 
 /// The screen capture setting shows: Windows, where there's a choice.
 const SCREEN_CAPTURE: bool = cfg!(target_os = "windows");
@@ -1385,17 +1391,26 @@ fn screen_capture_note(choice: settings::ScreenCapture, apps: bool, in_use: Opti
     (note.into(), false)
 }
 
-/// What recording in `shape` does to a `w`×`h` screen filling it, in words:
-/// its middle, and what's cut off.
-fn shape_note(shape: capture::Shape, (w, h): (u32, u32), what: &str) -> String {
-    let (sw, sh) = shape.of(w, h);
+/// What going into a video of `shape` as `framing` says (`None`: placed by
+/// hand) does to a `w`×`h` screen (`what` it is: "screen", "crop"), in
+/// words: its middle and what's cut off, or where the bars are.
+fn framing_note(framing: Option<settings::Framing>, shape: capture::Shape, (w, h): (u32, u32), what: &str) -> String {
+    let Some(framing) = framing else { return "Your screen's placed by hand on the Sources page".to_owned() };
     let screen = w as f64 / h.max(1) as f64;
     let wanted = shape.w as f64 / shape.h.max(1) as f64;
     if (screen / wanted - 1.0).abs() < 0.01 {
-        return format!("Your {w}×{h} {what} is already this aspect ratio");
+        return format!("Your {w}×{h} {what} is already the video's shape");
     }
-    let cut = if screen > wanted { "sides are" } else { "top and bottom are" };
-    format!("Records the middle {sw}×{sh} of your {w}×{h} {what}: its {cut} cut off")
+    let wider = screen > wanted;
+    match framing {
+        settings::Framing::Fill => {
+            let (sw, sh) = capture::Shape { framing: capture::Framing::Fill, ..shape }.of(w, h);
+            let cut = if wider { "sides are" } else { "top and bottom are" };
+            format!("The middle {sw}×{sh} of your {w}×{h} {what}: its {cut} cut off")
+        }
+        settings::Framing::Fit => format!("All of your {w}×{h} {what}, with black bars {}", if wider { "above and below" } else { "at its sides" }),
+        settings::Framing::Stretch => format!("All of your {w}×{h} {what}, {} to the video's shape", if wider { "squeezed" } else { "stretched" }),
+    }
 }
 
 /// Even or Soft: the one clicked, if one was.
