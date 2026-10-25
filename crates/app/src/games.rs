@@ -13,8 +13,9 @@
 //! whole length. So clipping a browser with a game open in the background
 //! files the clip under Desktop, not the game.
 //!
-//! It also keeps the moments marked during a recording (Save clip, while
-//! recording).
+//! With "Record whole sessions" on, it also looks every couple of seconds
+//! whether a game on the list is open (see `sessions.rs`), and keeps the
+//! moments marked during a recording (Save clip, while recording).
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -49,6 +50,10 @@ struct State {
     started: Option<std::time::Instant>,
     /// A recording: the moments marked in it.
     marks: Vec<std::time::Instant>,
+    /// Whether to look if a game on the list is open.
+    watching: bool,
+    /// A game on the list was open at the last look.
+    listed_open: bool,
 }
 
 /// What happened in the game in a clip, as it's saved.
@@ -77,9 +82,14 @@ impl Tracker {
         let t = tracker.clone();
         std::thread::Builder::new()
             .name("games".into())
-            .spawn(move || loop {
-                std::thread::sleep(Duration::from_secs(1));
-                sample(&t);
+            .spawn(move || {
+                for tick in 0u64.. {
+                    std::thread::sleep(Duration::from_secs(1));
+                    sample(&t);
+                    if tick % 2 == 0 {
+                        look(&t);
+                    }
+                }
             })
             .expect("spawn games thread");
         tracker
@@ -150,6 +160,19 @@ impl Tracker {
         true
     }
 
+    /// Look whether a game on the list is open, or stop looking.
+    pub fn watch(&self, on: bool) {
+        let mut s = self.state.lock().unwrap();
+        s.watching = on;
+        if !on {
+            s.listed_open = false;
+        }
+    }
+
+    /// A game on the list was open at the last look (while watching).
+    pub fn listed_open(&self) -> bool {
+        self.state.lock().unwrap().listed_open
+    }
 
     /// The app in focus now and the game it is, if it's one.
     pub fn focused(&self) -> Option<(String, Game)> {
@@ -206,6 +229,24 @@ fn sample(tracker: &Tracker) {
         }
         None => *s.totals.entry(game).or_default() += 1,
     }
+}
+
+/// Look whether a game on the list is open (has a window), while watching.
+fn look(tracker: &Tracker) {
+    let apps = {
+        let s = tracker.state.lock().unwrap();
+        if !s.watching {
+            return;
+        }
+        s.apps.clone()
+    };
+    let open = !apps.is_empty() && {
+        let windowed = capture::list_windowed_apps();
+        apps.iter().any(|(id, _)| windowed.iter().any(|w| w.id.eq_ignore_ascii_case(id)))
+    };
+    let mut s = tracker.state.lock().unwrap();
+    // Turned off while looking: stays off.
+    s.listed_open = open && s.watching;
 }
 
 /// The game an app is, if it's one: Discord's name for it, else its store
