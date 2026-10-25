@@ -827,7 +827,8 @@ impl Ready {
         let mut frames = self.show_frames;
         crate::transport::bar(
             ui,
-            if over_picture { bar.with_min_y(bar.top() + 1.0) } else { bar },
+            bar,
+            !over_picture,
             150.0,
             |ui, part| match part {
             crate::transport::Part::Left => crate::transport::timecode(ui, t, self.info.duration, self.info.fps, &mut frames),

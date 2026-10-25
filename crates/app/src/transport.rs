@@ -380,11 +380,13 @@ pub fn vrule(ui: &mut egui::Ui) {
 /// keeps the same at its right.
 pub const BAR_PAD: f32 = 14.0;
 
-/// The transport bar's frame: a hairline on top, three columns (left, the
-/// centre on the bar's true centre, right).
-pub fn bar(ui: &mut egui::Ui, rect: Rect, centre_w: f32, mut part: impl FnMut(&mut egui::Ui, Part)) {
-    let p = theme::pal(ui);
-    ui.painter().hline(rect.x_range(), rect.top(), Stroke::new(1.0, p.line));
+/// The transport bar's frame: a hairline on top (`hairline`: not over the
+/// picture, as in fullscreen), three columns (left, the centre on the bar's
+/// true centre, right).
+pub fn bar(ui: &mut egui::Ui, rect: Rect, hairline: bool, centre_w: f32, mut part: impl FnMut(&mut egui::Ui, Part)) {
+    if hairline {
+        ui.painter().hline(rect.x_range(), rect.top(), Stroke::new(1.0, theme::pal(ui).line));
+    }
     let inner = rect.shrink2(vec2(BAR_PAD, 0.0));
     let c = Rect::from_center_size(inner.center(), vec2(centre_w, rect.height()));
     let l = Rect::from_min_max(inner.min, Pos2::new(c.left() - 8.0, inner.bottom()));

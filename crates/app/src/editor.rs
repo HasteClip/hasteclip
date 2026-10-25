@@ -945,7 +945,7 @@ impl Ready {
         let medium = bar.width() < 1040.0;
         let narrow = bar.width() < 740.0;
         let centre_w = if narrow { 44.0 } else { 250.0 };
-        crate::transport::bar(ui, bar, centre_w, |ui, part| match part {
+        crate::transport::bar(ui, bar, true, centre_w, |ui, part| match part {
             crate::transport::Part::Left => {
                 // Narrow: the time joins these (there's no room in the
                 // middle), so they're smaller, with no rules between them,
