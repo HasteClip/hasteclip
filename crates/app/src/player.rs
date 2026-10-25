@@ -590,6 +590,15 @@ impl Player {
         self.landing = None;
         self.stepping = false;
         self.set_cuts(&[]);
+        // Hushed for a curtain and handed straight back (a quick switch
+        // back): its sound comes back. The sound is what moves the clock;
+        // without it, it would stand still, saying it plays.
+        if self._stream.is_none() {
+            (self._stream, self.audio_error) = match start_audio(self.shared.clone()) {
+                Ok(s) => (Some(s), None),
+                Err(e) => (None, Some(e)),
+            };
+        }
         true
     }
 
@@ -2229,6 +2238,45 @@ mod tests {
         }
         let hz = pitch(&out);
         assert!((hz - 880.0).abs() < 30.0, "after the jump: {hz:.0} Hz");
+    }
+
+    /// A player hushed into a curtain and handed straight back (switching
+    /// back before the new screen's picture came up) is taken over with its
+    /// sound back: its clock moves, as a player handed over as it is does.
+    #[test]
+    #[ignore = "needs a sound output"]
+    fn a_curtain_handed_back_plays() {
+        let clip = std::env::temp_dir().join(format!("hc-curtain-{}.mp4", std::process::id()));
+        let made = media::ffmpeg()
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=30:duration=3"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&clip)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let ctx = egui::Context::default();
+        let info = media::probe(&clip).unwrap();
+        let pcm = Pcm::from_tracks(vec![tone(440.0, 3.0)]);
+        // What `update` does once the first frame is there: the sound starts.
+        let moves = |p: &Player| {
+            p.shared.playing.store(true, Ordering::Relaxed);
+            let t0 = p.time();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let moved = p.time() - t0;
+            p.shared.playing.store(false, Ordering::Relaxed);
+            moved
+        };
+        let player = Player::new(&ctx, &clip, info.clone(), pcm.clone(), Vec::new());
+        let (mut player, _, taken) = Player::handed_over(&ctx, &clip, &info, pcm.clone(), Vec::new(), Some(player));
+        assert!(taken, "the same file is taken over");
+        let moved = moves(&player);
+        assert!(moved > 0.2, "handed over as it is, its clock moved {moved:.3} s in 0.4 s");
+        player.hush();
+        let (player, _, taken) = Player::handed_over(&ctx, &clip, &info, pcm, Vec::new(), Some(player));
+        assert!(taken, "a curtain on the same file is taken over");
+        let moved = moves(&player);
+        assert!(moved > 0.2, "handed back from a curtain, its clock moved {moved:.3} s in 0.4 s");
+        std::fs::remove_file(&clip).unwrap();
     }
 
     /// Noise (like game sound: no two slices alike), stereo, at the source rate.
