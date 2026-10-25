@@ -9,7 +9,7 @@ use egui::{Pos2, Rect, vec2};
 use crate::App;
 use crate::canvas_ui::Layer;
 use crate::theme::{self, W};
-use crate::ui_kit::{self, Btn, Kind, Row};
+use crate::ui_kit::{self, Btn, Kind};
 
 /// A box (fractions of the video) in a `vw`×`vh` video's pixels: left,
 /// top, width, height.
@@ -24,21 +24,27 @@ pub(crate) fn from_pixels([x, y, w, h]: [i64; 4], (vw, vh): (u32, u32)) -> Rect 
     Rect::from_min_size(Pos2::new(f(x, vw), f(y, vh)), vec2(f(w, vw), f(h, vh)))
 }
 
-/// Where a source is in a few words, for its card: where (`place`, if it's
-/// said), turned and flipped. Empty when there's nothing to say.
-pub(crate) fn summary(place: Option<&str>, turns: u8, mirrored: bool, upside_down: bool) -> String {
+/// Where a source is, for its card: its size and place in the video's
+/// pixels (`at`, when that's said), then what's been done to it. Empty
+/// when there's nothing to say.
+pub(crate) fn summary(at: Option<&str>, stretched: bool, turns: u8, mirrored: bool, upside_down: bool) -> String {
     let turned = match turns % 4 {
         1 => Some("turned 90°"),
         2 => Some("turned 180°"),
         3 => Some("turned 270°"),
         _ => None,
     };
-    let parts: Vec<&str> = [place, turned, mirrored.then_some("mirrored"), upside_down.then_some("upside down")].into_iter().flatten().collect();
+    let parts: Vec<&str> = [at, stretched.then_some("stretched"), turned, mirrored.then_some("mirrored"), upside_down.then_some("upside down")].into_iter().flatten().collect();
     let mut text = parts.join(" · ");
     if let Some(first) = text.get(..1) {
         text.replace_range(..1, &first.to_uppercase());
     }
     text
+}
+
+/// A box's size and place in the video's pixels, as a card says it.
+fn size_at([x, y, w, h]: [i64; 4]) -> String {
+    format!("{w}×{h} at {x}, {y}")
 }
 
 impl App {
@@ -54,46 +60,63 @@ impl App {
         v.placement_shown = Some(layer);
     }
 
-    /// A source's Placement row on its card: where it is in a few words, how
-    /// the video puts the screen in (a video of a shape of its own), and its
-    /// numbers, opening under it.
+    /// The video's size in pixels, its shape, and where a source is in it
+    /// (fractions of it), when they're known.
+    fn placed_in(&mut self, layer: Layer) -> Option<((u32, u32), f32, Rect)> {
+        let (vw, vh) = capture::frame_size(&self.video_source(), self.settings.video_size())?;
+        let aspect = vw as f32 / vh.max(1) as f32;
+        let rect = match layer {
+            Layer::Screen => self.screen_rect(aspect),
+            Layer::Webcam => self.webcam_placement().map(|p| Rect::from_min_size(Pos2::new(p.x, p.y), vec2(p.w, p.h)))?,
+        };
+        Some(((vw, vh), aspect, rect))
+    }
+
+    /// A source's Placement row on its card: where it is and what's been
+    /// done to it (while its numbers are shut), how the video puts the
+    /// screen in (a video of a shape of its own), and its numbers, opening
+    /// under it.
     pub(crate) fn placement_row(&mut self, ui: &mut egui::Ui, layer: Layer) {
         let pal = theme::pal(ui);
         let screen = layer == Layer::Screen;
         let shaped = screen && self.video_shaped();
+        let open = self.sources_view.placement_open.contains(&layer);
+        let at = self.placed_in(layer).map(|(video, _, r)| size_at(to_pixels(r, video)));
         let text = match layer {
+            _ if open => String::new(),
             Layer::Screen => {
                 let s = self.settings.screen;
-                // Shaped, Fill, Fit or Stretch beside it say where it is.
-                let place = match s.placed {
-                    Some(_) => Some("placed by hand"),
+                // Put in by Fill, Fit or Stretch (beside it, in a video of a
+                // shape of its own), or over all of the video.
+                let at = match s.placed {
+                    Some(_) => at.as_deref(),
                     None if shaped => None,
                     None => Some("fills the video"),
                 };
-                summary(place, s.turns, s.flip_h, s.flip_v)
+                summary(at, s.placed.is_some_and(|b| b.stretched()), s.turns, s.flip_h, s.flip_v)
             }
             Layer::Webcam => {
                 let Some(p) = self.webcam_placement() else { return };
-                let (position, size) = self.webcam_resettable();
-                summary(Some(if position || size { "placed by hand" } else { "in the bottom-right corner" }), p.turns, p.flip_h, p.flip_v)
+                summary(at.as_deref(), (p.stretch - 1.0).abs() > 0.02, p.turns, p.flip_h, p.flip_v)
             }
         };
-        let open = self.sources_view.placement_open.contains(&layer);
         let was = self.arrangement();
         let mut toggle = false;
         let row = ui.horizontal(|ui| {
             ui.set_min_height(crate::sources_ui::GROUP_ROW_H);
             ui.spacing_mut().item_spacing.x = 5.0;
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 1.0;
-                let pad = if text.is_empty() { 0.0 } else { 6.0 };
-                ui.add_space(pad);
-                ui.label(theme::text("Placement", 13.5, W::Regular).color(pal.text));
-                if !text.is_empty() {
+            let label = theme::text("Placement", 13.5, W::Regular).color(pal.text);
+            if text.is_empty() {
+                ui.label(label);
+            } else {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    ui.add_space(6.0);
+                    ui.label(label);
                     ui.label(theme::text(&text, 12.0, W::Regular).color(pal.text3));
-                    ui.add_space(pad);
-                }
-            });
+                    ui.add_space(6.0);
+                });
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
                 let caret = if open { egui_phosphor::regular::CARET_UP } else { egui_phosphor::regular::CARET_DOWN };
@@ -113,112 +136,110 @@ impl App {
             let v = &mut self.sources_view.placement_open;
             if open { v.retain(|l| *l != layer) } else { v.push(layer) }
         }
-        self.placement_numbers(ui, layer, open);
+        let open = self.sources_view.placement_open.contains(&layer);
+        ui_kit::reveal(ui, ("placement_numbers", layer), open, |ui| self.placement_numbers(ui, layer));
         if self.arrangement() != was {
             self.keep_for_undo(was);
         }
     }
 
-    /// A source's position and size in the video's pixels, each with its
-    /// Reset, and how it's turned and flipped: in a well under its Placement
-    /// row (sliding open and shut with `open`).
-    fn placement_numbers(&mut self, ui: &mut egui::Ui, layer: Layer, open: bool) {
+    /// A source's position and size in the video's pixels, how it's turned
+    /// and flipped, and putting its position and size back: rows of its
+    /// card under its Placement row, a little in from its others.
+    fn placement_numbers(&mut self, ui: &mut egui::Ui, layer: Layer) {
         use egui_phosphor::regular as icon;
-        let Some((vw, vh)) = capture::frame_size(&self.video_source(), self.settings.video_size()) else { return };
-        let aspect = vw as f32 / vh.max(1) as f32;
+        let Some(((vw, vh), aspect, rect)) = self.placed_in(layer) else { return };
         let screen = layer == Layer::Screen;
-        let rect = match layer {
-            Layer::Screen => self.screen_rect(aspect),
-            Layer::Webcam => match self.webcam_placement() {
-                Some(p) => Rect::from_min_size(Pos2::new(p.x, p.y), vec2(p.w, p.h)),
-                None => return,
-            },
-        };
         let [x, y, w, h] = to_pixels(rect, (vw, vh));
         let (can_place, can_size) = if screen { self.screen_resettable(aspect) } else { self.webcam_resettable() };
         let (turns, mirrored, upside_down) = match layer {
             Layer::Screen => (self.settings.screen.turns, self.settings.screen.flip_h, self.settings.screen.flip_v),
             Layer::Webcam => self.webcam_placement().map_or((0, false, false), |p| (p.turns, p.flip_h, p.flip_v)),
         };
-        let shaped = screen && self.video_shaped();
         let size_id = if screen { "placement_screen_size" } else { "placement_webcam_size" };
-        // The screen's size is linked at first (its shape kept, as dragging
-        // keeps it); the webcam's always is.
+        // Linked at first: typed, the size keeps its shape, as dragging does
+        // (unlinked, it stretches, as Shift does).
         let linked_once = egui::Id::new((size_id, "linked"));
-        if screen && open && ui.data(|d| d.get_temp::<bool>(linked_once)).is_none() {
+        if ui.data(|d| d.get_temp::<bool>(linked_once)).is_none() {
             ui.data_mut(|d| d.insert_temp(linked_once, true));
             ui_kit::set_size_field_keeps(ui.ctx(), size_id, Some(w as f64 / h.max(1) as f64));
         }
         let pal = theme::pal(ui);
         let small = |ui: &mut egui::Ui, t: &str| ui.label(theme::text(t, 12.5, W::Regular).color(pal.text3));
+        // A row of the card's, a little in: its name, then what's at its end.
+        let row = |ui: &mut egui::Ui, label: &str, add: &mut dyn FnMut(&mut egui::Ui)| {
+            ui_kit::divider(ui, 0.0);
+            ui.horizontal(|ui| {
+                ui.set_min_height(crate::sources_ui::GROUP_ROW_H);
+                ui.add_space(12.0);
+                ui.label(theme::text(label, 13.5, W::Regular).color(pal.text2));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    add(ui);
+                });
+            });
+        };
         const BOX: f32 = 64.0;
 
         let mut moved: Option<[i64; 4]> = None;
-        let (mut reset_place, mut reset_size, mut turn, mut flip) = (false, false, None, None);
-        ui_kit::well(ui, ("placement_well", layer), open, |l| {
-            // Its top-left corner. The screen can reach past the video's
-            // edges (a part of it over all of the video), some of it in it.
-            let (xs, ys) = if screen { (2 - w..=vw as i64 - 2, 2 - h..=vh as i64 - 2) } else { (0..=(vw as i64 - w).max(0), 0..=(vh as i64 - h).max(0)) };
-            l.row(Row::new("Position").kid(), |ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
-                reset_place = Btn::ghost("Reset").small().enabled(can_place).tip(if screen { "Back in the middle of the video, its size kept" } else { "Back to the bottom-right corner, its size kept" }).show(ui).clicked();
-                ui.allocate_ui_with_layout(vec2(BOX * 2.0 + 6.0 + 16.0 + 6.0 * 3.0, ui_kit::CONTROL_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    if let Some(v) = ui_kit::signed_box(ui, egui::Id::new((size_id, "x")), x, xs.clone(), BOX) {
-                        moved = Some([v, y, w, h]);
-                    }
-                    small(ui, ",");
-                    if let Some(v) = ui_kit::signed_box(ui, egui::Id::new((size_id, "y")), y, ys.clone(), BOX) {
-                        moved = Some([x, v, w, h]);
-                    }
-                    small(ui, "px");
-                });
-            });
-            // Its size, its top-left corner staying put. The webcam keeps
-            // its shape (its crop's); the screen too while it's linked.
-            l.row(Row::new("Size").kid(), |ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
-                let size_tip = match layer {
-                    Layer::Screen if shaped => "Back to the size the video gives it, where it is",
-                    Layer::Screen => "As big as the video again, where it is",
-                    Layer::Webcam => "A quarter of the video wide again, where it is",
-                };
-                reset_size = Btn::ghost("Reset").small().enabled(can_size).tip(size_tip).show(ui).clicked();
-                if screen {
-                    let most = (vw.max(vh) * 8).min(capture::MAX_SIDE * 8);
-                    if let Some((nw, nh)) = ui_kit::size_field(ui, size_id, (w.max(2) as u32, h.max(2) as u32), 16..=most, 16..=most) {
-                        moved = Some([x, y, nw as i64, nh as i64]);
-                    }
-                } else {
-                    ui.allocate_ui_with_layout(vec2(BOX + 6.0 + 80.0, ui_kit::CONTROL_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        if let Some(nw) = ui_kit::number_box(ui, egui::Id::new((size_id, "w")), w.max(2) as u32, 32..=vw, BOX) {
-                            let nh = (nw as f64 * h as f64 / w.max(1) as f64).round() as i64;
-                            moved = Some([x, y, nw as i64, nh]);
-                        }
-                        small(ui, &format!("× {h} px"));
-                    });
-                }
-            });
-            l.row(Row::new("Turn").kid(), |ui| {
+        let (mut reset_place, mut reset_size, mut turn) = (false, false, None);
+        let (mut m, mut u) = (mirrored, upside_down);
+        // Its top-left corner. The screen can reach past the video's edges
+        // (a part of it over all of the video), some of it in it.
+        let (xs, ys) = if screen { (2 - w..=vw as i64 - 2, 2 - h..=vh as i64 - 2) } else { (0..=(vw as i64 - w).max(0), 0..=(vh as i64 - h).max(0)) };
+        row(ui, "Position", &mut |ui| {
+            // Left to right at the row's end, so Tab goes through them in order.
+            ui.allocate_ui_with_layout(vec2(BOX * 2.0 + 6.0 + 16.0 + 6.0 * 3.0, ui_kit::CONTROL_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                if Btn::icon(Kind::Normal, icon::ARROW_CLOCKWISE).small().tip("Turn clockwise").show(ui).clicked() {
-                    turn = Some(1);
+                if let Some(v) = ui_kit::signed_box(ui, egui::Id::new((size_id, "x")), x, xs.clone(), BOX) {
+                    moved = Some([v, y, w, h]);
                 }
-                if Btn::icon(Kind::Normal, icon::ARROW_COUNTER_CLOCKWISE).small().tip("Turn anticlockwise").show(ui).clicked() {
-                    turn = Some(-1);
+                small(ui, ",");
+                if let Some(v) = ui_kit::signed_box(ui, egui::Id::new((size_id, "y")), y, ys.clone(), BOX) {
+                    moved = Some([x, v, w, h]);
                 }
-                ui.add_space(4.0);
-                small(ui, ["As it is", "90° clockwise", "180°", "90° anticlockwise"][usize::from(turns % 4)]);
+                small(ui, "px");
             });
-            let (mut m, mut u) = (mirrored, upside_down);
-            l.row(Row::new("Mirror").kid(), |ui| ui_kit::switch(ui, &mut m).on_hover_text("Left and right swapped"));
-            l.row(Row::new("Upside down").kid(), |ui| ui_kit::switch(ui, &mut u));
-            if m != mirrored {
-                flip = Some(true);
-            } else if u != upside_down {
-                flip = Some(false);
+        });
+        // Its size, its top-left corner staying put.
+        row(ui, "Size", &mut |ui| {
+            let most = if screen { (vw.max(vh) * 8).min(capture::MAX_SIDE * 8) } else { vw.max(vh) };
+            if let Some((nw, nh)) = ui_kit::size_field(ui, size_id, (w.max(2) as u32, h.max(2) as u32), 16..=most, 16..=most) {
+                moved = Some([x, y, nw as i64, nh as i64]);
             }
+        });
+        // A quarter at a time, as it's seen; how far, beside them.
+        row(ui, "Turn", &mut |ui| {
+            if Btn::icon(Kind::Normal, icon::ARROW_CLOCKWISE).small().tip("Turn clockwise").show(ui).clicked() {
+                turn = Some(1);
+            }
+            if Btn::icon(Kind::Normal, icon::ARROW_COUNTER_CLOCKWISE).small().tip("Turn anticlockwise").show(ui).clicked() {
+                turn = Some(-1);
+            }
+            ui.add_space(4.0);
+            small(ui, &format!("{}°", u32::from(turns % 4) * 90));
+        });
+        row(ui, "Mirror", &mut |ui| {
+            ui_kit::switch(ui, &mut m).on_hover_text("Left and right swapped");
+        });
+        row(ui, "Upside down", &mut |ui| {
+            ui_kit::switch(ui, &mut u);
+        });
+        // Its first place and size again, each on its own.
+        ui_kit::divider(ui, 0.0);
+        ui.horizontal(|ui| {
+            ui.set_min_height(crate::sources_ui::GROUP_ROW_H);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let size_tip = match layer {
+                    Layer::Screen if self.video_shaped() => "Back to the size the video gives it, where it is",
+                    Layer::Screen => "As big as the video again, where it is",
+                    Layer::Webcam => "A quarter of the video wide again, unstretched, where it is",
+                };
+                reset_size = Btn::ghost("Reset size").small().enabled(can_size).tip(size_tip).show(ui).clicked();
+                let place_tip = if screen { "Back in the middle of the video, its size kept" } else { "Back to the bottom-right corner, its size kept" };
+                reset_place = Btn::ghost("Reset position").small().enabled(can_place).tip(place_tip).show(ui).clicked();
+            });
         });
 
         if reset_place {
@@ -234,7 +255,9 @@ impl App {
                 Layer::Webcam => {
                     if let Some(cam) = self.settings.webcam.as_mut() {
                         let p: capture::webcam::Placement = cam.placement.into();
-                        let p = crate::webcam_ui::contain(capture::webcam::Placement { x: r.min.x, y: r.min.y, w: r.width(), h: r.height(), ..p });
+                        // Another shape typed (unlinked): as much more stretched.
+                        let stretch = p.stretch * (r.width() / r.height().max(1e-6)) / (p.w / p.h.max(1e-6));
+                        let p = crate::webcam_ui::contain(capture::webcam::Placement { x: r.min.x, y: r.min.y, w: r.width(), h: r.height(), stretch, ..p });
                         cam.placement = crate::settings::PlacementCfg::laid_out(p, aspect);
                     }
                 }
@@ -243,8 +266,10 @@ impl App {
         if let Some(by) = turn {
             self.turn_layer(layer, by, aspect);
         }
-        if let Some(across) = flip {
-            self.flip_layer(layer, across, aspect);
+        if m != mirrored {
+            self.flip_layer(layer, true, aspect);
+        } else if u != upside_down {
+            self.flip_layer(layer, false, aspect);
         }
     }
 }
@@ -265,12 +290,14 @@ mod tests {
         assert!((back.min.x + 0.1).abs() < 1e-6 && (back.width() - 1.2).abs() < 1e-6, "{back:?}");
     }
 
-    /// What a card says: only what's been done, the first word capitalised.
+    /// What a card says: where it is, then only what's been done, the
+    /// first word capitalised.
     #[test]
     fn what_a_card_says() {
-        assert_eq!(summary(None, 0, false, false), "");
-        assert_eq!(summary(Some("fills the video"), 0, false, false), "Fills the video");
-        assert_eq!(summary(Some("placed by hand"), 1, true, false), "Placed by hand · turned 90° · mirrored");
-        assert_eq!(summary(None, 2, false, true), "Turned 180° · upside down");
+        assert_eq!(summary(None, false, 0, false, false), "");
+        assert_eq!(summary(Some("fills the video"), false, 0, false, false), "Fills the video");
+        let at = size_at([1426, 996, 790, 444]);
+        assert_eq!(summary(Some(&at), true, 1, true, false), "790×444 at 1426, 996 · stretched · turned 90° · mirrored");
+        assert_eq!(summary(None, false, 2, false, true), "Turned 180° · upside down");
     }
 }
