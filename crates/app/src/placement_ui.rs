@@ -167,27 +167,27 @@ impl App {
         }
         let pal = theme::pal(ui);
         let small = |ui: &mut egui::Ui, t: &str| ui.label(theme::text(t, 12.5, W::Regular).color(pal.text3));
-        // The well: 8 from the card's edges (into its padding), its rows 8
-        // in from its own, so their text is a little in from the card's
-        // other rows (as a Settings well's is). Painted under them once
-        // they're laid out.
-        let reach = crate::sources_ui::GROUP_PAD - 8.0;
+        // The well, as a Settings well is: as far from the card's sides as
+        // that is from its list's (into the card's padding), its rows padded
+        // as that's are, the same height, with the same hairlines. Painted
+        // under them once they're laid out.
+        let reach = crate::sources_ui::GROUP_PAD - ui_kit::WELL_GAP;
+        let pad = ui_kit::WELL_ROW_PAD - reach;
         let (well, top) = (ui.painter().add(egui::Shape::Noop), ui.cursor().min.y);
-        ui.add_space(2.0);
+        ui.add_space(ui_kit::WELL_INSET);
         let mut first = true;
-        // A row of the well: its name, then what's at its end; hairlines
-        // between them, along the text.
+        // A row of the well: its name, then what's at its end.
         let mut row = |ui: &mut egui::Ui, label: &str, add: &mut dyn FnMut(&mut egui::Ui)| {
             if !std::mem::take(&mut first) {
-                ui_kit::divider(ui, 8.0 - reach);
+                ui_kit::divider(ui, ui_kit::ROW_LINE_INSET - reach);
             }
             ui.horizontal(|ui| {
-                ui.set_min_height(ui_kit::CONTROL_H + 12.0);
-                ui.add_space(8.0 - reach);
+                ui.set_min_height(ui_kit::WELL_ROW_H);
+                ui.add_space(pad);
                 ui.label(theme::text(label, 13.5, W::Regular).color(pal.text));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
-                    ui.add_space(8.0 - reach);
+                    ui.add_space(pad);
                     add(ui);
                 });
             });
@@ -239,12 +239,12 @@ impl App {
             ui_kit::switch(ui, &mut u);
         });
         // Its first place and size again, each on its own.
-        ui_kit::divider(ui, 8.0 - reach);
+        ui_kit::divider(ui, ui_kit::ROW_LINE_INSET - reach);
         ui.horizontal(|ui| {
-            ui.set_min_height(ui_kit::CONTROL_H + 12.0);
+            ui.set_min_height(ui_kit::WELL_ROW_H);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                ui.add_space(8.0 - reach);
+                ui.add_space(pad);
                 let size_tip = match layer {
                     Layer::Screen if self.video_shaped() => "Back to the size the video gives it, where it is",
                     Layer::Screen => "As big as the video again, where it is",
@@ -255,11 +255,11 @@ impl App {
                 reset_place = Btn::ghost("Reset position").small().enabled(can_place).tip(place_tip).show(ui).clicked();
             });
         });
-        ui.add_space(2.0);
+        ui.add_space(ui_kit::WELL_INSET);
         let r = Rect::from_x_y_ranges(ui.max_rect().x_range().expand(reach), top..=ui.cursor().min.y);
         ui.painter().set(well, egui::epaint::RectShape::filled(r, ui_kit::RADIUS, pal.well));
         // As far from the card's bottom as from its sides.
-        ui.add_space((8.0 - (crate::sources_ui::GROUP_PAD - (crate::sources_ui::GROUP_ROW_H - ui_kit::CONTROL_H) / 2.0)).max(0.0));
+        ui.add_space((ui_kit::WELL_GAP - (crate::sources_ui::GROUP_PAD - (crate::sources_ui::GROUP_ROW_H - ui_kit::CONTROL_H) / 2.0)).max(0.0));
 
         if reset_place {
             if screen { self.screen_reset_position(aspect) } else { self.webcam_reset_position(aspect) }

@@ -31,6 +31,18 @@ pub const SMALL_H: f32 = 26.0;
 pub const RADIUS: u8 = 6;
 /// Groups, menus, popovers.
 pub const CARD_RADIUS: u8 = 8;
+/// A setting row: its padding at each end, and its least height.
+pub const ROW_PAD: f32 = 16.0;
+pub const ROW_H: f32 = 52.0;
+/// A row in a well ([`well`]): a little smaller.
+pub const WELL_ROW_PAD: f32 = 12.0;
+pub const WELL_ROW_H: f32 = 44.0;
+/// A well's gap from its group's sides and bottom, and above and below
+/// its rows.
+pub const WELL_GAP: f32 = 8.0;
+pub const WELL_INSET: f32 = 2.0;
+/// The hairline between rows, in from each side of what they're in.
+pub const ROW_LINE_INSET: f32 = 16.0;
 /// Space between a page's edge and its content.
 pub const PAGE_MARGIN: i8 = 24;
 /// The search field's width, the same on every page that has one.
@@ -1371,7 +1383,7 @@ impl<'a> Row<'a> {
     /// was clicked (to say why it's locked).
     pub fn show<R>(self, ui: &mut egui::Ui, control: impl FnOnce(&mut egui::Ui) -> R) -> (R, bool) {
         let p = theme::pal(ui);
-        let (pad_x, min_h) = if self.kid { (12.0, 44.0) } else { (16.0, 52.0) };
+        let (pad_x, min_h) = if self.kid { (WELL_ROW_PAD, WELL_ROW_H) } else { (ROW_PAD, ROW_H) };
         let locked = self.locked.is_some();
         let width = ui.available_width();
         // How wide the control was last frame: beside the label when both
@@ -1551,7 +1563,7 @@ pub struct List<'u> {
 impl List<'_> {
     pub fn row<R>(&mut self, row: Row, control: impl FnOnce(&mut egui::Ui) -> R) -> (R, bool) {
         if self.rows > 0 {
-            divider(self.ui, 16.0);
+            divider(self.ui, ROW_LINE_INSET);
         }
         self.rows += 1;
         row.show(self.ui, control)
@@ -1593,13 +1605,14 @@ pub fn well(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, open:
         None => ui.clip_rect(),
     });
     child.multiply_opacity(t);
-    let inner = egui::Frame::new().outer_margin(Margin { left: 8, right: 8, top: 0, bottom: 8 }).fill(p.well).corner_radius(RADIUS).inner_margin(Margin::symmetric(0, 2)).show(&mut child, |ui| {
+    let gap = WELL_GAP as i8;
+    let inner = egui::Frame::new().outer_margin(Margin { left: gap, right: gap, top: 0, bottom: gap }).fill(p.well).corner_radius(RADIUS).inner_margin(Margin::symmetric(0, WELL_INSET as i8)).show(&mut child, |ui| {
         ui.set_width(ui.available_width());
         ui.spacing_mut().item_spacing.y = 0.0;
         let mut l = List { ui, rows: 0 };
         add(&mut l);
     });
-    let real_h = inner.response.rect.height() + 8.0;
+    let real_h = inner.response.rect.height() + WELL_GAP;
     ui.data_mut(|d| d.insert_temp(id.with("h"), real_h));
     ui.allocate_space(vec2(avail, h.unwrap_or(real_h)));
 }
