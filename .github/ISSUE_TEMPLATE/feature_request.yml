@@ -1,0 +1,47 @@
+name: Feature request
+description: Something HasteClip could do, or do better.
+type: Feature
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. Please [search the issues](https://github.com/hasteclip/hasteclip/issues?q=is%3Aissue) first: if someone has asked for it already, a 👍 on theirs helps more than a new one.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What you'd like
+      description: What HasteClip would do, as you'd use it.
+      placeholder: When a game I've added in Sources starts, HasteClip starts recording it until I stop, without me pressing anything.
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: What it's for
+      description: What you're trying to do, and how you do it today.
+      placeholder: I record whole matches to review later. Today I have to remember to start a recording each time, and I often forget.
+    validations:
+      required: true
+
+  - type: textarea
+    id: elsewhere
+    attributes:
+      label: In other apps
+      description: If another recorder does this (Medal, ShadowPlay, Outplayed, OBS…), how it works there.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: systems
+    attributes:
+      label: Systems you use
+      multiple: true
+      options:
+        - macOS
+        - Windows
+        - Linux
+    validations:
+      required: false

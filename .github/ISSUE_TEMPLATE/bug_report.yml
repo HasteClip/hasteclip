@@ -1,0 +1,94 @@
+name: Bug report
+description: Something doesn't work, or works the wrong way.
+type: Bug
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this. Please [search the issues](https://github.com/hasteclip/hasteclip/issues?q=is%3Aissue) first: if yours is there, add what you know to it.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What went wrong, and what you expected instead. A screenshot or a short clip helps a lot.
+      placeholder: After I changed the resolution from 1920×1080 to 1440×1080, the preview froze on one frame until I restarted HasteClip.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to make it happen
+      description: The steps, from opening HasteClip. If it happens at random, say what you were doing and how often it happens.
+      placeholder: |
+        1. Open Settings → Video.
+        2. Set Resolution to 1440×1080.
+        3. Open Sources.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: HasteClip version
+      description: It's in *Settings → App*, next to the name.
+      placeholder: "0.4.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: system
+    attributes:
+      label: System
+      options:
+        - macOS
+        - Windows
+        - Linux
+    validations:
+      required: true
+
+  - type: input
+    id: system-version
+    attributes:
+      label: System version
+      description: On Linux, your desktop too, and whether it's Wayland or X11.
+      placeholder: Windows 11 24H2 · macOS 15.3 · Fedora 42, KDE Plasma 6.3 on Wayland
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: Graphics card
+      description: And your screen's resolution and refresh rate, if it's about recording.
+      placeholder: RTX 4060 Ti, 2560×1440 at 165 Hz
+    validations:
+      required: false
+
+  - type: textarea
+    id: recording
+    attributes:
+      label: What you were recording
+      description: |
+        If it's about recording: the screen or a window, which game or app, and whether it runs fullscreen, borderless or in a window.
+        On Windows, also what *Settings → Video → Screen capture* is set to, and whether *Game capture* is on.
+      placeholder: Minecraft 1.21 in fullscreen. Screen capture is Automatic, Game capture is on.
+    validations:
+      required: false
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: |
+        HasteClip writes what it's doing to a log. Drag the file in here. It can include your folder and file names, so have a look first.
+
+        - **Windows:** `%LOCALAPPDATA%\hasteclip\logs\hasteclip.log`
+        - **Linux:** `~/.local/share/hasteclip/logs/hasteclip.log`
+        - **macOS:** there's no log file. Quit HasteClip (from the menu bar too), run `open -a HasteClip --stderr ~/Desktop/hasteclip.log` in Terminal, make it happen again, and send `hasteclip.log` from your desktop.
+
+        On Windows and Linux, each launch starts a new log. If HasteClip crashed or you've restarted it since, send `hasteclip.previous.log` from the same folder too.
+    validations:
+      required: false
