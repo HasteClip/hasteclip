@@ -418,7 +418,7 @@ mod tests {
 
     #[test]
     fn webcam_box_in_frame() {
-        let p = Placement { x: 0.75, y: 0.5, w: 0.25, h: 0.25, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0 };
+        let p = Placement { x: 0.75, y: 0.5, w: 0.25, h: 0.25, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0, stretch: 1.0 };
         let o = overlay_rects(p, (1280, 720), 1920, 1080).unwrap();
         assert_eq!(o.dest, [1440.0, 540.0, 1920.0, 810.0]);
         assert_eq!(o.src, [0.0, 0.0, 1280.0, 720.0]);
@@ -428,7 +428,7 @@ mod tests {
     fn mirrored_and_clipped() {
         // Half off the right edge, mirrored: the half that shows is the
         // camera's right half, drawn right to left.
-        let p = Placement { x: 0.875, y: 0.0, w: 0.25, h: 0.25, crop: [0.0; 4], flip_h: true, flip_v: false, turns: 0 };
+        let p = Placement { x: 0.875, y: 0.0, w: 0.25, h: 0.25, crop: [0.0; 4], flip_h: true, flip_v: false, turns: 0, stretch: 1.0 };
         let o = overlay_rects(p, (1280, 720), 1920, 1080).unwrap();
         assert_eq!(o.dest[0], 1680.0);
         assert_eq!(o.dest[2], 1920.0);
@@ -439,7 +439,7 @@ mod tests {
     fn turned_picture_takes_the_turned_shape() {
         // A 1280x720 camera turned a quarter is a 720x1280 picture: here in a
         // 720x1280-pixel box of a 1920x1080 frame, all of it showing.
-        let p = Placement { x: 0.0, y: 0.0, w: 720.0 / 1920.0, h: 1280.0 / 1080.0, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 1 };
+        let p = Placement { x: 0.0, y: 0.0, w: 720.0 / 1920.0, h: 1280.0 / 1080.0, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 1, stretch: 1.0 };
         let o = overlay_rects(p, (1280, 720), 1920, 1080).unwrap();
         assert_eq!((o.cam, o.turns), ([1280.0, 720.0], 1));
         // Clipped by the frame's bottom: 1080 of the 1280 rows show.
@@ -469,7 +469,7 @@ mod tests {
         }
         let out = FramePool::new(640, 360).unwrap().take().unwrap();
         // A 180x320 box (the turned camera's shape) at the frame's top-left.
-        let p = Placement { x: 0.0, y: 0.0, w: 180.0 / 640.0, h: 320.0 / 360.0, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 1 };
+        let p = Placement { x: 0.0, y: 0.0, w: 180.0 / 640.0, h: 320.0 / 360.0, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 1, stretch: 1.0 };
         gpu.compose(&screen, Some(ScreenRects::copied(640, 360)), false, Some(&cam), p, &out).unwrap();
         let (y, _) = planes(&out);
         assert_eq!(y[40 * 640 + 90], 20, "top half is the camera's left");
@@ -531,7 +531,7 @@ mod tests {
         let screen = fill(640, 360, 100, 110, 120);
         let cam = fill(320, 180, 200, 50, 60);
         let out = FramePool::new(640, 360).unwrap().take().unwrap();
-        let p = Placement { x: 0.5, y: 0.5, w: 0.25, h: 0.25, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0 };
+        let p = Placement { x: 0.5, y: 0.5, w: 0.25, h: 0.25, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0, stretch: 1.0 };
         gpu.compose(&screen, Some(ScreenRects::copied(640, 360)), false, Some(&cam), p, &out).unwrap();
         let (y, c) = planes(&out);
         assert_eq!(y[10 * 640 + 10], 100);

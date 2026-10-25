@@ -307,6 +307,19 @@ pub struct PlacementCfg {
     /// refitted then (`refit`), keeping its own shape in pixels.
     #[serde(default)]
     pub frame_aspect: Option<f32>,
+    /// How stretched its picture is (Shift on the preview): its box's shape
+    /// over what's shown of the camera's. 1, not at all; kept through
+    /// another crop, camera or video shape.
+    #[serde(default = "unstretched", skip_serializing_if = "is_unstretched")]
+    pub stretch: f32,
+}
+
+fn unstretched() -> f32 {
+    1.0
+}
+
+fn is_unstretched(s: &f32) -> bool {
+    (s - 1.0).abs() < 1e-6
 }
 
 impl PlacementCfg {
@@ -314,8 +327,9 @@ impl PlacementCfg {
     /// keep its shape in pixels, as wide a share of the frame (narrower if
     /// that won't fit), at the same place in the room it has to move in (so
     /// a box in a corner stays in it). Its shape is what's left of the
-    /// camera's picture once cropped, as every box is made: given the
-    /// camera's shape (`camera_aspect`, as turned, when known), a box of
+    /// camera's picture once cropped (as stretched as it's been), as every
+    /// box is made: given the camera's shape (`camera_aspect`, as turned,
+    /// when known), a box of
     /// another shape gets it back, one laid out before the frame's shape was
     /// kept or squashed by a frame that changed under it. Returns whether it
     /// changed.
@@ -324,7 +338,7 @@ impl PlacementCfg {
             return false;
         }
         let wanted = camera_aspect.filter(|&cam| cam > 0.0).map(|cam| {
-            cam * (1.0 - self.crop[0] - self.crop[2]).max(0.05) / (1.0 - self.crop[1] - self.crop[3]).max(0.05)
+            cam * (1.0 - self.crop[0] - self.crop[2]).max(0.05) / (1.0 - self.crop[1] - self.crop[3]).max(0.05) * self.stretch
         });
         // Its shape in pixels, in the frame it was made for.
         let had = self.frame_aspect.map(|was| self.w * was / self.h);
@@ -416,14 +430,14 @@ impl BoxCfg {
 
 impl From<PlacementCfg> for capture::webcam::Placement {
     fn from(p: PlacementCfg) -> Self {
-        Self { x: p.x, y: p.y, w: p.w, h: p.h, crop: p.crop, flip_h: p.flip_h, flip_v: p.flip_v, turns: p.turns }
+        Self { x: p.x, y: p.y, w: p.w, h: p.h, crop: p.crop, flip_h: p.flip_h, flip_v: p.flip_v, turns: p.turns, stretch: p.stretch }
     }
 }
 
 impl PlacementCfg {
     /// `p`, laid out in a frame of shape `frame_aspect`.
     pub fn laid_out(p: capture::webcam::Placement, frame_aspect: f32) -> Self {
-        Self { x: p.x, y: p.y, w: p.w, h: p.h, crop: p.crop, flip_h: p.flip_h, flip_v: p.flip_v, turns: p.turns, frame_aspect: Some(frame_aspect) }
+        Self { x: p.x, y: p.y, w: p.w, h: p.h, crop: p.crop, flip_h: p.flip_h, flip_v: p.flip_v, turns: p.turns, frame_aspect: Some(frame_aspect), stretch: p.stretch }
     }
 }
 
@@ -1580,7 +1594,24 @@ mod placement_tests {
     use super::{BoxCfg, PlacementCfg};
 
     fn cfg(x: f32, y: f32, w: f32, h: f32, frame_aspect: Option<f32>) -> PlacementCfg {
-        PlacementCfg { x, y, w, h, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0, frame_aspect }
+        PlacementCfg { x, y, w, h, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0, frame_aspect, stretch: 1.0 }
+    }
+
+    /// A stretched webcam stays as stretched: twice as wide as its 16:9
+    /// camera is left alone, and a 4:3 camera gets a box twice as wide as
+    /// 4:3; saved, the stretch is kept, and a file without it is unstretched.
+    #[test]
+    fn a_stretched_webcam_stays_stretched() {
+        let wide = 16.0 / 9.0;
+        let pixels = |p: &PlacementCfg| p.w * wide / p.h;
+        let mut p = PlacementCfg { stretch: 2.0, ..cfg(0.5, 0.5, 0.5, 0.25, Some(wide)) };
+        assert!(!p.refit(wide, Some(wide)), "{p:?}");
+        assert!(p.refit(wide, Some(4.0 / 3.0)));
+        assert!((pixels(&p) - 8.0 / 3.0).abs() < 1e-3, "{p:?}");
+        let json = serde_json::to_string(&p).unwrap();
+        assert_eq!(serde_json::from_str::<PlacementCfg>(&json).unwrap().stretch, 2.0);
+        let plain = serde_json::to_string(&cfg(0.0, 0.0, 0.25, 0.25, None)).unwrap();
+        assert!(!plain.contains("stretch") && serde_json::from_str::<PlacementCfg>(&plain).unwrap().stretch == 1.0);
     }
 
     /// The screen's box keeps its shape in pixels when the video changes

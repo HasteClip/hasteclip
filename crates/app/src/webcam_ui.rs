@@ -110,7 +110,7 @@ pub(crate) struct Mods {
     pub crop: bool,
     /// Snap to the frame's edges and centre (unless Ctrl).
     pub snap: bool,
-    /// Crop keeping the box's shape (Shift).
+    /// Shift: cropping, keep the box's shape; resizing, stretch it.
     pub keep: bool,
 }
 
@@ -126,9 +126,11 @@ pub(crate) struct Lines {
 /// The placement after dragging `handle` by `(dx, dy)` (fractions of the
 /// frame) from where it was at `start`, moves snapping to `lines` too.
 ///
-/// Resizing never stretches: every handle scales the whole picture, from the
-/// opposite corner or edge (an edge handle keeps the other axis centred).
-/// Dragging past that opposite side flips the picture on that axis.
+/// Resizing scales the whole picture, from the opposite corner or edge (an
+/// edge handle keeps the other axis centred), as stretched as it was; with
+/// Shift (`mods.keep`) each side dragged goes its own way, stretching it,
+/// as the screen's do. Dragging past that opposite side flips the picture
+/// on that axis.
 ///
 /// The box stays inside the frame: moving stops at its edges, and so does
 /// growing (what's not wanted of the picture is cropped instead).
@@ -185,9 +187,18 @@ pub(crate) fn drag(start: Placement, handle: Handle, dx: f32, dy: f32, mods: Mod
             }
         }
     };
-    let most = (room(l, kx, start.x, start.w) / start.w).min(room(t, ky, start.y, start.h) / start.h);
-    let k = k.min(most).max(MIN_SIZE / start.w.min(start.h));
-    let (w, h) = (start.w * k, start.h * k);
+    let (most_x, most_y) = (room(l, kx, start.x, start.w) / start.w, room(t, ky, start.y, start.h) / start.h);
+    // Shift: each axis as far as it's dragged (one not dragged stays), and
+    // the picture as much more stretched.
+    let (ax, ay) = if mods.keep {
+        let each = |ka: Option<(f32, f32)>, most: f32, size: f32| ka.map_or(1.0, |(_, k)| k.abs().min(most).max(MIN_SIZE / size));
+        (each(kx, most_x, start.w), each(ky, most_y, start.h))
+    } else {
+        let k = k.min(most_x.min(most_y)).max(MIN_SIZE / start.w.min(start.h));
+        (k, k)
+    };
+    let (w, h) = (start.w * ax, start.h * ay);
+    p.stretch = start.stretch * ax / ay;
     // Place each axis: from its anchor, on the side the drag ended up on; an
     // axis that wasn't dragged stays centred.
     let place = |near: bool, ka: Option<(f32, f32)>, pos: f32, size: f32, new: f32| -> (f32, bool) {
@@ -546,11 +557,12 @@ impl App {
     }
 
     /// Whether the webcam's position, and its size, can be reset: it's not
-    /// in the bottom-right corner, or not a quarter of the video wide.
+    /// in the bottom-right corner, or not a quarter of the video wide, or
+    /// stretched.
     pub(crate) fn webcam_resettable(&self) -> (bool, bool) {
         let Some(p) = self.settings.webcam.as_ref().map(|w| w.placement) else { return (false, false) };
         let at_corner = (p.x - (1.0 - p.w)).abs() < 1e-3 && (p.y - (1.0 - p.h)).abs() < 1e-3;
-        (!at_corner, (p.w - FIRST_WIDTH).abs() > 1e-3)
+        (!at_corner, (p.w - FIRST_WIDTH).abs() > 1e-3 || (p.stretch - 1.0).abs() > 1e-3)
     }
 
     /// The webcam back in the bottom-right corner, its size kept.
@@ -561,15 +573,17 @@ impl App {
         w.placement = PlacementCfg::laid_out(contain(p), frame_aspect);
     }
 
-    /// The webcam a quarter of the video wide again, in its shape, where it
-    /// is (in a corner, it stays in it).
+    /// The webcam a quarter of the video wide again, in its own shape
+    /// (unstretched), where it is (in a corner, it stays in it).
     pub(crate) fn webcam_reset_size(&mut self, frame_aspect: f32) {
         let Some(w) = self.settings.webcam.as_mut() else { return };
         let mut p: Placement = w.placement.into();
         if p.w <= 0.0 || p.h <= 0.0 {
             return;
         }
-        let r = crate::canvas_ui::resized_in_place(Rect::from_min_size(Pos2::new(p.x, p.y), vec2(p.w, p.h)), vec2(FIRST_WIDTH, FIRST_WIDTH * p.h / p.w));
+        let tall = p.h / p.w * p.stretch.max(1e-3);
+        p.stretch = 1.0;
+        let r = crate::canvas_ui::resized_in_place(Rect::from_min_size(Pos2::new(p.x, p.y), vec2(p.w, p.h)), vec2(FIRST_WIDTH, FIRST_WIDTH * tall));
         (p.x, p.y, p.w, p.h) = (r.min.x, r.min.y, r.width(), r.height());
         w.placement = PlacementCfg::laid_out(contain(p), frame_aspect);
     }
@@ -588,7 +602,7 @@ mod tests {
     use super::*;
 
     fn at(x: f32, y: f32, w: f32, h: f32) -> Placement {
-        Placement { x, y, w, h, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0 }
+        Placement { x, y, w, h, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0, stretch: 1.0 }
     }
 
     const PLAIN: Mods = Mods { crop: false, snap: false, keep: false };
@@ -633,6 +647,20 @@ mod tests {
         // Turned near the edge, a tall box is moved back in.
         let p = contain(at(0.8, 0.0, 0.3, 1.2));
         assert!(in_frame(p) && close(p.w / p.h, 0.25), "{p:?}");
+    }
+
+    /// With Shift, a side goes its own way, stretching the picture (the
+    /// other axis stays); a corner stretches both ways; without Shift, a
+    /// stretched webcam scales as stretched as it is.
+    #[test]
+    fn shift_stretches_the_webcam() {
+        let shift = Mods { keep: true, ..PLAIN };
+        let p = drag(at(0.5, 0.5, 0.2, 0.1), Handle::E, 0.1, 0.0, shift, &Lines::default());
+        assert!(close(p.w, 0.3) && close(p.h, 0.1) && close(p.x, 0.5) && close(p.y, 0.5) && close(p.stretch, 1.5), "{p:?}");
+        let q = drag(at(0.5, 0.5, 0.2, 0.1), Handle::SE, 0.2, 0.0, shift, &Lines::default());
+        assert!(close(q.w, 0.4) && close(q.h, 0.1) && close(q.stretch, 2.0), "{q:?}");
+        let r = drag(p, Handle::SE, 0.15, 0.05, PLAIN, &Lines::default());
+        assert!(close(r.w / r.h, 3.0) && close(r.stretch, 1.5), "{r:?}");
     }
 
     #[test]
@@ -1070,7 +1098,8 @@ impl App {
     }
 
     /// The webcam cropped to `c` (its sides cut off, as `Placement::crop`):
-    /// its box takes the shape of what's left (its width and middle kept),
+    /// its box takes the shape of what's left, as stretched as it was (its
+    /// width and middle kept),
     /// so nothing more is cut off to fill it; inside the video.
     fn webcam_recrop(&mut self, orient: Orientation, c: [f32; 4]) {
         let Some(w) = self.settings.webcam.as_mut() else { return };
@@ -1082,7 +1111,7 @@ impl App {
             let kept = crop_shown(orient, c);
             let visible = full * kept.width() / kept.height().max(0.01);
             let (cx, cy) = (p.x + p.w / 2.0, p.y + p.h / 2.0);
-            p.h = p.w * aspect / visible;
+            p.h = p.w * aspect / (visible * p.stretch.max(1e-3));
             p.x = cx - p.w / 2.0;
             p.y = cy - p.h / 2.0;
         }

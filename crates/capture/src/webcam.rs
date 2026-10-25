@@ -32,6 +32,9 @@ pub struct Placement {
     /// Quarter turns clockwise, 0 to 3: the camera's picture is turned first,
     /// then cropped and flipped.
     pub turns: u8,
+    /// How stretched the picture is: the box's shape over the shape of
+    /// what's shown of it (1 not at all, 2 twice as wide as it should be).
+    pub stretch: f32,
 }
 
 impl Placement {
@@ -41,14 +44,14 @@ impl Placement {
     pub fn default_for(camera_aspect: f32, frame_aspect: f32) -> Self {
         let w = 0.25;
         let h = w * frame_aspect / camera_aspect;
-        Self { x: 1.0 - w, y: 1.0 - h, w, h, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0 }
+        Self { x: 1.0 - w, y: 1.0 - h, w, h, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0, stretch: 1.0 }
     }
 
     /// The webcam switched off: a box of no size, which is never drawn, so a
     /// running capture drops it at once. The camera itself is closed too
     /// ([`keep_open`]) and taken up again when it's switched back on.
     pub fn hidden() -> Self {
-        Self { x: 0.0, y: 0.0, w: 0.0, h: 0.0, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0 }
+        Self { x: 0.0, y: 0.0, w: 0.0, h: 0.0, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0, stretch: 1.0 }
     }
 
     pub fn is_hidden(&self) -> bool {
@@ -63,9 +66,11 @@ impl Placement {
     /// Turned a quarter more, clockwise (`by` 1) or anticlockwise (`by` -1),
     /// in a frame of shape `frame_aspect`: the picture as you see it turns,
     /// mirrored or not, around the box's centre, and the box takes its new
-    /// shape. The crop stays on the same part of the picture.
+    /// shape. The crop stays on the same part of the picture, and a stretch
+    /// turns with it (wider is taller).
     pub fn turn(&self, by: i8, frame_aspect: f32) -> Self {
         let mut p = *self;
+        p.stretch = 1.0 / self.stretch.max(1e-3);
         // A mirrored picture turns the other way under its mirror.
         let by = if self.flip_h != self.flip_v { -by } else { by };
         p.turns = (self.turns as i8 + by).rem_euclid(4) as u8;
@@ -93,9 +98,9 @@ impl Placement {
     /// The crop actually drawn, for a camera of `camera` pixels in a frame
     /// of `frame` pixels: the chosen crop, plus as much more off both sides
     /// of the long direction as it takes for what's left to have the box's
-    /// exact shape. The picture fills its box and is never stretched, however
-    /// the box and the camera's shape (a format change, a portrait camera)
-    /// differ.
+    /// exact shape (unstretched, see `stretch`). The picture fills its box,
+    /// stretched only as much as it's been, however the box and the
+    /// camera's shape (a format change, a portrait camera) differ.
     pub fn fill_crop(&self, camera: (u32, u32), frame: (u32, u32)) -> [f32; 4] {
         let [l, t, r, b] = self.crop;
         let vis_w = (1.0 - l - r).max(1e-3) * camera.0 as f32;
@@ -105,7 +110,7 @@ impl Placement {
         if vis_w <= 0.0 || vis_h <= 0.0 || box_w <= 0.0 || box_h <= 0.0 {
             return self.crop;
         }
-        let (want, have) = (box_w / box_h, vis_w / vis_h);
+        let (want, have) = (box_w / box_h / self.stretch.max(1e-3), vis_w / vis_h);
         if have > want {
             // Too wide: trim both sides evenly.
             let extra = (1.0 - want / have) * (1.0 - l - r) / 2.0;
@@ -122,7 +127,7 @@ mod tests {
     use super::Placement;
 
     fn p(w: f32, h: f32) -> Placement {
-        Placement { x: 0.0, y: 0.0, w, h, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0 }
+        Placement { x: 0.0, y: 0.0, w, h, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0, stretch: 1.0 }
     }
 
     #[test]
@@ -195,6 +200,21 @@ mod tests {
         // 640x480 into 16:9: rows trimmed to 360.
         let c = p(0.25, 0.25).fill_crop((640, 480), (1920, 1080));
         assert!(((1.0 - c[1] - c[3]) * 480.0 - 360.0).abs() < 0.5, "{c:?}");
+    }
+
+    /// Stretched, a 4:3 camera fills a 16:9 box whole (not trimmed to it),
+    /// and is trimmed only as much as a box of another shape needs; turned
+    /// a quarter, it's stretched the other way.
+    #[test]
+    fn a_stretched_picture_fills_its_box() {
+        let wide = Placement { stretch: (16.0 / 9.0) / (4.0 / 3.0), ..p(0.25, 0.25) };
+        assert_eq!(wide.fill_crop((640, 480), (1920, 1080)), [0.0; 4]);
+        // Twice as wide a box: stretched no more, so the middle half of
+        // its rows fills it (960x270 at 4:3 stretched 4:3 is 640x240).
+        let wider = Placement { w: 0.5, ..wide };
+        let c = wider.fill_crop((640, 480), (1920, 1080));
+        assert!(c[0] == 0.0 && c[2] == 0.0 && ((1.0 - c[1] - c[3]) * 480.0 - 240.0).abs() < 0.5, "{c:?}");
+        assert!((wide.turn(1, 16.0 / 9.0).stretch * wide.stretch - 1.0).abs() < 1e-6);
     }
 
     #[test]
