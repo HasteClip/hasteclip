@@ -219,6 +219,12 @@ pub struct ScreenPlacement {
     /// at a lower resolution than the display, black around it): it goes
     /// into the box as all of the picture would. Never a window's.
     pub crop: Option<Crop>,
+    /// Quarter turns clockwise, then mirrored (left and right swapped) or
+    /// flipped upside down, as the webcam's are (`webcam::Placement`): the
+    /// picture as it shows, which is what goes into the box.
+    pub turns: u8,
+    pub flip_h: bool,
+    pub flip_v: bool,
 }
 
 /// The screen's placement, shared between the app and a running capture.
@@ -227,7 +233,37 @@ pub type SharedScreen = std::sync::Arc<std::sync::Mutex<ScreenPlacement>>;
 impl ScreenPlacement {
     /// All of the frame, the picture put in as `framing` says, behind the webcam.
     pub fn whole(framing: Framing) -> Self {
-        Self { rect: [0.0, 0.0, 1.0, 1.0], framing, in_front: false, hidden: false, crop: None }
+        Self { rect: [0.0, 0.0, 1.0, 1.0], framing, in_front: false, hidden: false, crop: None, turns: 0, flip_h: false, flip_v: false }
+    }
+
+    /// Whether its picture's turned, mirrored or flipped: then a compositor
+    /// draws it, never the capture as it comes.
+    pub fn transformed(&self) -> bool {
+        self.turns % 4 != 0 || self.flip_h || self.flip_v
+    }
+
+    /// A `w`×`h` picture's size as it's turned.
+    pub fn turned(&self, (w, h): (u32, u32)) -> (u32, u32) {
+        if self.turns % 2 == 1 { (h, w) } else { (w, h) }
+    }
+
+    /// A point of where the picture's drawn (from 0 to 1 across and down
+    /// it) in the part of the picture drawn there (from 0 to 1 across and
+    /// down that, in its own pixels): flipped back, then turned back, as
+    /// it's turned and then flipped. Every compositor samples it so.
+    pub fn unturn(&self, (mut u, mut v): (f32, f32)) -> (f32, f32) {
+        if self.flip_h {
+            u = 1.0 - u;
+        }
+        if self.flip_v {
+            v = 1.0 - v;
+        }
+        match self.turns % 4 {
+            1 => (v, 1.0 - u),
+            2 => (1.0 - u, 1.0 - v),
+            3 => (1.0 - v, u),
+            _ => (u, v),
+        }
     }
 
     /// Whether its box is all of the frame, no more.
@@ -269,10 +305,30 @@ impl ScreenPlacement {
         if self.hidden {
             return ([0; 4], [0; 4]);
         }
-        let Some(c) = self.crop else { return self.place_picture(content, frame) };
+        let Some(c) = self.crop else { return self.place_turned(content, frame) };
         let [x, y, w, h] = c.rect(content.0, content.1);
-        let ([sx, sy, sw, sh], dest) = self.place_picture((w, h), frame);
+        let ([sx, sy, sw, sh], dest) = self.place_turned((w, h), frame);
         ([x + sx, y + sy, sw, sh], dest)
+    }
+
+    /// [`place_picture`](Self::place_picture) for the picture as it shows,
+    /// turned and flipped: the part of it used, in its own (unturned)
+    /// pixels, and where it's drawn. A compositor maps each point of where
+    /// it's drawn into that part with [`unturn`](Self::unturn).
+    pub(crate) fn place_turned(&self, content: (u32, u32), frame: (u32, u32)) -> ([u32; 4], [u32; 4]) {
+        let shown = self.turned(content);
+        let ([sx, sy, sw, sh], dest) = self.place_picture(shown, frame);
+        if !self.transformed() || sw == 0 || sh == 0 {
+            return ([sx, sy, sw, sh], dest);
+        }
+        // The part used, as fractions of the picture as it shows, back in its own.
+        let (tw, th) = (shown.0.max(1) as f32, shown.1.max(1) as f32);
+        let a = self.unturn((sx as f32 / tw, sy as f32 / th));
+        let b = self.unturn(((sx + sw) as f32 / tw, (sy + sh) as f32 / th));
+        let px = |f: f32, n: u32| (f * n as f32).round().clamp(0.0, n as f32) as u32;
+        let (x0, x1) = (px(a.0.min(b.0), content.0), px(a.0.max(b.0), content.0));
+        let (y0, y1) = (px(a.1.min(b.1), content.1), px(a.1.max(b.1), content.1));
+        ([x0, y0, (x1 - x0).max(1), (y1 - y0).max(1)], dest)
     }
 
     /// Where a picture of `content`'s size goes in a `frame`-size frame,
@@ -1368,6 +1424,36 @@ mod size_tests {
         assert_eq!(ScreenPlacement { framing: Framing::Fill, rect: [0.75, 0.0, 0.5, 1.0], ..whole }.place((1920, 1080), (1920, 1080)), ([480, 0, 480, 1080], [1440, 0, 480, 1080]));
         // None of it in the frame: nothing drawn.
         assert_eq!(ScreenPlacement { rect: [1.2, 0.0, 0.5, 0.5], ..whole }.place((1920, 1080), (1920, 1080)), ([0; 4], [0; 4]));
+    }
+
+    /// Turned, mirrored or flipped: placed as it shows (a turned 16:9
+    /// screen is 9:16), the part used given back in its own pixels, and
+    /// each point of its box sampled from the right place in it.
+    #[test]
+    fn the_screen_turned_and_flipped() {
+        let whole = ScreenPlacement::whole(Framing::Stretch);
+        // Turned a quarter clockwise into an upright 1080×1920 frame: all of
+        // it, all of the frame; the frame's top-left is the screen's bottom-left.
+        let turned = ScreenPlacement { turns: 1, ..whole };
+        assert_eq!(turned.turned((1920, 1080)), (1080, 1920));
+        assert_eq!(turned.place((1920, 1080), (1080, 1920)), ([0, 0, 1920, 1080], [0, 0, 1080, 1920]));
+        assert_eq!(turned.unturn((0.0, 0.0)), (0.0, 1.0));
+        assert_eq!(turned.unturn((1.0, 0.0)), (0.0, 0.0));
+        assert_eq!(ScreenPlacement { turns: 3, ..whole }.unturn((0.0, 0.0)), (1.0, 0.0));
+        assert_eq!(ScreenPlacement { turns: 2, ..whole }.unturn((0.25, 0.0)), (0.75, 1.0));
+        // Fitted in a wide frame, upright: a band in its middle.
+        let fit = ScreenPlacement { framing: Framing::Fit, ..turned };
+        assert_eq!(fit.place((1920, 1080), (1920, 1080)), ([0, 0, 1920, 1080], [656, 0, 606, 1080]));
+        // Mirrored, half off the frame's right edge: what shows (its left
+        // half, as mirrored) is the screen's right half.
+        let half = ScreenPlacement { rect: [0.75, 0.25, 0.5, 0.5], flip_h: true, ..whole };
+        assert_eq!(half.place((1920, 1080), (1920, 1080)), ([960, 0, 960, 1080], [1440, 270, 480, 540]));
+        assert_eq!(half.unturn((0.0, 0.5)), (1.0, 0.5));
+        // Flipped upside down and cropped: the crop's, the same part of it.
+        let crop = Some(Crop { w: 1600, h: 900, at: None });
+        let flipped = ScreenPlacement { flip_v: true, crop, ..whole };
+        assert_eq!(flipped.place((2560, 1440), (1600, 900)), ([480, 270, 1600, 900], [0, 0, 1600, 900]));
+        assert!(!whole.transformed() && turned.transformed() && flipped.transformed());
     }
 }
 

@@ -1160,7 +1160,7 @@ impl RecordSettings {
             None => ([0.0, 0.0, 1.0, 1.0], capture::Framing::Fit),
         };
         let crop = self.screen_crop.filter(|c| capture::SCREEN_CROP && !apps && !c.is_none()).map(Into::into);
-        capture::ScreenPlacement { rect, framing, in_front: s.in_front, hidden: !s.enabled, crop }
+        capture::ScreenPlacement { rect, framing, in_front: s.in_front, hidden: !s.enabled, crop, ..capture::ScreenPlacement::whole(framing) }
     }
 
     pub fn blend_samples(&self) -> u32 {

@@ -70,13 +70,18 @@ pub(crate) struct ScreenRects {
     pub src: [f32; 4],
     pub dest: [f32; 4],
     pub copy: bool,
+    /// How it's turned and flipped from `src` to `dest` (see
+    /// `crate::ScreenPlacement::unturn`).
+    pub turns: u8,
+    pub flip_h: bool,
+    pub flip_v: bool,
 }
 
 impl ScreenRects {
     /// All of a `w`×`h` frame, as it is.
     pub(crate) fn copied(w: usize, h: usize) -> Self {
         let all = [0.0, 0.0, w as f32, h as f32];
-        Self { src: all, dest: all, copy: true }
+        Self { src: all, dest: all, copy: true, turns: 0, flip_h: false, flip_v: false }
     }
 }
 
@@ -90,7 +95,10 @@ struct Screen {
     copy: u32,
     /// In front of the webcam.
     front: u32,
-    _pad: u32,
+    turns: u32,
+    flip_h: u32,
+    flip_v: u32,
+    _pad: [u32; 2],
 }
 
 impl Gpu {
@@ -131,7 +139,17 @@ impl Gpu {
             };
             // In this plane's pixels: chroma is half size both ways.
             let o = overlay.map(|o| Overlay { dest: o.dest.map(|v| v * scale), src: o.src.map(|v| v * scale), cam: o.cam.map(|v| v * scale), ..o }).unwrap_or_default();
-            let sc = shown.map_or(Screen::default(), |r| Screen { dest: r.dest.map(|v| v * scale), src: r.src.map(|v| v * scale), shown: 1, copy: u32::from(r.copy), front: u32::from(in_front), _pad: 0 });
+            let sc = shown.map_or(Screen::default(), |r| Screen {
+                dest: r.dest.map(|v| v * scale),
+                src: r.src.map(|v| v * scale),
+                shown: 1,
+                copy: u32::from(r.copy),
+                front: u32::from(in_front),
+                turns: u32::from(r.turns % 4),
+                flip_h: u32::from(r.flip_h),
+                flip_v: u32::from(r.flip_v),
+                _pad: [0; 2],
+            });
             enc.setComputePipelineState(pipeline);
             unsafe {
                 enc.setTexture_atIndex(Some(&src), 0);
@@ -281,7 +299,10 @@ struct Screen {
     uint shown;
     uint copy;
     uint front;
-    uint pad;
+    uint turns;
+    uint flip_h;
+    uint flip_v;
+    uint2 pad;
 };
 
 bool inside(float2 p, float4 r) {
@@ -325,13 +346,29 @@ T resample(texture2d<float, access::read> cam, float2 p0, float2 p1, T zero) {
     return sum / float(n.x * n.y);
 }
 
+// A point of where the screen's drawn (0 to 1 across and down it) in its
+// picture: flipped back, then turned back (it's turned, then flipped), into
+// the part of the picture used (as `ScreenPlacement::unturn`).
+float2 screen_point(constant Screen& s, float2 q) {
+    if (s.flip_h != 0) q.x = 1.0 - q.x;
+    if (s.flip_v != 0) q.y = 1.0 - q.y;
+    switch (s.turns) {
+        case 1: q = float2(q.y, 1.0 - q.x); break;
+        case 2: q = 1.0 - q; break;
+        case 3: q = float2(1.0 - q.y, q.x); break;
+        default: break;
+    }
+    return s.src.xy + q * (s.src.zw - s.src.xy);
+}
+
 // The screen's sample at `p`: its own when it's copied, else resampled from
-// the part of its picture that goes in its box.
+// the part of its picture that goes in its box, as it's turned and flipped.
 float2 screen_at(texture2d<float, access::read> screen, constant Screen& s, float2 p, uint2 gid) {
     if (s.copy != 0) return screen.read(gid).xy;
-    float2 scale = (s.src.zw - s.src.xy) / (s.dest.zw - s.dest.xy);
-    float2 p0 = s.src.xy + (p - s.dest.xy) * scale;
-    return resample<float2>(screen, p0, p0 + scale, float2(0));
+    float2 size = s.dest.zw - s.dest.xy;
+    float2 q0 = (p - s.dest.xy) / size;
+    float2 q1 = (p + 1.0 - s.dest.xy) / size;
+    return resample<float2>(screen, screen_point(s, q0), screen_point(s, q1), float2(0));
 }
 
 // The camera's sample at `p` (inside its box).
@@ -437,6 +474,43 @@ mod tests {
         let (y, _) = planes(&out);
         assert_eq!(y[40 * 640 + 90], 20, "top half is the camera's left");
         assert_eq!(y[280 * 640 + 90], 200, "bottom half is the camera's right");
+    }
+
+    /// The screen turned and mirrored on the real GPU: turned clockwise
+    /// and fitted, its left half (dark) is the top of an upright band, black
+    /// beside it; mirrored, its left half is on the right.
+    #[test]
+    fn compose_turns_and_mirrors_the_screen() {
+        let gpu = Gpu::new().unwrap();
+        let screen = FramePool::new(640, 360).unwrap().take().unwrap();
+        plane_fill(&screen, 200, 128, 128);
+        unsafe {
+            use objc2_core_video::*;
+            CVPixelBufferLockBaseAddress(&screen, CVPixelBufferLockFlags(0));
+            let base = CVPixelBufferGetBaseAddressOfPlane(&screen, 0) as *mut u8;
+            let stride = CVPixelBufferGetBytesPerRowOfPlane(&screen, 0);
+            for y in 0..360 {
+                std::ptr::write_bytes(base.add(y * stride), 20, 320);
+            }
+            CVPixelBufferUnlockBaseAddress(&screen, CVPixelBufferLockFlags(0));
+        }
+        let out = FramePool::new(640, 360).unwrap().take().unwrap();
+        let rects = |p: crate::ScreenPlacement| {
+            let edges = |[x, y, w, h]: [u32; 4]| [x as f32, y as f32, (x + w) as f32, (y + h) as f32];
+            let (src, dest) = p.place_turned((640, 360), (640, 360));
+            ScreenRects { src: edges(src), dest: edges(dest), copy: false, turns: p.turns, flip_h: p.flip_h, flip_v: p.flip_v }
+        };
+        let turned = crate::ScreenPlacement { turns: 1, ..crate::ScreenPlacement::whole(crate::Framing::Fit) };
+        gpu.compose(&screen, Some(rects(turned)), false, None, Placement::hidden(), &out).unwrap();
+        let (y, _) = planes(&out);
+        assert_eq!(y[40 * 640 + 320], 20, "the band's top: the screen's left");
+        assert_eq!(y[320 * 640 + 320], 200, "its bottom: the screen's right");
+        assert_eq!(y[180 * 640 + 20], 16, "black beside it");
+        let mirrored = crate::ScreenPlacement { flip_h: true, ..crate::ScreenPlacement::whole(crate::Framing::Stretch) };
+        gpu.compose(&screen, Some(rects(mirrored)), false, None, Placement::hidden(), &out).unwrap();
+        let (y, _) = planes(&out);
+        assert_eq!(y[180 * 640 + 100], 200, "the left: the screen's right");
+        assert_eq!(y[180 * 640 + 540], 20, "the right: the screen's left");
     }
 
     #[test]

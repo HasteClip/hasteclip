@@ -246,6 +246,10 @@ pub(crate) fn plan(source: &VideoSource, size: crate::VideoSize) -> Result<(Reta
 /// over all of the frame (see [`showing`]); in any other box, all of it
 /// (it's cut to the box's shape by the compositor, see [`Frames`]).
 pub(crate) fn stream_view(placed: &crate::ScreenPlacement, display: Option<(u32, u32)>) -> (crate::Framing, Option<crate::Crop>) {
+    // Turned or flipped, all of it (the compositor turns it, and puts it in).
+    if placed.transformed() {
+        return (crate::Framing::Fit, placed.crop);
+    }
     if placed.is_whole() {
         return (placed.framing, placed.crop);
     }
@@ -278,7 +282,7 @@ fn showing(placed: &crate::ScreenPlacement, (dw, dh): (u32, u32)) -> Option<crat
 /// are (see [`stream_view`]): it fills the frame, or covers it, stretched
 /// over its box, from a display `display` pixels big.
 fn as_streamed(placed: &crate::ScreenPlacement, display: Option<(u32, u32)>) -> bool {
-    placed.is_whole() || display.is_some_and(|px| showing(placed, px).is_some())
+    !placed.transformed() && (placed.is_whole() || display.is_some_and(|px| showing(placed, px).is_some()))
 }
 
 /// One running capture: its stream, and for games and apps the thread that
@@ -956,7 +960,7 @@ impl Frames {
             let (framing, crop) = stream_view(&placed, display);
             ctl.set_view(framing, crop);
         }
-        let streamed = if self.ctl.is_some() { as_streamed(&placed, display) } else { placed.is_whole() };
+        let streamed = if self.ctl.is_some() { as_streamed(&placed, display) } else { placed.is_whole() && !placed.transformed() };
         let cam = self.camera.as_mut().and_then(|(layer, placement)| {
             let p = *placement.lock().unwrap();
             if p.is_hidden() { None } else { layer.latest().map(|c| (c, p)) }
@@ -1010,11 +1014,11 @@ pub(crate) fn screen_rects(placed: &crate::ScreenPlacement, streamed: bool, pict
     }
     let edges = |[x, y, w, h]: [u32; 4]| [x as f32, y as f32, (x + w) as f32, (y + h) as f32];
     if streamed {
-        return Some(super::gpu::ScreenRects { src: edges(picture), dest: edges(picture), copy: true });
+        return Some(super::gpu::ScreenRects { src: edges(picture), dest: edges(picture), copy: true, turns: 0, flip_h: false, flip_v: false });
     }
     let [px, py, pw, ph] = picture;
-    let ([sx, sy, sw, sh], dest) = placed.place_picture((pw, ph), frame);
-    Some(super::gpu::ScreenRects { src: edges([px + sx, py + sy, sw, sh]), dest: edges(dest), copy: false })
+    let ([sx, sy, sw, sh], dest) = placed.place_turned((pw, ph), frame);
+    Some(super::gpu::ScreenRects { src: edges([px + sx, py + sy, sw, sh]), dest: edges(dest), copy: false, turns: placed.turns, flip_h: placed.flip_h, flip_v: placed.flip_v })
 }
 
 /// A buffer's size.
