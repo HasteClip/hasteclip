@@ -902,6 +902,30 @@ impl Ready {
             }
             None => {}
         }
+
+        let below_ruler = |pos: Pos2| pos.y > ruler.bottom() - 6.0;
+        if resp.drag_started() && ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos()).is_some_and(below_ruler) {
+            self.dragging = Some(self.player.is_playing());
+            self.player.pause();
+        }
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let scrubbing = self.dragging.is_some() && (resp.dragged() || resp.drag_started());
+            if scrubbing || (resp.clicked() && below_ruler(pos)) {
+                let before = self.player.time();
+                self.seek(t_of(pos.x));
+                if self.player.time() != before {
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
+        if resp.drag_stopped() {
+            self.player.land();
+            if self.dragging.take() == Some(true) {
+                self.play();
+            }
+            ui.ctx().request_repaint();
+        }
+
         painter.rect_filled(video, 5, p.raise2);
         self.strip.paint(ui, video, 0.0, dur, dur);
         painter.rect_filled(audio, 5, p.raise);
@@ -914,7 +938,7 @@ impl Ready {
             self.wave.paint(&ui.painter_at(audio.shrink2(Vec2::new(0.0, 2.0))), audio.shrink2(Vec2::new(0.0, 2.0)), (0.0, dur), u64::from(p.dark), |_| 1.0, |_, _| wave_hi);
         }
         // What's left to play, dimmed: where you are reads at a glance.
-        let xp = x_of(self.info.snap(self.player.time()));
+        let xp = egui::emath::GuiRounding::round_to_pixels(x_of(self.info.snap(self.player.time())), ui.pixels_per_point());
         let dim = Color32::from_rgba_unmultiplied(10, 11, 14, if p.dark { 115 } else { 0 });
         let dim = if p.dark { dim } else { Color32::from_rgba_unmultiplied(248, 248, 249, 128) };
         let rest = Rect::from_min_max(Pos2::new(xp, video.top()), Pos2::new(outer.right(), audio.bottom()));
@@ -930,31 +954,7 @@ impl Ready {
             self.hover = None;
         }
 
-        // Playhead.
         crate::transport::playhead(&painter, xp, ruler.bottom() - 4.0, audio.bottom(), p.text);
-
-        // Click or drag to go there (below the ruler, whose pins are clicked).
-        // A drag follows the pointer wherever it goes until it's let go, over
-        // the picture or out of the window too. Playing pauses while you drag
-        // and carries on after.
-        let below_ruler = |pos: Pos2| pos.y > ruler.bottom() - 6.0;
-        if resp.drag_started() && ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos()).is_some_and(below_ruler) {
-            self.dragging = Some(self.player.is_playing());
-            self.player.pause();
-        }
-        if let Some(pos) = resp.interact_pointer_pos() {
-            let scrubbing = self.dragging.is_some() && (resp.dragged() || resp.drag_started());
-            if scrubbing || (resp.clicked() && below_ruler(pos)) {
-                self.seek(t_of(pos.x));
-            }
-        }
-        if resp.drag_stopped() {
-            // On the frame you see, not one decoded after.
-            self.player.land();
-            if self.dragging.take() == Some(true) {
-                self.play();
-            }
-        }
     }
 
     /// The picture at `t` in a small frame over the bottom of the preview, above

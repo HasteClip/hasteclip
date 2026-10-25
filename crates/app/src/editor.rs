@@ -2164,6 +2164,7 @@ impl Ready {
                     ui.ctx().request_repaint();
                 }
             }
+            let before = self.player.time();
             if resp.dragged() || resp.drag_started() {
                 // A volume drag goes a fifth as far with Shift held, for fine
                 // steps (the first frame takes in the movement before the drag
@@ -2278,6 +2279,10 @@ impl Ready {
                     }
                 }
             }
+            // The drag moved the playhead: drawn on the next frame, not on the next pointer event.
+            if self.player.time() != before {
+                ctx.request_repaint();
+            }
         }
         if resp.drag_stopped() {
             self.vol_guide = None;
@@ -2295,6 +2300,8 @@ impl Ready {
             if std::mem::take(&mut self.resume) && self.player.time() < self.edit.end - fd {
                 self.player.play(self.edit.end);
             }
+            // Letting go can move the playhead onto the frame shown: drawn now.
+            ctx.request_repaint();
         }
 
         if resp.double_clicked() {
