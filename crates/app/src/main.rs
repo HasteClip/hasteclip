@@ -1778,14 +1778,8 @@ impl App {
             return;
         }
         self.listen_as_set();
-        Self::warm_keys(&clip);
         self.editor = Some(editor::Editor::open(&self.ctx(), &clip, self.settings.editor_preview_share, self.settings.editor_snap, from, handoff));
         self.page = Page::Edit;
-    }
-
-    fn warm_keys(clip: &std::path::Path) {
-        let clip = clip.to_path_buf();
-        std::thread::spawn(move || media::warm_keyframes(&store::EditTarget::of(&clip).source));
     }
 
     /// The volume and mute you listen at, as last set (the player and the

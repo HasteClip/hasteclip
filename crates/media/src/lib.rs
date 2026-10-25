@@ -157,14 +157,6 @@ impl AudioStream {
     }
 }
 
-/// A file's size and when it was last written: how a clip is told from the
-pub type Stamp = (u64, Option<std::time::SystemTime>);
-
-pub fn stamp(source: &Path) -> Option<Stamp> {
-    let meta = std::fs::metadata(source).ok()?;
-    Some((meta.len(), meta.modified().ok()))
-}
-
 pub fn probe(source: &Path) -> Result<ClipInfo> {
     let out = ffprobe()
         .args(["-v", "error", "-show_entries"])
@@ -1060,8 +1052,19 @@ fn spread(keys: &[f64], max: usize) -> Vec<f64> {
 
 /// Presentation times of every keyframe, read from the container index.
 pub fn keyframe_times(source: &Path) -> Result<Vec<f64>> {
-    let out = ffprobe()
-        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0"])
+    keyframe_flags(source, None)
+}
+
+/// [`keyframe_times`], of the whole file or of `read` (ffprobe's
+/// `-read_intervals`).
+fn keyframe_flags(source: &Path, read: Option<&str>) -> Result<Vec<f64>> {
+    let mut cmd = ffprobe();
+    cmd.args(["-v", "error", "-select_streams", "v:0"]);
+    if let Some(read) = read {
+        cmd.args(["-read_intervals", read]);
+    }
+    let out = cmd
+        .args(["-show_entries", "packet=pts_time,flags", "-of", "csv=p=0"])
         .arg(source)
         .stdin(Stdio::null())
         .output()
@@ -1172,7 +1175,7 @@ fn plan(source: &Path, info: &ClipInfo, edit: &Edit) -> Vec<Piece> {
         return kept.into_iter().map(|(a, b)| Piece::Encode(a, b)).collect();
     }
     let fd = info.frame_duration();
-    let keys = known_keyframes(source).map(|all| all.to_vec()).unwrap_or_else(|| keyframes(source, Some(&kept)).unwrap_or_default());
+    let keys = keyframes(source, &kept).unwrap_or_default();
     let h264 = std::sync::OnceLock::new();
     let mut pieces = Vec::new();
     for (a, b) in kept {
@@ -1556,56 +1559,17 @@ fn run_progress(cmd: &mut Command, duration: f64, progress: &dyn Fn(f32)) -> Res
     Ok(())
 }
 
-static KEYFRAMES: std::sync::Mutex<Vec<(PathBuf, Stamp, Option<std::sync::Arc<Vec<f64>>>)>> = std::sync::Mutex::new(Vec::new());
-
-const KEYFRAMES_KEEP: usize = 8;
-
-pub fn warm_keyframes(source: &Path) {
-    let Some(stamp) = stamp(source) else { return };
-    {
-        let Ok(mut known) = KEYFRAMES.lock() else { return };
-        if known.iter().any(|(path, at, _)| path == source && *at == stamp) {
-            return;
-        }
-        known.retain(|(path, _, _)| path != source);
-        known.push((source.to_path_buf(), stamp, None));
-        if known.len() > KEYFRAMES_KEEP {
-            known.remove(0);
-        }
+/// The keyframes in `spans` (and up to a second before each), as
+/// [`keyframe_times`] reads them: from the packets' flags, nothing decoded,
+/// and only what's kept read (the render reads it next anyway). Decoding
+/// every keyframe of the file took 1.1 s for a 2-minute 1080p60 clip (and
+/// read all 411 MB of it); this, for 20 s of it, 0.07 s (72 MB).
+fn keyframes(source: &Path, spans: &[(f64, f64)]) -> Result<Vec<f64>> {
+    if spans.is_empty() {
+        return Ok(Vec::new());
     }
-    let source = source.to_path_buf();
-    std::thread::spawn(move || {
-        let Ok(keys) = keyframes(&source, None) else { return };
-        let Ok(mut known) = KEYFRAMES.lock() else { return };
-        if let Some(entry) = known.iter_mut().find(|(path, at, _)| *path == source && *at == stamp) {
-            entry.2 = Some(std::sync::Arc::new(keys));
-        }
-    });
-}
-
-fn known_keyframes(source: &Path) -> Option<std::sync::Arc<Vec<f64>>> {
-    let stamp = stamp(source)?;
-    let known = KEYFRAMES.lock().ok()?;
-    let entry = known.iter().find(|(path, at, _)| path == source && *at == stamp)?;
-    entry.2.clone()
-}
-
-/// Keyframe timestamps of the video stream.
-fn keyframes(source: &Path, spans: Option<&[(f64, f64)]>) -> Result<Vec<f64>> {
-    let mut cmd = ffprobe();
-    cmd.args(["-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey"]);
-    if let Some(spans) = spans {
-        if spans.is_empty() {
-            return Ok(Vec::new());
-        }
-        let read: Vec<String> = spans.iter().map(|(a, b)| format!("{:.6}%{:.6}", (a - 1.0).max(0.0), b)).collect();
-        cmd.args(["-read_intervals", &read.join(",")]);
-    }
-    let out = cmd.args(["-show_entries", "frame=pts_time", "-of", "csv=p=0"]).arg(source).output()?;
-    let mut keys: Vec<f64> = String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.trim().trim_end_matches(',').parse().ok()).collect();
-    keys.sort_by(f64::total_cmp);
-    keys.dedup();
-    Ok(keys)
+    let read: Vec<String> = spans.iter().map(|(a, b)| format!("{:.6}%{:.6}", (a - 1.0).max(0.0), b)).collect();
+    keyframe_flags(source, Some(&read.join(",")))
 }
 
 fn is_h264(source: &Path) -> bool {
@@ -2009,25 +1973,27 @@ mod cut_render_tests {
         a.rgba.iter().zip(&b.rgba).map(|(x, y)| x.abs_diff(*y) as f64).sum::<f64>() / a.rgba.len() as f64
     }
 
+    /// The keyframes a save cuts on, read from the packets' flags over only
+    /// the parts kept, are the ones decoding the whole file finds in them.
     #[test]
-    fn warmed_keyframes_match_the_ranged_scan() {
+    fn keyframes_of_the_parts_kept_are_the_decoded_ones() {
         let dir = std::env::temp_dir().join(format!("hc-media-keys-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("src.mp4");
         clip(&src);
-        let spans = [(1.2, 4.7)];
-        let ranged: Vec<f64> = keyframes(&src, Some(&spans[..])).unwrap().into_iter().filter(|k| (1.2..=4.7).contains(k)).collect();
-        assert!(!ranged.is_empty());
-        warm_keyframes(&src);
-        let whole = loop {
-            if let Some(keys) = known_keyframes(&src) {
-                break keys;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        };
-        let warmed: Vec<f64> = whole.iter().copied().filter(|k| (1.2..=4.7).contains(k)).collect();
-        assert_eq!(ranged, warmed);
+        let spans = [(1.2, 2.6), (3.4, 4.7)];
+        let kept = |keys: Vec<f64>| -> Vec<f64> { keys.into_iter().filter(|k| spans.iter().any(|&(a, b)| (a..=b).contains(k))).collect() };
+        let read = kept(keyframes(&src, &spans).unwrap());
+        // How a save found them before: every keyframe of the file, decoded.
+        let out = ffprobe()
+            .args(["-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey", "-show_entries", "frame=pts_time", "-of", "csv=p=0"])
+            .arg(&src)
+            .output()
+            .unwrap();
+        let decoded = kept(String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.trim().trim_end_matches(',').parse().ok()).collect());
+        assert_eq!(read, [2.0, 4.0]);
+        assert_eq!(read, decoded);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
