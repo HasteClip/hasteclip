@@ -160,6 +160,8 @@ pub struct Resume {
 struct Ready {
     info: ClipInfo,
     player: Player,
+    /// The last screen's player, hushed: its picture shows until this one
+    /// has one (see `handoff.rs`).
     curtain: Option<Player>,
     strip: Filmstrip,
     /// The mix's waveform, growing as the sound is decoded.
@@ -247,6 +249,8 @@ impl Viewer {
         &self.clip
     }
 
+    /// Where it is (in the recording) and whether it's playing: for the
+    /// editor opened from here to carry on there.
     pub fn at(&self) -> Option<Resume> {
         match &self.state {
             State::Ready(r) => Some(Resume { at: media::source_time(&r.span.parts, r.player.time()), playing: r.player.is_playing() }),
@@ -254,6 +258,8 @@ impl Viewer {
         }
     }
 
+    /// Where it was opened to carry on: kept while its edit saves, to open
+    /// there once it's done.
     pub fn resume(&self) -> Option<Resume> {
         self.resume
     }
@@ -549,10 +555,11 @@ impl Ready {
                 player.seek(at.min(l.info.duration));
             }
             if r.playing {
-                player.play_taken(l.info.duration, taken);
+                player.play_on(l.info.duration);
             }
         } else {
-            player.play_taken(l.info.duration, taken);
+            // Opened to watch: start right away.
+            player.play_on(l.info.duration);
         }
         let r = Self {
             strip: handoff.strip(clip).unwrap_or_else(|| Filmstrip::build(ctx, clip, &l.info)),

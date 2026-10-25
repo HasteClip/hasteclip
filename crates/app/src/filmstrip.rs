@@ -56,6 +56,7 @@ impl Filmstrip {
         Kind::Keys(Keys::build(ctx, source))
     }
 
+    /// The file it shows.
     pub fn source(&self) -> &Path {
         &self.source
     }

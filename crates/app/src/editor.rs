@@ -97,6 +97,8 @@ enum State {
 struct Ready {
     info: ClipInfo,
     player: Player,
+    /// The last screen's player, hushed: its picture shows until this one
+    /// has one (see `handoff.rs`).
     curtain: Option<Player>,
     edit: Edit,
     /// What was last saved, to know whether there are unsaved changes.
@@ -338,6 +340,8 @@ impl Editor {
         }
     }
 
+    /// Where the playhead is, in what's kept, and whether it's playing: for
+    /// the player to carry on there, back from the editor.
     pub fn resume(&self) -> Option<Resume> {
         let State::Ready(r) = &self.state else { return None };
         Some(Resume {
@@ -412,7 +416,7 @@ impl Ready {
         if from.is_some_and(|r| r.playing) {
             player.set_cuts(&edit.kept());
             player.set_listening(crate::transport::listening_gain(ctx));
-            player.play_taken(edit.end, taken);
+            player.play_on(edit.end);
         }
 
         let full = l.info.duration.max(1e-6);
@@ -2560,7 +2564,10 @@ fn trim_to_length(info: &media::ClipInfo, start: f64, end: f64, secs: f64) -> (f
     let a = info.snap(a.max(0.0));
     (a, (info.snap(a + secs)).min(info.duration).max(a + fd))
 }
-/// Returns the nearest time on a playhead
+
+/// The playhead at `t` (in the recording), moved into what's kept: where it
+/// is inside a part, else the next part's start (or the last part's last
+/// frame, past them all).
 fn settle(parts: &[(f64, f64)], t: f64, fd: f64) -> f64 {
     for &(a, b) in parts {
         if t < b - fd * 0.5 {

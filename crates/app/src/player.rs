@@ -600,12 +600,19 @@ impl Player {
         true
     }
 
+    /// Pause and let go of the sound output: a curtain only shows its
+    /// picture, while the player taking its place starts.
     pub fn hush(&mut self) {
         self.pause();
         self._stream = None;
         self.stepping = false;
     }
 
+    /// The player for `source`: `handoff` (the other screen's) taken over
+    /// if it can be (see [`Player::adopt`]), else a new one, with the
+    /// handoff hushed into its curtain if it has a picture to show. Says
+    /// whether it was taken over: then it's still where it was, and playing
+    /// if it was.
     pub fn handed_over(
         ctx: &egui::Context,
         source: &Path,
@@ -626,6 +633,7 @@ impl Player {
         (Self::new(ctx, source, info.clone(), pcm, gains), curtain, false)
     }
 
+    /// The picture's size, once there's one on screen.
     pub fn size(&self) -> Option<egui::Vec2> {
         self.display.as_ref().map(Display::size)
     }
@@ -701,8 +709,10 @@ impl Player {
         self.shared.playing.store(true, Ordering::Relaxed);
     }
 
-    pub fn play_taken(&mut self, until: f64, taken: bool) {
-        if taken && self.is_playing() {
+    /// Play until `until` seconds: playing already (taken over from the
+    /// other screen), it carries on, only stopping there instead.
+    pub fn play_on(&mut self, until: f64) {
+        if self.is_playing() {
             self.shared.end.store((until * PREVIEW_RATE as f64) as u64, Ordering::Relaxed);
         } else {
             self.play(until);
@@ -1784,6 +1794,8 @@ impl Scrub {
     }
 }
 
+/// What the audio callback and the player share, for `pcm`'s tracks mixed
+/// by `gains`, and the sound output playing it (or why there's none).
 fn sound(pcm: Arc<Pcm>, gains: Vec<TrackEdit>) -> (Arc<Shared>, Option<cpal::Stream>, Option<String>) {
     let n = pcm.len();
     let shared = Arc::new(Shared::new(Mix { tracks: gains, track_levels: vec![(0.0, 0.0); n], master_level: (0.0, 0.0), master_stereo: Default::default() }, pcm));
