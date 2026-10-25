@@ -8,6 +8,12 @@
 //!   the why behind a setting.
 //! - **Buttons**: main (one per screen, the brightest), normal, quiet
 //!   (ghost), destructive. 30 px tall, corners of 6.
+//! - **Can't be used now**: a control with nothing to do (an empty undo, a
+//!   reset with nothing to reset) is dimmed, keeping its shape
+//!   ([`Btn::enabled`]). One held back by what the app's doing (clipping,
+//!   recording) is locked: dimmed, with a lock, saying why on hover and in a
+//!   toast when clicked ([`Btn::locked`], [`Row::locked`]). Anything that
+//!   works now is left usable, even when it changes something not running.
 //! - **Space** in steps of 4; corners 4 for small marks, 6 for controls, 8
 //!   for groups and menus. Only switches, the play button and dots are round.
 //! - **Motion**: hover fades in, a chosen option slides to its place, a
@@ -25,6 +31,18 @@ pub const SMALL_H: f32 = 26.0;
 pub const RADIUS: u8 = 6;
 /// Groups, menus, popovers.
 pub const CARD_RADIUS: u8 = 8;
+/// A setting row: its padding at each end, and its least height.
+pub const ROW_PAD: f32 = 16.0;
+pub const ROW_H: f32 = 52.0;
+/// A row in a well ([`well`]): a little smaller.
+pub const WELL_ROW_PAD: f32 = 12.0;
+pub const WELL_ROW_H: f32 = 44.0;
+/// A well's gap from its group's sides and bottom, and above and below
+/// its rows.
+pub const WELL_GAP: f32 = 8.0;
+pub const WELL_INSET: f32 = 2.0;
+/// The hairline between rows, in from each side of what they're in.
+pub const ROW_LINE_INSET: f32 = 16.0;
 /// Space between a page's edge and its content.
 pub const PAGE_MARGIN: i8 = 24;
 /// The search field's width, the same on every page that has one.
@@ -458,6 +476,8 @@ pub struct Btn<'a> {
     min_w: f32,
     tip: Option<String>,
     enabled: bool,
+    /// Held back by what the app's doing, and why.
+    locked: Option<String>,
     corners: CornerRadius,
     id: Option<egui::Id>,
     progress: Option<f32>,
@@ -476,6 +496,7 @@ impl<'a> Btn<'a> {
             min_w: 0.0,
             tip: None,
             enabled: true,
+            locked: None,
             corners: CornerRadius::same(RADIUS),
             id: None,
             progress: None,
@@ -522,8 +543,19 @@ impl<'a> Btn<'a> {
         self.tip = Some(tip.into());
         self
     }
+    /// Off while there's nothing for it to do (an empty undo): dimmed,
+    /// keeping its shape. For one held back by what the app's doing, see
+    /// [`Btn::locked`].
     pub fn enabled(mut self, on: bool) -> Self {
         self.enabled = on;
+        self
+    }
+    /// Held back by what the app's doing (`Some(why)`: "Stop clipping
+    /// first"), as a setting row's [`Row::locked`]: dimmed, a lock in place
+    /// of its icon, why on hover, and in a toast when it's clicked (the app
+    /// shows it: [`take_locked_click`]). It never reports a click.
+    pub fn locked(mut self, why: Option<String>) -> Self {
+        self.locked = why;
         self
     }
     pub fn corners(mut self, c: CornerRadius) -> Self {
@@ -538,7 +570,12 @@ impl<'a> Btn<'a> {
     }
 
     fn icon_font(&self, size: f32) -> FontId {
-        if self.filled { FontId::new(size, theme::fill_family()) } else { FontId::proportional(size) }
+        if self.filled && self.locked.is_none() { FontId::new(size, theme::fill_family()) } else { FontId::proportional(size) }
+    }
+
+    /// Its icon as drawn: a lock while it's locked.
+    fn shown_icon(&self) -> Option<&'a str> {
+        if self.locked.is_some() { Some(icon::LOCK_SIMPLE) } else { self.icon }
     }
 
     /// How wide it's drawn this frame (its width eases to fit its words).
@@ -557,14 +594,14 @@ impl<'a> Btn<'a> {
         let icon_size = if self.small { 14.0 } else { 15.5 };
         let text_w = |t: &str, f: FontId| ui.painter().layout_no_wrap(t.to_owned(), f, Color32::PLACEHOLDER).size().x;
         let label_w = (!self.label.is_empty()).then(|| text_w(&self.label, theme::font(size, W::Medium)));
-        let icon_w = self.icon.map(|i| text_w(i, self.icon_font(icon_size)));
+        let icon_w = self.shown_icon().map(|i| text_w(i, self.icon_font(icon_size)));
         let trail_w = self.trail.map(|i| text_w(i, FontId::proportional(icon_size - 1.5)));
         let keys_w = self.keys.as_ref().map(|k| key_hint_width(ui, k, 11.0));
         let only_icon = label_w.is_none() && trail_w.is_none() && keys_w.is_none();
         if only_icon {
             return h;
         }
-        let pad_l = if self.icon.is_some() { 10.0 } else if self.small { 9.0 } else { 12.0 };
+        let pad_l = if self.shown_icon().is_some() { 10.0 } else if self.small { 9.0 } else { 12.0 };
         let pad_r = if self.keys.is_some() || self.trail.is_some() { 8.0 } else if self.small { 9.0 } else { 12.0 };
         let parts: Vec<f32> = [icon_w, label_w, trail_w, keys_w].into_iter().flatten().collect();
         let content = parts.iter().sum::<f32>() + 7.0 * (parts.len().max(1) - 1) as f32;
@@ -578,12 +615,12 @@ impl<'a> Btn<'a> {
         let font = theme::font(size, W::Medium);
         let icon_size = if self.small { 14.0 } else { 15.5 };
         let galley = (!self.label.is_empty()).then(|| ui.painter().layout_no_wrap(self.label.clone(), font.clone(), Color32::PLACEHOLDER));
-        let icon_g = self.icon.map(|i| ui.painter().layout_no_wrap(i.to_owned(), self.icon_font(icon_size), Color32::PLACEHOLDER));
+        let icon_g = self.shown_icon().map(|i| ui.painter().layout_no_wrap(i.to_owned(), self.icon_font(icon_size), Color32::PLACEHOLDER));
         let trail_g = self.trail.map(|i| ui.painter().layout_no_wrap(i.to_owned(), FontId::proportional(icon_size - 1.5), Color32::PLACEHOLDER));
         let keys_w = self.keys.as_ref().map_or(0.0, |k| key_hint_width(ui, k, 11.0));
         let gap = 7.0;
         let only_icon = galley.is_none() && trail_g.is_none() && self.keys.is_none();
-        let pad_l = if only_icon { 0.0 } else if self.icon.is_some() { 10.0 } else if self.small { 9.0 } else { 12.0 };
+        let pad_l = if only_icon { 0.0 } else if self.shown_icon().is_some() { 10.0 } else if self.small { 9.0 } else { 12.0 };
         let pad_r = if only_icon { 0.0 } else if self.keys.is_some() || self.trail.is_some() { 8.0 } else if self.small { 9.0 } else { 12.0 };
         let mut content = 0.0;
         let mut parts = 0;
@@ -595,11 +632,12 @@ impl<'a> Btn<'a> {
         let target_w = if only_icon { h } else { (pad_l + content + pad_r).max(self.min_w) };
         let id = self.id.unwrap_or_else(|| ui.next_auto_id());
         let w = theme::value(ui.ctx(), id.with("w"), target_w, theme::NORMAL);
-        let sense = if self.enabled { Sense::click() } else { Sense::hover() };
+        let usable = self.enabled && self.locked.is_none();
+        let sense = if usable { Sense::click() } else { Sense::hover() };
         let (rect, mut resp) = ui.allocate_exact_size(vec2(w, h), sense);
         if ui.is_rect_visible(rect) {
-            let hovered = self.enabled && resp.hovered();
-            let pressed = self.enabled && resp.is_pointer_button_down_on();
+            let hovered = usable && resp.hovered();
+            let pressed = usable && resp.is_pointer_button_down_on();
             let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), hovered, theme::FAST);
             let (fill, fg) = match self.kind {
                 Kind::Primary => (theme::mix(p.primary, if p.dark { Color32::from_gray(255) } else { Color32::from_gray(60) }, hv * 0.25), p.primary_fg),
@@ -609,10 +647,12 @@ impl<'a> Btn<'a> {
                 Kind::DangerText => (theme::fade(p.sel, hv).blend(theme::fade(p.control, if p.dark { 0.0 } else { hv })), p.danger),
                 Kind::On => (p.seg_on, p.text),
             };
-            let fg = if self.enabled { fg } else { theme::fade(fg, 0.38) };
-            let fill = if self.enabled || self.kind == Kind::Primary || self.kind == Kind::Stop { fill } else { Color32::TRANSPARENT };
+            // Not usable now, it keeps its shape, dimmed: still a button, not
+            // text (a quiet one has no fill to keep).
+            let fg = if usable { fg } else { theme::fade(fg, 0.38) };
+            let fill = if usable { fill } else { theme::fade(fill, 0.6) };
             let rect_d = if pressed { rect.shrink(0.5) } else { rect };
-            ui.painter().rect_filled(rect_d, self.corners, if self.enabled { fill } else { theme::fade(fill, 0.4) });
+            ui.painter().rect_filled(rect_d, self.corners, fill);
             // Content: centred when it fits, clipped when the width is still
             // catching up.
             let painter = ui.painter_at(rect);
@@ -641,6 +681,16 @@ impl<'a> Btn<'a> {
             }
         }
         crate::demo::mark(ui.ctx(), || format!("button:{}", if self.label.is_empty() { self.tip.as_deref().unwrap_or("") } else { &self.label }), resp.rect);
+        if let Some(why) = &self.locked {
+            // Its own click, apart from the button's: it says why, and the
+            // button reports none.
+            let lock = ui.interact(rect, resp.id.with("locked"), Sense::click()).on_hover_cursor(egui::CursorIcon::NotAllowed).on_hover_text(why);
+            if lock.clicked() {
+                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(LOCKED_CLICK), why.clone()));
+                ui.ctx().request_repaint();
+            }
+            return resp;
+        }
         if let Some(tip) = &self.tip {
             resp = if self.enabled { resp.on_hover_text(tip) } else { resp.on_disabled_hover_text(tip) };
         }
@@ -649,6 +699,25 @@ impl<'a> Btn<'a> {
         }
         resp
     }
+}
+
+/// Where a locked button's reason waits for the app, once it's clicked.
+const LOCKED_CLICK: &str = "locked_click";
+
+/// Whether the [`Row::go`] button of the row named `label` was clicked,
+/// once.
+pub fn take_row_go(ctx: &egui::Context, label: &str) -> bool {
+    ctx.data_mut(|d| d.remove_temp::<bool>(egui::Id::new(("row_go", label)))).is_some()
+}
+
+/// Why a locked button that was clicked is locked, once: the app shows it
+/// in a toast, wherever the button is ([`Btn::locked`]).
+pub fn take_locked_click(ctx: &egui::Context) -> Option<String> {
+    ctx.data_mut(|d| {
+        let why = d.get_temp::<String>(egui::Id::new(LOCKED_CLICK));
+        d.remove::<String>(egui::Id::new(LOCKED_CLICK));
+        why
+    })
 }
 
 /// A button at the standard height; `primary` is the screen's main action.
@@ -857,6 +926,7 @@ pub fn segmented_opts(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::De
     for (i, o) in opts.iter().enumerate() {
         let r = Rect::from_min_size(Pos2::new(xs[i], inner.top()), vec2(ws[i], inner.height()));
         let resp = ui.interact(r, base_id.with(i), if enabled { Sense::click() } else { Sense::hover() });
+        crate::demo::mark(ui.ctx(), || format!("button:{}", if o.label.is_empty() { o.tip.unwrap_or("") } else { o.label }), r);
         let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered() && enabled, theme::FAST);
         let on = i == chosen;
         let color = if on { p.text } else { theme::mix(p.text2, p.text, hv) };
@@ -1271,11 +1341,14 @@ pub struct Row<'a> {
     pub locked: Option<String>,
     /// A row inside a well ([`well`]): a little smaller.
     pub kid: bool,
+    /// Where what it says is changed, when that's elsewhere: a quiet button
+    /// under its note going there ([`Row::go`]).
+    pub go: Option<&'a str>,
 }
 
 impl<'a> Row<'a> {
     pub fn new(label: &'a str) -> Self {
-        Self { label, note: None, warn: false, tip: None, locked: None, kid: false }
+        Self { label, note: None, warn: false, tip: None, locked: None, kid: false, go: None }
     }
     pub fn note(mut self, n: impl Into<String>) -> Self {
         let n = n.into();
@@ -1298,13 +1371,19 @@ impl<'a> Row<'a> {
         self.kid = true;
         self
     }
+    /// A quiet button under its note, named `text`, to where what it says
+    /// is changed (another page): [`take_row_go`] says it was clicked.
+    pub fn go(mut self, text: Option<&'a str>) -> Self {
+        self.go = text;
+        self
+    }
 
     /// Draw it; the control is laid out right to left from the row's right
     /// edge. Returns what the control returns, and whether the locked control
     /// was clicked (to say why it's locked).
     pub fn show<R>(self, ui: &mut egui::Ui, control: impl FnOnce(&mut egui::Ui) -> R) -> (R, bool) {
         let p = theme::pal(ui);
-        let (pad_x, min_h) = if self.kid { (12.0, 44.0) } else { (16.0, 52.0) };
+        let (pad_x, min_h) = if self.kid { (WELL_ROW_PAD, WELL_ROW_H) } else { (ROW_PAD, ROW_H) };
         let locked = self.locked.is_some();
         let width = ui.available_width();
         // How wide the control was last frame: beside the label when both
@@ -1336,6 +1415,17 @@ impl<'a> Row<'a> {
             });
             if let Some(n) = &self.note {
                 ui.add(egui::Label::new(theme::text(n, 12.5, W::Regular).color(if self.warn { p.warn } else { p.text3 })).wrap());
+            }
+            // Its words in line with the note's (the button's padding
+            // to their left).
+            if let Some(go) = self.go {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(-9.0);
+                    if Btn::ghost(go).trail(icon::CARET_RIGHT).small().show(ui).clicked() {
+                        ui.data_mut(|d| d.insert_temp(egui::Id::new(("row_go", self.label)), true));
+                    }
+                });
             }
         };
         let mut clicked_locked = false;
@@ -1383,13 +1473,13 @@ impl<'a> Row<'a> {
                 ui.set_min_height(min_h);
                 ui.add_space(pad_x);
                 ui.allocate_ui_with_layout(vec2(label_w, min_h), egui::Layout::top_down(egui::Align::Min), |ui| {
-                    if self.note.is_some() {
+                    if self.note.is_some() || self.go.is_some() {
                         ui.add_space(9.0);
                     } else {
                         ui.add_space(((min_h - label_h) / 2.0).max(0.0));
                     }
                     drawn_label_h = ui.scope(label).response.rect.height();
-                    if self.note.is_some() {
+                    if self.note.is_some() || self.go.is_some() {
                         ui.add_space(8.0);
                     }
                 });
@@ -1473,7 +1563,7 @@ pub struct List<'u> {
 impl List<'_> {
     pub fn row<R>(&mut self, row: Row, control: impl FnOnce(&mut egui::Ui) -> R) -> (R, bool) {
         if self.rows > 0 {
-            divider(self.ui, 16.0);
+            divider(self.ui, ROW_LINE_INSET);
         }
         self.rows += 1;
         row.show(self.ui, control)
@@ -1515,13 +1605,14 @@ pub fn well(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, open:
         None => ui.clip_rect(),
     });
     child.multiply_opacity(t);
-    let inner = egui::Frame::new().outer_margin(Margin { left: 8, right: 8, top: 0, bottom: 8 }).fill(p.well).corner_radius(RADIUS).inner_margin(Margin::symmetric(0, 2)).show(&mut child, |ui| {
+    let gap = WELL_GAP as i8;
+    let inner = egui::Frame::new().outer_margin(Margin { left: gap, right: gap, top: 0, bottom: gap }).fill(p.well).corner_radius(RADIUS).inner_margin(Margin::symmetric(0, WELL_INSET as i8)).show(&mut child, |ui| {
         ui.set_width(ui.available_width());
         ui.spacing_mut().item_spacing.y = 0.0;
         let mut l = List { ui, rows: 0 };
         add(&mut l);
     });
-    let real_h = inner.response.rect.height() + 8.0;
+    let real_h = inner.response.rect.height() + WELL_GAP;
     ui.data_mut(|d| d.insert_temp(id.with("h"), real_h));
     ui.allocate_space(vec2(avail, h.unwrap_or(real_h)));
 }
@@ -1949,12 +2040,236 @@ impl ValueField<'_> {
     }
 }
 
+/// A size's width and height, each in its own box (Tab goes from one to the
+/// other), with a link between them that keeps its shape: changing one
+/// changes the other. Sides are even (video needs them so) and kept within
+/// their ranges; one typed between two goes the way it was changed. The new
+/// size, when it changes. The link is kept under `id`, for as long as the
+/// app runs ([`size_field_keeps`]); [`type_in_size`] puts the typing in its
+/// width.
+pub fn size_field(ui: &mut egui::Ui, id: &str, (w, h): (u32, u32), ws: std::ops::RangeInclusive<u32>, hs: std::ops::RangeInclusive<u32>) -> Option<(u32, u32)> {
+    const BOX: f32 = 58.0;
+    let p = theme::pal(ui);
+    let type_in = egui::Id::new((id, "type_in"));
+    if ui.data(|d| d.get_temp::<bool>(type_in)).is_some() && !ui.input(|i| i.pointer.any_click()) {
+        ui.data_mut(|d| d.remove::<bool>(type_in));
+        ui.memory_mut(|m| m.request_focus(egui::Id::new((id, "w"))));
+    }
+    let keep_id = egui::Id::new((id, "keep"));
+    let mut keep: Option<f64> = ui.data(|d| d.get_temp(keep_id));
+    let mut out = None;
+    ui.allocate_ui_with_layout(vec2(BOX * 2.0 + 28.0 + 16.0 + 6.0 * 3.0, CONTROL_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        if let Some(v) = number_box(ui, egui::Id::new((id, "w")), w, ws.clone(), BOX) {
+            let nw = typed_side(v, w, &ws);
+            out = Some((nw, keep.map_or(h, |shape| following_side(nw as f64 / shape, &hs))));
+        }
+        // The link goes between them, but is made after the height: Tab
+        // goes from the width to the height.
+        let (slot, _) = ui.allocate_exact_size(vec2(28.0, CONTROL_H), Sense::hover());
+        if let Some(v) = number_box(ui, egui::Id::new((id, "h")), h, hs.clone(), BOX) {
+            let nh = typed_side(v, h, &hs);
+            out = Some((keep.map_or(w, |shape| following_side(nh as f64 * shape, &ws)), nh));
+        }
+        ui.label(theme::text("px", 12.5, W::Regular).color(p.text3));
+        let (glyph, tip) = if keep.is_some() {
+            (icon::LINK_SIMPLE_HORIZONTAL, "The shape's kept: changing one changes the other. Click to set them on their own.")
+        } else {
+            (icon::LINK_SIMPLE_HORIZONTAL_BREAK, "Keep the shape: changing one changes the other")
+        };
+        let kind = if keep.is_some() { Kind::Normal } else { Kind::Ghost };
+        let link = ui.scope_builder(egui::UiBuilder::new().max_rect(slot).layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)), |ui| Btn::icon(kind, glyph).small().tip(tip).show(ui));
+        if link.inner.clicked() {
+            keep = if keep.is_some() { None } else { Some(w as f64 / h.max(1) as f64) };
+        }
+    });
+    ui.data_mut(|d| {
+        match keep {
+            Some(k) => {
+                d.insert_temp(keep_id, k);
+            }
+            None => {
+                d.remove::<f64>(keep_id);
+            }
+        };
+    });
+    out.filter(|s| *s != (w, h))
+}
+
+/// A side typed or stepped (from `was`), made even: up when it went up, so
+/// ↑ from 1080 reaches 1082 rather than staying. Within `r`.
+fn typed_side(v: u32, was: u32, r: &std::ops::RangeInclusive<u32>) -> u32 {
+    (if v > was { (v + 1) & !1 } else { v & !1 }).clamp(*r.start(), *r.end() & !1)
+}
+
+/// A side following the other, its shape kept: the nearest even, within `r`.
+fn following_side(v: f64, r: &std::ops::RangeInclusive<u32>) -> u32 {
+    (((v / 2.0).round() as u32) * 2).clamp(*r.start(), *r.end() & !1)
+}
+
+/// The shape a [`size_field`] keeps (width over height), if its link is on.
+pub fn size_field_keeps(ctx: &egui::Context, id: &str) -> Option<f64> {
+    ctx.data(|d| d.get_temp(egui::Id::new((id, "keep"))))
+}
+
+/// Have a [`size_field`] keep this shape (width over height), its link on,
+/// or none: an aspect ratio picked beside it.
+pub fn set_size_field_keeps(ctx: &egui::Context, id: &str, keep: Option<f64>) {
+    let key = egui::Id::new((id, "keep"));
+    ctx.data_mut(|d| match keep {
+        Some(k) => {
+            d.insert_temp(key, k);
+        }
+        None => d.remove::<f64>(key),
+    });
+}
+
+/// The next frame, typing goes into the [`size_field`] `id`'s width (it's
+/// just been shown, from a menu).
+pub fn type_in_size(ctx: &egui::Context, id: &str) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new((id, "type_in")), true));
+}
+
+/// The common aspect ratios, width and height, and what each is for: every
+/// aspect ratio chosen in the app is one of these or typed ([`ratio_field`]).
+pub const RATIOS: [(u32, u32, &str); 7] = [
+    (16, 9, "widescreen"),
+    (21, 9, "ultrawide"),
+    (32, 9, "super ultrawide"),
+    (16, 10, ""),
+    (4, 3, "older games"),
+    (1, 1, "square"),
+    (9, 16, "upright, for phones"),
+];
+
+/// Which of [`RATIOS`] `w`:`h` is (to half a percent), if one.
+pub fn common_ratio(w: u32, h: u32) -> Option<usize> {
+    let r = w as f64 / h.max(1) as f64;
+    RATIOS.iter().position(|&(rw, rh, _)| (r / (rw as f64 / rh as f64) - 1.0).abs() < 0.005)
+}
+
+/// A shape (width over height) as a ratio in small numbers, each up to 99:
+/// the nearest, in the smallest numbers that are (1.7778 is 16:9).
+pub fn ratio_of(shape: f64) -> [u32; 2] {
+    let shape = if shape.is_finite() && shape > 0.0 { shape } else { 1.0 };
+    let mut best = ([1, 1], f64::MAX);
+    for h in 1..=99u32 {
+        let w = (h as f64 * shape).round().clamp(1.0, 99.0) as u32;
+        let off = (w as f64 / h as f64 / shape - 1.0).abs();
+        if off < best.1 - 1e-9 {
+            best = ([w, h], off);
+        }
+    }
+    best.0
+}
+
+/// An aspect ratio: a menu of `first` (what none is called: "Same as
+/// screen", "Any"; its value beside it, if any), the common ones
+/// ([`RATIOS`]), and Custom…, which shows the ratio's width and height in
+/// two boxes on the menu's left (as Resolution's Custom size… shows its
+/// size), to type any (up to 99 each). Custom starts
+/// from `now`, or `custom_from` while it's none. The one chosen or typed,
+/// when it changes (`Some(None)`: `first`). Settings' Aspect ratio and every
+/// crop's are this.
+pub fn ratio_field(ui: &mut egui::Ui, id: &str, (first, first_value): (&str, &str), now: Option<[u32; 2]>, custom_from: [u32; 2]) -> Option<Option<[u32; 2]>> {
+    let p = theme::pal(ui);
+    let custom_id = egui::Id::new((id, "custom"));
+    let w_id = egui::Id::new((id, "w"));
+    // Custom just picked: typing goes into its width.
+    let type_in = egui::Id::new((id, "type_in"));
+    if ui.data(|d| d.get_temp::<bool>(type_in)).is_some() && !ui.input(|i| i.pointer.any_click()) {
+        ui.data_mut(|d| d.remove::<bool>(type_in));
+        ui.memory_mut(|m| m.request_focus(w_id));
+    }
+    let custom = ratio_custom(ui.ctx(), id, now);
+    let label = match now {
+        _ if custom => "Custom".to_owned(),
+        None => first.to_owned(),
+        Some([w, h]) => format!("{w}:{h}"),
+    };
+    let (select_w, width) = (if custom { 110.0 } else { 150.0 }, ratio_field_width(ui.ctx(), id, now));
+    let mut out = None;
+    let mut from_menu = false;
+    let mut to_custom = false;
+    // The boxes on the menu's left, as a custom size's are beside
+    // Resolution's (the menu stays where it was), in reading order for Tab.
+    ui.allocate_ui_with_layout(vec2(width, CONTROL_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        if custom {
+            let [w, h] = now.unwrap_or(custom_from);
+            if let Some(v) = number_box(ui, w_id, w, 1..=99, RATIO_BOX) {
+                out = Some(Some([v, h]));
+            }
+            // In a slot of its own width, so the menu ends where it does without the boxes.
+            let (slot, _) = ui.allocate_exact_size(vec2(8.0, CONTROL_H), Sense::hover());
+            ui.painter().text(slot.center(), Align2::CENTER_CENTER, ":", theme::font(13.0, W::Regular), p.text3);
+            if let Some(v) = number_box(ui, egui::Id::new((id, "h")), h, 1..=99, RATIO_BOX) {
+                out = Some(Some([w, v]));
+            }
+        }
+        let r = select(ui, &label, select_w);
+        menu_popup(&r, false, 250.0, |ui| {
+            let mut item = Item::new(first).check(now.is_none() && !custom);
+            if !first_value.is_empty() {
+                item = item.value(first_value);
+            }
+            if item.show(ui).clicked() {
+                (out, from_menu) = (Some(None), true);
+            }
+            for &(w, h, note) in &RATIOS {
+                let on = !custom && now.is_some_and(|[nw, nh]| common_ratio(nw, nh) == common_ratio(w, h));
+                if Item::new(format!("{w}:{h}")).check(on).value(note).show(ui).clicked() {
+                    (out, from_menu) = (Some(Some([w, h])), true);
+                }
+            }
+            menu_sep(ui);
+            if Item::new("Custom…").check(custom).value("any ratio").show(ui).clicked() {
+                to_custom = true;
+            }
+        });
+    });
+    if to_custom {
+        // Its boxes from the next frame, the width ready to type over.
+        ui.data_mut(|d| {
+            d.insert_temp(custom_id, true);
+            d.insert_temp(type_in, true);
+        });
+        if now.is_none() {
+            out = Some(Some(custom_from));
+        }
+    } else if from_menu {
+        ui.data_mut(|d| d.remove::<bool>(custom_id));
+    }
+    out
+}
+
+/// A [`ratio_field`]'s boxes' width.
+const RATIO_BOX: f32 = 46.0;
+
+/// Whether a [`ratio_field`] shows its boxes: Custom was picked, or its
+/// ratio isn't a common one.
+fn ratio_custom(ctx: &egui::Context, id: &str, now: Option<[u32; 2]>) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(egui::Id::new((id, "custom")))).unwrap_or(false) || now.is_some_and(|[w, h]| common_ratio(w, h).is_none())
+}
+
+/// How wide a [`ratio_field`] is drawn, showing `now`: its menu, and its
+/// boxes when it's custom.
+pub fn ratio_field_width(ctx: &egui::Context, id: &str, now: Option<[u32; 2]>) -> f32 {
+    if ratio_custom(ctx, id, now) { 110.0 + RATIO_BOX * 2.0 + 8.0 + 6.0 * 3.0 } else { 150.0 }
+}
+
 /// A whole number in a box of its own, typed or stepped: clicking it
 /// chooses all of it, so the digits typed replace it; ↑ ↓ (and the wheel
 /// over it) add or take one, with Shift ten. Enter, Tab or clicking away
 /// applies what's typed; Esc puts it back. Kept within `range`. The new
 /// number, when it changes.
 pub fn number_box(ui: &mut egui::Ui, id: egui::Id, value: u32, range: std::ops::RangeInclusive<u32>, width: f32) -> Option<u32> {
+    signed_box(ui, id, i64::from(value), i64::from(*range.start())..=i64::from(*range.end()), width).map(|v| v as u32)
+}
+
+/// A [`number_box`] that can go below zero (a minus typed first), where
+/// `range` does.
+pub fn signed_box(ui: &mut egui::Ui, id: egui::Id, value: i64, range: std::ops::RangeInclusive<i64>, width: f32) -> Option<i64> {
     use egui::{Event, EventFilter, Key};
     let p = theme::pal(ui);
     let (rect, _) = ui.allocate_exact_size(vec2(width, CONTROL_H), Sense::hover());
@@ -1964,20 +2279,25 @@ pub fn number_box(ui: &mut egui::Ui, id: egui::Id, value: u32, range: std::ops::
     }
     let key = id.with("typed");
     let mut typed: Option<String> = ui.data(|d| d.get_temp(key));
-    let kept = |v: i64| v.clamp(i64::from(*range.start()), i64::from(*range.end())) as u32;
+    let kept = |v: i64| v.clamp(*range.start(), *range.end());
+    // As many digits as the longest number it can be.
+    let digits = range.start().unsigned_abs().max(range.end().unsigned_abs()).to_string().len();
     let mut out = None;
     if resp.has_focus() {
         ui.memory_mut(|m| m.set_focus_lock_filter(id, EventFilter { tab: false, horizontal_arrows: false, vertical_arrows: true, escape: true }));
         let t = typed.get_or_insert_with(String::new);
-        let now = |t: &String, out: Option<u32>| t.parse::<i64>().unwrap_or(i64::from(out.unwrap_or(value)));
+        let now = |t: &String, out: Option<i64>| t.parse::<i64>().unwrap_or(out.unwrap_or(value));
         let mut done = false;
         for ev in ui.input(|i| i.events.clone()) {
             match ev {
                 Event::Text(s) => {
-                    for c in s.chars().filter(char::is_ascii_digit) {
-                        // No zeros in front, and no more digits than the
-                        // biggest has.
-                        if !(c == '0' && t.is_empty()) && t.len() < range.end().to_string().len() {
+                    for c in s.chars() {
+                        let sign = usize::from(t.starts_with('-'));
+                        // A minus first, where it can go below zero; no zeros
+                        // in front, and no more digits than the biggest has.
+                        if c == '-' && t.is_empty() && *range.start() < 0 {
+                            t.push(c);
+                        } else if c.is_ascii_digit() && !(c == '0' && t.len() == sign) && t.len() - sign < digits {
                             t.push(c);
                         }
                     }
@@ -2150,6 +2470,22 @@ pub fn replay_click(ctx: &egui::Context, raw: &mut egui::RawInput) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A size's sides are even: typed, rounded the way they were changed;
+    /// following the other (its shape kept), the nearest; within range.
+    #[test]
+    fn sizes_are_even() {
+        let r = 144..=4096;
+        assert_eq!(typed_side(1081, 1080, &r), 1082);
+        assert_eq!(typed_side(1079, 1080, &r), 1078);
+        assert_eq!(typed_side(1351, 1920, &r), 1350);
+        assert_eq!(typed_side(4096, 4096, &r), 4096);
+        assert_eq!(typed_side(145, 144, &r), 146);
+        assert_eq!(following_side(1080.0 * 16.0 / 9.0, &r), 1920);
+        assert_eq!(following_side(607.5, &r), 608);
+        assert_eq!(following_side(9000.0, &r), 4096);
+        assert_eq!(following_side(64.0, &(64..=3600)), 64);
+    }
 
     /// A click outside a dialog closes it without clicking the page behind.
     #[test]
@@ -2374,6 +2710,23 @@ mod tests {
         frames.extend(then.into_iter().map(|e| vec![e]));
         frames.push(vec![]);
         frames
+    }
+
+    /// A shape as a ratio in small numbers: exact ones in their smallest
+    /// numbers, any other the nearest with both up to 99; and which are common.
+    #[test]
+    fn ratios_in_small_numbers() {
+        assert_eq!(ratio_of(16.0 / 9.0), [16, 9]);
+        assert_eq!(ratio_of(1920.0 / 1080.0), [16, 9]);
+        assert_eq!(ratio_of(5.0 / 4.0), [5, 4]);
+        assert_eq!(ratio_of(9.0 / 16.0), [9, 16]);
+        // Any typed comes back as typed (it's kept as a number): 2.35:1.
+        assert_eq!(ratio_of(47.0 / 20.0), [47, 20]);
+        assert_eq!(ratio_of(3600.0 / 2338.0), [97, 63]);
+        assert_eq!(ratio_of(1000.0), [99, 1]);
+        assert_eq!(common_ratio(1920, 1080), Some(0));
+        assert_eq!(common_ratio(1081, 1920), Some(6));
+        assert_eq!(common_ratio(5, 4), None);
     }
 
     /// Typing replaces the number; arrows add or take one (Shift: ten); Tab

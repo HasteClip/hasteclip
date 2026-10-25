@@ -31,7 +31,10 @@
 //! ] }
 //! ```
 //!
-//! Targets: `clip:<title>` or `clip:N` (the Nth card on screen),
+//! Targets: `preview:x,y` (a point of the Sources page's preview, as
+//! fractions of it), `card:<source>` and `grip:<source>` (a picture
+//! source's card under it, and its handle: `card:Webcam`), `clip:<title>`
+//! or `clip:N` (the Nth card on screen),
 //! `filter:<name>` (the library's games and collections), `button:<label>`
 //! (buttons and menu items, by label or tooltip), `select:<value>` (a
 //! dropdown, by what it shows), `play`, `trim:in`,
@@ -438,6 +441,21 @@ impl Demo {
         let resolve = |s: &mut Self, target: &Target| -> Option<Pos2> {
             match target {
                 Target::Point([x, y]) => Some(pos2(*x, *y)),
+                Target::Named(name) if name.starts_with("preview:") => {
+                    // A point of the Sources page's preview, as fractions of it.
+                    let at: Vec<f32> = name["preview:".len()..].split(',').filter_map(|v| v.trim().parse().ok()).collect();
+                    let [fx, fy] = at[..] else { fail(&format!("a point of the preview is \"preview:x,y\" (fractions of it), not \"{name}\"")) };
+                    match marks.get("preview") {
+                        Some(r) => Some(pos2(r.left() + fx * r.width(), r.top() + fy * r.height())),
+                        None => {
+                            let since = *s.waiting.get_or_insert(now);
+                            if now - since > 5.0 {
+                                fail("the Sources page's preview isn't on screen");
+                            }
+                            None
+                        }
+                    }
+                }
                 Target::Named(name) => match marks.get(name).copied().or_else(|| nth_clip(&marks, name)).or_else(|| by_prefix(&marks, name)) {
                     Some(r) => Some(r.center()),
                     None => {

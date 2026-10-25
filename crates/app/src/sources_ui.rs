@@ -1,7 +1,9 @@
-//! The Sources page: what goes into your clips. Today that's audio — your mic,
-//! everything the computer plays, or single apps — each with a live meter and a
-//! volume fader, plus the clip's mix meter. Video sources (webcam, overlays)
-//! will live here too.
+//! The Sources page: what goes into your clips. The picture: a live preview
+//! of the video, its sources placed on it (`canvas_ui`), and under it a card
+//! for each (the screen or your games and apps, the webcam), the one in front
+//! first, opened for its settings and dragged to put it in front or behind.
+//! The sound: your mic, everything the computer plays, or single apps, each
+//! with a live meter and a volume fader, plus the clip's mix meter.
 //!
 //! Deliberately says nothing about "tracks": a source is either part of what the
 //! clip sounds like ("In the clip"), kept separately for editing, or both.
@@ -66,18 +68,56 @@ pub(crate) struct SourcesView {
     /// held there.
     pub(crate) crop_open: bool,
     crop_drag: Option<(crate::webcam_ui::Handle, egui::Rect, egui::Pos2)>,
-    /// Its width and height change together, keeping this shape (width over
-    /// height, as it was when they were linked: rounding each change to even
-    /// pixels doesn't make it drift).
-    crop_keep_shape: Option<f64>,
+    /// The picture's sources whose cards are open, showing their settings.
+    pub(crate) open_cards: Vec<crate::canvas_ui::Layer>,
+    /// The sources whose Placement numbers are open, under that row of
+    /// their cards; and one to bring into view (opened from its menu).
+    pub(crate) placement_open: Vec<crate::canvas_ui::Layer>,
+    pub(crate) placement_shown: Option<crate::canvas_ui::Layer>,
+    /// A card dragged by its handle to put it in front or behind: which,
+    /// how far below its top it was taken hold of, and how the sources were
+    /// before (to undo it).
+    reorder: Option<(crate::canvas_ui::Layer, f32, crate::canvas_ui::Arrangement)>,
+    /// The cards' order as last shown, and when it last changed: they slide
+    /// to their new places for a moment after.
+    card_order: (Vec<crate::canvas_ui::Layer>, Option<Instant>),
 }
 
-/// What a preview shows: the picture, its height and shape, the frame rate
-/// and the webcam.
-pub(crate) type PreviewSetup = (capture::VideoSource, (Option<u32>, Option<capture::Shape>), u32, Option<capture::webcam::Webcam>);
+impl SourcesView {
+    /// Dev aid: the cards named open (`screen`, `webcam`), their Placement
+    /// numbers (`placement`), or the crop's page (`crop`).
+    pub(crate) fn open_dev(&mut self, names: &str) {
+        use crate::canvas_ui::Layer;
+        for name in names.split(',').map(str::trim) {
+            match name {
+                "screen" => self.open_cards.push(Layer::Screen),
+                "webcam" => self.open_cards.push(Layer::Webcam),
+                "placement" => self.placement_open.extend([Layer::Screen, Layer::Webcam]),
+                "crop" => self.crop_open = true,
+                _ => {}
+            }
+        }
+    }
+}
+
+/// What a preview shows: the picture, its height and shape, the frame rate,
+/// the webcam, and whether it's all of the screen, uncropped (to crop on).
+pub(crate) type PreviewSetup = (capture::VideoSource, capture::VideoSize, u32, Option<capture::webcam::Webcam>, bool);
 
 
 impl App {
+    /// Sources, with the screen's card open (its own page, not a crop's):
+    /// where it's put in the video.
+    pub(crate) fn show_screen_card(&mut self) {
+        use crate::canvas_ui::Layer;
+        self.page = crate::Page::Sources;
+        self.sources_view.crop_open = false;
+        self.webcam_view.crop = None;
+        if !self.sources_view.open_cards.contains(&Layer::Screen) {
+            self.sources_view.open_cards.push(Layer::Screen);
+        }
+    }
+
     pub(crate) fn sources_page(&mut self, ui: &mut egui::Ui) {
         let now = Instant::now();
         // Opening the page: start the meters from silence. Their last state is
@@ -103,71 +143,130 @@ impl App {
         let every = if capture::preview::AVAILABLE { Duration::from_secs_f64(0.5 / self.settings.fps.max(1) as f64) } else { Duration::from_millis(16) };
         crate::ui_kit::repaint_after(ui.ctx(), every);
 
-        // Adjusting the camera, or the crop: its own page, in Sources' place.
+        // Adjusting the camera, or a crop: its own page, in Sources' place.
         if self.camera_panel.is_some() {
             self.camera_page(ui);
+            return;
+        }
+        if self.webcam_view.crop.is_some() {
+            self.webcam_crop_page(ui);
             return;
         }
         if self.sources_view.crop_open {
             self.screen_crop_page(ui);
             return;
         }
+        // Where the sources are, undone and done again from the keyboard (not
+        // while typing, or with a menu open).
+        if !ui.ctx().egui_wants_keyboard_input() && !crate::ui_kit::overlay_open(ui.ctx()) {
+            let (redo, undo) = ui.input_mut(|i| (i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z), i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)));
+            if undo {
+                self.undo_arrangement();
+            }
+            if redo {
+                self.redo_arrangement();
+            }
+        }
         self.page_head(ui, "Sources", |_, _| {});
-        crate::ui_kit::arrive(ui, |ui| crate::ui_kit::scroll(ui, "sources_page", |ui| {
+        // The preview stays in view: what's under it scrolls (each column on
+        // its own), so the cards' settings show on it as they change.
+        crate::ui_kit::arrive(ui, |ui| {
             // The headings' tops level with the other pages' first heading
             // (these are bigger, in a taller row).
             ui.add_space(4.0);
-            let w = ui.available_width();
+            let (w, h) = (ui.available_width(), ui.available_height());
             // Picture on the left, sound on the right, when there's room;
             // one above the other when there isn't.
             if w >= TWO_COLUMNS && capture::preview::AVAILABLE {
                 let col = (w - 28.0) / 2.0;
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = 28.0;
-                    ui.allocate_ui_with_layout(egui::vec2(col, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.allocate_ui_with_layout(egui::vec2(col, h), egui::Layout::top_down(egui::Align::Min), |ui| {
                         ui.set_width(col);
-                        self.picture_column(ui);
+                        let frame = self.picture_top(ui);
+                        crate::ui_kit::scroll(ui, "sources_cards", |ui| {
+                            self.layer_cards(ui, frame.as_deref());
+                            ui.add_space(28.0);
+                        });
                     });
-                    ui.allocate_ui_with_layout(egui::vec2(col, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.allocate_ui_with_layout(egui::vec2(col, h), egui::Layout::top_down(egui::Align::Min), |ui| {
                         ui.set_width(col);
-                        self.sound_column(ui, now, dt);
+                        self.sound_head(ui);
+                        crate::ui_kit::scroll(ui, "sources_sound", |ui| {
+                            self.sound_column(ui, now, dt);
+                            ui.add_space(28.0);
+                        });
                     });
                 });
             } else {
                 ui.vertical(|ui| {
                     ui.set_width(w);
-                    if capture::preview::AVAILABLE {
-                        self.picture_column(ui);
-                        ui.add_space(24.0);
-                    }
-                    self.sound_column(ui, now, dt);
+                    let frame = capture::preview::AVAILABLE.then(|| self.picture_top(ui)).flatten();
+                    crate::ui_kit::scroll(ui, "sources_page", |ui| {
+                        if capture::preview::AVAILABLE {
+                            self.layer_cards(ui, frame.as_deref());
+                            ui.add_space(24.0);
+                        }
+                        self.sound_head(ui);
+                        self.sound_column(ui, now, dt);
+                        ui.add_space(28.0);
+                    });
                 });
             }
-            ui.add_space(28.0);
-        }));
+        });
         self.live_audio.set_limiter(self.settings.limiter);
     }
 
-    /// What you see: the whole screen or your games and apps, its preview,
-    /// and the webcam.
-    fn picture_column(&mut self, ui: &mut egui::Ui) {
-        self.video_card(ui);
-        if capture::webcam::AVAILABLE {
-            crate::ui_kit::gap(ui, crate::ui_kit::SECTION_GAP);
-            self.webcam_card(ui);
+    /// What you see: the preview of the video, under its heading (its
+    /// sources' cards go under it, see `layer_cards`). The frame shown.
+    fn picture_top(&mut self, ui: &mut egui::Ui) -> Option<std::sync::Arc<capture::preview::PreviewFrame>> {
+        capture::preview::request();
+        // The capture's newest frame; while it's starting, the last one of the
+        // same picture (the page looks as it did straight away).
+        let setup = self.video_preview.as_ref().map(|(w, _)| w.clone());
+        let frame = match capture::preview::latest() {
+            Some(f) => {
+                if let Some(setup) = setup {
+                    self.sources_view.last_preview = Some((setup, f.clone()));
+                }
+                Some(f)
+            }
+            None => self.sources_view.last_preview.as_ref().filter(|(was, _)| Some(was) == setup.as_ref()).map(|(_, f)| f.clone()),
+        };
+        self.update_preview_texture(ui.ctx(), frame.as_deref());
+        // Which listed apps are open, for their status; cheap, so every 2 s.
+        let apps_mode = matches!(self.settings.capture, CaptureTarget::Apps { .. });
+        if apps_mode && self.sources_view.apps_checked.is_none_or(|t| t.elapsed() > Duration::from_secs(2)) {
+            self.sources_view.apps_checked = Some(Instant::now());
+            self.windowed_apps = capture::list_windowed_apps();
         }
+        // What's recorded; while a preview of another size starts, the size
+        // it will be (the button stays, and its choices stay open).
+        let size = frame.as_ref().map(|f| f.recorded).or_else(|| capture::frame_size(&self.video_source(), self.settings.video_size()));
+        let size_text = size.map_or_else(|| format!("{} fps", self.settings.fps), |(w, h)| format!("{w}×{h} at {} fps", self.settings.fps));
+        column_head(ui, "Picture", |ui| {
+            self.size_button(ui, &size_text);
+        });
+        self.preview_picture(ui, frame.as_deref());
+        crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
+        frame
     }
 
-    /// What you hear: the clip's mix, then each source, then adding one.
-    fn sound_column(&mut self, ui: &mut egui::Ui, now: Instant, dt: f32) {
+    /// What you hear's heading, with Refresh.
+    fn sound_head(&mut self, ui: &mut egui::Ui) {
         use crate::ui_kit::Btn;
-        let pal = crate::theme::pal(ui);
         column_head(ui, "Sound", |ui| {
             if Btn::ghost("Refresh").with_icon(egui_phosphor::regular::ARROWS_CLOCKWISE).small().tip("Look again for microphones you've plugged in").show(ui).clicked() {
                 self.refresh_audio_devices();
                 self.toast_icon(egui_phosphor::regular::ARROWS_CLOCKWISE, "Looked for microphones again");
             }
         });
+    }
+
+    /// What you hear (under `sound_head`): the clip's mix, then each
+    /// source, then adding one.
+    fn sound_column(&mut self, ui: &mut egui::Ui, now: Instant, dt: f32) {
+        let pal = crate::theme::pal(ui);
         // The mix first: it's what people hear, and where it gets too loud.
         self.master_strip(ui, now, dt);
         crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
@@ -339,52 +438,293 @@ impl App {
         }
     }
 
-    /// The clip's mix: a big stereo meter with scale, peak readout, clip light,
-    /// and the limiter with its gain-reduction meter.
-    /// The video source: what to record (the whole screen, or games and apps
-    /// following focus), with a live preview of exactly what gets recorded.
-    fn video_card(&mut self, ui: &mut egui::Ui) {
-        capture::preview::request();
-        // The capture's newest frame; while it's starting, the last one of the
-        // same picture (the page looks as it did straight away).
-        let setup = self.video_preview.as_ref().map(|(w, _)| w.clone());
-        let frame = match capture::preview::latest() {
-            Some(f) => {
-                if let Some(setup) = setup {
-                    self.sources_view.last_preview = Some((setup, f.clone()));
-                }
-                Some(f)
-            }
-            None => self.sources_view.last_preview.as_ref().filter(|(was, _)| Some(was) == setup.as_ref()).map(|(_, f)| f.clone()),
-        };
-        self.update_preview_texture(ui.ctx(), frame.as_deref());
-        // Which listed apps are open, for their status; cheap, so every 2 s.
-        let apps_mode = matches!(self.settings.capture, CaptureTarget::Apps { .. });
-        if apps_mode && self.sources_view.apps_checked.is_none_or(|t| t.elapsed() > Duration::from_secs(2)) {
-            self.sources_view.apps_checked = Some(Instant::now());
-            self.windowed_apps = capture::list_windowed_apps();
+    /// The video's sources, one card each, the one in front first: a card's
+    /// line says what it is, clicking it opens its settings, and dragging it
+    /// by its handle puts it in front of or behind the others. Each card is
+    /// laid out in a place of its own (its switch and menus stay its own as
+    /// cards change places) and slides to its new place when the order
+    /// changes; the one dragged follows the pointer, over the others.
+    fn layer_cards(&mut self, ui: &mut egui::Ui, frame: Option<&capture::preview::PreviewFrame>) {
+        use crate::canvas_ui::Layer;
+        use crate::theme::{self, W};
+        use egui::{pos2, vec2};
+        let pal = theme::pal(ui);
+        let aspect = frame.map_or(16.0 / 9.0, |f| f.width as f32 / f.height.max(1) as f32);
+        if self.settings.webcam.is_some() {
+            self.webcam_fit_pending(ui.ctx(), aspect);
         }
-        let idle = self.rec_state == crate::RecState::Idle;
-        let pal = crate::theme::pal(ui);
-        let size_text = frame.as_ref().map(|f| format!("{}×{} at {} fps", f.recorded.0, f.recorded.1, self.settings.fps));
-        column_head(ui, "Picture", |ui| {
-            if let Some(t) = &size_text {
-                ui.label(crate::theme::text(t, 12.5, crate::theme::W::Regular).color(pal.text3))
-                    .on_hover_text(format!("What's recorded. Change it in Settings, Video. The preview shows {} frames a second.", self.sources_view.preview_rate.2));
+        // Over the cards: undo and redo on the left (where the sources are),
+        // which is in front on the right. Its height is kept while the
+        // buttons come and go, so the cards don't move.
+        let order = self.layer_order();
+        if order.len() > 1 || self.arrangement_history() {
+            ui.horizontal(|ui| {
+                ui.set_min_height(crate::ui_kit::SMALL_H);
+                ui.spacing_mut().item_spacing.x = 2.0;
+                self.undo_buttons(ui);
+                if order.len() > 1 {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(theme::text("The top one's in front", 12.5, W::Regular).color(pal.text3));
+                    });
+                }
+            });
+            ui.add_space(2.0);
+        }
+        if self.sources_view.card_order.0 != order {
+            let moved = !self.sources_view.card_order.0.is_empty();
+            self.sources_view.card_order = (order.clone(), moved.then(Instant::now));
+        }
+        // Slides for a moment after the order changed (dragged, or put in
+        // front from a menu); else a card's place follows the ones above it
+        // at once (one opening pushes the others down as it opens).
+        let held = self.sources_view.reorder.map(|(l, grab, _)| (l, grab));
+        let sliding = held.is_some() || self.sources_view.card_order.1.is_some_and(|t| t.elapsed() < Duration::from_millis(400));
+        const GAP: f32 = 8.0;
+        let w = ui.available_width();
+        let ctx = ui.ctx().clone();
+        let height = |l: Layer| ctx.data(|d| d.get_temp::<f32>(egui::Id::new(("layer_card_h", l)))).unwrap_or(CARD_HEAD_H + 12.0);
+        let heights: Vec<f32> = order.iter().map(|l| height(*l)).collect();
+        let total = heights.iter().sum::<f32>() + GAP * order.len().saturating_sub(1) as f32;
+        let (area, _) = ui.allocate_exact_size(vec2(w, total), Sense::hover());
+        let pointer = ui.input(|i| i.pointer.latest_pos());
+        // Each card's place in the order, and where it's drawn now.
+        let mut slots = Vec::new();
+        let mut top = area.top();
+        for (layer, h) in order.iter().zip(&heights) {
+            let slot = egui::Rect::from_min_size(pos2(area.left(), top), vec2(w, *h));
+            top += h + GAP;
+            let id = egui::Id::new(("layer_card_y", *layer));
+            let y = match (held, pointer) {
+                // Held: where the pointer has it, and from there to its place once let go.
+                (Some((l, grab)), Some(p)) if l == *layer => {
+                    let y = (p.y - grab).clamp(area.top(), (area.bottom() - h).max(area.top()));
+                    theme::value(ui.ctx(), id, y - area.top(), 0.0);
+                    y
+                }
+                _ => area.top() + theme::value(ui.ctx(), id, slot.top() - area.top(), if sliding { theme::NORMAL } else { 0.0 }),
+            };
+            slots.push((*layer, slot, y));
+        }
+        // The one held last, over the others.
+        self.canvas.card_hover = None;
+        let mut drawn = slots.clone();
+        drawn.sort_by_key(|(l, ..)| held.is_some_and(|(h, _)| h == *l));
+        for (layer, _, y) in drawn {
+            let lifted = held.is_some_and(|(h, _)| h == layer);
+            let layer_id = if lifted { egui::LayerId::new(egui::Order::Foreground, egui::Id::new("layer_card_held")) } else { ui.layer_id() };
+            let at = egui::Rect::from_min_size(pos2(area.left(), y), vec2(w, 10_000.0));
+            let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(at).layout(egui::Layout::top_down(egui::Align::Min)).id_salt(("layer_card", layer)).layer_id(layer_id));
+            if lifted {
+                let shadow = egui::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_black_alpha(90) };
+                let r = egui::Rect::from_min_size(at.min, vec2(w, height(layer)));
+                cui.painter().add(shadow.as_shape(r, 8));
+            }
+            self.layer_card(&mut cui, layer, order.len() > 1, frame, aspect, y);
+            let shown = egui::Rect::from_min_size(at.min, vec2(w, cui.min_rect().height()));
+            ui.data_mut(|d| d.insert_temp(egui::Id::new(("layer_card_h", layer)), shown.height()));
+            if held.map_or_else(|| ui.rect_contains_pointer(shown), |(h, _)| h == layer) {
+                self.canvas.card_hover = Some(layer);
+            }
+        }
+        self.reorder_cards(ui, &slots);
+        // Adding sources.
+        if capture::webcam::AVAILABLE && self.settings.webcam.is_none() {
+            ui.add_space(12.0);
+            let add = crate::ui_kit::Btn::normal("Webcam").with_icon(egui_phosphor::regular::PLUS).small().tip("Put your camera in your clips, placed and sized on the preview");
+            if add.show(ui).clicked() {
+                self.add_webcam(aspect);
+                if self.settings.webcam.is_some() && !self.sources_view.open_cards.contains(&Layer::Webcam) {
+                    self.sources_view.open_cards.push(Layer::Webcam);
+                }
+            }
+        }
+    }
+
+    /// Dragging a card by its handle, live (the preview shows it): it goes
+    /// above a card once its top (following the pointer) is past that
+    /// card's middle, below one once its bottom is. Let go, it can be undone.
+    fn reorder_cards(&mut self, ui: &egui::Ui, slots: &[(crate::canvas_ui::Layer, egui::Rect, f32)]) {
+        let Some((held, grab, was)) = self.sources_view.reorder else { return };
+        let down = ui.input(|i| i.pointer.primary_down());
+        if down
+            && let Some(p) = ui.input(|i| i.pointer.interact_pos())
+            && let Some((_, me, _)) = slots.iter().find(|(l, ..)| *l == held)
+        {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            let (top, bottom) = (p.y - grab, p.y - grab + me.height());
+            let above = |r: &egui::Rect| if r.center().y < me.center().y { top >= r.center().y } else { bottom > r.center().y };
+            let mut order: Vec<_> = slots.iter().map(|(l, ..)| *l).filter(|l| *l != held).collect();
+            let at = slots.iter().filter(|(l, r, _)| *l != held && above(r)).count();
+            order.insert(at.min(order.len()), held);
+            self.set_layer_order(&order);
+        }
+        if !down {
+            if self.arrangement() != was {
+                self.keep_for_undo(was);
+            }
+            self.sources_view.reorder = None;
+            // Let go: it slides from there into its place.
+            self.sources_view.card_order.1 = Some(Instant::now());
+        }
+    }
+
+    /// One source's card, its top at `top`: its handle (`movable`: with
+    /// others to go in front of or behind), what it is and its state on one
+    /// line (with its switch), its settings below when it's open.
+    fn layer_card(&mut self, ui: &mut egui::Ui, layer: crate::canvas_ui::Layer, movable: bool, frame: Option<&capture::preview::PreviewFrame>, aspect: f32, top: f32) {
+        use crate::canvas_ui::Layer;
+        use crate::theme::{self, W};
+        use egui::{Align2, FontId, pos2, vec2};
+        use egui_phosphor::regular as icon;
+        let pal = theme::pal(ui);
+        let open = self.sources_view.open_cards.contains(&layer);
+        let held = self.sources_view.reorder.is_some_and(|(l, ..)| l == layer);
+        // Its line: what it is, then what's wrong with it, if anything.
+        let (glyph, name, line, state, on) = match layer {
+            Layer::Screen => {
+                let apps = matches!(self.settings.capture, CaptureTarget::Apps { .. }) && capture::app_capture();
+                let line = if apps {
+                    match frame.filter(|f| !f.waiting).and_then(|f| f.app.clone()) {
+                        Some(app) => format!("Following {app}"),
+                        None => "None of them showing".to_owned(),
+                    }
+                } else {
+                    let display = self.screens.get(self.display_at()).map_or_else(|| "Main display".to_owned(), |d| d.name.clone());
+                    // Open, its rows say how it's cropped.
+                    let cropped = self.crop_whole().zip(self.settings.screen_crop.filter(|c| !c.is_none() && !open)).map(|((w, h), c)| capture::Crop::from(c).rect(w, h));
+                    match cropped {
+                        Some([_, _, w, h]) => format!("{display} · cropped to {w}×{h}"),
+                        None => display,
+                    }
+                };
+                (if apps { icon::APP_WINDOW } else { icon::MONITOR }, if apps { "Games and apps" } else { "Screen" }, line, None, self.settings.screen.enabled)
+            }
+            Layer::Webcam => {
+                let (state, warn) = self.webcam_state();
+                let cam = self.settings.webcam.as_ref();
+                let state = (!state.is_empty()).then_some((state, if warn { pal.warn } else { pal.text3 }));
+                (icon::WEBCAM, "Webcam", cam.map(|w| w.name.clone()).unwrap_or_default(), state, cam.is_some_and(|w| w.enabled))
+            }
+        };
+        let state = state.or_else(|| (!on).then_some(("Off", pal.text3)));
+        group_rows(ui, ("layer_card", layer), |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            // All of its line opens and closes it, but for its handle and switch.
+            let (head, resp) = ui.allocate_exact_size(vec2(ui.available_width(), CARD_HEAD_H), Sense::click());
+            let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+            crate::demo::mark(ui.ctx(), || format!("card:{name}"), head);
+            let painter = ui.painter().clone();
+            let cy = head.center().y;
+            let mut x = head.left();
+            if movable {
+                let grip_rect = egui::Rect::from_min_max(pos2(x - 6.0, head.top()), pos2(x + 16.0, head.bottom()));
+                let grip = ui.interact(grip_rect, resp.id.with("grip"), Sense::drag());
+                crate::demo::mark(ui.ctx(), || format!("grip:{name}"), grip_rect);
+                let grip = if held { grip } else { grip.on_hover_text("Drag up or down: the top one's in front").on_hover_cursor(egui::CursorIcon::Grab) };
+                let ink = if held || grip.hovered() { pal.text } else { pal.text3 };
+                painter.text(pos2(x + 5.0, cy), Align2::CENTER_CENTER, icon::DOTS_SIX_VERTICAL, FontId::proportional(16.0), ink);
+                if grip.drag_started() {
+                    let grab = ui.input(|i| i.pointer.press_origin()).map_or(0.0, |p| p.y - top);
+                    self.sources_view.reorder = Some((layer, grab, self.arrangement()));
+                }
+                x += 20.0;
+            }
+            // What it is: its icon and name (dimmer while it's off), then its line.
+            let mut put = |text: &str, font: FontId, color: egui::Color32, gap: f32| {
+                let g = painter.layout_no_wrap(text.to_owned(), font, color);
+                let w = g.size().x;
+                painter.galley(pos2(x, cy - g.size().y / 2.0), g, color);
+                x += w + gap;
+            };
+            put(glyph, FontId::proportional(16.0), if on { pal.text2 } else { pal.text3 }, 8.0);
+            put(name, theme::font(13.5, W::Medium), if on { pal.text } else { pal.text2 }, 10.0);
+            // On the right: which way it opens, the webcam's switch, and its
+            // menu (the preview's right-click one; right-clicking here too).
+            let mut rui = ui.new_child(egui::UiBuilder::new().max_rect(head).layout(egui::Layout::right_to_left(egui::Align::Center)));
+            rui.spacing_mut().item_spacing.x = 10.0;
+            let (c, _) = rui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
+            let turn = theme::toggle(ui.ctx(), resp.id.with("turn"), open, theme::NORMAL);
+            crate::ui_kit::chevron(&painter, c.center(), 3.5, turn, if resp.hovered() { pal.text } else { pal.text3 });
+            if layer == Layer::Webcam
+                && let Some(w) = self.settings.webcam.as_mut()
+            {
+                let tip = if w.enabled { "Turn the webcam off: it leaves your clips, and its place, size, crop and format are kept" } else { "Put your webcam back in your clips" };
+                crate::ui_kit::switch(&mut rui, &mut w.enabled).on_hover_text(tip);
+            }
+            if layer == Layer::Screen {
+                let what = if name == "Screen" { "your screen" } else { "your games and apps" };
+                let tip = if self.settings.screen.enabled { format!("Turn {what} off: it leaves your clips, and its place and crop are kept") } else { format!("Put {what} back in your clips") };
+                crate::ui_kit::switch(&mut rui, &mut self.settings.screen.enabled).on_hover_text(tip);
+            }
+            rui.add_space(-4.0);
+            let more = crate::ui_kit::Btn::icon(crate::ui_kit::Kind::Ghost, icon::DOTS_THREE).small().tip(if layer == Layer::Webcam { "Reset, turn, flip, put in front or behind, remove" } else { "Fill or fit, reset, turn, flip, put in front or behind" }).show(&mut rui);
+            let was = self.arrangement();
+            crate::ui_kit::menu_popup(&more, false, 230.0, |ui| self.layer_menu(ui, layer, aspect));
+            crate::ui_kit::context_menu(&resp, 230.0, |ui| self.layer_menu(ui, layer, aspect));
+            if self.arrangement() != was {
+                self.keep_for_undo(was);
+            }
+            let right = rui.min_rect().left() - 10.0;
+            let mut job = crate::ui_kit::single_line_job(&line, theme::font(12.5, W::Regular), pal.text3, (right - x).max(0.0));
+            if let Some((state, color)) = state {
+                job.append(&format!(" · {state}"), 0.0, egui::TextFormat::simple(theme::font(12.5, W::Regular), color));
+            }
+            let g = ui.fonts_mut(|f| f.layout_job(job));
+            painter.galley(pos2(x, cy - g.size().y / 2.0), g, pal.text3);
+            if resp.clicked() {
+                if open {
+                    self.sources_view.open_cards.retain(|l| *l != layer);
+                } else {
+                    self.sources_view.open_cards.push(layer);
+                }
+            }
+            if open {
+                crate::ui_kit::divider(ui, 0.0);
+                // Off, its settings are kept (and can be changed): dimmed.
+                ui.scope(|ui| {
+                    if !on {
+                        ui.multiply_opacity(0.55);
+                    }
+                    match layer {
+                        Layer::Screen => self.screen_rows(ui, frame),
+                        Layer::Webcam => self.webcam_rows(ui),
+                    }
+                });
             }
         });
+    }
 
+    /// The screen's settings, in its card: what to record (the whole screen
+    /// or your games and apps), which display and how much of it, and where
+    /// it sits.
+    fn screen_rows(&mut self, ui: &mut egui::Ui, frame: Option<&capture::preview::PreviewFrame>) {
+        let idle = self.rec_state == crate::RecState::Idle;
+        let pal = crate::theme::pal(ui);
+        let apps_mode = matches!(self.settings.capture, CaptureTarget::Apps { .. });
+        let row = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
+            ui.horizontal(|ui| {
+                ui.set_min_height(GROUP_ROW_H);
+                ui.spacing_mut().item_spacing.x = 5.0;
+                add(ui);
+            });
+        };
         // What to record: changes right away, while capturing too (the clip
-        // switches mid-way; nothing restarts), except the display, which
-        // sets the recording's size (see below; where the desktop's dialog
+        // switches mid-way; nothing restarts), but for a display that would
+        // make the video another size (see below; where the desktop's dialog
         // picks the screen, that waits too).
         if capture::app_capture() {
             let opts = [
                 crate::ui_kit::Seg { icon: Some(egui_phosphor::regular::MONITOR), label: "Whole screen", tip: Some("Everything on one display") },
                 crate::ui_kit::Seg { icon: Some(egui_phosphor::regular::APP_WINDOW), label: "Games and apps", tip: Some("Only the games and apps you pick, following whichever you're using") },
             ];
-            let w = ui.available_width();
-            if let Some(i) = crate::ui_kit::segmented_opts(ui, "capture_kind", &opts, usize::from(apps_mode), Some(w), true) {
+            let mut picked = None;
+            row(ui, &mut |ui| {
+                ui.label(crate::theme::text("Record", 13.5, crate::theme::W::Regular).color(pal.text));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    picked = crate::ui_kit::segmented_opts(ui, "capture_kind", &opts, usize::from(apps_mode), None, true);
+                });
+            });
+            if let Some(i) = picked {
                 if i == 0 && apps_mode {
                     let apps = std::mem::replace(&mut self.settings.capture, CaptureTarget::Screen);
                     if matches!(apps, CaptureTarget::Apps { .. }) {
@@ -395,93 +735,217 @@ impl App {
                     self.windowed_apps = capture::list_windowed_apps();
                 }
             }
-            crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
+            crate::ui_kit::divider(ui, 0.0);
         }
-
-        self.preview_picture(ui, frame.as_deref());
-        crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
-
         match self.settings.capture.clone() {
-            CaptureTarget::Apps { apps, away_screen } if capture::app_capture() => self.app_list(ui, apps, away_screen, frame.as_deref()),
+            CaptureTarget::Apps { apps, away_screen } if capture::app_capture() => self.app_rows(ui, apps, away_screen, frame),
             // Linux on Wayland: the desktop's own dialog picks the screen (once; it's remembered).
             _ if cfg!(target_os = "linux") && !capture::screens_listed() => {
-                group(ui, "screen", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(crate::theme::text("Screen", 13.5, crate::theme::W::Regular).color(pal.text));
-                        ui.label(crate::theme::text("picked in your desktop's sharing dialog", 12.5, crate::theme::W::Regular).color(pal.text3));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let b = crate::ui_kit::Btn::normal("Choose another…").small().enabled(idle).tip(if idle { "Your desktop asks again which screen to record" } else { "Stop capturing to switch screens" });
-                            if b.show(ui).clicked() {
-                                capture::choose_screen_again();
-                                self.video_preview = None; // restarts, and asks
-                            }
-                        });
+                row(ui, &mut |ui| {
+                    ui.label(crate::theme::text("Display", 13.5, crate::theme::W::Regular).color(pal.text));
+                    ui.label(crate::theme::text("picked in your desktop's sharing dialog", 12.5, crate::theme::W::Regular).color(pal.text3));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let b = crate::ui_kit::Btn::normal("Choose another…").small().tip("Your desktop asks again which screen to record").locked((!idle).then(|| "Stop capturing to switch screens".to_owned()));
+                        if b.show(ui).clicked() {
+                            capture::choose_screen_again();
+                            self.video_preview = None; // restarts, and asks
+                        }
                     });
                 });
             }
             _ => {
                 let names: Vec<String> = self.screens.iter().map(|d| d.name.clone()).collect();
                 let at = self.display_at();
-                let stop_first = self.stop_first();
-                let mut locked_click = false;
-                group_rows(ui, "display", |ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    ui.horizontal(|ui| {
-                        ui.set_min_height(GROUP_ROW_H);
-                        ui.spacing_mut().item_spacing.x = 5.0;
-                        ui.label(crate::theme::text("Display", 13.5, crate::theme::W::Regular).color(if idle { pal.text } else { pal.text2 }));
-                        // Set before capturing: the recording is its size, so
-                        // another display mid-way came out boxed in black at
-                        // the first one's. Locked, as the crop is.
-                        if !idle {
-                            ui.label(crate::theme::ic(egui_phosphor::regular::LOCK_SIMPLE, 12.5).color(pal.text3)).on_hover_text(stop_first);
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let current = names.get(at).cloned().unwrap_or_else(|| "Main display".to_owned());
-                            let r = ui.add_enabled_ui(idle, |ui| crate::ui_kit::select(ui, &current, 180.0)).inner;
-                            locked_click = !idle && ui.input(|i| i.pointer.primary_clicked()) && r.contains_pointer();
-                            if idle {
-                                crate::ui_kit::menu_popup(&r, false, 240.0, |ui| {
-                                    for (i, name) in names.iter().enumerate() {
-                                        if crate::ui_kit::Item::new(name.clone()).check(at == i).show(ui).clicked() {
-                                            self.settings.display_id = Some(self.screens[i].id.clone());
-                                            self.settings.display_index = i;
-                                        }
-                                    }
-                                });
+                // While clipping, the video stays the size it started at: a
+                // display that would make it another size (it's the size of
+                // the display, in p or Native) waits until clipping stops.
+                // Any other is shown in it as the one before was.
+                let recording = frame.map(|f| f.recorded).filter(|_| !idle);
+                let sized: Vec<Option<(u32, u32)>> = match recording {
+                    Some(_) => self.screens.iter().map(|d| capture::frame_size(&self.display_source(&d.id), self.settings.video_size())).collect(),
+                    None => Vec::new(),
+                };
+                let waits = |i: usize| recording.is_some_and(|now| sized.get(i).copied().flatten().is_some_and(|size| size != now));
+                let stop = if self.rec_state == crate::RecState::Recording { "Stop recording" } else { "Stop clipping" };
+                row(ui, &mut |ui| {
+                    ui.label(crate::theme::text("Display", 13.5, crate::theme::W::Regular).color(pal.text));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let current = names.get(at).cloned().unwrap_or_else(|| "Main display".to_owned());
+                        let r = crate::ui_kit::select(ui, &current, 180.0);
+                        crate::ui_kit::menu_popup(&r, false, 240.0, |ui| {
+                            for (i, name) in names.iter().enumerate() {
+                                let mut item = crate::ui_kit::Item::new(name.clone()).check(at == i);
+                                if waits(i) {
+                                    let (w, h) = sized[i].unwrap_or_default();
+                                    item = item.enabled(false).value("Stop clipping first").tip(format!("It would make your video {w}×{h}, and its size is set when clipping starts. {stop} to switch, or give your video a size of its own."));
+                                }
+                                if item.show(ui).clicked() {
+                                    self.settings.display_id = Some(self.screens[i].id.clone());
+                                    self.settings.display_index = i;
+                                }
                             }
                         });
                     });
-                    if capture::SCREEN_CROP {
-                        crate::ui_kit::divider(ui, 0.0);
-                        self.crop_row(ui, idle);
-                    }
                 });
-                if locked_click {
-                    self.toast_icon(egui_phosphor::regular::LOCK_SIMPLE, stop_first.trim_end_matches('.'));
+                if capture::SCREEN_CROP {
+                    crate::ui_kit::divider(ui, 0.0);
+                    self.crop_row(ui);
                 }
             }
         }
+        // Where it is in the video, in a few words (and how the video puts
+        // it in, in a shape of its own); its numbers under it.
+        crate::ui_kit::divider(ui, 0.0);
+        self.placement_row(ui, crate::canvas_ui::Layer::Screen);
+    }
+
+    /// The video's size, as recorded, over the preview: a button opening the
+    /// size's own choices (the same setting as Settings' Resolution and
+    /// Aspect ratio), so the video can change shape while it's arranged.
+    fn size_button(&mut self, ui: &mut egui::Ui, text: &str) {
+        use crate::theme::{self, W};
+        let pal = theme::pal(ui);
+        let locked = self.rec_state != crate::RecState::Idle;
+        let galley = ui.painter().layout_no_wrap(text.to_owned(), theme::font(12.5, W::Regular), pal.text3);
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(galley.size().x + 30.0, 24.0), Sense::click());
+        crate::demo::mark(ui.ctx(), || "button:Video size".into(), rect);
+        let id = resp.id.with("size");
+        let open = egui::Popup::is_id_open(ui.ctx(), id);
+        let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered() || open, theme::FAST);
+        if hv > 0.0 {
+            ui.painter().rect_filled(rect, crate::ui_kit::RADIUS, theme::fade(pal.control, hv));
+        }
+        let ink = theme::mix(pal.text3, pal.text, hv);
+        ui.painter().galley_with_override_text_color(egui::pos2(rect.left() + 8.0, rect.center().y - galley.size().y / 2.0), galley, ink);
+        let mark = egui::pos2(rect.right() - 11.0, rect.center().y);
+        if locked {
+            ui.painter().text(mark, egui::Align2::CENTER_CENTER, egui_phosphor::regular::LOCK_SIMPLE, egui::FontId::proportional(12.0), ink);
+        } else {
+            crate::ui_kit::chevron(ui.painter(), mark, 3.5, theme::value(ui.ctx(), resp.id.with("turn"), if open { 1.0 } else { 0.0 }, theme::NORMAL), ink);
+        }
+        let tip = if locked { "Locked while clipping: the video's size is set when clipping starts" } else { "The video's size: what your clips are" };
+        let resp = resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand);
+        egui::Popup::from_toggle_button_response(&resp)
+            .id(id)
+            .gap(6.0)
+            .align(egui::RectAlign::BOTTOM_END)
+            .frame(crate::ui_kit::pop_frame(ui))
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| self.size_panel(ui, locked));
+    }
+
+    /// The video size's choices: a resolution and an aspect ratio, each one
+    /// click (an exact size, and the rest, in Settings).
+    fn size_panel(&mut self, ui: &mut egui::Ui, locked: bool) {
+        use crate::settings::OutputResolution as R;
+        use crate::theme::{self, W};
+        use crate::ui_kit::Seg;
+        let pal = theme::pal(ui);
+        ui.set_width(380.0);
+        ui.spacing_mut().item_spacing.y = 6.0;
+        ui.horizontal(|ui| {
+            ui.label(theme::text("Video size", 13.5, W::Semibold).color(pal.text));
+            ui.label(theme::text("what your clips are", 12.5, W::Regular).color(pal.text3));
+        });
+        if locked {
+            ui.horizontal(|ui| {
+                ui.label(theme::ic(egui_phosphor::regular::LOCK_SIMPLE, 12.5).color(pal.text3));
+                ui.label(theme::text("Stop clipping to change it: the size is set when clipping starts", 12.5, W::Regular).color(pal.text2));
+            });
+        }
+        ui.add_enabled_ui(!locked, |ui| {
+            let label = |ui: &mut egui::Ui, t: &str| {
+                ui.add_space(4.0);
+                ui.label(theme::text(t, 12.0, W::Medium).color(pal.text2));
+            };
+            label(ui, "Resolution");
+            // The common ones in p, or a custom size: its width and height
+            // in boxes under them.
+            const SIZES: [R; 5] = [R::Native, R::P1440, R::P1080, R::P720, R::P480];
+            let names = SIZES.map(|r| r.label());
+            let mut opts: Vec<Seg> = names.iter().map(|n| Seg { icon: None, label: n.as_str(), tip: None }).collect();
+            opts.push(Seg { icon: None, label: "Custom", tip: Some("Any width and height") });
+            let exact = self.settings.resolution.exact();
+            let now = if exact.is_some() { SIZES.len() } else { SIZES.iter().position(|r| *r == self.settings.resolution).unwrap_or(usize::MAX) };
+            match crate::ui_kit::segmented_opts(ui, "size_res", &opts, now, None, !locked) {
+                Some(i) if i < SIZES.len() => self.settings.resolution = SIZES[i],
+                // From the size it records at now, the width chosen to type over.
+                Some(_) if exact.is_none() => {
+                    let (w, h) = capture::frame_size(&self.video_source(), self.settings.video_size()).unwrap_or((1920, 1080));
+                    self.settings.resolution = R::Exact(w & !1, h & !1);
+                    crate::ui_kit::type_in_size(ui.ctx(), "res_size");
+                }
+                _ => {}
+            }
+            // The same boxes as Settings' (and their link).
+            if let Some(size) = self.settings.resolution.exact()
+                && let Some((w, h)) = crate::ui_kit::size_field(ui, "res_size", size, 144..=capture::MAX_SIDE, 144..=capture::MAX_SIDE)
+            {
+                self.settings.resolution = R::Exact(w, h);
+            }
+            label(ui, "Aspect ratio");
+            const SHAPES: [Option<[u32; 2]>; 6] = [None, Some([16, 9]), Some([9, 16]), Some([1, 1]), Some([4, 3]), Some([21, 9])];
+            let names: Vec<String> = SHAPES.iter().map(|s| s.map_or("Same as screen".to_owned(), |[w, h]| format!("{w}:{h}"))).collect();
+            let opts: Vec<Seg> = names.iter().map(|n| Seg { icon: None, label: n.as_str(), tip: None }).collect();
+            let exact = self.settings.resolution.exact();
+            let now = if exact.is_some() { usize::MAX } else { SHAPES.iter().position(|s| *s == self.settings.shape).unwrap_or(usize::MAX) };
+            if let Some(i) = crate::ui_kit::segmented_opts(ui, "size_shape", &opts, now, None, !locked) {
+                self.settings.shape = SHAPES[i];
+                // A custom size is its own shape: a resolution in p, as near it, instead.
+                if let Some((w, h)) = exact {
+                    let short = w.min(h);
+                    self.settings.resolution = R::PRESETS.iter().copied().find(|r| r.short_side() == Some(short)).unwrap_or(R::Custom(short));
+                }
+            }
+            // Cropped (on its page, or with Alt on the preview), filling the
+            // video: the crop's size, for every pixel of it as it is.
+            let video = capture::frame_size(&self.video_source(), self.settings.video_size());
+            if let Some((w, h)) = self.crop_size().filter(|m| Some(*m) != video) {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.label(theme::text(format!("Your screen's cropped to {w}×{h}"), 12.5, W::Regular).color(pal.text2));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let b = crate::ui_kit::Btn::normal("Match the crop").small().tip(format!("Make your video {w}×{h}, the crop's size: every pixel of it as it is"));
+                        if b.show(ui).clicked() {
+                            self.settings.resolution = R::Exact(w, h);
+                        }
+                    });
+                });
+            }
+        });
+        ui.add_space(4.0);
+        crate::ui_kit::divider(ui, 0.0);
+        let size = capture::frame_size(&self.video_source(), self.settings.video_size());
+        let native = capture::frame_size(&self.video_source(), capture::VideoSize { shape: self.settings.capture_shape(), ..Default::default() });
+        let note = match (size, native) {
+            (Some((w, h)), Some((nw, nh))) if self.settings.resolution.short_side().is_some_and(|t| t > nw.min(nh)) => format!("Records at {w}×{h}: as big as your screen allows"),
+            (Some((w, h)), _) => format!("Records at {w}×{h}"),
+            (None, _) => String::new(),
+        };
+        ui.horizontal(|ui| {
+            ui.label(theme::text(note, 12.5, W::Regular).color(pal.text2));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let more = crate::ui_kit::Btn::ghost("More in Settings").trail(egui_phosphor::regular::CARET_RIGHT).small().tip("Every resolution, frame rate and quality");
+                if more.show(ui).clicked() {
+                    self.page = crate::Page::Settings;
+                    ui.close();
+                }
+            });
+        });
     }
 
     /// The Crop row: what's kept of the screen, and a way to its page.
-    fn crop_row(&mut self, ui: &mut egui::Ui, idle: bool) {
+    fn crop_row(&mut self, ui: &mut egui::Ui) {
         use crate::ui_kit::Btn;
         let pal = crate::theme::pal(ui);
         let kept = self.crop_whole().zip(self.settings.screen_crop.filter(|c| !c.is_none())).map(|((w, h), c)| capture::Crop::from(c).rect(w, h));
-        let stop_first = self.stop_first();
         ui.horizontal(|ui| {
             ui.set_min_height(GROUP_ROW_H);
             ui.spacing_mut().item_spacing.x = 5.0;
-            ui.label(crate::theme::text("Crop", 13.5, crate::theme::W::Regular).color(if idle { pal.text } else { pal.text2 }));
-            // Set before capturing (it's the recording's size): locked, as
-            // Settings' rows are, while capturing.
-            if !idle {
-                ui.label(crate::theme::ic(egui_phosphor::regular::LOCK_SIMPLE, 12.5).color(pal.text3)).on_hover_text(stop_first);
-            }
+            ui.label(crate::theme::text("Crop", 13.5, crate::theme::W::Regular).color(pal.text));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
-                let b = Btn::normal("Adjust").trail(egui_phosphor::regular::CARET_RIGHT).small().tip("Record only part of the screen: a game at a lower resolution than your display, with black around it");
+                let b = Btn::normal("Adjust").trail(egui_phosphor::regular::CARET_RIGHT).small().tip("Show only part of your screen: a game at a lower resolution than your display, with black around it");
                 if b.show(ui).clicked() {
                     self.sources_view.crop_open = true;
                 }
@@ -491,10 +955,21 @@ impl App {
         });
     }
 
+    /// The size a video would be to show the screen's crop as it is (even,
+    /// as big as a video can be; turned, as it shows), when it's cropped and
+    /// fills the video.
+    fn crop_size(&self) -> Option<(u32, u32)> {
+        let (sw, sh) = self.crop_whole()?;
+        let crop = self.settings.screen_crop.filter(|c| !c.is_none() && self.settings.screen.placed.is_none())?;
+        let [_, _, w, h] = capture::Crop::from(crop).rect(sw, sh);
+        let (w, h) = crate::canvas_ui::Turned::of(&self.settings.screen).size((w, h));
+        ((w, h) != crate::canvas_ui::Turned::of(&self.settings.screen).size((sw & !1, sh & !1))).then(|| capture::output_size(w, h, None))
+    }
+
     /// The display's own size, uncropped, when it's known.
-    fn crop_whole(&self) -> Option<(u32, u32)> {
+    pub(crate) fn crop_whole(&self) -> Option<(u32, u32)> {
         match self.video_source() {
-            capture::VideoSource::Screen { id, hook, method, .. } => capture::frame_size(&capture::VideoSource::Screen { id, hook, method, crop: None }, None, None),
+            source @ capture::VideoSource::Screen { .. } => capture::frame_size(&source, Default::default()),
             capture::VideoSource::Apps { .. } => None,
         }
     }
@@ -502,6 +977,8 @@ impl App {
     /// The crop's page, in Sources' place: all of the screen with what's
     /// kept drawn on it to drag, and its size and place as numbers. It starts
     /// centred, and stays so as its size changes, until it's put somewhere.
+    /// It's only what's shown of the screen, so it changes while clipping
+    /// too; the video's size can be made the crop's, for every pixel of it.
     fn screen_crop_page(&mut self, ui: &mut egui::Ui) {
         use crate::settings::ScreenCrop;
         use crate::theme::{self, W};
@@ -513,11 +990,8 @@ impl App {
             self.sources_view.crop_open = false;
             return;
         }
-        // It's the recording's size: set before capturing, locked meanwhile
-        // (as in Settings), showing what's recorded.
-        let lock = (self.rec_state != crate::RecState::Idle).then(|| self.stop_first().to_owned());
-        let locked = lock.is_some();
-        let keep = self.sources_view.crop_keep_shape.is_some();
+        // Its size's link keeps the shape as its edges are dragged too.
+        let keep = crate::ui_kit::size_field_keeps(ui.ctx(), "screen_crop").is_some();
         let mut back = false;
         self.page_head(ui, "", |_, ui| {
             back = Btn::icon(crate::ui_kit::Kind::Ghost, egui_phosphor::regular::CARET_LEFT).tip("Back to Sources  (Esc)").show(ui).clicked();
@@ -540,6 +1014,15 @@ impl App {
         let [x, y, w, h] = capture::Crop::from(crop).rect(sw, sh);
         let centred = crop.at.is_none();
         let mut set: Option<ScreenCrop> = None;
+        // What the video does with it, when it fills the video: the video's
+        // size, the crop's (as a video can be), and why that can't change now.
+        let video = capture::frame_size(&self.video_source(), self.settings.video_size());
+        // The crop as it shows in the video: turned, if the screen is.
+        let (tw, th) = crate::canvas_ui::Turned::of(&self.settings.screen).size((w, h));
+        let matched = capture::output_size(tw, th, None);
+        let filling = self.settings.screen.placed.is_none() && (w, h) != (sw & !1, sh & !1);
+        let size_lock = (self.rec_state != crate::RecState::Idle).then(|| "Stop clipping to change your video's size: it's set when clipping starts".to_owned());
+        let mut match_crop = false;
         // The least kept each way.
         let least = 64u32;
 
@@ -551,25 +1034,14 @@ impl App {
                 let p = ui.painter();
                 p.rect_filled(rect, 6.0, pal.stage);
                 // Only a picture of the whole screen is cropped on (one of
-                // the cropped picture shows for a moment as the preview
-                // starts over). Capturing, there's only what's recorded:
-                // shown where it is on the screen, without handles.
+                // the video shows for a moment as the preview starts over).
                 let whole = frame.as_ref().is_some_and(|f| (f.recorded.0 as f32 / f.recorded.1.max(1) as f32 - aspect).abs() < 0.01);
-                let to = |px: f32, py: f32| egui::pos2(rect.left() + px / sw as f32 * rect.width(), rect.top() + py / sh as f32 * rect.height());
-                let kept_on_screen = egui::Rect::from_min_max(to(x as f32, y as f32), to((x + w) as f32, (y + h) as f32));
-                // Without a frame, what's held is an older capture's picture.
-                let drawn = if locked { frame.is_some() && this.paint_preview(p, kept_on_screen) } else { whole && this.paint_preview(p, rect) };
-                if !drawn {
+                if !(whole && this.paint_preview(p, rect)) {
                     let text = match this.video_preview.as_ref().and_then(|(_, v)| v.error()) {
                         Some(e) => format!("No preview: {e}"),
                         None => "Starting preview…".to_owned(),
                     };
                     p.text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(13.0), Color32::from_gray(170));
-                }
-                // Locked: where it is, outlined as when it's set, without grips.
-                if locked {
-                    crate::webcam_ui::crop_outline(p, kept_on_screen, false);
-                    return;
                 }
                 let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(sw as f32, sh as f32));
                 let kept = egui::Rect::from_min_size(egui::pos2(x as f32, y as f32), egui::vec2(w as f32, h as f32));
@@ -581,9 +1053,7 @@ impl App {
             });
             ui.add_space(8.0);
             ui.vertical_centered(|ui| {
-                let hint = if locked {
-                    "Stop clipping to change the crop: it's the size of what's recorded."
-                } else if keep {
+                let hint = if keep {
                     "Drag the edges or corners (the shape's kept), or the middle to move it."
                 } else {
                     "Drag the edges or corners (Shift keeps the shape), or the middle to move it."
@@ -592,8 +1062,7 @@ impl App {
             });
         };
         let mut locked_click = false;
-        let mut keep_now = self.sources_view.crop_keep_shape;
-        let numbers = |ui: &mut egui::Ui, set: &mut Option<ScreenCrop>, locked_click: &mut bool, keep: &mut Option<f64>| {
+        let numbers = |ui: &mut egui::Ui, set: &mut Option<ScreenCrop>, locked_click: &mut bool, match_crop: &mut bool| {
             let small = |ui: &mut egui::Ui, t: &str| ui.label(theme::text(t, 12.5, W::Regular).color(pal.text3));
             // Laid out left to right at the row's end, so Tab goes through
             // them in reading order: `width` across, made by `add`.
@@ -605,40 +1074,38 @@ impl App {
             };
             const BOX: f32 = 64.0;
             crate::ui_kit::list(ui, "screen_crop", |l| {
+                // Its shape: the biggest of it there's room for, where it is,
+                // and kept as it's sized (it's the size's link).
+                let (_, c) = l.row(Row::new("Aspect ratio"), |ui| {
+                    let now = crate::ui_kit::size_field_keeps(ui.ctx(), "screen_crop").map(crate::ui_kit::ratio_of);
+                    let from = crate::ui_kit::ratio_of(w as f64 / h.max(1) as f64);
+                    match crate::ui_kit::ratio_field(ui, "screen_crop_ratio", ("Any", ""), now, from) {
+                        Some(None) => crate::ui_kit::set_size_field_keeps(ui.ctx(), "screen_crop", None),
+                        Some(Some([aw, ah])) => {
+                            crate::ui_kit::set_size_field_keeps(ui.ctx(), "screen_crop", Some(aw as f64 / ah as f64));
+                            let centre = (x as f64 + w as f64 / 2.0, y as f64 + h as f64 / 2.0);
+                            // All of the display, when it's that shape.
+                            *set = Some(match media::Crop::largest(sw, sh, aw, ah, centre).within(sw, sh) {
+                                Some(c) => ScreenCrop { w: c.w, h: c.h, at: (!centred).then_some([c.x, c.y]) },
+                                None => ScreenCrop::default(),
+                            });
+                        }
+                        None => {}
+                    }
+                });
+                *locked_click |= c;
                 // Its size: the game's resolution. Centred, it stays in the
                 // middle; else its top-left corner stays put. With the shape
                 // kept, one follows the other.
-                let even = |v: f64| ((v / 2.0).round() as u32 * 2).max(least);
-                let (_, c) = l.row(Row::new("Size").note("The game's resolution, like 1600 × 900").locked(lock.clone()), |ui| {
-                    boxes(ui, BOX * 2.0 + 28.0 + 16.0 + 6.0 * 3.0, &mut |ui| {
-                        if let Some(v) = crate::ui_kit::number_box(ui, egui::Id::new("screen_crop_w"), w, least..=sw, BOX) {
-                            let h = keep.map_or(h, |shape| even(v as f64 / shape).min(sh));
-                            *set = Some(ScreenCrop { w: v, h, ..crop });
-                        }
-                        // The link between them goes here, but is made after
-                        // the height: Tab goes from width to height.
-                        let (slot, _) = ui.allocate_exact_size(egui::vec2(28.0, crate::ui_kit::CONTROL_H), Sense::hover());
-                        if let Some(v) = crate::ui_kit::number_box(ui, egui::Id::new("screen_crop_h"), h, least..=sh, BOX) {
-                            let w = keep.map_or(w, |shape| even(v as f64 * shape).min(sw));
-                            *set = Some(ScreenCrop { w, h: v, ..crop });
-                        }
-                        small(ui, "px");
-                        let (icon, tip) = if keep.is_some() {
-                            (egui_phosphor::regular::LINK_SIMPLE_HORIZONTAL, "The shape's kept: changing one changes the other. Click to set them on their own.")
-                        } else {
-                            (egui_phosphor::regular::LINK_SIMPLE_HORIZONTAL_BREAK, "Keep the shape: changing one changes the other")
-                        };
-                        let kind = if keep.is_some() { crate::ui_kit::Kind::Normal } else { crate::ui_kit::Kind::Ghost };
-                        let link = ui.scope_builder(egui::UiBuilder::new().max_rect(slot).layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)), |ui| Btn::icon(kind, icon).small().tip(tip).show(ui));
-                        if link.inner.clicked() {
-                            *keep = if keep.is_some() { None } else { Some(w as f64 / h.max(1) as f64) };
-                        }
-                    });
+                let (_, c) = l.row(Row::new("Size").note("The game's resolution, like 1600 × 900"), |ui| {
+                    if let Some((w, h)) = crate::ui_kit::size_field(ui, "screen_crop", (w, h), least..=sw, least..=sh) {
+                        *set = Some(ScreenCrop { w, h, ..crop });
+                    }
                 });
                 *locked_click |= c;
                 // Where it is: its top-left corner, or the middle.
                 let note = if centred { "Centred on the screen".to_owned() } else { "Its top-left corner, from the screen's".to_owned() };
-                let (_, c) = l.row(Row::new("Position").note(note).locked(lock.clone()), |ui| {
+                let (_, c) = l.row(Row::new("Position").note(note), |ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
                     let b = Btn::normal("Centre").small().enabled(!centred).tip("Put it in the middle of the screen, and keep it there");
                     if b.show(ui).clicked() {
@@ -656,14 +1123,45 @@ impl App {
                     });
                 });
                 *locked_click |= c;
+                // The video: as big as the crop, every pixel as it is; else
+                // what it does to it, and a way to make it the crop's size.
+                if let (true, Some((vw, vh))) = (filling, video) {
+                    let note = if (vw, vh) == matched {
+                        "The crop's size: every pixel as it is".to_owned()
+                    } else {
+                        let (crop_shape, video_shape) = (tw as f32 / th.max(1) as f32, vw as f32 / vh.max(1) as f32);
+                        let scale = vh as f32 / capture::Shape { w: vw, h: vh, framing: capture::Framing::Fill }.of(tw, th).1.max(1) as f32;
+                        let does = if (crop_shape / video_shape - 1.0).abs() > 0.01 {
+                            if crop_shape > video_shape { "the crop's sides are cut off to fit it" } else { "the crop's top and bottom are cut off to fit it" }
+                        } else if scale > 1.01 {
+                            "the crop is made bigger to fill it, a little softer"
+                        } else if scale < 0.99 {
+                            "the crop is made smaller to fit it"
+                        } else {
+                            "about the crop's size"
+                        };
+                        format!("{vw}×{vh}: {does}")
+                    };
+                    let lock = size_lock.clone().filter(|_| (vw, vh) != matched);
+                    let (_, c) = l.row(Row::new("Video size").note(note).locked(lock), |ui| {
+                        if (vw, vh) != matched {
+                            let (mw, mh) = matched;
+                            let b = Btn::normal("Match the crop").small().tip(format!("Make your video {mw}×{mh}, the crop's size: every pixel of it as it is"));
+                            *match_crop = b.show(ui).clicked();
+                        } else {
+                            ui.label(theme::ic(egui_phosphor::regular::CHECK, 14.0).color(pal.text3));
+                        }
+                    });
+                    *locked_click |= c;
+                }
             });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.add_space(2.0);
-                let what = if (w, h) == (sw, sh) { format!("All of the screen, {sw}×{sh}") } else { format!("{w}×{h} of {sw}×{sh}, recorded like a display that size") };
+                let what = if (w, h) == (sw, sh) { format!("All of the screen, {sw}×{sh}") } else { format!("{w}×{h} of {sw}×{sh}") };
                 ui.label(theme::text(what, 12.5, W::Regular).color(pal.text3));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if (w, h) != (sw, sh) && Btn::ghost("Reset").small().enabled(!locked).tip("All of the screen again").show(ui).clicked() {
+                    if (w, h) != (sw, sh) && Btn::ghost("Reset").small().tip("All of the screen again").show(ui).clicked() {
                         *set = Some(ScreenCrop::default());
                     }
                 });
@@ -684,21 +1182,23 @@ impl App {
                 });
                 ui.allocate_ui_with_layout(egui::vec2(col, avail_h), egui::Layout::top_down(egui::Align::Min), |ui| {
                     ui.set_width(col);
-                    numbers(ui, &mut set, &mut locked_click, &mut keep_now);
+                    numbers(ui, &mut set, &mut locked_click, &mut match_crop);
                 });
             });
         } else {
             crate::ui_kit::scroll(ui, "screen_crop_page", |ui| {
                 picture(ui, self, avail_h * 0.4, &mut set);
                 ui.add_space(16.0);
-                numbers(ui, &mut set, &mut locked_click, &mut keep_now);
+                numbers(ui, &mut set, &mut locked_click, &mut match_crop);
             });
         }
-        self.sources_view.crop_keep_shape = keep_now;
-        if locked_click && let Some(why) = &lock {
-            self.toast_icon(egui_phosphor::regular::LOCK_SIMPLE, why.trim_end_matches('.').to_owned());
+        if locked_click && let Some(why) = &size_lock {
+            self.toast_icon(egui_phosphor::regular::LOCK_SIMPLE, why.clone());
         }
-        if let Some(c) = set.filter(|_| !locked) {
+        if match_crop && size_lock.is_none() {
+            self.settings.resolution = crate::settings::OutputResolution::Exact(matched.0, matched.1);
+        }
+        if let Some(c) = set {
             let all = c.is_none() || capture::Crop::from(c).rect(sw, sh) == [0, 0, sw & !1, sh & !1];
             self.settings.screen_crop = (!all).then_some(c);
         }
@@ -790,6 +1290,7 @@ impl App {
         let w = ui.available_width().min(max_h * aspect);
         ui.vertical_centered(|ui| {
             let (rect, response) = ui.allocate_exact_size(egui::vec2(w, w / aspect), Sense::click_and_drag());
+            crate::demo::mark(ui.ctx(), || "preview".into(), rect);
             let p = ui.painter();
             p.rect_filled(rect, 6.0, crate::theme::pal(ui).stage);
             let message = |text: &str| {
@@ -798,23 +1299,25 @@ impl App {
             let drawn = self.paint_preview(p, rect);
             // While a new preview starts (another frame rate, size, webcam)
             // the last picture stays up; the message is only for when there's
-            // none to show.
+            // none to show. With every source off, the video is black: said.
+            let webcam_on = self.settings.webcam.as_ref().is_some_and(|w| w.enabled);
             match self.video_preview.as_ref().and_then(|(_, p)| p.error()) {
                 Some(e) => message(&format!("No preview: {e}")),
                 None if !drawn => message("Starting preview…"),
+                None if !self.settings.screen.enabled && !webcam_on => message("Nothing's in your video: turn a source on below"),
                 None => {}
             }
-            if self.settings.webcam.is_some() && frame.is_some() {
-                self.webcam_on_preview(ui, rect, &response);
+            if frame.is_some() {
+                self.canvas_on_preview(ui, rect, &response);
             }
         });
     }
 
-    /// The games and apps to record: a framed list, each with whether it's
-    /// open (and which is being recorded) and a remove button, then a way to
-    /// add more. Right-clicking one has its game capture option. Changes apply
-    /// right away, even while capturing.
-    fn app_list(&mut self, ui: &mut egui::Ui, apps: Vec<CaptureApp>, away_screen: bool, frame: Option<&capture::preview::PreviewFrame>) {
+    /// The games and apps to record, in the screen's card: each with whether
+    /// it's open (and which is being recorded) and a remove button, then a
+    /// way to add more, and the Tabbed out switch. Changes apply right away,
+    /// even while capturing.
+    fn app_rows(&mut self, ui: &mut egui::Ui, apps: Vec<CaptureApp>, away_screen: bool, frame: Option<&capture::preview::PreviewFrame>) {
         use crate::theme::{self, W};
         use crate::ui_kit::{Btn, Item, Kind};
         use egui_phosphor::regular as icon;
@@ -824,10 +1327,9 @@ impl App {
         let mut list = apps.clone();
         let mut away = away_screen;
         let mut remove = None;
-        group(ui, "apps", |ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
+        {
             if list.is_empty() {
-                ui.add_space(4.0);
+                ui.add_space(10.0);
                 ui.label(theme::text("No games or apps yet. Add the games you play.", 13.0, W::Regular).color(pal.text3));
                 ui.add_space(8.0);
             }
@@ -895,20 +1397,20 @@ impl App {
                     crate::ui_kit::menu_head(ui, "Nothing else is open. Start the game or app, then add it here.");
                 }
             });
-        });
-        if list.len() > 1 {
             ui.add_space(6.0);
-            crate::ui_kit::hint(ui, "Records the one you're using, and keeps it while you click into something else as long as it's on screen.");
         }
-        ui.add_space(10.0);
-        group(ui, "tabbed_out", |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                ui.label(theme::text("Show “Tabbed out” when you leave it", 13.5, W::Regular).color(pal.text));
-                crate::ui_kit::info(ui, "Tabbed out", "When the game you were in stops showing (most games minimize when you alt-tab), or none of yours is open, clips show the HasteClip logo with “Tabbed out”. Off: they keep the game's last picture, or show black when none is open. A window that's still on screen keeps being recorded either way.");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    crate::ui_kit::switch(ui, &mut away);
-                });
+        if list.len() > 1 {
+            crate::ui_kit::hint(ui, "Records the one you're using, and keeps it while you click into something else as long as it's on screen.");
+            ui.add_space(6.0);
+        }
+        crate::ui_kit::divider(ui, 0.0);
+        ui.horizontal(|ui| {
+            ui.set_min_height(GROUP_ROW_H);
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.label(theme::text("Show “Tabbed out” when you leave it", 13.5, W::Regular).color(pal.text));
+            crate::ui_kit::info(ui, "Tabbed out", "When the game you were in stops showing (most games minimize when you alt-tab), or none of yours is open, clips show the HasteClip logo with “Tabbed out”. Off: they keep the game's last picture, or show black when none is open. A window that's still on screen keeps being recorded either way.");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                crate::ui_kit::switch(ui, &mut away);
             });
         });
         if let Some(i) = remove {
@@ -1001,7 +1503,9 @@ impl App {
             self.sources_view.preview_gpu = None;
             self.sources_view.preview_frames = Default::default();
         }
-        let want = capture::preview::AVAILABLE && self.wants_sources_capture() && self.rec_state == crate::RecState::Idle;
+        // While clipping, the capture shows what it records; the crop's page
+        // has one of its own, of all of the screen (shown over it till it closes).
+        let want = capture::preview::AVAILABLE && self.wants_sources_capture() && (self.rec_state == crate::RecState::Idle || self.sources_view.crop_open);
         if !want {
             self.video_preview = None;
             return;
@@ -1016,8 +1520,8 @@ impl App {
         // the crop's set: all of the screen as it is, to crop on.
         let webcam = self.webcam_source();
         let wanted = match self.video_source() {
-            capture::VideoSource::Screen { id, hook, method, .. } if self.sources_view.crop_open => (capture::VideoSource::Screen { id, hook, method, crop: None }, (None, None), self.settings.fps, None),
-            source => (source, (self.settings.resolution.height(), self.settings.capture_shape()), self.settings.fps, webcam.clone()),
+            source @ capture::VideoSource::Screen { .. } if self.sources_view.crop_open => (source, Default::default(), self.settings.fps, None, true),
+            source => (source, self.settings.video_size(), self.settings.fps, webcam.clone(), false),
         };
         let webcam = wanted.3.clone();
         // A changed app list reaches the running preview without a restart,
@@ -1027,18 +1531,20 @@ impl App {
         // in a frame of the wrong shape (until clipping started a new capture).
         if let Some((have, preview)) = &mut self.video_preview {
             if *have != wanted
-                && (&have.1, have.2, &have.3) == (&wanted.1, wanted.2, &wanted.3)
-                && capture::frame_size(&have.0, have.1.0, have.1.1) == capture::frame_size(&wanted.0, wanted.1.0, wanted.1.1)
+                && (&have.1, have.2, &have.3, have.4) == (&wanted.1, wanted.2, &wanted.3, wanted.4)
+                && capture::frame_size(&have.0, have.1) == capture::frame_size(&wanted.0, wanted.1)
                 && preview.update(&wanted.0)
             {
                 have.0 = wanted.0.clone();
             }
         }
         if self.video_preview.as_ref().is_none_or(|(w, _)| *w != wanted) {
-            let (source, (height, shape), fps, _) = &wanted;
+            let (source, size, fps, _, whole) = &wanted;
+            // All of the screen: placed on its own, filling the picture.
+            let screen = if *whole { std::sync::Arc::new(std::sync::Mutex::new(capture::ScreenPlacement::whole(capture::Framing::Fit))) } else { self.screen_placement.clone() };
             // Both happen in the background: the old capture closes as the new
             // one opens, and only the new one's frames are shown.
-            let preview = capture::preview::VideoPreview::start(source, *height, *shape, *fps, Some(self.away_screen.clone()), webcam);
+            let preview = capture::preview::VideoPreview::start(source, *size, *fps, Some(self.away_screen.clone()), webcam, screen);
             self.video_preview = Some((wanted, preview));
         }
     }
@@ -1577,6 +2083,10 @@ pub(crate) fn group(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debu
 pub(crate) const GROUP_PAD: f32 = 12.0;
 /// How tall a row in a group of rows is (`group_rows`).
 pub(crate) const GROUP_ROW_H: f32 = 42.0;
+
+/// A picture source's card's line: as tall as its menu button and a little
+/// room (its settings below are rows of `GROUP_ROW_H`).
+const CARD_HEAD_H: f32 = 34.0;
 
 /// A group of rows (`GROUP_ROW_H` tall, their control centred): less above
 /// and below, so the controls are as far from its edges as from its sides.

@@ -6,7 +6,7 @@
 
 use media::{BlendShape, ClipInfo, Crop, Edit, Output};
 
-use crate::crop_ui::{SHAPES, shape_of};
+use crate::ui_kit::{RATIOS, common_ratio};
 
 /// Common heights, offered when smaller than the clip.
 const HEIGHTS: [u32; 5] = [2160, 1440, 1080, 720, 480];
@@ -22,7 +22,7 @@ pub fn summary(info: &ClipInfo, edit: &Edit) -> String {
     let o = edit.output;
     let mut parts = Vec::new();
     if let Some(c) = o.crop.and_then(|c| c.within(info.width, info.height)) {
-        parts.push(shape_of(&c).map_or("Cropped".into(), |i| format!("{} crop", SHAPES[i].0)));
+        parts.push(common_ratio(c.w, c.h).map_or("Cropped".into(), |i| format!("{}:{} crop", RATIOS[i].0, RATIOS[i].1)));
     }
     if o.height.is_some_and(|h| h < o.picture(info).1) {
         parts.push(format!("{}p", o.height.unwrap()));
@@ -97,8 +97,8 @@ pub fn ui(ui: &mut egui::Ui, info: &ClipInfo, edit: &mut Edit, crop_on_picture: 
         let crop = o.crop.and_then(|c| c.within(info.width, info.height));
         let shown = match crop {
             None => "None".to_owned(),
-            Some(c) => match shape_of(&c) {
-                Some(i) => format!("{} ({}×{})", SHAPES[i].0, c.w, c.h),
+            Some(c) => match common_ratio(c.w, c.h) {
+                Some(i) => format!("{}:{} ({}×{})", RATIOS[i].0, RATIOS[i].1, c.w, c.h),
                 None => format!("{}×{}", c.w, c.h),
             },
         };
@@ -110,9 +110,9 @@ pub fn ui(ui: &mut egui::Ui, info: &ClipInfo, edit: &mut Edit, crop_on_picture: 
             // Each shape the biggest it can be, where the crop is (else in
             // the middle); not one the picture already is.
             let centre = crop.map_or((info.width as f64 / 2.0, info.height as f64 / 2.0), |c| c.centre());
-            for (i, &(name, w, h, tip)) in SHAPES.iter().enumerate() {
+            for (i, &(w, h, note)) in RATIOS.iter().enumerate() {
                 let Some(c) = Crop::largest(info.width, info.height, w, h, centre).within(info.width, info.height) else { continue };
-                if Item::new(name).check(crop.as_ref().and_then(shape_of) == Some(i)).tip(tip).show(ui).clicked() {
+                if Item::new(format!("{w}:{h}")).check(crop.and_then(|c| common_ratio(c.w, c.h)) == Some(i)).value(note).show(ui).clicked() {
                     o.crop = Some(c);
                 }
             }

@@ -92,8 +92,13 @@ pub enum RateControl {
     Cqp,
 }
 
+/// What [`RecordSettings::size_version`] is for settings made now.
+pub const SIZE_VERSION: u32 = 1;
+
 /// Output resolution. `Native` records at the capture source's resolution;
-/// the others downscale on encode (never up: a smaller display stays its size).
+/// the p ones bring its short side down to that many pixels on encode (never
+/// up: a smaller display stays its size), so 1080p is 1920×1080 widescreen
+/// and 1080×1920 upright. `Exact` is that size whatever the display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OutputResolution {
     Native,
@@ -103,8 +108,10 @@ pub enum OutputResolution {
     P1080,
     P1440,
     P2160,
-    /// Any height, in pixels (the width follows the display's shape).
+    /// Any short side, in pixels (the other follows the recording's shape).
     Custom(u32),
+    /// Exactly this width and height.
+    Exact(u32, u32),
 }
 
 impl OutputResolution {
@@ -113,7 +120,8 @@ impl OutputResolution {
             OutputResolution::Native => "Native".into(),
             OutputResolution::P2160 => "2160p (4K)".into(),
             OutputResolution::Custom(h) => format!("{h}p (custom)"),
-            r => format!("{}p", r.height().unwrap_or(0)),
+            OutputResolution::Exact(w, h) => format!("{w}×{h}"),
+            r => format!("{}p", r.short_side().unwrap_or(0)),
         }
     }
 
@@ -127,14 +135,15 @@ impl OutputResolution {
             OutputResolution::P900 => "",
             OutputResolution::P720 => "small files, quick to upload",
             OutputResolution::P480 => "smallest files",
-            OutputResolution::Custom(_) => "",
+            OutputResolution::Custom(_) | OutputResolution::Exact(..) => "",
         }
     }
 
-    /// Target height in pixels, or `None` for native (no rescale).
-    pub fn height(self) -> Option<u32> {
+    /// The short side to bring the recording down to, in pixels; `None` for
+    /// native (no rescale) and for an exact size.
+    pub fn short_side(self) -> Option<u32> {
         match self {
-            OutputResolution::Native => None,
+            OutputResolution::Native | OutputResolution::Exact(..) => None,
             OutputResolution::P480 => Some(480),
             OutputResolution::P720 => Some(720),
             OutputResolution::P900 => Some(900),
@@ -142,6 +151,14 @@ impl OutputResolution {
             OutputResolution::P1440 => Some(1440),
             OutputResolution::P2160 => Some(2160),
             OutputResolution::Custom(h) => Some(h),
+        }
+    }
+
+    /// The exact size asked for, if it's one.
+    pub fn exact(self) -> Option<(u32, u32)> {
+        match self {
+            OutputResolution::Exact(w, h) => Some((w, h)),
+            _ => None,
         }
     }
 
@@ -155,6 +172,59 @@ impl OutputResolution {
         OutputResolution::P720,
         OutputResolution::P480,
     ];
+}
+
+/// The screen (or games and apps) as a source in the video: whether it's
+/// in it, in front of the webcam or behind it, and where it sits: over all
+/// of the video, or in a box of its own showing all of it (in its own
+/// shape, as cropped), placed on the Sources page's preview.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScreenCfg {
+    /// In the video (its switch). Off, the webcam shows on black.
+    pub enabled: bool,
+    /// In front of the webcam, rather than behind it.
+    pub in_front: bool,
+    /// Placed by hand: its box. `None`: it fills the video (its middle,
+    /// with a shape of the video's own).
+    pub placed: Option<BoxCfg>,
+    /// Quarter turns clockwise, then mirrored or flipped upside down, as the
+    /// webcam's: see `capture::ScreenPlacement`.
+    pub turns: u8,
+    pub flip_h: bool,
+    pub flip_v: bool,
+}
+
+impl Default for ScreenCfg {
+    fn default() -> Self {
+        Self { enabled: true, in_front: false, placed: None, turns: 0, flip_h: false, flip_v: false }
+    }
+}
+
+/// The video's size as it's chosen, saved apart from `resolution` and
+/// `shape` themselves, which are saved as older versions read them (see
+/// [`RecordSettings::to_json`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SizeCfg {
+    pub resolution: OutputResolution,
+    pub shape: Option<[u32; 2]>,
+}
+
+/// A box in the video: left, top, width, height as fractions of the video
+/// (it can reach past the video's edges: a screen bigger than it), the
+/// shape (width / height) of the video it was laid out in, to keep its own
+/// shape in a video of another, and of the picture it was laid out for: a
+/// box of another shape stretches it (see [`BoxCfg::refit`]).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BoxCfg {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub frame_aspect: f32,
+    /// `None` in a box from before boxes could stretch: it has the picture's shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picture_aspect: Option<f32>,
 }
 
 /// What the video shows.
@@ -237,6 +307,19 @@ pub struct PlacementCfg {
     /// refitted then (`refit`), keeping its own shape in pixels.
     #[serde(default)]
     pub frame_aspect: Option<f32>,
+    /// How stretched its picture is (Shift on the preview): its box's shape
+    /// over what's shown of the camera's. 1, not at all; kept through
+    /// another crop, camera or video shape.
+    #[serde(default = "unstretched", skip_serializing_if = "is_unstretched")]
+    pub stretch: f32,
+}
+
+fn unstretched() -> f32 {
+    1.0
+}
+
+fn is_unstretched(s: &f32) -> bool {
+    (s - 1.0).abs() < 1e-6
 }
 
 impl PlacementCfg {
@@ -244,8 +327,9 @@ impl PlacementCfg {
     /// keep its shape in pixels, as wide a share of the frame (narrower if
     /// that won't fit), at the same place in the room it has to move in (so
     /// a box in a corner stays in it). Its shape is what's left of the
-    /// camera's picture once cropped, as every box is made: given the
-    /// camera's shape (`camera_aspect`, as turned, when known), a box of
+    /// camera's picture once cropped (as stretched as it's been), as every
+    /// box is made: given the camera's shape (`camera_aspect`, as turned,
+    /// when known), a box of
     /// another shape gets it back, one laid out before the frame's shape was
     /// kept or squashed by a frame that changed under it. Returns whether it
     /// changed.
@@ -254,7 +338,7 @@ impl PlacementCfg {
             return false;
         }
         let wanted = camera_aspect.filter(|&cam| cam > 0.0).map(|cam| {
-            cam * (1.0 - self.crop[0] - self.crop[2]).max(0.05) / (1.0 - self.crop[1] - self.crop[3]).max(0.05)
+            cam * (1.0 - self.crop[0] - self.crop[2]).max(0.05) / (1.0 - self.crop[1] - self.crop[3]).max(0.05) * self.stretch
         });
         // Its shape in pixels, in the frame it was made for.
         let had = self.frame_aspect.map(|was| self.w * was / self.h);
@@ -267,34 +351,93 @@ impl PlacementCfg {
             (None, Some(wanted)) => wanted,
             (None, None) => return false, // wait for the camera's shape
         };
-        // From 0 against the left or top edge to 1 against the other.
-        let along = |at: f32, size: f32| if size < 1.0 - 1e-4 { (at / (1.0 - size)).clamp(0.0, 1.0) } else { 0.5 };
-        let (ax, ay) = (along(self.x, self.w), along(self.y, self.h));
-        let mut w = self.w.min(1.0);
-        let mut h = w * frame_aspect / box_aspect;
-        if h > 1.0 {
-            w *= 1.0 / h;
-            h = 1.0;
-        }
-        self.w = w;
-        self.h = h;
-        self.x = ax * (1.0 - w);
-        self.y = ay * (1.0 - h);
+        [self.x, self.y, self.w, self.h] = refit_box([self.x, self.y, self.w, self.h], box_aspect, frame_aspect);
         self.frame_aspect = Some(frame_aspect);
         true
     }
 }
 
+/// A box (left, top, width, height as fractions of the frame) of shape
+/// `box_aspect` in pixels, in a frame of shape `frame_aspect`: as wide a
+/// share of the frame (narrower if that won't fit, for a box that was in
+/// it), at the same place in the room it has to move in (so a box in a
+/// corner stays in it, and one bigger than the frame covers as much of it).
+fn refit_box([x, y, w, h]: [f32; 4], box_aspect: f32, frame_aspect: f32) -> [f32; 4] {
+    // From 0 against the left or top edge to 1 against the other.
+    let along = |at: f32, size: f32| if (1.0 - size).abs() > 1e-4 { (at / (1.0 - size)).clamp(0.0, 1.0) } else { 0.5 };
+    let (ax, ay) = (along(x, w), along(y, h));
+    let inside = w <= 1.0 + 1e-4 && h <= 1.0 + 1e-4;
+    let mut w = if inside { w.min(1.0) } else { w };
+    let mut h = w * frame_aspect / box_aspect;
+    if inside && h > 1.0 {
+        w *= 1.0 / h;
+        h = 1.0;
+    }
+    [ax * (1.0 - w), ay * (1.0 - h), w, h]
+}
+
+impl BoxCfg {
+    /// `rect` (left, top, width, height as fractions of the frame), laid out
+    /// in a frame of shape `frame_aspect` for a picture of shape
+    /// `picture_aspect`, when it's known.
+    pub fn new([x, y, w, h]: [f32; 4], frame_aspect: f32, picture_aspect: Option<f32>) -> Self {
+        Self { x, y, w, h, frame_aspect, picture_aspect }
+    }
+
+    pub fn rect(&self) -> [f32; 4] {
+        [self.x, self.y, self.w, self.h]
+    }
+
+    /// Keep it right for a frame of shape `frame_aspect`: its shape in
+    /// pixels kept, at the same place (see [`refit_box`]). For a picture of
+    /// another shape (`picture_aspect`: another display, another crop) it
+    /// gets the picture's, as stretched as it was, keeping its width and
+    /// place; a box from before boxes could stretch, the picture's own.
+    /// Returns whether it changed.
+    pub fn refit(&mut self, frame_aspect: f32, picture_aspect: Option<f32>) -> bool {
+        if frame_aspect <= 0.0 || self.w <= 0.0 || self.h <= 0.0 {
+            return false;
+        }
+        let had = self.w * self.frame_aspect / self.h;
+        let now = picture_aspect.filter(|&a| a > 0.0);
+        // Off by more than rounding.
+        let off = |a: f32, b: f32| (a / b - 1.0).abs() > 0.02;
+        let box_aspect = match (now, self.picture_aspect) {
+            (Some(now), Some(was)) if off(now, was) => had * now / was,
+            (Some(now), None) if off(had, now) => now,
+            _ if (self.frame_aspect - frame_aspect).abs() < 1e-3 => {
+                let known = self.picture_aspect.is_some() || now.is_none();
+                self.picture_aspect = self.picture_aspect.or(now);
+                return !known;
+            }
+            _ => had,
+        };
+        [self.x, self.y, self.w, self.h] = refit_box(self.rect(), box_aspect, frame_aspect);
+        self.frame_aspect = frame_aspect;
+        if now.is_some_and(|now| self.picture_aspect.is_none_or(|was| off(now, was))) {
+            self.picture_aspect = now;
+        }
+        true
+    }
+
+    /// Whether it's another shape than its picture, by more than rounding:
+    /// stretched on purpose (Shift on the preview).
+    pub fn stretched(&self) -> bool {
+        let shape = self.w * self.frame_aspect / self.h.max(1e-6);
+        self.picture_aspect.is_some_and(|p| p > 0.0 && (shape / p - 1.0).abs() > 0.02)
+    }
+}
+
 impl From<PlacementCfg> for capture::webcam::Placement {
     fn from(p: PlacementCfg) -> Self {
-        Self { x: p.x, y: p.y, w: p.w, h: p.h, crop: p.crop, flip_h: p.flip_h, flip_v: p.flip_v, turns: p.turns }
+        Self { x: p.x, y: p.y, w: p.w, h: p.h, crop: p.crop, flip_h: p.flip_h, flip_v: p.flip_v, turns: p.turns, stretch: p.stretch }
     }
 }
 
 impl PlacementCfg {
     /// `p`, laid out in a frame of shape `frame_aspect`.
     pub fn laid_out(p: capture::webcam::Placement, frame_aspect: f32) -> Self {
-        Self { x: p.x, y: p.y, w: p.w, h: p.h, crop: p.crop, flip_h: p.flip_h, flip_v: p.flip_v, turns: p.turns, frame_aspect: Some(frame_aspect) }
+        Self { x: p.x, y: p.y, w: p.w, h: p.h, crop: p.crop, flip_h: p.flip_h, flip_v: p.flip_v, turns: p.turns, frame_aspect: Some(frame_aspect), stretch: p.stretch }
     }
 }
 
@@ -698,8 +841,10 @@ pub struct RecordSettings {
     /// The games and apps list while the whole screen is recorded, so
     /// switching back to games and apps brings it back.
     pub idle_apps: Option<CaptureTarget>,
-    /// A webcam over the picture, if any.
+    /// A webcam over the picture (or under it), if any.
     pub webcam: Option<WebcamCfg>,
+    /// The screen as a source in the video: in front or behind, its box.
+    pub screen: ScreenCfg,
     /// Each camera's settings changed from its defaults (Linux: V4L2 control
     /// id to value), by camera id: put back each time it's opened, as
     /// cameras forget them when unplugged.
@@ -718,11 +863,28 @@ pub struct RecordSettings {
     pub blend_fps: u32,
     /// How the looks in a blended frame are weighed.
     pub blend_shape: BlendShape,
+    /// The video's size: Native, in p on its short side, or a width and
+    /// height of its own. Saved as older versions read it (p was the
+    /// height, there was no size of its own), the size itself in
+    /// `saved_size`.
     pub resolution: OutputResolution,
+    /// What `resolution`'s p means in a file without `saved_size`: 0 from
+    /// before it was the short side (it was the height), 1 in one saved by
+    /// a version that had it be the short side. Read once, on load.
+    #[serde(default, skip_serializing)]
+    pub size_version: u32,
     /// The shape recordings are made in, width to height, when it isn't the
-    /// screen's (16:9 out of an ultrawide screen).
+    /// screen's (16:9 out of an ultrawide screen). Saved as `resolution` is.
     pub shape: Option<[u32; 2]>,
-    /// How the screen goes into that shape.
+    /// `resolution` and `shape` as they are, in the file (see `to_json`):
+    /// read instead of them when it's there. Older versions don't know it,
+    /// and leave it out when they save.
+    #[serde(rename = "video_size", skip_serializing_if = "Option::is_none")]
+    saved_size: Option<SizeCfg>,
+    /// How the screen goes into a video of a shape of its own (an aspect
+    /// ratio, or a size of its own) while it isn't placed by hand: its
+    /// middle covering it, all of it with bars, or all of it stretched. In
+    /// the screen's own shape, all of it goes in (a window too).
     pub framing: Framing,
     /// The part of the screen kept (a game at a lower resolution than the
     /// display, black around it): set on Sources. It's recorded as a display
@@ -822,6 +984,7 @@ impl Default for RecordSettings {
             capture: CaptureTarget::Screen,
             idle_apps: None,
             webcam: None,
+            screen: ScreenCfg::default(),
             camera_controls: Default::default(),
             display_id: None,
             display_index: 0,
@@ -829,7 +992,9 @@ impl Default for RecordSettings {
             blend_fps: 0,
             blend_shape: BlendShape::Even,
             resolution: OutputResolution::Native,
+            size_version: SIZE_VERSION,
             shape: None,
+            saved_size: None,
             framing: Framing::Fill,
             screen_crop: None,
             video_bitrate_mbps: 40,
@@ -985,14 +1150,75 @@ pub const MAX_BLEND: u32 = 2000;
 impl RecordSettings {
     /// Looks at the screen per recorded frame: the blend rate over the frame
     /// rate, 1 (no blending) when off or no longer a multiple above it.
-    /// The shape recordings are made in, if it isn't the screen's.
+    /// The shape recordings are made in, if it isn't the screen's: an exact
+    /// size's own, else the aspect ratio chosen.
     pub fn capture_shape(&self) -> Option<capture::Shape> {
-        self.shape.filter(|[w, h]| *w > 0 && *h > 0).map(|[w, h]| capture::Shape { w, h, framing: self.framing.into() })
+        match self.resolution.exact() {
+            Some((w, h)) => (w > 0 && h > 0).then_some(capture::Shape { w, h, framing: capture::Framing::Fill }),
+            None => self.aspect_shape(),
+        }
+    }
+
+    /// The aspect ratio chosen, if it isn't the screen's (an exact size
+    /// aside: it's what a resolution in p records in). The screen fills it,
+    /// its middle.
+    pub fn aspect_shape(&self) -> Option<capture::Shape> {
+        self.shape.filter(|[w, h]| *w > 0 && *h > 0).map(|[w, h]| capture::Shape { w, h, framing: capture::Framing::Fill })
+    }
+
+    /// The size recordings are made at.
+    pub fn video_size(&self) -> capture::VideoSize {
+        capture::VideoSize { short_side: self.resolution.short_side(), shape: self.capture_shape(), exact: self.resolution.exact() }
+    }
+
+    /// Where the screen's picture goes in the video, for the capture: its
+    /// box when it's been placed by hand, all of the box (stretched, if
+    /// it's been stretched; a game's window that isn't, whatever its shape,
+    /// all of it, as big as fits); else all of the video, as `framing` says
+    /// in a shape of the video's own (else all of the picture). A display's
+    /// crop, if it's cropped.
+    pub fn screen_placement(&self) -> capture::ScreenPlacement {
+        let s = &self.screen;
+        let apps = matches!(self.capture, CaptureTarget::Apps { .. });
+        // A game's or app's window can change shape: fitted in its box, so
+        // it's never squashed, unless the box was stretched on purpose.
+        let (rect, framing) = match s.placed {
+            Some(b) => ([b.x, b.y, b.w, b.h], if apps && !b.stretched() { capture::Framing::Fit } else { capture::Framing::Stretch }),
+            None if self.capture_shape().is_some() => ([0.0, 0.0, 1.0, 1.0], self.framing.into()),
+            None => ([0.0, 0.0, 1.0, 1.0], capture::Framing::Fit),
+        };
+        let crop = self.screen_crop.filter(|c| capture::SCREEN_CROP && !apps && !c.is_none()).map(Into::into);
+        capture::ScreenPlacement { rect, framing, in_front: s.in_front, hidden: !s.enabled, crop, turns: s.turns % 4, flip_h: s.flip_h, flip_v: s.flip_v }
     }
 
     pub fn blend_samples(&self) -> u32 {
         if self.blend_fps == 0 { 1 } else { (self.blend_fps as f64 / self.fps.max(1) as f64).round().max(1.0) as u32 }
     }
+}
+
+/// A shape `w`:`h` in small numbers, as older versions' Aspect ratio takes
+/// them (up to 99 each): 1920×1080 is 16:9, 1366×768 about that.
+fn small_ratio(w: u32, h: u32) -> [u32; 2] {
+    let gcd = |mut a: u32, mut b: u32| {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a.max(1)
+    };
+    let g = gcd(w, h);
+    let (w, h) = (w / g, h / g);
+    if w.max(h) <= 99 {
+        return [w.max(1), h.max(1)];
+    }
+    // The nearest with both up to 99.
+    let ratio = w as f64 / h.max(1) as f64;
+    let candidates = (1..=99u32).flat_map(|q| [(((q as f64 * ratio).round() as u32), q), (q, ((q as f64 / ratio).round() as u32))]);
+    let ok = candidates.filter(|&(a, b)| (1..=99).contains(&a) && (1..=99).contains(&b));
+    let best = ok.min_by(|x, y| ((x.0 as f64 / x.1 as f64 - ratio).abs()).total_cmp(&(y.0 as f64 / y.1 as f64 - ratio).abs()));
+    best.map_or([16, 9], |(a, b)| {
+        let g = gcd(a, b);
+        [a / g, b / g]
+    })
 }
 
 /// Common frame rates for the picker; those above the display's refresh
@@ -1038,10 +1264,12 @@ fn load_path() -> Option<PathBuf> {
 impl RecordSettings {
     /// Last saved settings, or defaults on first run / unreadable file.
     pub fn load() -> Self {
-        let mut s: Self = load_path()
-            .and_then(|p| std::fs::read(p).ok())
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+        Self::from_saved(load_path().and_then(|p| std::fs::read(p).ok()).as_deref())
+    }
+
+    /// Settings from a saved file (defaults without one), brought up to date.
+    fn from_saved(bytes: Option<&[u8]>) -> Self {
+        let mut s: Self = bytes.and_then(Self::from_json).unwrap_or_default();
         s.upgrade_capture();
         s.upgrade_save_sound();
         s.upgrade_noise_reduction();
@@ -1072,6 +1300,52 @@ impl RecordSettings {
         }
     }
 
+    /// Settings as saved (see `to_json`): the video's size as it is, from
+    /// a file this version saved; else moved over from an older one's.
+    fn from_json(bytes: &[u8]) -> Option<Self> {
+        let mut s: Self = serde_json::from_slice(bytes).ok()?;
+        match s.saved_size.take() {
+            Some(size) => (s.resolution, s.shape) = (size.resolution, size.shape),
+            None => s.upgrade_sizes(),
+        }
+        Some(s)
+    }
+
+    /// The video's size from a version before it was its own, making clips
+    /// the size they were:
+    /// - p was the height: upright, 1080p was 608×1080, so it's 608p now
+    ///   (wider shapes' height is their short side already).
+    /// - A crop was recorded as a display that size: the video is the size
+    ///   that made, now the crop is only what's shown of the screen.
+    fn upgrade_sizes(&mut self) {
+        if self.size_version < 1
+            && let (Some([w, h]), Some(p)) = (self.shape.filter(|[w, h]| *w > 0 && w < h), self.resolution.short_side())
+        {
+            let short = ((p as f64 * w as f64 / h as f64 / 2.0).round() as u32 * 2).max(2);
+            self.resolution = OutputResolution::PRESETS.iter().copied().find(|r| r.short_side() == Some(short)).unwrap_or(OutputResolution::Custom(short));
+        }
+        self.size_version = SIZE_VERSION;
+        let screen = matches!(self.capture, CaptureTarget::Screen) && capture::SCREEN_CROP;
+        if let Some(c) = self.screen_crop.filter(|c| screen && !c.is_none() && self.resolution.exact().is_none()) {
+            let shape = self.shape.filter(|[w, h]| *w > 0 && *h > 0).map(|[w, h]| capture::Shape { w, h, framing: self.framing.into() });
+            let (w, h) = capture::VideoSize { short_side: self.resolution.short_side(), shape, exact: None }.of(c.w & !1, c.h & !1);
+            self.resolution = OutputResolution::Exact(w, h);
+        }
+    }
+
+    /// `resolution` and `shape` as versions from before they changed read
+    /// them, for about the same size there: p was the height (an upright
+    /// 1080p is 1920p there), and a size of its own is a height in a shape
+    /// of its own.
+    fn size_for_older(&self) -> (OutputResolution, Option<[u32; 2]>) {
+        let height = |h: u32| OutputResolution::PRESETS.iter().copied().find(|r| r.short_side() == Some(h)).unwrap_or(OutputResolution::Custom(h));
+        match (self.resolution, self.resolution.short_side(), self.shape) {
+            (OutputResolution::Exact(w, h), ..) => (height(h), Some(small_ratio(w, h))),
+            (_, Some(short), Some([w, h])) if w > 0 && w < h => (height(((short as f64 * h as f64 / w as f64 / 2.0).round() as u32 * 2).max(2)), self.shape),
+            (r, ..) => (r, self.shape),
+        }
+    }
+
     /// Noise removal that was on, from before there were two, is the one it
     /// was: Strong.
     fn upgrade_noise_reduction(&mut self) {
@@ -1083,8 +1357,14 @@ impl RecordSettings {
     }
 
     /// Serialized form, used both to save and to detect changes cheaply.
+    /// The video's size is saved in `video_size`, and as older versions read
+    /// it where it always was (see `size_for_older`): going back to one
+    /// keeps every setting, and about the same size.
     pub fn to_json(&self) -> String {
-        serde_json::to_string_pretty(self).unwrap_or_default()
+        let mut s = self.clone();
+        s.saved_size = Some(SizeCfg { resolution: self.resolution, shape: self.shape });
+        (s.resolution, s.shape) = self.size_for_older();
+        serde_json::to_string_pretty(&s).unwrap_or_default()
     }
 
     pub fn save_json(json: &str) {
@@ -1117,14 +1397,177 @@ mod screen_capture_tests {
 mod shape_tests {
     use super::*;
 
-    /// No shape unless chosen; chosen, it's saved and goes to the capture.
+    /// No shape unless chosen; chosen, it's saved and goes to the capture
+    /// (its size), with how the screen goes into it, which is saved too.
     #[test]
     fn shape_is_saved_and_given_to_the_capture() {
         let s = RecordSettings::default();
         assert_eq!(s.capture_shape(), None);
         let s: RecordSettings = serde_json::from_str(r#"{"shape":[16,9],"framing":"fit"}"#).unwrap();
-        assert_eq!(s.capture_shape(), Some(capture::Shape { w: 16, h: 9, framing: capture::Framing::Fit }));
-        assert!(s.to_json().contains(r#""framing": "fit""#));
+        assert_eq!(s.capture_shape(), Some(capture::Shape { w: 16, h: 9, framing: capture::Framing::Fill }));
+        assert_eq!(s.framing, Framing::Fit);
+        assert!(s.to_json().contains(r#""shape": ["#) && s.to_json().contains(r#""framing": "fit""#));
+    }
+
+    /// The screen goes into a video of its own shape as Fill, Fit or Stretch
+    /// say, unless it's placed by hand; in the screen's own shape, all of it.
+    #[test]
+    fn how_the_screen_goes_in() {
+        let framed = |shape: Option<[u32; 2]>, framing, placed: bool| {
+            let screen = ScreenCfg { placed: placed.then(|| BoxCfg::new([0.1, -0.1, 0.5, 1.5], 16.0 / 9.0, None)), ..Default::default() };
+            RecordSettings { shape, framing, screen, ..Default::default() }.screen_placement()
+        };
+        assert_eq!(framed(Some([4, 3]), Framing::Stretch, false).framing, capture::Framing::Stretch);
+        assert_eq!(framed(Some([4, 3]), Framing::Fit, false).framing, capture::Framing::Fit);
+        assert_eq!(framed(None, Framing::Fill, false).framing, capture::Framing::Fit);
+        // In its box, past the video's edge too: all of it over all of the
+        // box, stretched as the box is.
+        let boxed = framed(Some([4, 3]), Framing::Fill, true);
+        assert_eq!((boxed.framing, boxed.rect), (capture::Framing::Stretch, [0.1, -0.1, 0.5, 1.5]));
+    }
+
+    /// A game in a box of its own shape fits in it (its window can change
+    /// shape); stretched with Shift, it's stretched, as a display is.
+    #[test]
+    fn a_game_stretched_by_hand() {
+        let (wide, four_three) = (16.0 / 9.0, 4.0 / 3.0);
+        let game = |placed: BoxCfg| {
+            let screen = ScreenCfg { placed: Some(placed), ..Default::default() };
+            let capture = CaptureTarget::Apps { apps: Vec::new(), away_screen: true };
+            RecordSettings { shape: Some([16, 9]), capture, screen, ..Default::default() }.screen_placement().framing
+        };
+        // A 4:3 game in a 4:3 box in a 16:9 video.
+        let own = BoxCfg::new([0.125, 0.0, 0.75, 1.0], wide, Some(four_three));
+        assert!(!own.stretched());
+        assert_eq!(game(own), capture::Framing::Fit);
+        // Stretched over all of the video.
+        let stretched = BoxCfg::new([0.0, 0.0, 1.0, 1.0], wide, Some(four_three));
+        assert!(stretched.stretched());
+        assert_eq!(game(stretched), capture::Framing::Stretch);
+        // From before boxes could stretch: the picture's own shape.
+        assert_eq!(game(BoxCfg::new([0.0, 0.0, 1.0, 1.0], wide, None)), capture::Framing::Fit);
+    }
+
+    /// An exact size is its own shape, whatever aspect ratio was chosen, and
+    /// is kept as it is.
+    #[test]
+    fn an_exact_size_is_the_shape() {
+        let s: RecordSettings = serde_json::from_str(r#"{"shape":[4,3],"resolution":{"Exact":[1080,1350]}}"#).unwrap();
+        assert_eq!(s.capture_shape(), Some(capture::Shape { w: 1080, h: 1350, framing: capture::Framing::Fill }));
+        assert_eq!(s.video_size().of(2560, 1440), (1080, 1350));
+        assert!(s.to_json().contains(r#""Exact": ["#));
+    }
+
+    /// From when 1080p was the height, an upright recording keeps its size
+    /// (1080p 9:16 was 608×1080); wider ones, new settings and settings
+    /// already moved over aren't touched.
+    #[test]
+    fn old_upright_resolutions_keep_their_size() {
+        let load = |json: &str| RecordSettings::from_json(json.as_bytes()).unwrap();
+        let s = load(r#"{"shape":[9,16],"resolution":"P1080"}"#);
+        assert_eq!(s.resolution, OutputResolution::Custom(608));
+        assert_eq!(s.size_version, SIZE_VERSION);
+        assert_eq!(s.video_size().of(2560, 1440), (608, 1080));
+        assert_eq!(load(r#"{"shape":[9,16],"resolution":"P1440"}"#).resolution, OutputResolution::Custom(810));
+        assert_eq!(load(r#"{"shape":[3,4],"resolution":"P1440"}"#).resolution, OutputResolution::P1080);
+        assert_eq!(load(r#"{"shape":[9,16],"resolution":"Native"}"#).resolution, OutputResolution::Native);
+        assert_eq!(load(r#"{"shape":[21,9],"resolution":"P1080"}"#).resolution, OutputResolution::P1080);
+        assert_eq!(load(r#"{"shape":[9,16],"resolution":"P1080","size_version":1}"#).resolution, OutputResolution::P1080);
+        let mut fresh = RecordSettings { shape: Some([9, 16]), resolution: OutputResolution::P1080, ..Default::default() };
+        fresh.upgrade_sizes();
+        assert_eq!(fresh.resolution, OutputResolution::P1080);
+    }
+
+    /// A crop was recorded as a display that size: the video keeps being
+    /// that size (in the shape and resolution it was in), now a crop
+    /// doesn't change it. Not for games and apps, which weren't cropped, or
+    /// a size of its own.
+    #[test]
+    fn a_crop_keeps_its_clips_size() {
+        let load = |json: &str| RecordSettings::from_json(json.as_bytes()).unwrap().resolution;
+        let crop = r#""screen_crop":{"w":1600,"h":900,"at":null}"#;
+        assert_eq!(load(&format!(r#"{{{crop},"resolution":"Native"}}"#)), OutputResolution::Exact(1600, 900));
+        assert_eq!(load(&format!(r#"{{{crop},"resolution":"P720"}}"#)), OutputResolution::Exact(1280, 720));
+        // A 4:3 game in a 16:9 recording: its middle (Fill), or all of it with bars (Fit).
+        let four_three = r#""screen_crop":{"w":1440,"h":1080,"at":[240,0]},"shape":[16,9]"#;
+        assert_eq!(load(&format!(r#"{{{four_three},"resolution":"P1080"}}"#)), OutputResolution::Exact(1440, 810));
+        assert_eq!(load(&format!(r#"{{{four_three},"resolution":"P1080","framing":"fit"}}"#)), OutputResolution::Exact(1920, 1080));
+        assert_eq!(load(&format!(r#"{{{crop},"resolution":"Native","capture":{{"type":"apps","apps":[]}}}}"#)), OutputResolution::Native);
+        assert_eq!(load(&format!(r#"{{{crop},"resolution":{{"Exact":[1920,1080]}},"size_version":1}}"#)), OutputResolution::Exact(1920, 1080));
+        assert_eq!(load(r#"{"resolution":"Native"}"#), OutputResolution::Native);
+    }
+
+    /// A crop saved by this version is only what's shown of the screen:
+    /// loaded again and again, the size stays as chosen.
+    #[test]
+    fn a_crop_from_now_leaves_the_size_alone() {
+        let s = RecordSettings { resolution: OutputResolution::P1080, screen_crop: Some(ScreenCrop { w: 2400, h: 1600, at: None }), ..Default::default() };
+        let once = RecordSettings::from_saved(Some(s.to_json().as_bytes()));
+        let twice = RecordSettings::from_saved(Some(once.to_json().as_bytes()));
+        assert_eq!((once.resolution, twice.resolution), (OutputResolution::P1080, OutputResolution::P1080));
+    }
+
+    /// Saved and read again, the size is as it was.
+    #[test]
+    fn the_size_is_saved_as_it_is() {
+        let sizes = [
+            (OutputResolution::Exact(1080, 1350), Some([4, 3])),
+            (OutputResolution::P1080, Some([9, 16])),
+            (OutputResolution::Custom(608), Some([9, 16])),
+            (OutputResolution::P720, None),
+            (OutputResolution::Native, Some([21, 9])),
+        ];
+        for (resolution, shape) in sizes {
+            let s = RecordSettings { resolution, shape, ..Default::default() };
+            let back = RecordSettings::from_json(s.to_json().as_bytes()).unwrap();
+            assert_eq!((back.resolution, back.shape), (resolution, shape));
+        }
+    }
+
+    /// What's saved, read the way the version before a size of its own
+    /// reads it (its own settings, in miniature): every setting is there
+    /// (one value it doesn't know would lose them all), at about the size,
+    /// p being the height there.
+    #[test]
+    fn older_versions_read_what_is_saved() {
+        #[derive(Debug, PartialEq, Deserialize)]
+        enum Old {
+            Native,
+            P480,
+            P720,
+            P900,
+            P1080,
+            P1440,
+            P2160,
+            Custom(u32),
+        }
+        #[derive(Deserialize)]
+        struct Older {
+            resolution: Old,
+            shape: Option<[u32; 2]>,
+            fps: u32,
+        }
+        let read = |resolution, shape| {
+            let s = RecordSettings { resolution, shape, fps: 120, ..Default::default() };
+            let old: Older = serde_json::from_str(&s.to_json()).expect("an older version reads it");
+            assert_eq!(old.fps, 120);
+            (old.resolution, old.shape)
+        };
+        assert_eq!(read(OutputResolution::P1080, None), (Old::P1080, None));
+        assert_eq!(read(OutputResolution::P1080, Some([9, 16])), (Old::Custom(1920), Some([9, 16])));
+        assert_eq!(read(OutputResolution::Custom(608), Some([9, 16])), (Old::P1080, Some([9, 16])));
+        assert_eq!(read(OutputResolution::Exact(1080, 1350), None), (Old::Custom(1350), Some([4, 5])));
+        assert_eq!(read(OutputResolution::Exact(1920, 1080), Some([1, 1])), (Old::P1080, Some([16, 9])));
+        assert_eq!(read(OutputResolution::Exact(1366, 768), None).1, Some([16, 9]));
+        // Saved again by an older version (without the size as it is), it's
+        // moved over: the same size.
+        for (resolution, shape) in [(OutputResolution::P1080, Some([9, 16])), (OutputResolution::Custom(608), Some([9, 16]))] {
+            let s = RecordSettings { resolution, shape, ..Default::default() };
+            let mut json: serde_json::Value = serde_json::from_str(&s.to_json()).unwrap();
+            json.as_object_mut().unwrap().remove("video_size");
+            let back = RecordSettings::from_json(json.to_string().as_bytes()).unwrap();
+            assert_eq!((back.resolution, back.shape), (resolution, shape));
+        }
     }
 }
 
@@ -1148,10 +1591,89 @@ mod noise_reduction_tests {
 
 #[cfg(test)]
 mod placement_tests {
-    use super::PlacementCfg;
+    use super::{BoxCfg, PlacementCfg};
 
     fn cfg(x: f32, y: f32, w: f32, h: f32, frame_aspect: Option<f32>) -> PlacementCfg {
-        PlacementCfg { x, y, w, h, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0, frame_aspect }
+        PlacementCfg { x, y, w, h, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0, frame_aspect, stretch: 1.0 }
+    }
+
+    /// A stretched webcam stays as stretched: twice as wide as its 16:9
+    /// camera is left alone, and a 4:3 camera gets a box twice as wide as
+    /// 4:3; saved, the stretch is kept, and a file without it is unstretched.
+    #[test]
+    fn a_stretched_webcam_stays_stretched() {
+        let wide = 16.0 / 9.0;
+        let pixels = |p: &PlacementCfg| p.w * wide / p.h;
+        let mut p = PlacementCfg { stretch: 2.0, ..cfg(0.5, 0.5, 0.5, 0.25, Some(wide)) };
+        assert!(!p.refit(wide, Some(wide)), "{p:?}");
+        assert!(p.refit(wide, Some(4.0 / 3.0)));
+        assert!((pixels(&p) - 8.0 / 3.0).abs() < 1e-3, "{p:?}");
+        let json = serde_json::to_string(&p).unwrap();
+        assert_eq!(serde_json::from_str::<PlacementCfg>(&json).unwrap().stretch, 2.0);
+        let plain = serde_json::to_string(&cfg(0.0, 0.0, 0.25, 0.25, None)).unwrap();
+        assert!(!plain.contains("stretch") && serde_json::from_str::<PlacementCfg>(&plain).unwrap().stretch == 1.0);
+    }
+
+    /// The screen's box keeps its shape in pixels when the video changes
+    /// shape, in its corner; the same video leaves it alone.
+    #[test]
+    fn the_screens_box_keeps_its_shape() {
+        let wide = 16.0 / 9.0;
+        let mut b = BoxCfg::new([0.6, 0.0, 0.4, 0.4], wide, Some(wide));
+        assert!(!b.refit(wide, Some(wide)));
+        assert!(b.refit(9.0 / 16.0, Some(wide)));
+        let pixels = |b: &BoxCfg, frame: f32| b.w * frame / b.h;
+        assert!((pixels(&b, 9.0 / 16.0) - 16.0 / 9.0).abs() < 1e-4, "{b:?}");
+        assert!((b.x + b.w - 1.0).abs() < 1e-4 && b.y.abs() < 1e-4, "still top right: {b:?}");
+        assert!(b.h <= 1.0 && b.w <= 1.0);
+        // Another screen (an ultrawide): its shape, the box's width and
+        // place kept.
+        let mut b = BoxCfg::new([0.6, 0.0, 0.4, 0.4], wide, Some(wide));
+        assert!(b.refit(wide, Some(21.0 / 9.0)));
+        assert!((pixels(&b, wide) - 21.0 / 9.0).abs() < 1e-4 && (b.w - 0.4).abs() < 1e-4, "{b:?}");
+        assert_eq!(b.picture_aspect, Some(21.0 / 9.0));
+    }
+
+    /// A box stretched by hand stays stretched: in a video of another shape,
+    /// and for another screen (as much wider as that screen is). One from
+    /// before boxes could stretch is given the screen's shape, once.
+    #[test]
+    fn a_stretched_box_stays_stretched() {
+        let (wide, mac) = (16.0 / 9.0, 3024.0 / 1964.0);
+        let pixels = |b: &BoxCfg, frame: f32| b.w * frame / b.h;
+        // A 16:10 screen stretched over all of a 16:9 video.
+        let mut b = BoxCfg::new([0.0, 0.0, 1.0, 1.0], wide, Some(mac));
+        assert!(!b.refit(wide, Some(mac)));
+        assert_eq!(b.rect(), [0.0, 0.0, 1.0, 1.0]);
+        // The video goes 4:3: the box keeps its own shape (as wide as the video).
+        assert!(b.refit(4.0 / 3.0, Some(mac)));
+        assert!((pixels(&b, 4.0 / 3.0) - wide).abs() < 1e-4 && (b.w - 1.0).abs() < 1e-4, "{b:?}");
+        // An ultrawide screen instead: as stretched, wider.
+        let mut b = BoxCfg::new([0.0, 0.0, 1.0, 1.0], wide, Some(mac));
+        assert!(b.refit(wide, Some(21.0 / 9.0)));
+        assert!((pixels(&b, wide) - wide * (21.0 / 9.0) / mac).abs() < 1e-3, "{b:?}");
+        // From before: the screen's shape, and then it's known.
+        let mut old = BoxCfg::new([0.0, 0.0, 1.0, 1.0], wide, None);
+        assert!(old.refit(wide, Some(mac)));
+        assert!((pixels(&old, wide) - mac).abs() < 1e-4 && old.picture_aspect == Some(mac), "{old:?}");
+        assert!(!old.refit(wide, Some(mac)));
+    }
+
+    /// A screen bigger than the video (its middle covering it) keeps
+    /// covering as much of it in a video of another shape, its share of the
+    /// width kept; one in the video stays in it.
+    #[test]
+    fn a_box_past_the_video() {
+        let (wide, mac) = (16.0 / 9.0, 3024.0 / 1964.0);
+        // Covering a 16:9 video, moved to its top.
+        let mut b = BoxCfg::new([0.0, 0.0, 1.0, wide / mac], wide, Some(mac));
+        assert!(b.refit(21.0 / 9.0, Some(mac)));
+        let [x, y, w, h] = b.rect();
+        assert!(x.abs() < 1e-4 && (w - 1.0).abs() < 1e-4 && (h - (21.0 / 9.0) / mac).abs() < 1e-4, "{b:?}");
+        assert!(y.abs() < 1e-4, "still at its top: {b:?}");
+        // Upright, it's narrower than tall: as wide as the video, in it.
+        assert!(b.refit(9.0 / 16.0, Some(mac)));
+        assert!(b.y >= -1e-4 && b.y + b.h <= 1.0 + 1e-4 && (b.w - 1.0).abs() < 1e-4, "{b:?}");
     }
 
     fn pixel_aspect(p: &PlacementCfg, frame: f32) -> f32 {

@@ -27,24 +27,56 @@ impl Canvas {
     /// Fill with a picture, put in as `framing` says (see `crate::placement`):
     /// its middle filling the canvas, all of it with black bars, or all of
     /// it stretched.
-    pub(crate) fn fill_from(&mut self, src: &Frame, framing: crate::Framing, crop: Option<crate::Crop>) {
-        let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = crate::placement_cropped(crop, (src.width, src.height), (self.width, self.height), framing);
+    #[cfg(test)]
+    pub(crate) fn fill_from(&mut self, src: &Frame, framing: crate::Framing) {
+        self.draw_screen(src, &crate::ScreenPlacement::whole(framing), false);
+    }
+
+    /// Draw a picture where `place` puts it (its crop, into its box as its
+    /// framing says; nothing when hidden). `over` what's drawn already, the
+    /// rest is left as it is; else the rest is black.
+    pub(crate) fn draw_screen(&mut self, src: &Frame, place: &crate::ScreenPlacement, over: bool) {
+        let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = place.place((src.width, src.height), (self.width, self.height));
+        if dw == 0 || dh == 0 || sw == 0 || sh == 0 {
+            if !over {
+                self.clear();
+            }
+            return;
+        }
         let data = &src.data[sy as usize * src.stride + sx as usize * 4..];
         let (size, to) = ((sw as usize, sh as usize), (dw as usize, dh as usize));
         let swap = src.order == Order::Rgb;
-        if (dw, dh) == (self.width, self.height) {
+        let turned = place.transformed();
+        if !over && !turned && (dx, dy, dw, dh) == (0, 0, self.width, self.height) {
             resample(data, size, src.stride, swap, &mut self.bgra, to);
             return;
         }
-        // Smaller than the canvas: scaled on its own, then put in the middle
-        // of black.
-        self.part.resize(dw as usize * dh as usize * 4, 0);
-        resample(data, size, src.stride, swap, &mut self.part, to);
-        self.clear();
-        let row = dw as usize * 4;
-        for (y, line) in self.part.chunks_exact(row).enumerate() {
-            let at = ((dy as usize + y) * self.width as usize + dx as usize) * 4;
-            self.bgra[at..at + row].copy_from_slice(line);
+        // Smaller than the canvas, or turned or flipped: scaled on its own
+        // (its own way round), then put in its place, turned and flipped (on
+        // black, unless it's over what's there).
+        let (pw, ph) = if place.turns % 2 == 1 { (dh as usize, dw as usize) } else { (dw as usize, dh as usize) };
+        self.part.resize(pw * ph * 4, 0);
+        resample(data, size, src.stride, swap, &mut self.part, (pw, ph));
+        if !over {
+            self.clear();
+        }
+        let (dx, dy, dw, dh) = (dx as usize, dy as usize, dw as usize, dh as usize);
+        if !turned {
+            let row = dw * 4;
+            for (y, line) in self.part.chunks_exact(row).enumerate() {
+                let at = ((dy + y) * self.width as usize + dx) * 4;
+                self.bgra[at..at + row].copy_from_slice(line);
+            }
+            return;
+        }
+        // Each pixel from the one it shows of the picture its own way round.
+        for y in 0..dh {
+            for x in 0..dw {
+                let (s, t) = place.unturn(((x as f32 + 0.5) / dw as f32, (y as f32 + 0.5) / dh as f32));
+                let (px, py) = (((s * pw as f32) as usize).min(pw - 1), ((t * ph as f32) as usize).min(ph - 1));
+                let (from, at) = ((py * pw + px) * 4, ((dy + y) * self.width as usize + dx + x) * 4);
+                self.bgra[at..at + 4].copy_from_slice(&self.part[from..from + 4]);
+            }
         }
     }
 
@@ -401,11 +433,58 @@ mod tests {
     fn flat_colours_survive_scaling() {
         for (sw, sh, dw, dh) in [(64, 36, 64, 36), (64, 36, 32, 18), (96, 54, 64, 36), (40, 30, 64, 48)] {
             let mut c = Canvas::new(dw, dh);
-            c.fill_from(&frame(sw, sh, [10, 120, 250, 0], Order::Bgr), crate::Framing::Fit, None);
+            c.fill_from(&frame(sw, sh, [10, 120, 250, 0], Order::Bgr), crate::Framing::Fit);
             assert!(c.bgra.chunks_exact(4).all(|p| p == [10, 120, 250, 255]), "{sw}x{sh} -> {dw}x{dh}");
-            c.fill_from(&frame(sw, sh, [250, 120, 10, 0], Order::Rgb), crate::Framing::Fit, None);
+            c.fill_from(&frame(sw, sh, [250, 120, 10, 0], Order::Rgb), crate::Framing::Fit);
             assert!(c.bgra.chunks_exact(4).all(|p| p == [10, 120, 250, 255]), "rgb {sw}x{sh} -> {dw}x{dh}");
         }
+    }
+
+    /// The screen in a box: on black, or over what's drawn (the webcam,
+    /// when the screen's in front), which shows around it.
+    #[test]
+    fn the_screen_in_its_box() {
+        let px = |c: &Canvas, x: u32, y: u32| {
+            let at = ((y * c.width + x) * 4) as usize;
+            c.bgra[at..at + 3].to_vec()
+        };
+        let white = frame(16, 8, [255, 255, 255, 0], Order::Bgr);
+        let left = crate::ScreenPlacement { rect: [0.0, 0.0, 0.5, 1.0], ..crate::ScreenPlacement::whole(crate::Framing::Fill) };
+        let mut c = Canvas::new(16, 8);
+        c.draw_screen(&white, &left, false);
+        assert_eq!((px(&c, 2, 4), px(&c, 12, 4)), (vec![255, 255, 255], vec![0, 0, 0]));
+        let grey = CameraPicture { width: 4, height: 2, bgra: [40, 40, 40, 255].repeat(8) };
+        let all = Placement { x: 0.0, y: 0.0, w: 1.0, h: 1.0, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0, stretch: 1.0 };
+        c.clear();
+        c.draw_camera(&grey, &all);
+        c.draw_screen(&white, &left, true);
+        assert_eq!((px(&c, 2, 4), px(&c, 12, 4)), (vec![255, 255, 255], vec![40, 40, 40]));
+        // Hidden: nothing of it, over the webcam or on black.
+        c.draw_screen(&white, &crate::ScreenPlacement { hidden: true, ..left }, false);
+        assert!(c.bgra.chunks_exact(4).all(|p| p == [0, 0, 0, 255]));
+    }
+
+    /// Turned a quarter clockwise, the screen's left (white) is the top;
+    /// mirrored, it's on the right.
+    #[test]
+    fn the_screen_turned_and_mirrored() {
+        let px = |c: &Canvas, x: u32, y: u32| {
+            let at = ((y * c.width + x) * 4) as usize;
+            c.bgra[at..at + 3].to_vec()
+        };
+        let mut f = frame(8, 4, [0, 0, 0, 0], Order::Bgr);
+        for y in 0..4 {
+            for x in 0..4 {
+                f.data[(y * 8 + x) * 4..(y * 8 + x) * 4 + 3].copy_from_slice(&[255, 255, 255]);
+            }
+        }
+        let whole = crate::ScreenPlacement::whole(crate::Framing::Stretch);
+        let mut c = Canvas::new(4, 8);
+        c.draw_screen(&f, &crate::ScreenPlacement { turns: 1, ..whole }, false);
+        assert_eq!((px(&c, 2, 1), px(&c, 2, 6)), (vec![255, 255, 255], vec![0, 0, 0]));
+        let mut c = Canvas::new(8, 4);
+        c.draw_screen(&f, &crate::ScreenPlacement { flip_h: true, ..whole }, false);
+        assert_eq!((px(&c, 1, 2), px(&c, 6, 2)), (vec![0, 0, 0], vec![255, 255, 255]));
     }
 
     #[test]
@@ -418,7 +497,7 @@ mod tests {
             }
         }
         let mut c = Canvas::new(2, 1);
-        c.fill_from(&f, crate::Framing::Stretch, None);
+        c.fill_from(&f, crate::Framing::Stretch);
         assert!(c.bgra.chunks_exact(4).all(|p| (127..=128).contains(&p[0])), "{:?}", c.bgra);
     }
 
@@ -439,12 +518,12 @@ mod tests {
             c.bgra[at..at + 3].to_vec()
         };
         let mut c = Canvas::new(4, 4);
-        c.fill_from(&f, crate::Framing::Fill, None);
+        c.fill_from(&f, crate::Framing::Fill);
         assert!((0..4).all(|x| px(&c, x, 0) == [0, 255, 0]), "the green middle: {:?}", c.bgra);
-        c.fill_from(&f, crate::Framing::Stretch, None);
+        c.fill_from(&f, crate::Framing::Stretch);
         assert_eq!((px(&c, 0, 2), px(&c, 3, 2)), (vec![0, 0, 255], vec![255, 0, 0]));
         let mut c = Canvas::new(12, 12);
-        c.fill_from(&f, crate::Framing::Fit, None);
+        c.fill_from(&f, crate::Framing::Fit);
         assert_eq!((px(&c, 0, 0), px(&c, 0, 6), px(&c, 11, 6)), (vec![0, 0, 0], vec![0, 0, 255], vec![255, 0, 0]));
     }
 
@@ -468,7 +547,7 @@ mod tests {
         let mut c = Canvas::new(100, 50);
         c.clear();
         let cam = CameraPicture { width: 16, height: 9, bgra: [200, 100, 50, 255].repeat(16 * 9) };
-        let place = Placement { x: 0.5, y: 0.5, w: 0.5, h: 0.5, crop: [0.0; 4], flip_h: true, flip_v: false, turns: 0 };
+        let place = Placement { x: 0.5, y: 0.5, w: 0.5, h: 0.5, crop: [0.0; 4], flip_h: true, flip_v: false, turns: 0, stretch: 1.0 };
         c.draw_camera(&cam, &place);
         let at = |x: usize, y: usize| &c.bgra[(y * 100 + x) * 4..(y * 100 + x) * 4 + 4];
         assert_eq!(at(75, 37), [200, 100, 50, 255]);

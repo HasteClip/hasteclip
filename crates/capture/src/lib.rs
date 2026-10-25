@@ -112,14 +112,15 @@ impl Recorder for Unsupported {
 /// `examples/vt_limits`), as do NVENC, AMF, Quick Sync and VA-API for H.264.
 pub const MAX_SIDE: u32 = 4096;
 
-/// The recording's size for a source `w`×`h`: downscaled to `target_height`
-/// if that's smaller, and to fit [`MAX_SIDE`] (a 5K2K ultrawide, 6720×2836
-/// natively, records at 4096×1728). Keeps the shape; even dimensions, as
-/// H.264 4:2:0 requires.
-pub fn output_size(w: u32, h: u32, target_height: Option<u32>) -> (u32, u32) {
+/// The recording's size for a source `w`×`h`: its short side downscaled to
+/// `short_side` if that's smaller (1080 makes a 16:9 picture 1920×1080 and
+/// a 9:16 one 1080×1920), and to fit [`MAX_SIDE`] (a 5K2K ultrawide,
+/// 6720×2836 natively, records at 4096×1728). Keeps the shape; even
+/// dimensions, as H.264 4:2:0 requires.
+pub fn output_size(w: u32, h: u32, short_side: Option<u32>) -> (u32, u32) {
     let (w, h) = (w.max(2) as f64, h.max(2) as f64);
-    let mut scale = target_height.map_or(1.0, |t| (t as f64 / h).min(1.0));
-    scale = scale.min(MAX_SIDE as f64 / (w * scale).max(1.0)).min(1.0).min(MAX_SIDE as f64 / h);
+    let fits = (MAX_SIDE as f64 / w.max(h)).min(1.0);
+    let scale = short_side.map_or(1.0, |t| (t as f64 / w.min(h)).min(1.0)).min(fits);
     let even = |v: f64| ((v.round() as u32) & !1).max(2);
     (even(w * scale), even(h * scale))
 }
@@ -164,46 +165,270 @@ impl Shape {
     }
 }
 
-/// The size a `w`×`h` screen is recorded at: in `shape` if there is one,
-/// then as [`output_size`] makes it.
-pub fn recorded_size(w: u32, h: u32, target_height: Option<u32>, shape: Option<Shape>) -> (u32, u32) {
-    let (w, h) = shape.map_or((w, h), |s| s.of(w, h));
-    output_size(w, h, target_height)
+/// The size recordings are made at, whatever size the screen turns out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VideoSize {
+    /// The short side brought down to this (never up): 1080 is "1080p", a
+    /// 9:16 recording's too. `None` keeps the screen's own size.
+    pub short_side: Option<u32>,
+    /// A shape to record in, when it isn't the screen's.
+    pub shape: Option<Shape>,
+    /// Exactly this size, whatever the screen's: `short_side` and the size
+    /// `shape` gives don't apply (its framing still does).
+    pub exact: Option<(u32, u32)>,
 }
 
-/// Where a picture of `content`'s size goes in a frame of `frame`'s, each
-/// as (left, top, width, height): the part of the picture used, and where
-/// it's drawn. Fit uses all of it, black around it (what a recording
-/// without a shape does with a window that isn't the screen's shape); Fill
-/// cuts off what's past the frame's shape; Stretch draws all of it over all
-/// of the frame. Where it's drawn is even, for the encoder's 4:2:0 colour.
-#[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
-pub(crate) fn placement((cw, ch): (u32, u32), (fw, fh): (u32, u32), framing: Framing) -> ([u32; 4], [u32; 4]) {
-    let (all, whole) = ([0, 0, cw, ch], [0, 0, fw, fh]);
-    if cw == 0 || ch == 0 || fw == 0 || fh == 0 {
+impl VideoSize {
+    /// The size a `w`×`h` screen is recorded at (all of it, cropped or not):
+    /// exactly the size asked for, or in `shape` if there is one, then as
+    /// [`output_size`] makes it.
+    pub fn of(&self, w: u32, h: u32) -> (u32, u32) {
+        if let Some((w, h)) = self.exact {
+            return output_size(w, h, None);
+        }
+        let (w, h) = self.shape.map_or((w, h), |s| s.of(w, h));
+        output_size(w, h, self.short_side)
+    }
+
+    /// How the picture goes into the frame: as the shape says, else all of
+    /// it (a window that isn't the screen's shape goes in whole).
+    pub fn framing(&self) -> Framing {
+        self.shape.map_or(Framing::Fit, |s| s.framing)
+    }
+}
+
+/// Where the screen's picture goes in the frame: into a box (all of the
+/// frame, unless it's been placed by hand), as `framing` says, in front of
+/// the webcam or behind it, and the part of it shown. Shared with the app
+/// ([`SharedScreen`]), which changes it as you drag the screen around the
+/// preview or crop it; the capture reads it every frame, so it changes at
+/// once, while recording too. None of it changes the frame's size.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScreenPlacement {
+    /// The box: left, top, width, height as fractions of the frame. It can
+    /// reach past the frame's edges (a screen bigger than the video, part
+    /// of it showing): only what's in the frame is drawn.
+    pub rect: [f32; 4],
+    /// How the picture goes into the box.
+    pub framing: Framing,
+    /// Drawn over the webcam, instead of under it.
+    pub in_front: bool,
+    /// Not drawn at all: the webcam shows on black.
+    pub hidden: bool,
+    /// The part of a display shown, in its pixels, if not all of it (a game
+    /// at a lower resolution than the display, black around it): it goes
+    /// into the box as all of the picture would. Never a window's.
+    pub crop: Option<Crop>,
+    /// Quarter turns clockwise, then mirrored (left and right swapped) or
+    /// flipped upside down, as the webcam's are (`webcam::Placement`): the
+    /// picture as it shows, which is what goes into the box.
+    pub turns: u8,
+    pub flip_h: bool,
+    pub flip_v: bool,
+}
+
+/// The screen's placement, shared between the app and a running capture.
+pub type SharedScreen = std::sync::Arc<std::sync::Mutex<ScreenPlacement>>;
+
+impl ScreenPlacement {
+    /// All of the frame, the picture put in as `framing` says, behind the webcam.
+    pub fn whole(framing: Framing) -> Self {
+        Self { rect: [0.0, 0.0, 1.0, 1.0], framing, in_front: false, hidden: false, crop: None, turns: 0, flip_h: false, flip_v: false }
+    }
+
+    /// Whether its picture's turned, mirrored or flipped: then a compositor
+    /// draws it, never the capture as it comes.
+    pub fn transformed(&self) -> bool {
+        self.turns % 4 != 0 || self.flip_h || self.flip_v
+    }
+
+    /// A `w`×`h` picture's size as it's turned.
+    pub fn turned(&self, (w, h): (u32, u32)) -> (u32, u32) {
+        if self.turns % 2 == 1 { (h, w) } else { (w, h) }
+    }
+
+    /// A point of where the picture's drawn (from 0 to 1 across and down
+    /// it) in the part of the picture drawn there (from 0 to 1 across and
+    /// down that, in its own pixels): flipped back, then turned back, as
+    /// it's turned and then flipped. Every compositor samples it so.
+    pub fn unturn(&self, (mut u, mut v): (f32, f32)) -> (f32, f32) {
+        if self.flip_h {
+            u = 1.0 - u;
+        }
+        if self.flip_v {
+            v = 1.0 - v;
+        }
+        match self.turns % 4 {
+            1 => (v, 1.0 - u),
+            2 => (1.0 - u, 1.0 - v),
+            3 => (1.0 - v, u),
+            _ => (u, v),
+        }
+    }
+
+    /// Whether its box is all of the frame, no more.
+    pub fn is_whole(&self) -> bool {
+        let [x, y, w, h] = self.rect;
+        let on = |v: f32, edge: f32| (v - edge).abs() <= 1e-4;
+        on(x, 0.0) && on(y, 0.0) && on(x + w, 1.0) && on(y + h, 1.0)
+    }
+
+    /// Whether its box covers all of the frame: all of it, or past its edges.
+    pub fn covers(&self) -> bool {
+        let [x, y, w, h] = self.rect;
+        x <= 1e-4 && y <= 1e-4 && x + w >= 1.0 - 1e-4 && y + h >= 1.0 - 1e-4
+    }
+
+    /// Whether its box is inside the frame.
+    fn inside(&self) -> bool {
+        let [x, y, w, h] = self.rect;
+        x >= -1e-4 && y >= -1e-4 && x + w <= 1.0 + 1e-4 && y + h <= 1.0 + 1e-4
+    }
+
+    /// Its box in a `fw`×`fh` frame's pixels, inside the frame: (left, top,
+    /// width, height), its edges on even pixels for the encoder's 4:2:0
+    /// colour (the frame's own edges as they are).
+    pub fn rect_in(&self, fw: u32, fh: u32) -> [u32; 4] {
+        let edge = |v: f32, n: u32| if v >= 1.0 - 1e-4 { n } else { ((v.max(0.0) * n as f32).round() as u32 & !1).min(n) };
+        let [x, y, w, h] = self.rect;
+        let (x0, y0) = (edge(x, fw), edge(y, fh));
+        let (x1, y1) = (edge(x + w, fw).max(x0), edge(y + h, fh).max(y0));
+        [x0, y0, x1 - x0, y1 - y0]
+    }
+
+    /// Where a picture of `content`'s size (its crop, if any) goes in a
+    /// `frame`-size frame: see [`place_picture`](Self::place_picture).
+    /// Nothing of it when hidden.
+    // macOS has ScreenCaptureKit cut the crop out (`mac::video::stream_config`).
+    #[cfg_attr(not(any(target_os = "windows", target_os = "linux", test)), allow(dead_code))]
+    pub(crate) fn place(&self, content: (u32, u32), frame: (u32, u32)) -> ([u32; 4], [u32; 4]) {
+        if self.hidden {
+            return ([0; 4], [0; 4]);
+        }
+        let Some(c) = self.crop else { return self.place_turned(content, frame) };
+        let [x, y, w, h] = c.rect(content.0, content.1);
+        let ([sx, sy, sw, sh], dest) = self.place_turned((w, h), frame);
+        ([x + sx, y + sy, sw, sh], dest)
+    }
+
+    /// [`place_picture`](Self::place_picture) for the picture as it shows,
+    /// turned and flipped: the part of it used, in its own (unturned)
+    /// pixels, and where it's drawn. A compositor maps each point of where
+    /// it's drawn into that part with [`unturn`](Self::unturn).
+    pub(crate) fn place_turned(&self, content: (u32, u32), frame: (u32, u32)) -> ([u32; 4], [u32; 4]) {
+        let shown = self.turned(content);
+        let ([sx, sy, sw, sh], dest) = self.place_picture(shown, frame);
+        if !self.transformed() || sw == 0 || sh == 0 {
+            return ([sx, sy, sw, sh], dest);
+        }
+        // The part used, as fractions of the picture as it shows, back in its own.
+        let (tw, th) = (shown.0.max(1) as f32, shown.1.max(1) as f32);
+        let a = self.unturn((sx as f32 / tw, sy as f32 / th));
+        let b = self.unturn(((sx + sw) as f32 / tw, (sy + sh) as f32 / th));
+        let px = |f: f32, n: u32| (f * n as f32).round().clamp(0.0, n as f32) as u32;
+        let (x0, x1) = (px(a.0.min(b.0), content.0), px(a.0.max(b.0), content.0));
+        let (y0, y1) = (px(a.1.min(b.1), content.1), px(a.1.max(b.1), content.1));
+        ([x0, y0, (x1 - x0).max(1), (y1 - y0).max(1)], dest)
+    }
+
+    /// Where a picture of `content`'s size goes in a `frame`-size frame,
+    /// into the box as `framing` says (see [`placement_in`]): the part of it
+    /// used, and where it's drawn. A box reaching past the frame is cut at
+    /// its edges, and the picture with it (see [`placement_past`]).
+    pub(crate) fn place_picture(&self, content: (u32, u32), (fw, fh): (u32, u32)) -> ([u32; 4], [u32; 4]) {
+        if self.inside() {
+            return placement_in(content, self.rect_in(fw, fh), self.framing);
+        }
+        placement_past(content, self.rect, (fw, fh), self.framing)
+    }
+}
+
+/// Where a picture of `content`'s size goes in a box reaching past the
+/// edges of a `fw`×`fh` frame (`rect`, as fractions of it): put in as
+/// `framing` says, as if the frame went on (see [`placement_in`]), then cut
+/// at the frame's edges, the part of the picture used with them. Where it's
+/// drawn is even, for the encoder's 4:2:0 colour (the frame's own edges as
+/// they are); nothing, when none of it is in the frame.
+fn placement_past((cw, ch): (u32, u32), [x, y, w, h]: [f32; 4], (fw, fh): (u32, u32), framing: Framing) -> ([u32; 4], [u32; 4]) {
+    let (cw, ch, fw, fh) = (cw as f64, ch as f64, fw as f64, fh as f64);
+    let bx = [x as f64 * fw, y as f64 * fh, w as f64 * fw, h as f64 * fh];
+    if cw <= 0.0 || ch <= 0.0 || bx[2] <= 0.0 || bx[3] <= 0.0 {
+        return ([0; 4], [0; 4]);
+    }
+    // The part of the picture used, and where it goes, in all of the box.
+    let (src, dest) = match framing {
+        Framing::Stretch => ([0.0, 0.0, cw, ch], bx),
+        Framing::Fit => {
+            let k = (bx[2] / cw).min(bx[3] / ch);
+            let (w, h) = (cw * k, ch * k);
+            ([0.0, 0.0, cw, ch], [bx[0] + (bx[2] - w) / 2.0, bx[1] + (bx[3] - h) / 2.0, w, h])
+        }
+        Framing::Fill => {
+            let k = (bx[2] / cw).max(bx[3] / ch);
+            let (w, h) = (bx[2] / k, bx[3] / k);
+            ([(cw - w) / 2.0, (ch - h) / 2.0, w, h], bx)
+        }
+    };
+    // Cut at the frame's edges, on even pixels inside it.
+    let even = |v: f64, n: f64| if v >= n - 0.5 { n } else { ((v.max(0.0).round() as u32) & !1) as f64 };
+    let (x0, y0, x1, y1) = (even(dest[0], fw), even(dest[1], fh), even(dest[0] + dest[2], fw), even(dest[1] + dest[3], fh));
+    if x1 <= x0 || y1 <= y0 {
+        return ([0; 4], [0; 4]);
+    }
+    // The picture's part under that, as near as its pixels go (a pixel of
+    // it at least).
+    let part = |from: f64, size: f64, d0: f64, d1: f64, dsize: f64, most: f64| {
+        let at = |d: f64| (from + d * size / dsize).round().clamp(0.0, most) as u32;
+        let n = at(d1).saturating_sub(at(d0)).max(1);
+        (at(d0).min((most as u32).saturating_sub(n)), n)
+    };
+    let (sx, sw) = part(src[0], src[2], x0 - dest[0], x1 - dest[0], dest[2], cw);
+    let (sy, sh) = part(src[1], src[3], y0 - dest[1], y1 - dest[1], dest[3], ch);
+    ([sx, sy, sw, sh], [x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32])
+}
+
+/// Where a picture of `content`'s size goes in a frame of `frame`'s: see
+/// [`placement_in`], the box being all of the frame.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(crate) fn placement(content: (u32, u32), (fw, fh): (u32, u32), framing: Framing) -> ([u32; 4], [u32; 4]) {
+    placement_in(content, [0, 0, fw, fh], framing)
+}
+
+/// Where a picture of `content`'s size goes in the box `bx` (each as left,
+/// top, width, height, the box in the frame's pixels): the part of the
+/// picture used, and where it's drawn. Fit uses all of it, with nothing
+/// around it in the box (what a recording without a shape does with a
+/// window that isn't the screen's shape); Fill cuts off what's past the
+/// box's shape; Stretch draws all of it over all of the box. Where it's
+/// drawn is even, for the encoder's 4:2:0 colour.
+#[cfg_attr(not(any(target_os = "windows", target_os = "linux", target_os = "macos")), allow(dead_code))]
+pub(crate) fn placement_in((cw, ch): (u32, u32), [bx, by, bw, bh]: [u32; 4], framing: Framing) -> ([u32; 4], [u32; 4]) {
+    let (all, whole) = ([0, 0, cw, ch], [bx, by, bw, bh]);
+    if cw == 0 || ch == 0 || bw == 0 || bh == 0 {
         return (all, whole);
     }
-    // Wider than the frame, as shapes go.
-    let wider = cw as u64 * fh as u64 > ch as u64 * fw as u64;
+    // Wider than the box, as shapes go.
+    let wider = cw as u64 * bh as u64 > ch as u64 * bw as u64;
     match framing {
         Framing::Stretch => (all, whole),
         Framing::Fit => {
-            let (w, h) = if wider { (fw, (ch as u64 * fw as u64 / cw as u64) as u32) } else { ((cw as u64 * fh as u64 / ch as u64) as u32, fh) };
+            let (w, h) = if wider { (bw, (ch as u64 * bw as u64 / cw as u64) as u32) } else { ((cw as u64 * bh as u64 / ch as u64) as u32, bh) };
             let (w, h) = (w & !1, h & !1);
-            (all, [((fw - w) / 2) & !1, ((fh - h) / 2) & !1, w, h])
+            (all, [bx + (((bw - w) / 2) & !1), by + (((bh - h) / 2) & !1), w, h])
         }
         Framing::Fill => {
-            let (w, h) = if wider { ((ch as u64 * fw as u64 / fh as u64) as u32, ch) } else { (cw, (cw as u64 * fh as u64 / fw as u64) as u32) };
+            let (w, h) = if wider { ((ch as u64 * bw as u64 / bh as u64) as u32, ch) } else { (cw, (cw as u64 * bh as u64 / bw as u64) as u32) };
             ([(cw - w) / 2, (ch - h) / 2, w, h], whole)
         }
     }
 }
 
 /// The size a recording of `source` will be, without starting anything
-/// (cheap: asks the system for display sizes). Games and apps record at the
-/// main display's size. `None` if the display isn't known (on Linux, until
-/// the screen has been picked in the system's dialog once).
-pub fn frame_size(source: &VideoSource, target_height: Option<u32>, shape: Option<Shape>) -> Option<(u32, u32)> {
+/// (cheap: asks the system for display sizes): `size` of the display's
+/// (a crop doesn't change it). Games and apps record at the main display's
+/// size. `None` if the display isn't known (on Linux, until the screen has
+/// been picked in the system's dialog once).
+pub fn frame_size(source: &VideoSource, size: VideoSize) -> Option<(u32, u32)> {
     let id = match source {
         VideoSource::Screen { id, .. } => Some(id.as_str()),
         VideoSource::Apps { .. } => None,
@@ -219,8 +444,7 @@ pub fn frame_size(source: &VideoSource, target_height: Option<u32>, shape: Optio
         let _ = id;
         None
     };
-    // Cropped: what's kept, as a display that size.
-    native.map(|size| cropped_size(crop_of(source), size)).map(|(w, h)| recorded_size(w, h, target_height, shape))
+    native.map(|(w, h)| size.of(w, h))
 }
 
 /// The fastest a recording of `source` can look at the screen for frame
@@ -309,21 +533,11 @@ impl Crop {
     }
 }
 
-/// Whether a screen can be cropped ([`VideoSource::Screen`]'s `crop`) here.
+/// Whether a screen can be cropped ([`ScreenPlacement`]'s `crop`) here.
 pub const SCREEN_CROP: bool = cfg!(any(target_os = "linux", target_os = "windows", target_os = "macos"));
 
-/// The part of a screen `video` records, if it's cropped.
-#[cfg_attr(not(any(target_os = "windows", target_os = "linux", target_os = "macos")), allow(dead_code))]
-pub(crate) fn crop_of(video: &VideoSource) -> Option<Crop> {
-    match video {
-        VideoSource::Screen { crop, .. } => *crop,
-        VideoSource::Apps { .. } => None,
-    }
-}
-
 /// A `w`×`h` picture's size once `crop` is cut out of it.
-#[cfg_attr(not(any(target_os = "windows", target_os = "linux", target_os = "macos")), allow(dead_code))]
-pub(crate) fn cropped_size(crop: Option<Crop>, (w, h): (u32, u32)) -> (u32, u32) {
+pub fn cropped_size(crop: Option<Crop>, (w, h): (u32, u32)) -> (u32, u32) {
     match crop {
         Some(c) => {
             let [_, _, w, h] = c.rect(w, h);
@@ -333,16 +547,6 @@ pub(crate) fn cropped_size(crop: Option<Crop>, (w, h): (u32, u32)) -> (u32, u32)
     }
 }
 
-/// [`placement`] of part of a picture: `crop` of it, if any.
-// macOS has ScreenCaptureKit cut and place it (`mac::video::stream_config`).
-#[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
-pub(crate) fn placement_cropped(crop: Option<Crop>, (cw, ch): (u32, u32), frame: (u32, u32), framing: Framing) -> ([u32; 4], [u32; 4]) {
-    let Some(c) = crop else { return placement((cw, ch), frame, framing) };
-    let [x, y, w, h] = c.rect(cw, ch);
-    let ([sx, sy, sw, sh], dest) = placement((w, h), frame, framing);
-    ([x + sx, y + sy, sw, sh], dest)
-}
-
 /// What a recording's video shows. This is the bottom layer of the picture;
 /// overlays (a webcam) will go on top of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,10 +554,8 @@ pub enum VideoSource {
     /// A whole display, by backend id (see [`list_screens`]), captured the
     /// way `method` says (Windows). A game that needs the game capture hook,
     /// fullscreen and in focus on it, is recorded through the hook while it is.
-    /// `crop`: its sides cut off, the rest recorded as a display that size
-    /// would be (a game running at a lower resolution than the display,
-    /// black around it).
-    Screen { id: String, hook: GameHook, method: ScreenCapture, crop: Option<Crop> },
+    /// The part of it shown is its placement's (see [`ScreenPlacement`]).
+    Screen { id: String, hook: GameHook, method: ScreenCapture },
     /// Games and apps, by executable name (see [`list_windowed_apps`]): records
     /// whichever of them was last in focus, for as long as it's showing, even
     /// while you click into something else. When it stops showing (minimized,
@@ -850,16 +1052,27 @@ pub(crate) fn count_missed(n: u64) {
     count(|s| s.missed = s.missed.saturating_add(n.min(u32::MAX as u64) as u32));
 }
 
-/// How the running capture kept up over its last `span` ([`health`]).
+/// How the running capture keeps up ([`health`]).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CaptureHealth {
+    /// Its last whole second, as a frame rate counter would have it (none
+    /// until one has gone by).
+    pub last_second: Option<LastSecond>,
+    /// Frame blending, if the capture blends.
+    pub blend: Option<BlendHealth>,
+}
+
+/// One whole second of the running capture ([`CaptureHealth::last_second`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LastSecond {
     /// Frames handed to the video encoder, and frames skipped because it (or
     /// the graphics card making them) couldn't keep up: the file shows the one
     /// before a skipped frame longer.
-    pub encoded: u64,
-    pub skipped: u64,
-    /// Frame blending, if the capture blends.
-    pub blend: Option<BlendHealth>,
+    pub encoded: u32,
+    pub skipped: u32,
+    /// Frame blending's pictures that missed their frame (came too late for
+    /// it, or were let go of waiting): those frames reused the picture before.
+    pub missed: u32,
 }
 
 /// How frame blending kept up ([`CaptureHealth::blend`]).
@@ -868,17 +1081,15 @@ pub struct BlendHealth {
     /// Looks at the screen a second, and per frame.
     pub rate: u32,
     pub looks: u32,
-    /// The screen's new pictures in the busiest whole second (none until
-    /// one has gone by): the screen only sends one when something changes.
+    /// The screen's new pictures in the busiest whole second of the span
+    /// (none until one has gone by): the screen only sends one when
+    /// something changes.
     pub busiest: Option<u32>,
-    /// Pictures that missed their frame (came too late for it, or were let
-    /// go of waiting): those frames reused the picture before.
-    pub missed: u64,
 }
 
-/// How the running capture kept up over its last `span`, counted each second
-/// from its start (the second under way counts toward the sums, not the
-/// busiest second). None before a capture starts.
+/// How the running capture keeps up: its last whole second, and frame
+/// blending's busiest whole second in its last `span`, counted each second
+/// from its start. None before a capture starts.
 pub fn health(span: std::time::Duration) -> Option<CaptureHealth> {
     HISTORY.lock().unwrap().summary(span)
 }
@@ -887,20 +1098,12 @@ impl History {
     /// [`health`] of this history.
     fn summary(&mut self, span: std::time::Duration) -> Option<CaptureHealth> {
         self.now()?;
-        let whole = (span.as_secs().max(1) as usize).min(self.seconds.len().saturating_sub(1));
-        let mut out = CaptureHealth::default();
-        let (mut missed, mut busiest) = (0u64, None::<u32>);
-        // The second under way, then the span's whole seconds before it.
-        for (k, s) in self.seconds.iter().rev().take(whole + 1).enumerate() {
-            out.encoded += s.encoded as u64;
-            out.skipped += s.skipped as u64;
-            missed += s.missed as u64;
-            if k > 0 {
-                busiest = Some(busiest.unwrap_or(0).max(s.pictures));
-            }
-        }
-        out.blend = (self.rate > 0).then_some(BlendHealth { rate: self.rate, looks: self.looks, busiest, missed });
-        Some(out)
+        // The second under way is the last: those before it are whole.
+        let whole = || self.seconds.iter().rev().skip(1);
+        let last_second = whole().next().map(|s| LastSecond { encoded: s.encoded, skipped: s.skipped, missed: s.missed });
+        let busiest = whole().take(span.as_secs().max(1) as usize).map(|s| s.pictures).max();
+        let blend = (self.rate > 0).then_some(BlendHealth { rate: self.rate, looks: self.looks, busiest });
+        Some(CaptureHealth { last_second, blend })
     }
 }
 
@@ -914,47 +1117,50 @@ mod health_tests {
         History { started: Some(Instant::now() - Duration::from_secs(secs)), ..History::NONE }
     }
 
-    /// Counts go to the second they happened in; a span sums its seconds
-    /// and the one under way, and the busiest second is a whole one.
+    /// Counts go to the second they happened in: the last whole second is
+    /// as it was, and the busiest second a whole one of the span.
     #[test]
-    fn a_span_counts_its_seconds() {
+    fn the_last_whole_second() {
         let mut h = started(0);
-        assert!(h.summary(Duration::from_secs(60)).is_some_and(|s| s.blend.is_none()), "not blending");
+        assert!(h.summary(Duration::from_secs(60)).is_some_and(|s| s.blend.is_none() && s.last_second.is_none()), "not blending, no whole second yet");
         h.rate = 540;
         h.looks = 9;
         // Three seconds in: 500 pictures in second 0, 530 in second 1, 40 so far in second 2.
         h.started = Some(Instant::now() - Duration::from_millis(2500));
         h.seconds = [500u32, 530, 40].iter().map(|&p| Second { encoded: 60, skipped: 0, pictures: p, missed: 0 }).collect();
+        h.seconds[0].skipped = 7;
         h.seconds[1].skipped = 3;
         h.seconds[2].missed = 2;
         let s = h.summary(Duration::from_secs(60)).unwrap();
-        assert_eq!((s.encoded, s.skipped), (180, 3));
+        assert_eq!(s.last_second, Some(LastSecond { encoded: 60, skipped: 3, missed: 0 }), "the second under way isn't whole yet");
         let b = s.blend.unwrap();
-        assert_eq!((b.rate, b.looks, b.busiest, b.missed), (540, 9, Some(530), 2), "the second under way isn't the busiest");
-        // A one-second span: the last whole second and the one under way.
-        let s = h.summary(Duration::from_secs(1)).unwrap();
-        assert_eq!((s.encoded, s.skipped, s.blend.unwrap().busiest), (120, 3, Some(530)));
+        assert_eq!((b.rate, b.looks, b.busiest), (540, 9, Some(530)), "the second under way isn't the busiest");
+        // A one-second span: the busiest is the last whole second's.
+        h.seconds[0].pictures = 539;
+        assert_eq!(h.summary(Duration::from_secs(1)).unwrap().blend.unwrap().busiest, Some(530));
     }
 
     /// Seconds with nothing counted still go by: a span reaches only as far
-    /// back as it says, and the first second has no busiest yet.
+    /// back as it says, and the last whole second is a quiet one.
     #[test]
     fn quiet_seconds_go_by() {
         let mut h = started(0);
         h.rate = 540;
         h.looks = 9;
         h.now().unwrap().missed = 5;
+        h.now().unwrap().pictures = 500;
         assert_eq!(h.summary(Duration::from_secs(60)).unwrap().blend.unwrap().busiest, None, "no whole second yet");
-        // Ten seconds later, nothing more counted: the missed ones are outside a 5 s span.
+        // Ten seconds later, nothing more counted.
         h.started = Some(Instant::now() - Duration::from_secs(10));
-        let b = h.summary(Duration::from_secs(5)).unwrap().blend.unwrap();
-        assert_eq!((b.missed, b.busiest), (0, Some(0)));
-        assert_eq!(h.summary(Duration::from_secs(60)).unwrap().blend.unwrap().missed, 5);
-        // Over an hour later: only the last hour is kept.
+        let s = h.summary(Duration::from_secs(5)).unwrap();
+        assert_eq!((s.last_second, s.blend.unwrap().busiest), (Some(LastSecond::default()), Some(0)));
+        assert_eq!(h.summary(Duration::from_secs(60)).unwrap().blend.unwrap().busiest, Some(500));
+        // Over an hour later: only the last hour is kept (and nothing of it
+        // was counted: no whole second known yet).
         h.started = Some(Instant::now() - Duration::from_secs(5000));
-        h.summary(Duration::from_secs(60));
+        let s = h.summary(Duration::from_secs(4000)).unwrap();
         assert!(h.seconds.len() <= HEALTH_SECONDS + 1);
-        assert_eq!(h.summary(Duration::from_secs(4000)).unwrap().blend.unwrap().missed, 0);
+        assert_eq!((s.last_second, s.blend.unwrap().busiest), (None, None));
     }
 }
 
@@ -988,10 +1194,8 @@ pub struct EncodeSettings {
     /// How the looks in a blended frame are weighed.
     pub blend_shape: BlendShape,
     pub video_bitrate_kbps: u32,
-    /// Downscale target height, or `None` to keep native resolution.
-    pub target_height: Option<u32>,
-    /// A shape to record in, when not the screen's.
-    pub shape: Option<Shape>,
+    /// The size to record at.
+    pub size: VideoSize,
     /// Use a hardware encoder (VideoToolbox, or the GPU's Media Foundation
     /// encoder on Windows) vs. software.
     pub use_hardware: bool,
@@ -1001,8 +1205,10 @@ pub struct EncodeSettings {
     /// Shown while recording games and apps and there's nothing to show (none
     /// is open, or you've tabbed out); black if `None`. Scaled to the frame.
     pub away_screen: Option<std::sync::Arc<StillImage>>,
-    /// A webcam drawn over the picture.
+    /// A webcam drawn over the picture (or under it, as `screen` says).
     pub webcam: Option<webcam::Webcam>,
+    /// Where the screen's picture goes in the frame, read every frame.
+    pub screen: SharedScreen,
     /// Audio sources, in track order. Track 1 is the mix of every source with
     /// `in_mix` (so the file sounds right in any player); each source with
     /// `own_track` follows on its own track, for rebalancing later.
@@ -1094,7 +1300,7 @@ pub trait Recorder {
 
 #[cfg(test)]
 mod size_tests {
-    use super::{Crop, Framing, Shape, output_size, placement, placement_cropped, recorded_size};
+    use super::{Crop, Framing, ScreenPlacement, Shape, VideoSize, output_size, placement};
 
     #[test]
     fn output_size_keeps_aspect_and_even() {
@@ -1102,6 +1308,8 @@ mod size_tests {
         assert_eq!(output_size(2560, 1440, Some(1080)), (1920, 1080));
         assert_eq!(output_size(1920, 1080, Some(1440)), (1920, 1080));
         assert_eq!(output_size(3440, 1440, Some(721)), (1722, 720));
+        // The short side: upright, it's the width.
+        assert_eq!(output_size(1440, 2560, Some(1080)), (1080, 1920));
     }
 
     #[test]
@@ -1109,6 +1317,8 @@ mod size_tests {
         assert_eq!(output_size(6720, 2836, None), (4096, 1728));
         assert_eq!(output_size(7680, 4320, Some(2160)), (3840, 2160));
         assert_eq!(output_size(5120, 2880, None), (4096, 2304));
+        // Asked for more than fits: still no wider than it takes.
+        assert_eq!(output_size(7680, 4320, Some(2592)), (4096, 2304));
         // Portrait.
         assert_eq!(output_size(2160, 7680, None), (1152, 4096));
         assert_eq!(output_size(4096, 2304, None), (4096, 2304));
@@ -1117,21 +1327,34 @@ mod size_tests {
     /// An ultrawide screen recorded 16:9 three ways, and at 1080p.
     #[test]
     fn shapes() {
-        let wide = |framing| Some(Shape { w: 16, h: 9, framing });
-        assert_eq!(recorded_size(3440, 1440, None, wide(Framing::Fill)), (2560, 1440));
-        assert_eq!(recorded_size(3440, 1440, None, wide(Framing::Fit)), (3440, 1934));
-        assert_eq!(recorded_size(3440, 1440, None, wide(Framing::Stretch)), (2560, 1440));
-        assert_eq!(recorded_size(3440, 1440, Some(1080), wide(Framing::Fill)), (1920, 1080));
-        // Upright from a 16:9 screen: its middle.
-        assert_eq!(recorded_size(1920, 1080, None, Some(Shape { w: 9, h: 16, framing: Framing::Fill })), (608, 1080));
-        assert_eq!(recorded_size(3440, 1440, None, None), (3440, 1440));
+        let wide = |framing| VideoSize { shape: Some(Shape { w: 16, h: 9, framing }), ..Default::default() };
+        assert_eq!(wide(Framing::Fill).of(3440, 1440), (2560, 1440));
+        assert_eq!(wide(Framing::Fit).of(3440, 1440), (3440, 1934));
+        assert_eq!(wide(Framing::Stretch).of(3440, 1440), (2560, 1440));
+        assert_eq!(VideoSize { short_side: Some(1080), ..wide(Framing::Fill) }.of(3440, 1440), (1920, 1080));
+        // Upright from a 16:9 screen: its middle, 1080p on its short side.
+        let upright = VideoSize { shape: Some(Shape { w: 9, h: 16, framing: Framing::Fill }), ..Default::default() };
+        assert_eq!(upright.of(1920, 1080), (608, 1080));
+        assert_eq!(VideoSize { short_side: Some(480), ..upright }.of(1920, 1080), (480, 852));
+        assert_eq!(VideoSize::default().of(3440, 1440), (3440, 1440));
+    }
+
+    /// An exact size is kept whatever the screen, made even and small
+    /// enough for the encoder.
+    #[test]
+    fn exact_sizes() {
+        let exact = |w, h| VideoSize { exact: Some((w, h)), short_side: Some(720), shape: None };
+        assert_eq!(exact(1920, 1080).of(3440, 1440), (1920, 1080));
+        assert_eq!(exact(1080, 1920).of(2560, 1440), (1080, 1920));
+        assert_eq!(exact(1281, 721).of(2560, 1440), (1280, 720));
+        assert_eq!(exact(8192, 4096).of(2560, 1440), (4096, 2048));
     }
 
     #[test]
     fn where_the_picture_goes() {
         // Cropped: the middle 1600×900 of 2560×1440, then as usual.
         let crop = Some(Crop { w: 1600, h: 900, at: None });
-        assert_eq!(placement_cropped(crop, (2560, 1440), (1600, 900), Framing::Fit), ([480, 270, 1600, 900], [0, 0, 1600, 900]));
+        assert_eq!(ScreenPlacement { crop, ..ScreenPlacement::whole(Framing::Fit) }.place((2560, 1440), (1600, 900)), ([480, 270, 1600, 900], [0, 0, 1600, 900]));
         // Placed past the edge: moved back in; odd sizes made even.
         assert_eq!(Crop { w: 1601, h: 901, at: Some((2000, 1000)) }.rect(2560, 1440), [960, 540, 1600, 900]);
         // Fill: the middle 2560 of 3440, over all of the frame.
@@ -1144,6 +1367,93 @@ mod size_tests {
         assert_eq!(placement((3440, 1440), (1920, 1080), Framing::Stretch), ([0, 0, 3440, 1440], [0, 0, 1920, 1080]));
         // Nothing to place yet.
         assert_eq!(placement((0, 0), (1920, 1080), Framing::Fit), ([0, 0, 0, 0], [0, 0, 1920, 1080]));
+    }
+
+    /// The screen in a box of its own: the box in pixels, even, inside the
+    /// frame, and the picture filling it (cut to its shape) or fitted in it.
+    #[test]
+    fn the_screen_in_a_box() {
+        let whole = ScreenPlacement::whole(Framing::Fill);
+        assert!(whole.is_whole());
+        assert_eq!(whole.rect_in(1921, 1081), [0, 0, 1921, 1081]);
+        let boxed = ScreenPlacement { rect: [0.5, 0.25, 0.25, 0.5], ..whole };
+        assert!(!boxed.is_whole());
+        assert_eq!(boxed.rect_in(1920, 1080), [960, 270, 480, 540]);
+        // Odd edges land on even pixels; past the frame, it's cut at its edge.
+        assert_eq!(ScreenPlacement { rect: [0.1, 0.1, 0.3, 0.3], ..whole }.rect_in(1000, 1000), [100, 100, 300, 300]);
+        assert_eq!(ScreenPlacement { rect: [0.1003, 0.0, 0.2, 0.2], ..whole }.rect_in(1000, 1000), [100, 0, 200, 200]);
+        assert_eq!(ScreenPlacement { rect: [0.8, 0.9, 0.4, 0.4], ..whole }.rect_in(1000, 1000), [800, 900, 200, 100]);
+        // A 16:9 screen in a square box: its middle (Fill), or all of it in a band (Fit).
+        let square = ScreenPlacement { rect: [0.0, 0.0, 0.5, 1.0], ..whole };
+        assert_eq!(square.place((1920, 1080), (2160, 1080)), ([420, 0, 1080, 1080], [0, 0, 1080, 1080]));
+        let fit = ScreenPlacement { framing: Framing::Fit, ..square };
+        assert_eq!(fit.place((1920, 1080), (2160, 1080)), ([0, 0, 1920, 1080], [0, 236, 1080, 606]));
+        // In a box placed further in, the picture goes where the box is.
+        let inset = ScreenPlacement { rect: [0.25, 0.5, 0.5, 0.5], framing: Framing::Fit, ..whole };
+        assert_eq!(inset.place((1920, 1080), (1920, 1080)), ([0, 0, 1920, 1080], [480, 540, 960, 540]));
+        // A crop is cut out first.
+        let crop = Some(Crop { w: 1600, h: 900, at: None });
+        assert_eq!(ScreenPlacement { crop, ..inset }.place((2560, 1440), (1920, 1080)), ([480, 270, 1600, 900], [480, 540, 960, 540]));
+        // Hidden: nothing of it anywhere.
+        assert_eq!(ScreenPlacement { hidden: true, ..whole }.place((1920, 1080), (1920, 1080)), ([0; 4], [0; 4]));
+    }
+
+    /// A box reaching past the frame: the picture placed in it as if the
+    /// frame went on, and only what's in the frame drawn, the picture cut
+    /// with it.
+    #[test]
+    fn the_screen_past_the_frame() {
+        let whole = ScreenPlacement::whole(Framing::Stretch);
+        // A 16:10 screen covering a 16:9 frame: 1920×1200 of it, 60 above
+        // and below. Its middle shows, at its own scale.
+        let over = ScreenPlacement { rect: [0.0, -60.0 / 1080.0, 1.0, 1200.0 / 1080.0], ..whole };
+        assert!(over.covers() && !over.is_whole());
+        assert!(whole.covers() && whole.is_whole());
+        assert_eq!(over.place((2560, 1600), (1920, 1080)), ([0, 80, 2560, 1440], [0, 0, 1920, 1080]));
+        // Moved down as far as it goes: its top.
+        let top = ScreenPlacement { rect: [0.0, 0.0, 1.0, 1200.0 / 1080.0], ..whole };
+        assert_eq!(top.place((2560, 1600), (1920, 1080)), ([0, 0, 2560, 1440], [0, 0, 1920, 1080]));
+        // Half off the right edge: its left half, in the frame's right quarter.
+        let half = ScreenPlacement { rect: [0.75, 0.25, 0.5, 0.5], ..whole };
+        assert_eq!(half.place((1920, 1080), (1920, 1080)), ([0, 0, 960, 1080], [1440, 270, 480, 540]));
+        // A crop is cut out first, then cut at the frame with the rest.
+        let crop = Some(Crop { w: 1600, h: 900, at: None });
+        assert_eq!(ScreenPlacement { crop, ..half }.place((2560, 1440), (1920, 1080)), ([480, 270, 800, 900], [1440, 270, 480, 540]));
+        // Fit and Fill in such a box: as big as fits, or covers, then cut.
+        assert_eq!(ScreenPlacement { framing: Framing::Fit, rect: [0.75, 0.0, 0.5, 1.0], ..whole }.place((1920, 1080), (1920, 1080)), ([0, 0, 960, 1080], [1440, 270, 480, 540]));
+        assert_eq!(ScreenPlacement { framing: Framing::Fill, rect: [0.75, 0.0, 0.5, 1.0], ..whole }.place((1920, 1080), (1920, 1080)), ([480, 0, 480, 1080], [1440, 0, 480, 1080]));
+        // None of it in the frame: nothing drawn.
+        assert_eq!(ScreenPlacement { rect: [1.2, 0.0, 0.5, 0.5], ..whole }.place((1920, 1080), (1920, 1080)), ([0; 4], [0; 4]));
+    }
+
+    /// Turned, mirrored or flipped: placed as it shows (a turned 16:9
+    /// screen is 9:16), the part used given back in its own pixels, and
+    /// each point of its box sampled from the right place in it.
+    #[test]
+    fn the_screen_turned_and_flipped() {
+        let whole = ScreenPlacement::whole(Framing::Stretch);
+        // Turned a quarter clockwise into an upright 1080×1920 frame: all of
+        // it, all of the frame; the frame's top-left is the screen's bottom-left.
+        let turned = ScreenPlacement { turns: 1, ..whole };
+        assert_eq!(turned.turned((1920, 1080)), (1080, 1920));
+        assert_eq!(turned.place((1920, 1080), (1080, 1920)), ([0, 0, 1920, 1080], [0, 0, 1080, 1920]));
+        assert_eq!(turned.unturn((0.0, 0.0)), (0.0, 1.0));
+        assert_eq!(turned.unturn((1.0, 0.0)), (0.0, 0.0));
+        assert_eq!(ScreenPlacement { turns: 3, ..whole }.unturn((0.0, 0.0)), (1.0, 0.0));
+        assert_eq!(ScreenPlacement { turns: 2, ..whole }.unturn((0.25, 0.0)), (0.75, 1.0));
+        // Fitted in a wide frame, upright: a band in its middle.
+        let fit = ScreenPlacement { framing: Framing::Fit, ..turned };
+        assert_eq!(fit.place((1920, 1080), (1920, 1080)), ([0, 0, 1920, 1080], [656, 0, 606, 1080]));
+        // Mirrored, half off the frame's right edge: what shows (its left
+        // half, as mirrored) is the screen's right half.
+        let half = ScreenPlacement { rect: [0.75, 0.25, 0.5, 0.5], flip_h: true, ..whole };
+        assert_eq!(half.place((1920, 1080), (1920, 1080)), ([960, 0, 960, 1080], [1440, 270, 480, 540]));
+        assert_eq!(half.unturn((0.0, 0.5)), (1.0, 0.5));
+        // Flipped upside down and cropped: the crop's, the same part of it.
+        let crop = Some(Crop { w: 1600, h: 900, at: None });
+        let flipped = ScreenPlacement { flip_v: true, crop, ..whole };
+        assert_eq!(flipped.place((2560, 1440), (1600, 900)), ([480, 270, 1600, 900], [0, 0, 1600, 900]));
+        assert!(!whole.transformed() && turned.transformed() && flipped.transformed());
     }
 }
 

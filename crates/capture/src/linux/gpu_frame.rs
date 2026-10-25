@@ -1,7 +1,8 @@
 //! The recording's frame made on the graphics card (`super::gpu`): the
-//! picture put into the frame's size (`crate::placement`), the webcam over
-//! it, and NV12 for the encoder, in compute shaders; only the NV12 frame
-//! comes down to the CPU (an eighth of the screen's pixels at 1440p → 1080p).
+//! picture put into its box in the frame (`crate::ScreenPlacement`), the
+//! webcam over it or under it, and NV12 for the encoder, in compute shaders;
+//! only the NV12 frame comes down to the CPU (an eighth of the screen's
+//! pixels at 1440p → 1080p).
 //! The same as `super::image` does on the CPU, which this replaces when the
 //! screen's pictures are on the card.
 //!
@@ -16,15 +17,26 @@ use super::image::{CameraPicture, Canvas};
 use super::screen::{Frame, Order};
 use crate::webcam::Placement;
 
+/// How the screen's flipped, for the shaders' `unturn`: 1 mirrored, 2 upside down.
+fn flips(p: &crate::ScreenPlacement) -> u32 {
+    u32::from(p.flip_h) | u32::from(p.flip_v) << 1
+}
+
 const SCALE_SHADER: &str = r#"
 struct Scale {
-    // The part of the source shown (x, y, w, h), and where in the frame (x, y, w, h).
+    // The part of the source shown (x, y, w, h, in its own pixels), and
+    // where in the frame (x, y, w, h).
     src: vec4<f32>,
     dst: vec4<f32>,
-    // The frame's size, and whether a webcam layer is laid over it.
+    // The frame's size, whether a webcam layer is laid over it, and whether
+    // the picture is in front of it instead.
     size: vec2<u32>,
     layer: u32,
-    _pad: u32,
+    front: u32,
+    // How the picture's turned and flipped (see `unturn`).
+    turns: u32,
+    flips: u32,
+    _pad: vec2<u32>,
 }
 
 @group(0) @binding(0) var source: texture_2d<f32>;
@@ -32,22 +44,53 @@ struct Scale {
 @group(0) @binding(2) var<uniform> s: Scale;
 @group(0) @binding(3) var overlay: texture_2d<f32>;
 
-// The source interval an output sample covers, at least one sample wide
-// (enlarging then blends the nearest two), as `Taps` does on the CPU.
-fn span(i: f32, scale: f32, n: f32) -> vec2<f32> {
-    var a = i * scale;
-    var b = (i + 1.0) * scale;
+// A point of the picture's box (0 to 1 across and down it) in the part of
+// the source used (0 to 1): flipped back, then turned back, as it's turned
+// and then flipped (`ScreenPlacement::unturn`). `flips`: 1 mirrored, 2 upside down.
+fn unturn(q0: vec2<f32>, turns: u32, flips: u32) -> vec2<f32> {
+    var q = q0;
+    if ((flips & 1u) != 0u) {
+        q.x = 1.0 - q.x;
+    }
+    if ((flips & 2u) != 0u) {
+        q.y = 1.0 - q.y;
+    }
+    switch turns {
+        case 1u: { q = vec2<f32>(q.y, 1.0 - q.x); }
+        case 2u: { q = vec2<f32>(1.0 - q.x, 1.0 - q.y); }
+        case 3u: { q = vec2<f32>(1.0 - q.y, q.x); }
+        default: {}
+    }
+    return q;
+}
+
+// An interval of the source at least one sample wide (enlarging then blends
+// the nearest two), within [lo, hi], as `Taps` does on the CPU.
+fn widen(a0: f32, b0: f32, lo: f32, hi: f32) -> vec2<f32> {
+    var a = a0;
+    var b = b0;
     if (b - a < 1.0) {
         let c = (a + b) / 2.0;
-        a = max(c - 0.5, 0.0);
-        b = min(a + 1.0, n);
+        a = max(c - 0.5, lo);
+        b = min(a + 1.0, hi);
         a = b - 1.0;
     }
     return vec2<f32>(a, b);
 }
 
+// The source area the output pixel at `p` covers (x0, x1, y0, y1): its
+// corners through the turn and flip, into `src` (x, y, w, h) from `dst`.
+fn area(p: vec2<f32>, src: vec4<f32>, dst: vec4<f32>, turns: u32, flips: u32) -> vec4<f32> {
+    let a = src.xy + unturn((p - dst.xy) / dst.zw, turns, flips) * src.zw;
+    let b = src.xy + unturn((p + 1.0 - dst.xy) / dst.zw, turns, flips) * src.zw;
+    let lo = min(a, b);
+    let hi = max(a, b);
+    return vec4<f32>(widen(lo.x, hi.x, src.x, src.x + src.z), widen(lo.y, hi.y, src.y, src.y + src.w));
+}
+
 // Each frame pixel: the average of the source area it covers; black outside
-// the picture's place; the webcam layer over it where it's drawn.
+// the picture's place; the webcam layer over it where it's drawn (or only
+// outside the picture, when the picture's in front).
 @compute @workgroup_size(8, 8)
 fn scale(@builtin(global_invocation_id) id: vec3<u32>) {
     if (id.x >= s.size.x || id.y >= s.size.y) {
@@ -55,9 +98,11 @@ fn scale(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     var c = vec3<f32>(0.0);
     let p = vec2<f32>(id.xy);
-    if (p.x >= s.dst.x && p.y >= s.dst.y && p.x < s.dst.x + s.dst.z && p.y < s.dst.y + s.dst.w) {
-        let sx = span(p.x - s.dst.x, s.src.z / s.dst.z, s.src.z) + s.src.x;
-        let sy = span(p.y - s.dst.y, s.src.w / s.dst.w, s.src.w) + s.src.y;
+    let inside = p.x >= s.dst.x && p.y >= s.dst.y && p.x < s.dst.x + s.dst.z && p.y < s.dst.y + s.dst.w;
+    if (inside) {
+        let a = area(p, s.src, s.dst, s.turns, s.flips);
+        let sx = a.xy;
+        let sy = a.zw;
         var sum = vec3<f32>(0.0);
         var total = 0.0;
         for (var y = floor(sy.x); y < sy.y; y += 1.0) {
@@ -70,7 +115,7 @@ fn scale(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         c = sum / max(total, 1e-6);
     }
-    if (s.layer != 0u) {
+    if (s.layer != 0u && !(inside && s.front != 0u)) {
         let l = textureLoad(overlay, vec2<i32>(id.xy), 0);
         if (l.a > 0.5) {
             c = l.rgb;
@@ -87,22 +132,57 @@ struct Look {
     size: vec2<u32>,
     weight: f32,
     _pad: f32,
+    turns: u32,
+    flips: u32,
+    _pad2: vec2<u32>,
 }
 
 @group(0) @binding(0) var source: texture_2d<f32>;
 @group(0) @binding(1) var<storage, read_write> sum: array<vec4<f32>>;
 @group(0) @binding(2) var<uniform> l: Look;
 
-fn span(i: f32, scale: f32, n: f32) -> vec2<f32> {
-    var a = i * scale;
-    var b = (i + 1.0) * scale;
+// A point of the picture's box (0 to 1 across and down it) in the part of
+// the source used (0 to 1): flipped back, then turned back, as it's turned
+// and then flipped (`ScreenPlacement::unturn`). `flips`: 1 mirrored, 2 upside down.
+fn unturn(q0: vec2<f32>, turns: u32, flips: u32) -> vec2<f32> {
+    var q = q0;
+    if ((flips & 1u) != 0u) {
+        q.x = 1.0 - q.x;
+    }
+    if ((flips & 2u) != 0u) {
+        q.y = 1.0 - q.y;
+    }
+    switch turns {
+        case 1u: { q = vec2<f32>(q.y, 1.0 - q.x); }
+        case 2u: { q = vec2<f32>(1.0 - q.x, 1.0 - q.y); }
+        case 3u: { q = vec2<f32>(1.0 - q.y, q.x); }
+        default: {}
+    }
+    return q;
+}
+
+// An interval of the source at least one sample wide (enlarging then blends
+// the nearest two), within [lo, hi], as `Taps` does on the CPU.
+fn widen(a0: f32, b0: f32, lo: f32, hi: f32) -> vec2<f32> {
+    var a = a0;
+    var b = b0;
     if (b - a < 1.0) {
         let c = (a + b) / 2.0;
-        a = max(c - 0.5, 0.0);
-        b = min(a + 1.0, n);
+        a = max(c - 0.5, lo);
+        b = min(a + 1.0, hi);
         a = b - 1.0;
     }
     return vec2<f32>(a, b);
+}
+
+// The source area the output pixel at `p` covers (x0, x1, y0, y1): its
+// corners through the turn and flip, into `src` (x, y, w, h) from `dst`.
+fn area(p: vec2<f32>, src: vec4<f32>, dst: vec4<f32>, turns: u32, flips: u32) -> vec4<f32> {
+    let a = src.xy + unturn((p - dst.xy) / dst.zw, turns, flips) * src.zw;
+    let b = src.xy + unturn((p + 1.0 - dst.xy) / dst.zw, turns, flips) * src.zw;
+    let lo = min(a, b);
+    let hi = max(a, b);
+    return vec4<f32>(widen(lo.x, hi.x, src.x, src.x + src.z), widen(lo.y, hi.y, src.y, src.y + src.w));
 }
 
 // sRGB's values to light.
@@ -120,8 +200,9 @@ fn accumulate(@builtin(global_invocation_id) id: vec3<u32>) {
     var c = vec3<f32>(0.0);
     let p = vec2<f32>(id.xy);
     if (p.x >= l.dst.x && p.y >= l.dst.y && p.x < l.dst.x + l.dst.z && p.y < l.dst.y + l.dst.w) {
-        let sx = span(p.x - l.dst.x, l.src.z / l.dst.z, l.src.z) + l.src.x;
-        let sy = span(p.y - l.dst.y, l.src.w / l.dst.w, l.src.w) + l.src.y;
+        let a = area(p, l.src, l.dst, l.turns, l.flips);
+        let sx = a.xy;
+        let sy = a.zw;
         var total = 0.0;
         for (var y = floor(sy.x); y < sy.y; y += 1.0) {
             let wy = min(sy.y, y + 1.0) - max(sy.x, y);
@@ -143,6 +224,10 @@ struct Resolve {
     size: vec2<u32>,
     total: f32,
     layer: u32,
+    // Where the picture is, and whether it's in front of the webcam layer.
+    dst: vec4<f32>,
+    front: u32,
+    _pad: vec3<u32>,
 }
 
 @group(0) @binding(0) var<storage, read> sum: array<vec4<f32>>;
@@ -154,14 +239,17 @@ fn srgb(c: vec3<f32>) -> vec3<f32> {
     return select(1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - 0.055, c * 12.92, c <= vec3<f32>(0.0031308));
 }
 
-// The frame: its looks' average light, back to sRGB; the webcam over it.
+// The frame: its looks' average light, back to sRGB; the webcam over it
+// (or only outside the picture, when the picture's in front).
 @compute @workgroup_size(8, 8)
 fn resolve(@builtin(global_invocation_id) id: vec3<u32>) {
     if (id.x >= r.size.x || id.y >= r.size.y) {
         return;
     }
     var c = srgb(clamp(sum[id.y * r.size.x + id.x].rgb / r.total, vec3<f32>(0.0), vec3<f32>(1.0)));
-    if (r.layer != 0u) {
+    let p = vec2<f32>(id.xy);
+    let inside = p.x >= r.dst.x && p.y >= r.dst.y && p.x < r.dst.x + r.dst.z && p.y < r.dst.y + r.dst.w;
+    if (r.layer != 0u && !(inside && r.front != 0u)) {
         let l = textureLoad(overlay, vec2<i32>(id.xy), 0);
         if (l.a > 0.5) {
             c = l.rgb;
@@ -229,9 +317,9 @@ pub(crate) struct GpuPicture {
     gpu: Arc<Gpu>,
     pub width: u32,
     pub height: u32,
-    framing: crate::Framing,
-    /// The part of the picture used, if not all of it.
-    crop: Option<crate::Crop>,
+    /// Where the picture goes (and the part of it used), as last set
+    /// (`set_screen`).
+    screen: crate::ScreenPlacement,
     scale: wgpu::ComputePipeline,
     nv12: wgpu::ComputePipeline,
     /// The frame, RGBA.
@@ -269,6 +357,8 @@ struct Blend {
     slots: Vec<Slot>,
     resolve_uniforms: wgpu::Buffer,
     held: Option<wgpu::Texture>,
+    /// Where the looks put the picture, last: where the frame has it.
+    dst: [u32; 4],
 }
 
 /// One open frame: its sum, which frame it is, its looks' weight so far
@@ -294,7 +384,7 @@ struct Layer {
 }
 
 impl GpuPicture {
-    pub(crate) fn new(gpu: Arc<Gpu>, width: u32, height: u32, framing: crate::Framing, crop: Option<crate::Crop>) -> Self {
+    pub(crate) fn new(gpu: Arc<Gpu>, width: u32, height: u32, screen: crate::ScreenPlacement) -> Self {
         let device = &gpu.device;
         let pipeline = |source: &str, entry: &str| {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(entry), source: wgpu::ShaderSource::Wgsl(source.into()) });
@@ -342,7 +432,12 @@ impl GpuPicture {
         let size_bytes: Vec<u8> = [width, height, 0, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
         gpu.queue.write_buffer(&sizes, 0, &size_bytes);
         let layer = Layer { canvas: Canvas::new(width, height), texture: overlay, rows: None, on: false };
-        Self { gpu, width, height, framing, crop, scale, nv12, frame, uniforms, nv12_buf, readback, layer, uploaded: None, nv12_bind, blend: None, preview: None }
+        Self { gpu, width, height, screen, scale, nv12, frame, uniforms, nv12_buf, readback, layer, uploaded: None, nv12_bind, blend: None, preview: None }
+    }
+
+    /// Where the picture goes from now on.
+    pub(crate) fn set_screen(&mut self, screen: crate::ScreenPlacement) {
+        self.screen = screen;
     }
 
     /// Draw the webcam's layer: `cam` placed at `place`, or none.
@@ -389,8 +484,9 @@ impl GpuPicture {
             },
         };
         let (sw, sh) = (texture.width(), texture.height());
-        let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = crate::placement_cropped(self.crop, (sw, sh), (self.width, self.height), self.framing);
-        let floats: Vec<u8> = [sx, sy, sw, sh, dx, dy, dw, dh].iter().flat_map(|v| (*v as f32).to_le_bytes()).chain([self.width, self.height, u32::from(self.layer.on), 0].iter().flat_map(|v| v.to_le_bytes())).collect();
+        let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = self.screen.place((sw, sh), (self.width, self.height));
+        let flags = [self.width, self.height, u32::from(self.layer.on), u32::from(self.screen.in_front), u32::from(self.screen.turns % 4), flips(&self.screen), 0, 0];
+        let floats: Vec<u8> = [sx, sy, sw, sh, dx, dy, dw, dh].iter().flat_map(|v| (*v as f32).to_le_bytes()).chain(flags.iter().flat_map(|v| v.to_le_bytes())).collect();
         self.gpu.queue.write_buffer(&self.uniforms, 0, &floats);
         let device = &self.gpu.device;
         let source_view = texture.create_view(&Default::default());
@@ -435,7 +531,7 @@ impl GpuPicture {
                 pending: 0.0,
             })
             .collect();
-        self.blend = Some(Blend { accumulate: pipeline(BLEND_SHADER, "accumulate"), resolve: pipeline(RESOLVE_SHADER, "resolve"), slots, resolve_uniforms: uniform("resolve"), held: None });
+        self.blend = Some(Blend { accumulate: pipeline(BLEND_SHADER, "accumulate"), resolve: pipeline(RESOLVE_SHADER, "resolve"), slots, resolve_uniforms: uniform("resolve"), held: None, dst: [0; 4] });
     }
 
     /// The looks from now on see this picture (number `seq`).
@@ -477,7 +573,7 @@ impl GpuPicture {
     /// False if it saw no picture.
     pub(crate) fn finish(&mut self, k: i64) -> bool {
         self.flush();
-        let (width, height, layer) = (self.width, self.height, self.layer.on);
+        let (width, height, layer, front) = (self.width, self.height, self.layer.on, self.screen.in_front);
         let Some(b) = &mut self.blend else { return false };
         let n = b.slots.len() as i64;
         let at = k.rem_euclid(n) as usize;
@@ -487,7 +583,12 @@ impl GpuPicture {
             slot.added = 0.0;
             return false;
         }
-        let bytes: Vec<u8> = [width.to_le_bytes(), height.to_le_bytes(), slot.added.to_le_bytes(), u32::from(layer).to_le_bytes()].concat();
+        let bytes: Vec<u8> = [width.to_le_bytes(), height.to_le_bytes(), slot.added.to_le_bytes(), u32::from(layer).to_le_bytes()]
+            .into_iter()
+            .chain(b.dst.map(|v| (v as f32).to_le_bytes()))
+            .chain([u32::from(front), 0, 0, 0].map(u32::to_le_bytes))
+            .collect::<Vec<_>>()
+            .concat();
         self.gpu.queue.write_buffer(&b.resolve_uniforms, 0, &bytes);
         let device = &self.gpu.device;
         let frame_view = self.frame.create_view(&Default::default());
@@ -518,7 +619,7 @@ impl GpuPicture {
 
     /// Add each open frame's waiting weight of the held picture to its sum.
     fn flush(&mut self) {
-        let (width, height, framing, crop) = (self.width, self.height, self.framing, self.crop);
+        let (width, height, screen) = (self.width, self.height, self.screen);
         let Some(b) = &mut self.blend else { return };
         let Some(held) = &b.held else {
             b.slots.iter_mut().for_each(|s| s.pending = 0.0);
@@ -527,7 +628,8 @@ impl GpuPicture {
         if b.slots.iter().all(|s| s.pending <= 0.0) {
             return;
         }
-        let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = crate::placement_cropped(crop, (held.width(), held.height()), (width, height), framing);
+        let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = screen.place((held.width(), held.height()), (width, height));
+        b.dst = [dx, dy, dw, dh];
         let device = &self.gpu.device;
         let source_view = held.create_view(&Default::default());
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("looks") });
@@ -539,6 +641,7 @@ impl GpuPicture {
                 .chain(height.to_le_bytes())
                 .chain(slot.pending.to_le_bytes())
                 .chain(0f32.to_le_bytes())
+                .chain([u32::from(screen.turns % 4), flips(&screen), 0, 0].iter().flat_map(|v| v.to_le_bytes()))
                 .collect();
             self.gpu.queue.write_buffer(&slot.uniforms, 0, &bytes);
             let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -716,6 +819,39 @@ fn nv12_len(width: u32, height: u32) -> usize {
 mod tests {
     use super::*;
 
+    /// The screen in a box of its own in front of the webcam covers it there
+    /// and nowhere else; behind it, the webcam covers it. The same for a
+    /// blended frame.
+    #[test]
+    #[ignore = "uses the graphics card: cargo test -p capture in_front_or_behind -- --ignored"]
+    fn in_front_or_behind() {
+        let gpu = super::super::gpu::gpu().expect("a graphics card");
+        let white = Frame { width: 64, height: 36, stride: 256, order: Order::Bgr, data: [255u8, 255, 255, 255].repeat(64 * 36), texture: None };
+        let cam = CameraPicture { width: 16, height: 9, bgra: [40u8, 40, 40, 255].repeat(16 * 9) };
+        let all = Placement { x: 0.0, y: 0.0, w: 1.0, h: 1.0, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0, stretch: 1.0 };
+        let left = crate::ScreenPlacement { rect: [0.0, 0.0, 0.5, 1.0], ..crate::ScreenPlacement::whole(crate::Framing::Fill) };
+        // Luma of white, and of the camera's grey.
+        let (screen, camera) = (235u8, 50u8);
+        for blended in [false, true] {
+            for (in_front, want_left) in [(true, screen), (false, camera)] {
+                let mut pic = GpuPicture::new(gpu.clone(), 64, 36, crate::ScreenPlacement { in_front, ..left });
+                pic.set_camera(Some((&cam, &all)));
+                if blended {
+                    pic.start_blending(1);
+                    pic.hold(&white, 1);
+                    pic.add(0, 1.0);
+                    assert!(pic.finish(0));
+                } else {
+                    assert!(pic.draw(&white, 1));
+                }
+                let mut out = Vec::new();
+                pic.nv12(&mut out);
+                let (l, r) = (out[18 * 64 + 10], out[18 * 64 + 50]);
+                assert_eq!((l, r), (want_left, camera), "in front {in_front}, blended {blended}");
+            }
+        }
+    }
+
     /// Blending black and white evenly averages their light (sRGB 188, luma
     /// 178), not their values (128); a frame no look saw isn't made; two
     /// frames open at once keep their sums apart.
@@ -724,7 +860,7 @@ mod tests {
     fn blends_light() {
         let gpu = super::super::gpu::gpu().expect("a graphics card");
         let solid = |v: u8| Frame { width: 16, height: 16, stride: 64, order: Order::Bgr, data: [v, v, v, 255].repeat(256), texture: None };
-        let mut pic = GpuPicture::new(gpu, 16, 16, crate::Framing::Fit, None);
+        let mut pic = GpuPicture::new(gpu, 16, 16, crate::ScreenPlacement::whole(crate::Framing::Fit));
         pic.start_blending(2);
         assert!(!pic.finish(0), "no look, no frame");
         pic.hold(&solid(0), 1);
@@ -753,7 +889,7 @@ mod tests {
         let gpu = super::super::gpu::gpu().expect("a graphics card");
         let (sw, sh) = (2560u32, 1440u32);
         let frame = Frame { width: sw, height: sh, stride: sw as usize * 4, order: Order::Bgr, data: vec![90; (sw * sh * 4) as usize], texture: None };
-        let mut pic = GpuPicture::new(gpu, 1920, 1080, crate::Framing::Fit, None);
+        let mut pic = GpuPicture::new(gpu, 1920, 1080, crate::ScreenPlacement::whole(crate::Framing::Fit));
         let mut out = Vec::new();
         let mut nv12 = Vec::new();
         for i in 0..3 {
@@ -780,14 +916,16 @@ mod tests {
     #[ignore = "uses the graphics card: cargo test -p capture same_frame_as_the_cpu -- --ignored"]
     fn same_frame_as_the_cpu() {
         let gpu = super::super::gpu::gpu().expect("a graphics card");
-        for (sw, sh, dw, dh, framing) in [(64, 36, 64, 36, crate::Framing::Fit), (2560, 1440, 1920, 1080, crate::Framing::Fit), (300, 200, 128, 128, crate::Framing::Fill), (40, 30, 64, 48, crate::Framing::Fit)] {
+        let whole = crate::ScreenPlacement::whole;
+        let boxed = crate::ScreenPlacement { rect: [0.5, 0.25, 0.375, 0.5], ..whole(crate::Framing::Fill) };
+        for (sw, sh, dw, dh, place) in [(64, 36, 64, 36, whole(crate::Framing::Fit)), (2560, 1440, 1920, 1080, whole(crate::Framing::Fit)), (300, 200, 128, 128, whole(crate::Framing::Fill)), (40, 30, 64, 48, whole(crate::Framing::Fit)), (2560, 1440, 1920, 1080, boxed)] {
             let data: Vec<u8> = (0..sw * sh * 4).map(|i| ((i * 7919) % 251) as u8).collect();
             let frame = Frame { width: sw, height: sh, stride: sw as usize * 4, order: Order::Bgr, data, texture: None };
             let mut cpu = Canvas::new(dw, dh);
-            cpu.fill_from(&frame, framing, None);
+            cpu.draw_screen(&frame, &place, false);
             let mut want = Vec::new();
             cpu.to_nv12(&mut want);
-            let mut pic = GpuPicture::new(gpu.clone(), dw, dh, framing, None);
+            let mut pic = GpuPicture::new(gpu.clone(), dw, dh, place);
             assert!(pic.draw(&frame, 1));
             let mut got = Vec::new();
             pic.nv12(&mut got);

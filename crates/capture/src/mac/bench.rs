@@ -32,13 +32,13 @@ fn settings(fps: u32, kbps: u32) -> EncodeSettings {
         blend_samples: 1,
         blend_shape: Default::default(),
         video_bitrate_kbps: kbps,
-        target_height: None,
-        shape: None,
+        size: Default::default(),
         use_hardware: true,
         replay_seconds: 60,
-        video: VideoSource::Screen { id: String::new(), hook: Default::default(), method: Default::default(), crop: None },
+        video: VideoSource::Screen { id: String::new(), hook: Default::default(), method: Default::default() },
         away_screen: None,
         webcam: None,
+        screen: Arc::new(Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit))),
         sources: Vec::new(),
     }
 }
@@ -115,7 +115,9 @@ pub fn save_render(screen: &Path, camera: Option<&Path>, out: &Path, mode: Rende
         }
         let buf = pool.take()?;
         let ct = Instant::now();
-        gpu.compose(surface.buffer(), cam_frame.as_ref().map(|c| c.buffer()), placement.unwrap_or_else(Placement::hidden), &buf)?;
+        let (bw, bh) = super::video::size_of(surface.buffer());
+        let whole = Some(super::gpu::ScreenRects::copied(bw, bh));
+        gpu.compose(surface.buffer(), whole, false, cam_frame.as_ref().map(|c| c.buffer()), placement.unwrap_or_else(Placement::hidden), &buf)?;
         compose_time += ct.elapsed();
         if let Some(e) = &encoder {
             e.encode(&buf, p.index as i64, 60);
@@ -247,8 +249,8 @@ fn spawn_sampler(stop: Arc<AtomicBool>) -> thread::JoinHandle<(Vec<f64>, Vec<f64
 /// Record the main display (and the webcam, as `mode` says) for `secs` into
 /// files in `dir`, and report what it cost.
 pub fn live(mode: LiveMode, secs: f64, camera: &str, dir: &Path, kbps: u32, cam_kbps: u32, target_height: Option<u32>) -> Result<()> {
-    let source = VideoSource::Screen { id: String::new(), hook: Default::default(), method: Default::default(), crop: None };
-    let (content, display, (w, h)) = super::video::plan(&source, target_height, None)?;
+    let source = VideoSource::Screen { id: String::new(), hook: Default::default(), method: Default::default() };
+    let (content, display, (w, h)) = super::video::plan(&source, crate::VideoSize { short_side: target_height, ..Default::default() })?;
     let fps = 60;
     let s = settings(fps, kbps);
     let webcam = (mode != LiveMode::Screen).then(|| {
@@ -263,9 +265,10 @@ pub fn live(mode: LiveMode, secs: f64, camera: &str, dir: &Path, kbps: u32, cam_
             thread::sleep(Duration::from_millis(50));
         }
     }
-    let picture = Picture::start(&source, &content, &display, (w, h), fps, None, crate::Framing::Fit)?;
+    let picture = Picture::start(&source, &content, &display, (w, h), fps, None, crate::ScreenPlacement::whole(crate::Framing::Fit))?;
     let composite = if mode == LiveMode::Composited { webcam.as_ref() } else { None };
-    let mut frames = Frames::new(picture.latest.clone(), composite, w, h, 0)?;
+    let whole = Arc::new(Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit)));
+    let mut frames = Frames::new(picture.latest.clone(), composite, whole, Some(picture.ctl()), w, h, 0)?;
 
     let t0 = Arc::new(Mutex::new(0.0));
     let screen_stats = Arc::new(Mutex::new(Stats::default()));

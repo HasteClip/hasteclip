@@ -730,17 +730,16 @@ impl TexturePool {
 }
 
 /// Scales and converts the latest captured image into one of its targets,
-/// fitted into the frame with black bars when its shape differs, then draws
-/// the webcam over it if there is one. Targets are NV12 frames for the
-/// encoder, or an RGB picture for the preview.
+/// put where the screen's placement says (its box, black around it), with
+/// the webcam over it or under it if there is one. Targets are NV12 frames
+/// for the encoder, or an RGB picture for the preview.
 pub(crate) struct Converter {
     gpu: Gpu,
     width: u32,
     height: u32,
-    /// How the picture goes into the frame (see `crate::placement`).
-    framing: crate::Framing,
-    /// The part of the picture used, if not all of it.
-    crop: Option<crate::Crop>,
+    /// Where the picture goes in the frame, and the part of it used (see
+    /// `crate::ScreenPlacement`), read for each frame.
+    screen: crate::SharedScreen,
     video: ID3D11VideoContext,
     base: Layer,
     overlay: Option<(Layer, crate::webcam::SharedPlacement)>,
@@ -810,10 +809,38 @@ impl Layer {
         }
     }
 
-    /// Draw `source_rect` of the picture into `dest` of target `slot`, leaving
-    /// the rest of the target as it is (only `target` is written).
-    fn draw(&self, video: &ID3D11VideoContext, slot: usize, source_rect: RECT, dest: RECT, target: RECT, mirror: (bool, bool)) -> windows::core::Result<()> {
+    /// Fill `target` of target `slot` with black (the stream off: only the
+    /// background is drawn).
+    fn clear(&self, video: &ID3D11VideoContext, slot: usize, target: RECT) -> windows::core::Result<()> {
+        unsafe { video.VideoProcessorSetOutputTargetRect(&self.processor, true, Some(&target)) };
+        let stream = D3D11_VIDEO_PROCESSOR_STREAM {
+            Enable: false.into(),
+            OutputIndex: 0,
+            InputFrameOrField: 0,
+            PastFrames: 0,
+            FutureFrames: 0,
+            ppPastSurfaces: std::ptr::null_mut(),
+            pInputSurface: std::mem::ManuallyDrop::new(Some(self.input.clone())),
+            ppFutureSurfaces: std::ptr::null_mut(),
+            ppPastSurfacesRight: std::ptr::null_mut(),
+            pInputSurfaceRight: std::mem::ManuallyDrop::new(None),
+            ppFutureSurfacesRight: std::ptr::null_mut(),
+        };
+        let mut streams = [stream];
+        let result = unsafe { video.VideoProcessorBlt(&self.processor, &self.outputs[slot], 0, &streams) };
+        unsafe { std::mem::ManuallyDrop::drop(&mut streams[0].pInputSurface) };
+        result
+    }
+
+    /// Draw `source_rect` of the picture (in its own pixels) into `dest` of
+    /// target `slot`, turned `turns` quarters clockwise then mirrored as
+    /// `mirror` says (left and right, upside down), leaving the rest of the
+    /// target as it is (only `target` is written).
+    #[allow(clippy::too_many_arguments)]
+    fn draw(&self, video: &ID3D11VideoContext, slot: usize, source_rect: RECT, dest: RECT, target: RECT, turns: u8, mirror: (bool, bool)) -> windows::core::Result<()> {
         unsafe {
+            // Turned, then mirrored, as the processor does them.
+            video.VideoProcessorSetStreamRotation(&self.processor, 0, turns % 4 != 0, D3D11_VIDEO_PROCESSOR_ROTATION((turns % 4) as i32));
             if let Ok(video1) = video.cast::<ID3D11VideoContext1>() {
                 video1.VideoProcessorSetStreamMirror(&self.processor, 0, mirror.0 || mirror.1, mirror.0, mirror.1);
             }
@@ -842,9 +869,9 @@ impl Layer {
 }
 
 impl Converter {
-    /// `overlay`: the webcam's picture and where it goes, drawn over `source`.
-    /// `framing`: how `source` (`crop` of it, if any) goes into the
-    /// `width`×`height` frame.
+    /// `overlay`: the webcam's picture and where it goes, drawn over `source`
+    /// (or under it). `screen`: where `source` (its crop, if any) goes in
+    /// the `width`×`height` frame.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         gpu: &Gpu,
@@ -855,8 +882,7 @@ impl Converter {
         width: u32,
         height: u32,
         fps: u32,
-        framing: crate::Framing,
-        crop: Option<crate::Crop>,
+        screen: crate::SharedScreen,
     ) -> Result<Self> {
         let video: ID3D11VideoContext = gpu.context.cast()?;
         let base = Layer::new(gpu, &video, source, targets, yuv, width, height, fps)?;
@@ -864,29 +890,53 @@ impl Converter {
             Some((cam, placement)) => Some((Layer::new(gpu, &video, cam, targets, yuv, width, height, fps)?, placement)),
             None => None,
         };
-        Ok(Self { gpu: gpu.clone(), width, height, framing, crop, video, base, overlay })
+        Ok(Self { gpu: gpu.clone(), width, height, screen, video, base, overlay })
     }
 
-    /// Convert the latest captured image (and the webcam over it) into target `slot`.
+    /// Convert the latest captured image (and the webcam over it, or under
+    /// it) into target `slot`.
     pub(crate) fn convert(&self, slot: usize) -> Result<()> {
+        let placed = *self.screen.lock().unwrap();
         let (cw, ch) = self.base.source.content();
         let rect = |[x, y, w, h]: [u32; 4]| RECT { left: x as i32, top: y as i32, right: (x + w) as i32, bottom: (y + h) as i32 };
-        let (source, dest) = crate::placement_cropped(self.crop, (cw, ch), (self.width, self.height), self.framing);
-        let (source, dest) = (rect(source), rect(dest));
+        let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = placed.place((cw, ch), (self.width, self.height));
+        let screen = (sw > 0 && sh > 0 && dw > 0 && dh > 0).then(|| (rect([sx, sy, sw, sh]), rect([dx, dy, dw, dh])));
         let full = RECT { left: 0, top: 0, right: self.width as i32, bottom: self.height as i32 };
-        let result = self.base.draw(&self.video, slot, source, dest, full, (false, false)).context("couldn't convert a screen frame");
-        if result.is_ok() {
-            if let Some((layer, placement)) = &self.overlay {
-                if layer.source.has_frame() {
-                    let p = *placement.lock().unwrap();
-                    if let Some((source, dest)) = overlay_rects(p, layer.source.content(), self.width, self.height) {
-                        if let Err(e) = layer.draw(&self.video, slot, source, dest, dest, (p.flip_h, p.flip_v)) {
-                            eprintln!("couldn't draw the webcam: {e}");
-                        }
-                    }
-                }
+        // The webcam, where it shows.
+        let cam = self.overlay.as_ref().filter(|(layer, _)| layer.source.has_frame()).and_then(|(layer, placement)| {
+            let p = *placement.lock().unwrap();
+            overlay_rects(p, layer.source.content(), self.width, self.height).map(|(source, dest)| (layer, source, dest, (p.flip_h, p.flip_v)))
+        });
+        // Only `target` is written: all of the frame (black around the
+        // picture), or just the picture's place, over what's there.
+        let draw_cam = |target: Option<RECT>| {
+            if let Some((layer, source, dest, mirror)) = &cam
+                && let Err(e) = layer.draw(&self.video, slot, *source, *dest, target.unwrap_or(*dest), 0, *mirror)
+            {
+                eprintln!("couldn't draw the webcam: {e}");
             }
+        };
+        let result = match screen {
+            // In front of the webcam: the webcam first, then the screen over it.
+            Some((source, dest)) if placed.in_front && cam.is_some() => {
+                draw_cam(Some(full));
+                self.base.draw(&self.video, slot, source, dest, dest, placed.turns, (placed.flip_h, placed.flip_v))
+            }
+            Some((source, dest)) => {
+                let drawn = self.base.draw(&self.video, slot, source, dest, full, placed.turns, (placed.flip_h, placed.flip_v));
+                if drawn.is_ok() {
+                    draw_cam(None);
+                }
+                drawn
+            }
+            // No screen: the webcam on black, or black.
+            None if cam.is_some() => {
+                draw_cam(Some(full));
+                Ok(())
+            }
+            None => self.base.clear(&self.video, slot, full),
         }
+        .context("couldn't convert a screen frame");
         unsafe { self.gpu.context.Flush() };
         result
     }
@@ -953,8 +1003,7 @@ impl Previewer {
         recorded_width: u32,
         recorded_height: u32,
         fps: u32,
-        framing: crate::Framing,
-        crop: Option<crate::Crop>,
+        screen: crate::SharedScreen,
         generation: u64,
     ) -> Result<Self> {
         let recorded = (recorded_width, recorded_height);
@@ -966,7 +1015,7 @@ impl Previewer {
             let staging = (0..Self::SLOTS)
                 .map(|_| gpu.texture(width, height, format, 0, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ.0 as u32))
                 .collect::<Result<Vec<_>>>()?;
-            let converter = Converter::new(gpu, latest, overlay.clone(), std::slice::from_ref(&target), false, width, height, fps, framing, crop)?;
+            let converter = Converter::new(gpu, latest, overlay.clone(), std::slice::from_ref(&target), false, width, height, fps, screen.clone())?;
             Ok((target, staging, converter))
         };
         let (rgba, (target, staging, converter)) = match make(DXGI_FORMAT_R8G8B8A8_UNORM) {
@@ -1079,7 +1128,7 @@ mod overlay_tests {
 
     #[test]
     fn webcam_box_in_frame() {
-        let p = Placement { x: 0.75, y: 0.5, w: 0.25, h: 0.25, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0 };
+        let p = Placement { x: 0.75, y: 0.5, w: 0.25, h: 0.25, crop: [0.0; 4], flip_h: false, flip_v: false, turns: 0, stretch: 1.0 };
         let (s, d) = overlay_rects(p, (1280, 720), 1920, 1080).unwrap();
         assert_eq!((s.left, s.top, s.right, s.bottom), (0, 0, 1280, 720));
         assert_eq!((d.left, d.top, d.right, d.bottom), (1440, 540, 1920, 810));
@@ -1088,7 +1137,7 @@ mod overlay_tests {
     #[test]
     fn crop_and_clip_take_the_same_share() {
         // Half off the right edge, with the left quarter of the camera cropped.
-        let p = Placement { x: 0.875, y: 0.0, w: 0.25, h: 0.25, crop: [0.25, 0.0, 0.0, 0.0], flip_h: false, flip_v: false, turns: 0 };
+        let p = Placement { x: 0.875, y: 0.0, w: 0.25, h: 0.25, crop: [0.25, 0.0, 0.0, 0.0], flip_h: false, flip_v: false, turns: 0, stretch: 1.0 };
         let (s, d) = overlay_rects(p, (1280, 720), 1920, 1080).unwrap();
         assert_eq!((d.left, d.right), (1680, 1920));
         // Visible camera is 320..1280; half of it shows.

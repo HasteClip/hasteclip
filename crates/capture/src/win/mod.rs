@@ -47,6 +47,7 @@ use anyhow::{Context, Result, bail};
 pub(crate) use loopback::SystemAudio;
 pub(crate) use system::host_now;
 pub use camera::{keep_open as keep_camera_open, list_cameras, open_camera_settings};
+pub(crate) use camera::picture as camera_picture;
 pub use system::{cursor_state, foreground_app_path, foreground_exe, list_apps, list_screens, list_windowed_apps};
 pub(crate) use system::display_pixels;
 
@@ -249,13 +250,8 @@ impl Session {
         system::com_init();
         system::mf_startup()?;
         let gpu = d3d::Gpu::new()?;
-        let (picture_source, canvas) = PictureSource::plan(&s.video)?;
-        // Cropped: what's kept, recorded as a screen that size.
-        let crop = crate::crop_of(&s.video);
-        let (canvas_w, canvas_h) = crate::cropped_size(crop, canvas);
-        let (width, height) = crate::recorded_size(canvas_w, canvas_h, s.target_height, s.shape);
-        // Without a shape, a window that isn't the screen's goes in whole.
-        let framing = s.shape.map_or(crate::Framing::Fit, |shape| shape.framing);
+        let (picture_source, (canvas_w, canvas_h)) = PictureSource::plan(&s.video)?;
+        let (width, height) = s.size.of(canvas_w, canvas_h);
         let clock = Arc::new(Clock::default());
 
         let (titles, comment, has_rest) = track_layout(&s.sources);
@@ -330,8 +326,8 @@ impl Session {
             let shutter = crate::shutter::Shutter::new(looks, s.blend_shape);
             let blend = FrameBlend::new(&gpu, &latest, looks, shutter.frames_open())?;
             latest.set_wants_queue(true);
-            let converter = d3d::Converter::new(&gpu, &blend.average, overlay.clone(), &encoder.pool.textures, true, width, height, s.fps, framing, crop)?;
-            let preview = d3d::Previewer::new(&gpu, &latest, overlay, width, height, s.fps, framing, crop, crate::preview::new_producer())?;
+            let converter = d3d::Converter::new(&gpu, &blend.average, overlay.clone(), &encoder.pool.textures, true, width, height, s.fps, s.screen.clone())?;
+            let preview = d3d::Previewer::new(&gpu, &latest, overlay, width, height, s.fps, s.screen.clone(), crate::preview::new_producer())?;
             session.pacer = Some(spawn_blend_pacer(s.fps, looks, shutter, latest, blend, converter, encoder, preview, camera, clock));
             Ok(())
         })();
@@ -356,11 +352,6 @@ impl Session {
         let Some(sw) = &mut self.switch else { return false };
         if sw.source == *video {
             return true;
-        }
-        // Another crop is another size: that's a new recording.
-        if crate::crop_of(video) != crate::crop_of(&sw.source) {
-            eprintln!("can't switch what's recorded: another crop makes it another size");
-            return false;
         }
         let source = match PictureSource::plan(video) {
             Ok((source, _)) => source,
@@ -566,11 +557,11 @@ pub(crate) struct PreviewCapture {
 impl PreviewCapture {
     pub(crate) fn start(
         source: VideoSource,
-        target_height: Option<u32>,
-        shape: Option<crate::Shape>,
+        size: crate::VideoSize,
         fps: u32,
         away: Option<Arc<crate::StillImage>>,
         webcam: Option<crate::webcam::Webcam>,
+        screen: crate::SharedScreen,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let error = Arc::new(std::sync::Mutex::new(None));
@@ -582,24 +573,22 @@ impl PreviewCapture {
             system::com_init();
             let opened = (|| -> Result<(Picture, d3d::Previewer, Option<camera::CameraLayer>)> {
                 let gpu = d3d::Gpu::new()?;
-                let crop = crate::crop_of(&source);
                 let (mut source, (w, h)) = PictureSource::plan(&source)?;
                 if let (PictureSource::Apps(list), Some(shared)) = (&mut source, apps2) {
                     *list = shared; // so `update` reaches the running follower
                 }
                 let picture = source.open(&gpu, w, h, fps, away)?;
-                let (cw, ch) = crate::cropped_size(crop, (w, h));
-                let (width, height) = crate::recorded_size(cw, ch, target_height, shape);
-                let framing = shape.map_or(crate::Framing::Fit, |shape| shape.framing);
+                let (width, height) = size.of(w, h);
                 let cam = webcam.as_ref().and_then(|wc| camera::CameraLayer::new(&gpu, wc).ok());
                 let overlay = cam.as_ref().zip(webcam.as_ref()).map(|(c, wc)| (&c.latest, wc.placement.clone()));
-                let preview = d3d::Previewer::new(&gpu, &picture.latest, overlay, width, height, fps, framing, crop, generation)?;
+                let preview = d3d::Previewer::new(&gpu, &picture.latest, overlay, width, height, fps, screen, generation)?;
                 Ok((picture, preview, cam))
             })();
             let (picture, preview, mut cam) = match opened {
                 Ok(p) => p,
                 Err(e) => {
                     *error2.lock().unwrap() = Some(format!("{e:#}"));
+                    crate::preview::clear(generation);
                     return;
                 }
             };
@@ -1792,7 +1781,7 @@ mod tests {
     #[ignore = "captures the screen: cargo test -p capture screenshot_of_the_screen -- --ignored"]
     fn screenshot_of_the_screen() {
         let screen = system::list_screens().into_iter().next().expect("a screen");
-        let video = VideoSource::Screen { id: screen.id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() }, method: Default::default(), crop: None };
+        let video = VideoSource::Screen { id: screen.id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() }, method: Default::default() };
         let mut rec = WinRecorder::new(Arc::new(LiveAudio::default()));
         let t = Instant::now();
         let img = rec.screenshot(&video).unwrap().finish().unwrap();
@@ -1815,7 +1804,7 @@ mod tests {
     #[ignore = "captures the screen: cargo test -p capture screenshot_while_clipping -- --ignored"]
     fn screenshot_while_clipping() {
         let screen = system::list_screens().into_iter().next().expect("a screen");
-        let video = VideoSource::Screen { id: screen.id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() }, method: Default::default(), crop: None };
+        let video = VideoSource::Screen { id: screen.id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() }, method: Default::default() };
         let settings = EncodeSettings {
             output_dir: std::env::temp_dir().join("hc-shot-test"),
             container_ext: "mp4".into(),
@@ -1823,13 +1812,13 @@ mod tests {
             blend_samples: 1,
             blend_shape: crate::BlendShape::Even,
             video_bitrate_kbps: 4000,
-            target_height: Some(720),
-            shape: Some(crate::Shape { w: 1, h: 1, framing: crate::Framing::Fill }),
+            size: crate::VideoSize { short_side: Some(720), shape: Some(crate::Shape { w: 1, h: 1, framing: crate::Framing::Fill }), exact: None },
             use_hardware: true,
             replay_seconds: 5,
             video: video.clone(),
             away_screen: None,
             webcam: None,
+            screen: Arc::new(std::sync::Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fill))),
             sources: Vec::new(),
         };
         let mut rec = WinRecorder::new(Arc::new(LiveAudio::default()));

@@ -132,17 +132,17 @@ impl App {
     fn settings_group(&mut self, ui: &mut egui::Ui, name: &'static str, f: &Filter, jump: bool) -> bool {
         // Measure first: a group with no matching rows doesn't show at all.
         let matches = match name {
-            "Clipping" => f.shows(&["clip length", "replay buffer duration", "start clipping when hasteclip opens", "auto start"]),
-            "Video" => f.shows(&["resolution", "height", "size", "frame rate", "fps", "quality", "bitrate", "mbps", "frame blending", "motion blur", "encoder", "hardware", "software", "file format", "mp4", "mov", "game capture", "anti-cheat", "obs"]) || SCREEN_CAPTURE && f.shows(SCREEN_CAPTURE_WORDS),
-            "Clips" => f.shows(&["clips folder", "location", "directory", "folder per game", "name clips after what happened", "game events", "osu", "names", "delete", "trash", "permanently"]),
-            "Screenshots" => capture::SCREENSHOTS && f.shows(&["screenshots", "take a screenshot", "shortcut", "hotkey", "format", "png", "jpg", "jpeg", "copy", "clipboard", "paste"]),
+            "Clipping" => f.shows(&["clip length", "replay buffer duration", "start clipping when hasteclip opens", "auto start", "memory"]),
+            "Video" => VIDEO_WORDS.iter().any(|w| f.shows(w)) || SCREEN_CAPTURE && f.shows(SCREEN_CAPTURE_WORDS),
+            "Clips" => f.shows(&["clips folder", "location", "directory", "folder per game", "name clips after what happened", "game events", "osu", "names", "delete", "trash", "permanently", "output", "titles", "recycle"]),
+            "Screenshots" => capture::SCREENSHOTS && f.shows(&["screenshots", "take a screenshot", "shortcut", "hotkey", "format", "png", "jpg", "jpeg", "copy", "clipboard", "paste", "keyboard"]),
             "Sharing" => f.shows(&["discord", "activity", "rich presence"]),
             "Saved sound" => f.shows(&["play a sound when a clip is saved", "sound", "volume", "record the sound", "in clip", "add your own"]),
-            "Shortcuts" => f.shows(&["shortcuts", "hotkey", "keyboard", "save clip", "take a screenshot", "start or stop clipping", "start or stop recording", "fullscreen games", "input monitoring", "permission"]),
+            "Shortcuts" => f.shows(&["shortcuts", "hotkey", "keyboard", "save clip", "take a screenshot", "start or stop clipping", "start or stop recording", "fullscreen games", "input monitoring", "permission", "system settings"]),
             #[cfg(target_os = "macos")]
             "Permissions" => crate::setup::Need::ALL.iter().any(|n| f.shows(n.words()) || f.shows(&[n.label()])) || f.shows(&["permissions", "privacy", "allow"]),
-            "Voice" => f.shows(&["save by voice", "hasteclip that", "speech", "command", "voice samples", "review"]),
-            "App" => f.shows(&["appearance", "theme", "dark", "light", "open at login", "autostart", "startup", "closing the window", "tray", "menu bar", "update", "version", "license", "licence", "about", "source code", "copyright", "open source", "reset"]),
+            "Voice" => f.shows(&["save by voice", "hasteclip that", "speech", "command", "voice samples", "review", "keep", "improve"]),
+            "App" => f.shows(&["appearance", "theme", "dark", "light", "open at login", "autostart", "startup", "closing the window", "tray", "menu bar", "update", "version", "license", "licence", "about", "source code", "copyright", "open source", "reset", "system", "quit", "what's new", "start with", "defaults"]),
             _ => false,
         };
         if !matches {
@@ -215,10 +215,12 @@ impl App {
         let lock = self.lock();
         let mut said = false;
         let size = self.recorded_size();
-        let native = capture::frame_size(&self.video_source(), None, self.settings.capture_shape());
-        let screen = capture::frame_size(&self.video_source(), None, None);
+        let native = capture::frame_size(&self.video_source(), capture::VideoSize { shape: self.settings.capture_shape(), ..Default::default() });
+        let screen = capture::frame_size(&self.video_source(), Default::default());
         let res_note = match (size, native) {
-            (Some((w, h)), Some((_, nh))) if self.settings.resolution.height().is_some_and(|t| t > nh) => format!("Records at {w}×{h}: your display's size, it isn't made bigger"),
+            // A custom size: its boxes say it.
+            _ if self.settings.resolution.exact().is_some() => String::new(),
+            (Some((w, h)), Some((nw, nh))) if self.settings.resolution.short_side().is_some_and(|t| t > nw.min(nh)) => format!("Records at {w}×{h}: your display's size, it isn't made bigger"),
             (Some((w, h)), _) => format!("Records at {w}×{h}"),
             _ => String::new(),
         };
@@ -239,33 +241,34 @@ impl App {
         let quality_note = format!("{}about {per_min} per minute", if preset.is_some() { "" } else { "Your own bitrate, " });
         let mut locked_click = false;
         ui_kit::list(ui, "video", |l| {
-            if f.shows(&["resolution", "height", "size", "native"]) {
-                let (_, c) = l.row(Row::new("Resolution").tip("Resolution", "Lower makes smaller files that are quicker to share. Native keeps every pixel of your display.").note(res_note.clone()).locked(lock.clone()), |ui| self.resolution_field(ui));
+            if f.shows(RESOLUTION_WORDS) {
+                let (_, c) = l.row(Row::new("Resolution").tip("Resolution", RESOLUTION_TIP).note(res_note.clone()).locked(lock.clone()), |ui| self.resolution_field(ui));
                 locked_click |= c;
             }
-            if f.shows(&["aspect ratio", "shape", "same as screen", "16:9", "21:9", "ultrawide", "black bars", "crop", "fill", "fit", "stretch"]) {
-                let (_, c) = l.row(Row::new("Aspect ratio").tip("Aspect ratio", SHAPE_TIP).locked(lock.clone()), |ui| self.shape_field(ui, screen));
+            // What a shape of the video's own does to the screen, said, and
+            // where that's changed: how it sits in the video is the screen's,
+            // on Sources.
+            if f.shows(SHAPE_WORDS) {
+                let placed = self.settings.screen.placed.is_some();
+                let what = if self.settings.screen_placement().crop.is_some() { "crop" } else { "screen" };
+                let shaped = self.settings.capture_shape().zip(self.screen_picture());
+                let note = shaped.map_or(String::new(), |(shape, size)| framing_note((!placed).then_some(self.settings.framing), shape, size, what));
+                let go = shaped.is_some_and(|(shape, size)| !same_shape(shape, size)).then_some(SHAPE_GO);
+                let (_, c) = l.row(Row::new("Aspect ratio").tip("Aspect ratio", SHAPE_TIP).note(note).go(go).locked(lock.clone()), |ui| self.shape_field(ui, screen));
                 locked_click |= c;
-                let shape = self.settings.capture_shape();
-                l.well("shape_well", shape.is_some(), |l| {
-                    let note = shape.zip(screen).map_or(String::new(), |(shape, screen)| shape_note(shape, screen));
-                    let (_, c) = l.row(Row::new("Screen").tip("Screen", FRAMING_TIP).kid().note(note).locked(lock.clone()), |ui| {
-                        if let Some(framing) = framing_field(ui, self.settings.framing) {
-                            self.settings.framing = framing;
-                        }
-                    });
-                    locked_click |= c;
-                });
+                if ui_kit::take_row_go(l.ui.ctx(), "Aspect ratio") {
+                    self.show_screen_card();
+                }
             }
-            if f.shows(&["frame rate", "fps"]) {
+            if f.shows(FPS_WORDS) {
                 let (_, c) = l.row(Row::new("Frame rate").note(fps_note.clone()).locked(lock.clone()), |ui| self.fps_field(ui));
                 locked_click |= c;
             }
-            if f.shows(&["quality", "bitrate", "mbps"]) {
+            if f.shows(QUALITY_WORDS) {
                 let (_, c) = l.row(Row::new("Quality").tip("Quality", "How much detail each second gets. Fast motion needs more, and files grow with it. Balanced looks good in fast motion at this size and frame rate.").note(quality_note.clone()).locked(lock.clone()), |ui| self.quality_field(ui, rec, preset));
                 locked_click |= c;
             }
-            if capture::frame_blending() && f.shows(&["frame blending", "motion blur"]) {
+            if capture::frame_blending() && f.shows(BLEND_WORDS) {
                 let (_, c) = l.row(Row::new("Frame blending").tip("Frame blending", "Captures faster than the frame rate and averages the pictures into each frame, for smooth motion like motion blur. On macOS and Linux, up to your display's refresh rate.").note(blend_note.clone()).locked(lock.clone()), |ui| self.blend_field(ui, &blends));
                 locked_click |= c;
                 let on = samples > 1;
@@ -278,7 +281,7 @@ impl App {
                     locked_click |= c;
                 });
             }
-            if f.shows(&["encoder", "hardware", "software", "gpu"]) {
+            if f.shows(ENCODER_WORDS) {
                 let (_, c) = l.row(Row::new("Encoder").tip("Encoder", "Hardware encoding barely affects your game's frame rate. Software is slower and uses the CPU.").locked(lock.clone()), |ui| {
                     let r = ui_kit::select(ui, self.settings.encoder.label(), 150.0);
                     ui_kit::menu_popup(&r, false, 260.0, |ui| {
@@ -291,7 +294,7 @@ impl App {
                 });
                 locked_click |= c;
             }
-            if f.shows(&["file format", "mp4", "mov", "container"]) {
+            if f.shows(FORMAT_WORDS) {
                 let (_, c) = l.row(Row::new("File format").tip("File format", "MP4 plays everywhere. MOV is for QuickTime and Final Cut.").locked(lock.clone()), |ui| {
                     let chosen = usize::from(self.settings.container == Container::Mov);
                     if let Some(i) = ui_kit::segmented_opts(ui, "container", &[Seg::from("MP4"), Seg::from("MOV")], chosen, None, ui.is_enabled()) {
@@ -300,7 +303,7 @@ impl App {
                 });
                 locked_click |= c;
             }
-            if capture::game_hook_available() && f.shows(&["game capture", "anti-cheat", "anticheat", "obs", "fullscreen"]) {
+            if capture::game_hook_available() && f.shows(GAME_CAPTURE_WORDS) {
                 let (_, c) = l.row(Row::new("Game capture").tip("Game capture", "For games Windows can't record properly, like exclusive fullscreen games that record frozen, or that lose their cursor. Uses OBS Studio's game capture, only where it's needed.").note("For games that record frozen or without a cursor").locked(lock.clone()), |ui| ui_kit::switch(ui, &mut self.settings.game_capture));
                 locked_click |= c;
                 let on = self.settings.game_capture;
@@ -679,7 +682,7 @@ impl App {
                     match status {
                         Status::Ready(_) => {
                             let recording = self.rec_state == RecState::Recording;
-                            if Btn::normal("Restart now").small().enabled(!recording).tip(if recording { "Finish your recording first" } else { "Restart into the new version" }).show(ui).clicked() && self.updater.install_on_exit(true) {
+                            if Btn::normal("Restart now").small().tip("Restart into the new version").locked(recording.then(|| "Finish your recording first".to_owned())).show(ui).clicked() && self.updater.install_on_exit(true) {
                                 self.quit(ui.ctx());
                             }
                         }
@@ -704,7 +707,7 @@ impl App {
             }
             if f.shows(&["reset", "defaults"]) {
                 l.row(Row::new("Reset all settings").note("Your clips, folders and sources are kept."), |ui| {
-                    let b = Btn::new(Kind::DangerText, "Reset…").small().enabled(idle).tip(if idle { "Back to the defaults" } else { "Stop capturing first" });
+                    let b = Btn::new(Kind::DangerText, "Reset…").small().tip("Back to the defaults").locked((!idle).then(|| "Stop capturing first".to_owned()));
                     if b.show(ui).clicked() {
                         self.confirm_reset = true;
                     }
@@ -733,90 +736,56 @@ impl App {
     /// screen's, or a common one), or two numbers of your own (Custom), each
     /// in its own box.
     fn shape_field(&mut self, ui: &mut egui::Ui, screen: Option<(u32, u32)>) {
-        let pal = theme::pal(ui);
-        let custom_id = egui::Id::new("aspect_custom");
-        let shape = self.settings.shape;
-        // Custom: picked from the menu, or a ratio that isn't a common one.
-        let custom = ui.data(|d| d.get_temp::<bool>(custom_id)).unwrap_or(false) || shape.is_some_and(|s| !RATIOS.iter().any(|r| [r.0, r.1] == s));
-        let shown = match shape {
-            _ if custom => "Custom".to_owned(),
-            None => SAME_AS_SCREEN.to_owned(),
-            Some([w, h]) => format!("{w}:{h}"),
-        };
-        let r = ui_kit::select(ui, &shown, if custom { 100.0 } else { 150.0 });
-        let (mut picked, mut to_custom) = (None, false);
-        ui_kit::menu_popup(&r, false, 250.0, |ui| {
-            let mut same = Item::new(SAME_AS_SCREEN).check(!custom && shape.is_none());
-            if let Some((w, h)) = screen {
-                same = same.value(format!("{w}×{h}"));
-            }
-            if same.show(ui).clicked() {
-                picked = Some(None);
-            }
-            for &(w, h, note) in &RATIOS {
-                if Item::new(format!("{w}:{h}")).check(!custom && shape == Some([w, h])).value(note).show(ui).clicked() {
-                    picked = Some(Some([w, h]));
-                }
-            }
-            ui_kit::menu_sep(ui);
-            to_custom = Item::new("Custom…").check(custom).tip("Two numbers of your own, like 5:4").show(ui).clicked();
-        });
-        if let Some(p) = picked {
-            ui.data_mut(|d| d.remove::<bool>(custom_id));
-            self.settings.shape = p;
+        // A custom size is its own shape: shown, not picked.
+        if let Some((w, h)) = self.settings.resolution.exact() {
+            ui.add_enabled_ui(false, |ui| ui_kit::select(ui, &ratio_label(w, h), 150.0)).inner.on_disabled_hover_text("Your custom size sets it. Pick a resolution in p to choose one.");
+            return;
         }
-        if to_custom {
-            // From the ratio there is (or 16:9), to change.
-            ui.data_mut(|d| d.insert_temp(custom_id, true));
-            self.settings.shape = Some(shape.unwrap_or([16, 9]));
-        }
-        if custom || to_custom {
-            let [w, h] = self.settings.shape.unwrap_or([16, 9]);
-            // The width's box, then the height's, left to right, so Tab goes
-            // from one to the other.
-            let boxes = ui.allocate_ui_with_layout(egui::vec2(2.0 * 46.0 + 16.0, ui_kit::CONTROL_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                let w = ui_kit::number_box(ui, egui::Id::new("aspect_w"), w, 1..=99, 46.0).unwrap_or(w);
-                ui.label(theme::text(":", 13.5, W::Medium).color(pal.text2));
-                let h = ui_kit::number_box(ui, egui::Id::new("aspect_h"), h, 1..=99, 46.0).unwrap_or(h);
-                [w, h]
-            });
-            self.settings.shape = Some(kept_ratio(boxes.inner));
+        // Custom starts from the screen's own shape: nothing changes till it's typed.
+        let same = screen.map_or(String::new(), |(w, h)| format!("{w}×{h}"));
+        let from = screen.map_or([16, 9], |(w, h)| ui_kit::ratio_of(w as f64 / h.max(1) as f64));
+        if let Some(shape) = ui_kit::ratio_field(ui, "video_shape", (SAME_AS_SCREEN, &same), self.settings.shape, from) {
+            self.settings.shape = shape;
         }
     }
 
+    /// The resolution: Native or one in p, in the aspect ratio chosen,
+    /// picked from its menu; or a size of its own, its width and height in
+    /// boxes beside it (the shape kept, if its link's on).
     fn resolution_field(&mut self, ui: &mut egui::Ui) {
         let r = self.settings.resolution;
-        let native = capture::frame_size(&self.video_source(), None, self.settings.capture_shape());
-        let presets: Vec<(String, String, String)> = OutputResolution::PRESETS
-            .iter()
-            .map(|p| {
+        let exact = r.exact();
+        // Native in the aspect ratio chosen (a custom size isn't one).
+        let aspect = capture::VideoSize { shape: self.settings.aspect_shape(), ..Default::default() };
+        let native = capture::frame_size(&self.video_source(), aspect);
+        let shown = if exact.is_some() { "Custom".to_owned() } else { r.label() };
+        let menu = ui_kit::select(ui, &shown, if exact.is_some() { 110.0 } else { 150.0 });
+        let mut picked = None;
+        ui_kit::menu_popup(&menu, false, 260.0, |ui| {
+            for p in OutputResolution::PRESETS {
                 let note = match (p, native) {
                     (OutputResolution::Native, Some((w, h))) => format!("{w}×{h}"),
                     _ => p.note().to_owned(),
                 };
-                (p.label(), p.height().map_or("Native".into(), |h| h.to_string()), note)
-            })
-            .collect();
-        let current = OutputResolution::PRESETS.iter().position(|p| *p == r || (p.height() == r.height()));
-        let text = r.height().map_or("Native".to_owned(), |h| h.to_string());
-        let field = ValueField { id: egui::Id::new("vf_res"), text, unit: if r.height().is_some() { "p" } else { "" }, width: 116.0, hint: "Type any height from 144 to 4320, or Native", presets, current, range: "144–4320" };
-        match field.show(ui) {
-            Typed::Preset(i) => self.settings.resolution = OutputResolution::PRESETS[i],
-            Typed::Text(t) => {
-                let t = t.trim().trim_end_matches(['p', 'P']).trim();
-                if t.to_lowercase().starts_with('n') {
-                    self.settings.resolution = OutputResolution::Native;
-                } else {
-                    match t.parse::<u32>() {
-                        Ok(h) if (144..=4320).contains(&h) => {
-                            self.settings.resolution = OutputResolution::PRESETS.iter().copied().find(|p| p.height() == Some(h)).unwrap_or(OutputResolution::Custom(h));
-                        }
-                        _ => self.toast_error(format!("“{t}” isn't a height from 144 to 4320")),
-                    }
+                if Item::new(p.label()).check(exact.is_none() && p.short_side() == r.short_side()).value(note).show(ui).clicked() {
+                    picked = Some(p);
                 }
             }
-            Typed::None | Typed::Secs(_) => {}
+            ui_kit::menu_sep(ui);
+            // From the size it records at now, the width chosen to type over.
+            if Item::new("Custom size…").check(exact.is_some()).value("any width and height").show(ui).clicked() && exact.is_none() {
+                let (w, h) = self.recorded_size().unwrap_or((1920, 1080));
+                picked = Some(OutputResolution::Exact(w & !1, h & !1));
+                ui_kit::type_in_size(ui.ctx(), "res_size");
+            }
+        });
+        if let Some(p) = picked {
+            self.settings.resolution = p;
+        }
+        if let Some(size) = self.settings.resolution.exact()
+            && let Some((w, h)) = ui_kit::size_field(ui, "res_size", size, 144..=capture::MAX_SIDE, 144..=capture::MAX_SIDE)
+        {
+            self.settings.resolution = OutputResolution::Exact(w, h);
         }
     }
 
@@ -989,7 +958,7 @@ impl App {
     /// The size recordings come out at with the chosen resolution, when the
     /// display is known.
     fn recorded_size(&self) -> Option<(u32, u32)> {
-        capture::frame_size(&self.video_source(), self.settings.resolution.height(), self.settings.capture_shape())
+        capture::frame_size(&self.video_source(), self.settings.video_size())
     }
 
     /// A bitrate that looks good for the recorded size and frame rate, in
@@ -1356,24 +1325,49 @@ pub const BLEND_TIP: &str = "How the pictures in each frame are weighed. Even: a
 pub const BLEND_EVEN_TIP: &str = "Every picture counts the same: each frame's trail ends sharply";
 pub const BLEND_SOFT_TIP: &str = "The middle of each frame counts most, fading into the frames either side: smoother, a little blurrier";
 
-/// Aspect ratio's and its Screen's tips.
-const SHAPE_TIP: &str = "Record in another aspect ratio than your screen's: 16:9 out of an ultrawide screen, say, or 9:16 for phones. Type any other, like 21:9. Every recording and clip is made in it.";
-const FRAMING_TIP: &str = "How your screen goes into the aspect ratio. Fill: its middle, with what's past it cut off (an ultrawide screen's sides, for 16:9). Fit: all of it, with black bars. Stretch: all of it, stretched or squeezed.";
+/// Resolution's tip.
+const RESOLUTION_TIP: &str = "Lower makes smaller files that are quicker to share. Native keeps every pixel of your display. 1080p is 1920×1080 widescreen and 1080×1920 upright. A custom size records at exactly the width and height you give it, whatever your display is.";
 
-/// Fill, Fit or Stretch: the one clicked, if one was.
-fn framing_field(ui: &mut egui::Ui, now: settings::Framing) -> Option<settings::Framing> {
-    use settings::Framing;
-    const ALL: [Framing; 3] = [Framing::Fill, Framing::Fit, Framing::Stretch];
-    let opts = [
-        Seg { icon: None, label: "Fill", tip: Some("Its middle, as much as fills the aspect ratio: the edges past it are cut off") },
-        Seg { icon: None, label: "Fit", tip: Some("All of it, with black bars where the aspect ratios differ") },
-        Seg { icon: None, label: "Stretch", tip: Some("All of it, stretched or squeezed into the aspect ratio") },
-    ];
-    let chosen = ALL.iter().position(|f| *f == now).unwrap_or(0);
-    ui_kit::segmented_opts(ui, "framing", &opts, chosen, None, ui.is_enabled()).map(|i| ALL[i])
+/// A custom size's shape, as a ratio when it's a readable one ("16:9",
+/// "64:27"), else to two places ("1.78:1").
+fn ratio_label(w: u32, h: u32) -> String {
+    let gcd = |mut a: u32, mut b: u32| {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a.max(1)
+    };
+    let g = gcd(w, h);
+    let (rw, rh) = (w / g, h / g);
+    if rw <= 99 && rh <= 99 { format!("{rw}:{rh}") } else { format!("{:.2}:1", w as f64 / h.max(1) as f64) }
 }
 
-/// What recording in `shape` does to a `w`×`h` screen, in words.
+/// Aspect ratio's way to Sources, where the screen's put in the video.
+const SHAPE_GO: &str = "Fill, fit or stretch it on Sources";
+
+/// Aspect ratio's tip.
+const SHAPE_TIP: &str = "Record in another aspect ratio than your screen's: 16:9 out of an ultrawide screen, say, or 9:16 for phones. Every recording and clip is made in it. A custom size has a shape of its own. How your screen sits in it is on the Sources page: drag it on the preview to show another part of it or make it smaller (Shift stretches it), or right-click it to fill the video, fit all of it in, or stretch it.";
+
+/// What finds Resolution in the search.
+const RESOLUTION_WORDS: &[&str] = &["resolution", "height", "width", "size", "custom size", "native"];
+/// What finds Aspect ratio in the search.
+const SHAPE_WORDS: &[&str] = &["aspect ratio", "shape", "same as screen", "16:9", "21:9", "9:16", "4:3", "ultrawide", "vertical", "crop", "fill", "fit", "stretched res", "stretch res", "black bars"];
+/// What finds Frame rate in the search.
+const FPS_WORDS: &[&str] = &["frame rate", "fps"];
+/// What finds Quality in the search.
+const QUALITY_WORDS: &[&str] = &["quality", "bitrate", "mbps"];
+/// What finds Frame blending in the search.
+const BLEND_WORDS: &[&str] = &["frame blending", "motion blur"];
+/// What finds Encoder in the search.
+const ENCODER_WORDS: &[&str] = &["encoder", "hardware", "software", "gpu"];
+/// What finds File format in the search.
+const FORMAT_WORDS: &[&str] = &["file format", "mp4", "mov", "container"];
+/// What finds Game capture in the search.
+const GAME_CAPTURE_WORDS: &[&str] = &["game capture", "anti-cheat", "anticheat", "obs", "fullscreen"];
+/// Every Video row's words (but the screen capture's, Windows only): the
+/// group shows when any of its rows does.
+const VIDEO_WORDS: [&[&str]; 8] = [RESOLUTION_WORDS, SHAPE_WORDS, FPS_WORDS, QUALITY_WORDS, BLEND_WORDS, ENCODER_WORDS, FORMAT_WORDS, GAME_CAPTURE_WORDS];
+
 /// The screen capture setting shows: Windows, where there's a choice.
 const SCREEN_CAPTURE: bool = cfg!(target_os = "windows");
 const SCREEN_CAPTURE_WORDS: &[&str] = &["screen capture", "desktop duplication", "dxgi", "windows graphics capture", "yellow border", "capture method"];
@@ -1406,19 +1400,30 @@ fn screen_capture_note(choice: settings::ScreenCapture, apps: bool, in_use: Opti
     (note.into(), false)
 }
 
-fn shape_note(shape: capture::Shape, (w, h): (u32, u32)) -> String {
-    let (sw, sh) = shape.of(w, h);
-    let screen = w as f64 / h.max(1) as f64;
+/// What going into a video of `shape` as `framing` says (`None`: placed by
+/// hand) does to a `w`×`h` screen (`what` it is: "screen", "crop"), in
+/// words: its middle and what's cut off, or where the bars are.
+fn framing_note(framing: Option<settings::Framing>, shape: capture::Shape, (w, h): (u32, u32), what: &str) -> String {
+    let Some(framing) = framing else { return "Your screen's placed by hand on the Sources page".to_owned() };
+    if same_shape(shape, (w, h)) {
+        return format!("Your {w}×{h} {what} is already the video's shape");
+    }
+    let wider = w as f64 / h.max(1) as f64 > shape.w as f64 / shape.h.max(1) as f64;
+    match framing {
+        settings::Framing::Fill => {
+            let (sw, sh) = capture::Shape { framing: capture::Framing::Fill, ..shape }.of(w, h);
+            let cut = if wider { "sides are" } else { "top and bottom are" };
+            format!("The middle {sw}×{sh} of your {w}×{h} {what}: its {cut} cut off")
+        }
+        settings::Framing::Fit => format!("All of your {w}×{h} {what}, with black bars {}", if wider { "above and below" } else { "at its sides" }),
+        settings::Framing::Stretch => format!("All of your {w}×{h} {what}, {} to the video's shape", if wider { "squeezed" } else { "stretched" }),
+    }
+}
+
+/// Whether a `w`×`h` picture is the shape's shape, near enough.
+fn same_shape(shape: capture::Shape, (w, h): (u32, u32)) -> bool {
     let wanted = shape.w as f64 / shape.h.max(1) as f64;
-    if (screen / wanted - 1.0).abs() < 0.01 {
-        return format!("Your {w}×{h} screen is already this aspect ratio");
-    }
-    let wider = screen > wanted;
-    match shape.framing {
-        capture::Framing::Fill => format!("Records the middle {sw}×{sh} of your {w}×{h} screen: its {} cut off", if wider { "sides are" } else { "top and bottom are" }),
-        capture::Framing::Fit => format!("Records all of your {w}×{h} screen, with black bars {}", if wider { "above and below" } else { "at the sides" }),
-        capture::Framing::Stretch => format!("Records all of your {w}×{h} screen, {}", if wider { "squeezed narrower" } else { "stretched wider" }),
-    }
+    (w as f64 / h.max(1) as f64 / wanted - 1.0).abs() < 0.01
 }
 
 /// Even or Soft: the one clicked, if one was.
@@ -1430,24 +1435,6 @@ fn blend_shape_field(ui: &mut egui::Ui, now: settings::BlendShape) -> Option<set
 
 /// What the aspect ratio is called when it's the screen's own.
 const SAME_AS_SCREEN: &str = "Same as screen";
-
-/// The aspect ratios offered for recording: width, height, and what it is.
-const RATIOS: [(u32, u32, &str); 7] = [
-    (16, 9, "widescreen"),
-    (21, 9, "ultrawide"),
-    (32, 9, "super ultrawide"),
-    (16, 10, ""),
-    (4, 3, "older games"),
-    (1, 1, "square"),
-    (9, 16, "upright, for phones"),
-];
-
-/// A custom ratio kept from 1:4 to 4:1: a side that's too long is cut to
-/// four times the other.
-fn kept_ratio([w, h]: [u32; 2]) -> [u32; 2] {
-    let w = w.clamp(1, 4 * h.max(1));
-    [w, h.clamp(1, 4 * w)]
-}
 
 /// "48 MB", "1.2 GB".
 fn human_bytes(b: f64) -> String {
@@ -1503,14 +1490,40 @@ mod length_tests {
 }
 
 #[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    /// What a stretched-res player types finds the aspect ratio, in the
+    /// Video group (the group used to have a list of its own, without it).
+    #[test]
+    fn searching_finds_the_aspect_ratio() {
+        for q in ["aspect", "4:3", "stretched", "stretch res", "black bars"] {
+            let f = Filter { q: q.to_owned() };
+            assert!(f.shows(SHAPE_WORDS) && VIDEO_WORDS.iter().any(|w| f.shows(w)), "{q}");
+        }
+        // Nothing of Video's finds it.
+        assert!(!VIDEO_WORDS.iter().any(|w| Filter { q: "discord".to_owned() }.shows(w)));
+    }
+
+    /// One aspect ratio and a screen of another shape: the way to Sources.
+    #[test]
+    fn shapes_alike_or_not() {
+        let wide = capture::Shape { w: 16, h: 9, framing: capture::Framing::Fill };
+        assert!(same_shape(wide, (1920, 1080)) && same_shape(wide, (1366, 768)));
+        assert!(!same_shape(wide, (1280, 960)));
+    }
+}
+
+#[cfg(test)]
 mod ratio_tests {
     use super::*;
 
     #[test]
-    fn custom_ratios_stay_within_four_to_one() {
-        assert_eq!(kept_ratio([21, 9]), [21, 9]);
-        assert_eq!(kept_ratio([99, 1]), [4, 1]);
-        assert_eq!(kept_ratio([1, 99]), [1, 4]);
+    fn exact_sizes_name_their_shape() {
+        assert_eq!(ratio_label(1920, 1080), "16:9");
+        assert_eq!(ratio_label(1080, 1350), "4:5");
+        assert_eq!(ratio_label(2560, 1080), "64:27");
+        assert_eq!(ratio_label(1366, 768), "1.78:1");
     }
 }
 

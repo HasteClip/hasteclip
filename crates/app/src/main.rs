@@ -11,6 +11,7 @@ mod app_icons;
 mod archive;
 mod autostart;
 mod away;
+mod canvas_ui;
 mod clips;
 mod collections;
 mod crop_ui;
@@ -41,6 +42,7 @@ mod meter;
 mod moments;
 mod nav;
 mod picture;
+mod placement_ui;
 mod player;
 #[cfg(target_os = "linux")]
 mod portal_shortcuts;
@@ -399,9 +401,9 @@ struct App {
     rec_state: RecState,
     /// When the current recording/buffer started (for the live timer).
     rec_started: Option<Instant>,
-    /// How the capture kept up over what a clip saved now holds (frames
-    /// skipped, frame blending), for the status by the recorder, and when
-    /// that was last looked up.
+    /// How the capture keeps up (frames skipped and pictures missed in its
+    /// last whole second, frame blending), for the status by the recorder,
+    /// and when that was last looked up.
     health: Option<capture::CaptureHealth>,
     health_at: Option<Instant>,
     /// A replay clip is being written; shows a placeholder card until it lands.
@@ -441,7 +443,7 @@ struct App {
     /// The recording's frame size for (what's recorded, resolution), cached:
     /// for keeping the webcam's box its shape. Kept while capturing; cleared
     /// when a capture starts or stops.
-    frame_size: Option<((capture::VideoSource, Option<u32>, Option<capture::Shape>), Option<(u32, u32)>, Instant)>,
+    frame_size: Option<((capture::VideoSource, capture::VideoSize), Option<(u32, u32)>, Instant)>,
     /// Apps with a window, for the games-and-apps list: to add, and to show
     /// which are open. Refreshed while the Sources page shows.
     pub(crate) windowed_apps: Vec<capture::Device>,
@@ -460,7 +462,12 @@ struct App {
     /// Where the webcam sits, shared with a running capture so dragging it
     /// takes effect at once. Mirrors `settings.webcam` every frame.
     webcam_placement: capture::webcam::SharedPlacement,
+    /// Where the screen's picture goes in the video, shared with the capture
+    /// like the webcam's placement (kept in step with the settings each frame).
+    pub(crate) screen_placement: capture::SharedScreen,
     pub(crate) webcam_view: webcam_ui::WebcamView,
+    /// The picture's sources on the Sources page's preview: dragging them.
+    pub(crate) canvas: canvas_ui::CanvasView,
     /// The camera last asked to stay open (it stays open while a webcam is set
     /// up, so its own settings don't reset).
     kept_camera: Option<(String, Option<capture::webcam::Format>)>,
@@ -602,6 +609,7 @@ impl App {
     fn new(ctx: egui::Context, instance: Option<std::net::TcpListener>) -> Self {
         add_symbol_font(&ctx);
         let settings = RecordSettings::load();
+        let screen_placement = std::sync::Arc::new(std::sync::Mutex::new(settings.screen_placement()));
         // egui keeps the window's frame in step (on Wayland, drawn by winit).
         ctx.set_theme(settings.theme.preference());
         // Dev aid: `HASTECLIP_THEME=light|dark` for this launch only.
@@ -699,7 +707,9 @@ impl App {
             capturing_replay: None,
             away_screen: away::screen(),
             webcam_placement: std::sync::Arc::new(std::sync::Mutex::new(capture::webcam::Placement::default_for(16.0 / 9.0, 16.0 / 9.0))),
+            screen_placement,
             webcam_view: Default::default(),
+            canvas: Default::default(),
             kept_camera: None,
             audio: capture::audio::list_audio_devices(),
             live_audio,
@@ -841,10 +851,12 @@ impl App {
         if let Some(clip) = std::env::var_os("HASTECLIP_DEMO_PREBUILD").map(PathBuf::from) {
             proxy::prebuild(&app.ctx(), &clip);
         }
-        // `HASTECLIP_OPEN_SOURCES=1` opens on the Sources page.
+        // `HASTECLIP_OPEN_SOURCES=1` opens on the Sources page; naming
+        // sources (`=screen,webcam`) opens their cards too, `crop` the crop's page.
         let open_sources = std::env::var_os("HASTECLIP_OPEN_SOURCES").is_some();
-        if open_sources {
+        if let Some(v) = std::env::var_os("HASTECLIP_OPEN_SOURCES") {
             app.page = Page::Sources;
+            app.sources_view.open_dev(&v.to_string_lossy());
         }
         // `HASTECLIP_OPEN_VOICE_REVIEW=1` opens the voice samples review.
         let open_review = std::env::var_os("HASTECLIP_OPEN_VOICE_REVIEW").is_some();
@@ -927,8 +939,7 @@ impl App {
             blend_samples: self.settings.blend_samples(),
             blend_shape: self.settings.blend_shape.into(),
             video_bitrate_kbps: self.settings.video_bitrate_mbps * 1000,
-            target_height: self.settings.resolution.height(),
-            shape: self.settings.capture_shape(),
+            size: self.settings.video_size(),
             use_hardware: self.settings.encoder != Encoder::Software,
             replay_seconds: self.settings.replay_seconds,
             video: self.video_source(),
@@ -940,38 +951,53 @@ impl App {
                 format: None,
                 placement: self.webcam_placement.clone(),
             })),
+            screen: self.screen_placement.clone(),
             sources: self.capture_sources(),
         }
     }
 
-    /// What the video shows, for the capture backend.
-    /// The webcam, for the capture backend.
-    /// Keep the webcam's box its own shape in the frame being recorded: the
-    /// box is fractions of the frame, so switching to a display of another
-    /// shape would stretch it into that shape (a strip on an ultrawide).
-    fn refit_webcam(&mut self) {
-        if self.settings.webcam.is_none() {
+    /// Keep the webcam's box, and the screen's when it's placed by hand,
+    /// their own shape in the frame being recorded: a box is fractions of
+    /// the frame, so switching to a display of another shape would stretch
+    /// it into that shape (a strip on an ultrawide).
+    fn refit_boxes(&mut self) {
+        if self.settings.webcam.is_none() && self.settings.screen.placed.is_none() {
             return;
         }
-        let key = (self.video_source(), self.settings.resolution.height(), self.settings.capture_shape());
+        let key = (self.video_source(), self.settings.video_size());
         // Asked again now and then too: a display's mode can change, or it
         // can be plugged in, under the same choice. Not while capturing: its
         // frame stays the size it started at, whatever's chosen meanwhile.
         let capturing = self.rec_state != RecState::Idle;
         if self.frame_size.as_ref().is_none_or(|(k, _, at)| !capturing && (*k != key || at.elapsed() > Duration::from_secs(2))) {
-            let size = capture::frame_size(&key.0, key.1, key.2);
+            let size = capture::frame_size(&key.0, key.1);
             self.frame_size = Some((key, size, Instant::now()));
         }
-        let Some((_, Some((fw, fh)), _)) = &self.frame_size else { return };
-        let frame_aspect = *fw as f32 / (*fh).max(1) as f32;
-        let turned = self.settings.webcam.as_ref().is_some_and(|w| w.placement.turns % 2 == 1);
-        let camera_aspect = match capture::webcam::status() {
-            capture::webcam::Status::Live { width, height } if turned => Some(height as f32 / width.max(1) as f32),
-            capture::webcam::Status::Live { width, height } => Some(width as f32 / height.max(1) as f32),
-            _ => None,
-        };
+        let Some(frame_aspect) = self.frame_aspect() else { return };
+        let screen_aspect = self.screen_picture().map(|(w, h)| w as f32 / h.max(1) as f32);
+        if let Some(b) = self.settings.screen.placed.as_mut() {
+            b.refit(frame_aspect, screen_aspect);
+        }
+        let camera_aspect = self.camera_size().map(|(w, h)| w as f32 / h.max(1) as f32);
         if let Some(w) = self.settings.webcam.as_mut() {
             w.placement.refit(frame_aspect, camera_aspect);
+        }
+    }
+
+    /// The shape (width / height) of the frame being recorded, when it's
+    /// known (see `refit_boxes`).
+    pub(crate) fn frame_aspect(&self) -> Option<f32> {
+        let (_, size, _) = self.frame_size.as_ref()?;
+        size.map(|(w, h)| w as f32 / h.max(1) as f32)
+    }
+
+    /// The webcam's picture size as it's turned, once it's live.
+    pub(crate) fn camera_size(&self) -> Option<(u32, u32)> {
+        let turned = self.settings.webcam.as_ref().is_some_and(|w| w.placement.turns % 2 == 1);
+        match capture::webcam::status() {
+            capture::webcam::Status::Live { width, height } if turned => Some((height, width)),
+            capture::webcam::Status::Live { width, height } => Some((width, height)),
+            _ => None,
         }
     }
 
@@ -998,13 +1024,13 @@ impl App {
                 away_when_unfocused: *away_screen,
                 hook: self.game_hook(),
             },
-            _ => capture::VideoSource::Screen {
-                id: self.screens.get(self.display_at()).map(|d| d.id.clone()).unwrap_or_else(|| "0".to_owned()),
-                hook: self.game_hook(),
-                method: self.settings.screen_capture.into(),
-                crop: self.settings.screen_crop.filter(|c| capture::SCREEN_CROP && !c.is_none()).map(Into::into),
-            },
+            _ => self.display_source(&self.screens.get(self.display_at()).map(|d| d.id.clone()).unwrap_or_else(|| "0".to_owned())),
         }
+    }
+
+    /// Recording the display `id`.
+    pub(crate) fn display_source(&self, id: &str) -> capture::VideoSource {
+        capture::VideoSource::Screen { id: id.to_owned(), hook: self.game_hook(), method: self.settings.screen_capture.into() }
     }
 
     /// When to use the game capture hook: the setting, and the games with
@@ -1252,8 +1278,20 @@ impl eframe::App for App {
             eprintln!("dev: quitting");
             self.quit(ctx);
         }
+        // `HASTECLIP_DEV_SAVE=<secs>`: save a clip once, that long after
+        // opening (with the replay buffer running, as `HASTECLIP_DEV_BUFFER_QUIT`
+        // starts it), to check what's recorded without a key press.
+        static SAVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if let Some(secs) = std::env::var("HASTECLIP_DEV_SAVE").ok().and_then(|s| s.parse::<f64>().ok())
+            && launched.elapsed().as_secs_f64() > secs
+            && self.rec_state == RecState::Buffering
+            && !SAVED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            eprintln!("dev: saving a clip");
+            self.save_clip();
+        }
         // `HASTECLIP_DEV_CAMERA_PANEL`: open on Sources with the camera panel
-        // (to look at it without clicking there).
+        // (to look at it without clicking there); `=crop`, the webcam's crop page.
         static CAMERA_PANEL: std::sync::Once = std::sync::Once::new();
         if std::env::var_os("HASTECLIP_DEV_CAMERA_PANEL").is_some()
             && let Some(w) = &self.settings.webcam
@@ -1261,10 +1299,11 @@ impl eframe::App for App {
             let id = w.id.clone();
             CAMERA_PANEL.call_once(|| {
                 self.page = Page::Sources;
-                let mut panel = crate::webcam_ui::CameraPanel::open(&id);
-                // `=crop`: cropping already.
-                panel.set_cropping(std::env::var("HASTECLIP_DEV_CAMERA_PANEL").is_ok_and(|v| v == "crop"));
-                self.camera_panel = Some(panel);
+                if std::env::var("HASTECLIP_DEV_CAMERA_PANEL").is_ok_and(|v| v == "crop") {
+                    self.webcam_view.crop = Some(crate::webcam_ui::CameraPanel::cropping(&id));
+                } else {
+                    self.camera_panel = Some(crate::webcam_ui::CameraPanel::open(&id));
+                }
             });
         }
         // `HASTECLIP_DEV_PAGES=<secs>`: go round Clips, Sources and Settings,
@@ -1397,15 +1436,22 @@ impl App {
         self.sync_capture_video();
         self.sync_capture_mics();
         self.sync_capture_settings();
-        self.refit_webcam();
+        self.refit_boxes();
+        // A locked button clicked anywhere: why, in a toast, as a locked
+        // setting says it.
+        if let Some(why) = ui_kit::take_locked_click(ctx) {
+            self.toast_icon(egui_phosphor::regular::LOCK_SIMPLE, why);
+        }
         *self.webcam_placement.lock().unwrap() = match &self.settings.webcam {
             Some(w) if w.enabled => w.placement.into(),
             _ => capture::webcam::Placement::hidden(),
         };
+        *self.screen_placement.lock().unwrap() = self.settings.screen_placement();
         // Keep the webcam open whenever one is set up and on, previewed or
         // recorded or not: closing a camera can reset its own settings. Off,
-        // it's closed (its light goes out); a capture takes it up again.
-        let on = self.settings.webcam.as_ref().is_some_and(|w| w.enabled);
+        // it's closed (its light goes out), but while its crop's set (its
+        // picture's cropped on); a capture takes it up again.
+        let on = self.settings.webcam.as_ref().is_some_and(|w| w.enabled) || self.webcam_view.crop.is_some();
         let camera = self.webcam_source().filter(|_| on).map(|w| (w.device, w.format));
         if camera != self.kept_camera {
             // Its settings go back on as it opens.
@@ -1536,9 +1582,8 @@ impl App {
         self.health_at = Some(Instant::now());
     }
 
-    /// What the status by the recorder counts over (seconds): what a clip
-    /// saved now holds; recording, the last minute (a few frames now and
-    /// then over a long recording are normal, not worth a total).
+    /// How far back frame blending's busiest second is looked for (seconds):
+    /// what a clip saved now holds; recording, the last minute.
     fn health_span(&self) -> u32 {
         match self.rec_state {
             RecState::Buffering => self.settings.replay_seconds.max(1),
@@ -1546,41 +1591,41 @@ impl App {
         }
     }
 
-    /// [`Self::health_span`] in words ("the last minute"), and what it
-    /// means for a clip.
-    fn health_words(&self) -> (String, &'static str) {
+    /// [`Self::health_span`] in words ("the last minute").
+    fn health_words(&self) -> String {
         let words = crate::settings_ui::length_words(self.health_span());
         let words = words.strip_prefix("1 ").filter(|w| !w.contains(' ')).map_or(words.clone(), str::to_owned);
-        let clip = if self.rec_state == RecState::Buffering { ": a clip saved now has them" } else { "" };
-        (format!("the last {words}"), clip)
+        format!("the last {words}")
     }
 
-    /// Shown while what a clip saved now holds has skipped frames: the
-    /// computer couldn't keep up with the recording settings. Says how many,
-    /// what that does to the clip, and what the settings are; a click opens
-    /// Settings. `compact`: a narrow window, just the count. Laid out right
-    /// to left, before the recorder.
+    /// Shown while frames are being skipped, as a frame rate counter would
+    /// say it: how many of the last whole second's ("Skipping 30 of 60
+    /// fps"), what that does to the clip, and what the settings are; a click
+    /// opens Settings. `compact`: a narrow window, just the count. Laid out
+    /// right to left, before the recorder.
     pub(crate) fn skipped_warning(&mut self, ui: &mut egui::Ui, compact: bool) {
-        let Some(h) = self.health.filter(|h| h.skipped > 0) else { return };
-        let (lost, all) = (h.skipped, h.encoded + h.skipped);
+        let Some(s) = self.health.and_then(|h| h.last_second).filter(|s| s.skipped > 0) else { return };
         let warn = theme::pal(ui).warn;
         let r = &self.settings;
+        // Caught up after a stall, more than a second's frames go at once.
+        let lost = s.skipped.min(r.fps);
         let size = match r.resolution {
             settings::OutputResolution::Native => "native resolution".to_owned(),
             res => res.label(),
         };
         let blending = r.blend_samples() > 1;
-        let (span, clip) = self.health_words();
-        let text = if lost == 1 { "Skipped 1 frame".to_owned() } else { format!("Skipped {lost} frames") };
+        let text = format!("Skipping {lost} of {} fps", r.fps);
+        let frames = if lost == 1 { "frame was" } else { "frames were" };
         let tip = format!(
-            "{text}: {lost} of the {all} frames in {span}{clip}. \
+            "{text}: in the last second, {lost} of its {} {frames} skipped. \
              The video encoder couldn't keep up: where a frame is skipped, the one before stays on screen longer, so the clip stutters there.\n\n\
              Recording at {size}, {} fps{}. A lower frame rate or resolution gives it less to do{}. Click to open Settings.",
+            r.fps,
             r.fps,
             if blending { format!(", blended from {} fps", r.fps * r.blend_samples()) } else { String::new() },
             if blending { ", and so does turning off frame blending" } else { "" },
         );
-        let shown = if compact { format!("{}  {lost} skipped", egui_phosphor::regular::WARNING) } else { format!("{}  {text}", egui_phosphor::regular::WARNING) };
+        let shown = if compact { format!("{}  {lost} of {} skipped", egui_phosphor::regular::WARNING, r.fps) } else { format!("{}  {text}", egui_phosphor::regular::WARNING) };
         let label = egui::Label::new(theme::text(shown, 13.0, theme::W::Semibold).color(warn)).sense(egui::Sense::click());
         ui.add_space(6.0);
         let response = ui.add(label).on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -1592,25 +1637,26 @@ impl App {
     /// Frame blending, while the capture blends: how many of the screen's
     /// pictures a second it blends ("Blending 540 fps", or "Blending 412 of
     /// 540 fps" when the screen showed no more, at its busiest moment of
-    /// what a clip saved now holds), and a warning instead when pictures
-    /// missed their frame (blending fell behind: those frames reused the
-    /// picture before), which a click takes to Settings. `compact`: a narrow
-    /// window, only the warning, as a count. Laid out right to left, before
-    /// the recorder.
+    /// what a clip saved now holds), and a warning instead while pictures
+    /// miss their frame (blending fell behind: those frames reused the
+    /// picture before), as many as the last whole second's, which a click
+    /// takes to Settings. `compact`: a narrow window, only the warning, as a
+    /// count. Laid out right to left, before the recorder.
     pub(crate) fn blend_status(&mut self, ui: &mut egui::Ui, compact: bool) {
         let Some(b) = self.health.and_then(|h| h.blend) else { return };
         let p = theme::pal(ui);
         let fps = b.rate / b.looks.max(1);
-        let (span, clip) = self.health_words();
-        if b.missed > 0 {
-            let text = if b.missed == 1 { "Blending missed 1 picture".to_owned() } else { format!("Blending missed {} pictures", b.missed) };
+        let span = self.health_words();
+        let missed = self.health.and_then(|h| h.last_second).map_or(0, |s| s.missed.min(b.rate));
+        if missed > 0 {
+            let text = format!("Blending missed {missed} of {} fps", b.rate);
             let tip = format!(
-                "{text}: in {span}, {} of the screen's pictures came too late for their frame, or were dropped while the computer was busy{clip}. \
+                "{text}: in the last second, {missed} of the screen's pictures came too late for their frame, or were dropped while the computer was busy. \
                  Those frames reused the picture before: their motion blur is made of fewer pictures.\n\n\
                  Each {fps} fps frame blends {} looks at the screen, {} a second. Fewer looks, or a lower resolution, give it less to do. Click to open Settings.",
-                b.missed, b.looks, b.rate,
+                b.looks, b.rate,
             );
-            let shown = if compact { format!("{}  {} missed", egui_phosphor::regular::WARNING, b.missed) } else { format!("{}  {text}", egui_phosphor::regular::WARNING) };
+            let shown = if compact { format!("{}  {missed} missed", egui_phosphor::regular::WARNING) } else { format!("{}  {text}", egui_phosphor::regular::WARNING) };
             let label = egui::Label::new(theme::text(shown, 13.0, theme::W::Semibold).color(p.warn)).sense(egui::Sense::click());
             ui.add_space(6.0);
             let response = ui.add(label).on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -1725,7 +1771,7 @@ impl App {
         } else {
             format!("HasteClip {version} is ready. Click to restart into it now, or it installs when you quit.")
         };
-        let b = ui_kit::Btn::ghost("Update ready").with_icon(egui_phosphor::regular::ARROW_CIRCLE_UP).enabled(!recording).tip(tip);
+        let b = ui_kit::Btn::ghost("Update ready").with_icon(egui_phosphor::regular::ARROW_CIRCLE_UP).tip(tip.clone()).locked(recording.then_some(tip));
         if b.show(ui).clicked() && self.updater.install_on_exit(true) {
             // Really quit (not to the tray): the update goes in, then it starts again.
             self.quit(ui.ctx());

@@ -103,7 +103,7 @@ impl BlendPacer {
     /// Frame `k` is done: made (with the webcam over it) and encoded.
     fn close(&mut self, k: i64) {
         self.closed = k;
-        self.picture.camera_layer();
+        self.picture.layers();
         let Some(g) = &mut self.picture.gpu else { return };
         if !g.finish(k) {
             return;

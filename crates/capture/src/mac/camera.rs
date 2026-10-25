@@ -303,8 +303,72 @@ impl CameraLayer {
     }
 }
 
+/// The open camera's newest picture, if it's newer than picture
+/// `newer_than`: shrunk to at most `max_width` wide (each pixel the one
+/// under it), in RGBA, for showing it on its own (the webcam's crop page).
+pub(crate) fn picture(max_width: u32, newer_than: u64) -> Option<crate::webcam::CameraPreview> {
+    use objc2_core_video::{CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeight, CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress};
+    let feed = CURRENT.lock().unwrap().clone().filter(|f| !f.stop.load(Ordering::Relaxed))?;
+    let f = feed.latest().filter(|f| f.seq > newer_than)?;
+    let buf = &f.buffer;
+    let (sw, sh) = (CVPixelBufferGetWidth(buf), CVPixelBufferGetHeight(buf));
+    if sw == 0 || sh == 0 {
+        return None;
+    }
+    let scale = (max_width as f64 / sw as f64).min(1.0);
+    let (w, h) = (((sw as f64 * scale).round() as usize).max(1), ((sh as f64 * scale).round() as usize).max(1));
+    let mut rgba = vec![255u8; w * h * 4];
+    // NV12, studio range, BT.709 (as the camera's asked to send it).
+    unsafe {
+        if CVPixelBufferLockBaseAddress(buf, CVPixelBufferLockFlags::ReadOnly) != 0 {
+            return None;
+        }
+        let y = CVPixelBufferGetBaseAddressOfPlane(buf, 0) as *const u8;
+        let ys = CVPixelBufferGetBytesPerRowOfPlane(buf, 0);
+        let c = CVPixelBufferGetBaseAddressOfPlane(buf, 1) as *const u8;
+        let cs = CVPixelBufferGetBytesPerRowOfPlane(buf, 1);
+        if !y.is_null() && !c.is_null() {
+            for oy in 0..h {
+                let sy = ((oy * 2 + 1) * sh / (h * 2)).min(sh - 1);
+                for ox in 0..w {
+                    let sx = ((ox * 2 + 1) * sw / (w * 2)).min(sw - 1);
+                    let at = (sy / 2) * cs + (sx / 2) * 2;
+                    let rgb = studio_709(*y.add(sy * ys + sx), *c.add(at), *c.add(at + 1));
+                    rgba[(oy * w + ox) * 4..][..3].copy_from_slice(&rgb);
+                }
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(buf, CVPixelBufferLockFlags::ReadOnly);
+    }
+    // Each picture the camera sends is a new one (it doesn't say otherwise).
+    Some(crate::webcam::CameraPreview { width: w as u32, height: h as u32, rgba, seq: f.seq, new_pictures: f.seq })
+}
+
+/// A pixel's colour from its studio-range BT.709 luma and chroma.
+fn studio_709(y: u8, cb: u8, cr: u8) -> [u8; 3] {
+    let luma = (y as f32 - 16.0) * (255.0 / 219.0);
+    let (cb, cr) = ((cb as f32 - 128.0) * (255.0 / 224.0), (cr as f32 - 128.0) * (255.0 / 224.0));
+    let byte = |v: f32| v.round().clamp(0.0, 255.0) as u8;
+    [byte(luma + 1.5748 * cr), byte(luma - 0.1873 * cb - 0.4681 * cr), byte(luma + 1.8556 * cb)]
+}
+
 /// The newest picture's size, from the open camera.
 pub(crate) fn frame_size() -> Option<(usize, usize)> {
     let f = CURRENT.lock().unwrap().clone()?.latest()?;
     Some((objc2_core_video::CVPixelBufferGetWidth(&f.buffer), objc2_core_video::CVPixelBufferGetHeight(&f.buffer)))
+}
+
+#[cfg(test)]
+mod tests {
+    /// Studio range: 16 is black, 235 white; red, green and blue come back.
+    #[test]
+    fn camera_colours() {
+        use super::studio_709;
+        assert_eq!(studio_709(16, 128, 128), [0, 0, 0]);
+        assert_eq!(studio_709(235, 128, 128), [255, 255, 255]);
+        let near = |a: [u8; 3], b: [u8; 3]| a.iter().zip(b).all(|(x, y)| x.abs_diff(y) <= 3);
+        assert!(near(studio_709(63, 102, 240), [255, 0, 0]), "{:?}", studio_709(63, 102, 240));
+        assert!(near(studio_709(173, 42, 26), [0, 255, 0]), "{:?}", studio_709(173, 42, 26));
+        assert!(near(studio_709(32, 240, 118), [0, 0, 255]), "{:?}", studio_709(32, 240, 118));
+    }
 }
