@@ -1159,10 +1159,10 @@ impl RecordSettings {
 
     /// Where the screen's picture goes in the video, for the capture: its
     /// box when it's been placed by hand, all of the box (stretched, if
-    /// it's been stretched; a game's window, whatever its shape, all of it,
-    /// as big as fits); else all of the video, as `framing` says in a shape
-    /// of the video's own (else all of the picture). A display's crop, if
-    /// it's cropped.
+    /// it's been stretched; a game's window that isn't, whatever its shape,
+    /// all of it, as big as fits); else all of the video, as `framing` says
+    /// in a shape of the video's own (else all of the picture). A display's
+    /// crop, if it's cropped.
     pub fn screen_placement(&self) -> capture::ScreenPlacement {
         let s = &self.screen;
         let apps = matches!(self.capture, CaptureTarget::Apps { .. });
