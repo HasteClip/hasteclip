@@ -275,6 +275,10 @@ impl Editor {
         let State::Ready(mut r) = self.state else { return (None, None) };
         let player = if r.player.size().is_none() && r.curtain.as_ref().is_some_and(|c| c.size().is_some()) {
             r.curtain.take()
+        } else if r.saved_crop().is_some() {
+            // The saved clip is cropped, and this plays its original: as the
+            // player's curtain, the whole picture would show for a moment.
+            None
         } else {
             Some(r.player)
         };
@@ -1046,6 +1050,11 @@ impl Ready {
     /// The part of the picture kept, if not all of it.
     fn crop(&self) -> Option<media::Crop> {
         self.edit.output.crop.and_then(|c| c.within(self.info.width, self.info.height))
+    }
+
+    /// The part of the picture the saved clip keeps, if not all of it.
+    fn saved_crop(&self) -> Option<media::Crop> {
+        self.saved.output.crop.and_then(|c| c.within(self.info.width, self.info.height))
     }
 
     /// Open the crop tool, or close it.
