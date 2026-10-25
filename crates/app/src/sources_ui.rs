@@ -1404,14 +1404,14 @@ fn source_card(
                 let opts = [
                     Seg::from("Off"),
                     Seg { icon: None, label: "Light", tip: Some("Takes out steady noise: fans, hum, hiss. Your keyboard stays") },
-                    Seg { icon: None, label: "Strong", tip: Some("Takes out everything but your voice, your keyboard too") },
+                    Seg { icon: None, label: "Strong", tip: Some("Takes out everything but your voice") },
                 ];
                 let chosen = MODES.iter().position(|m| *m == source.noise_reduction).unwrap_or(0);
                 if let Some(i) = crate::ui_kit::segmented_opts(ui, ("noise_reduction", source.id.as_str()), &opts, chosen, None, true) {
                     source.noise_reduction = MODES[i];
                 }
                 ui.spacing_mut().item_spacing.x = 6.0;
-                crate::ui_kit::info(ui, "Noise reduction", "Light takes out steady noise behind your voice, like a fan, hum or hiss, and keeps sounds that come and go, like your keyboard. Strong takes out everything but your voice, your keyboard too. Changes apply straight away.");
+                crate::ui_kit::info(ui, "Noise reduction", "Light takes out steady noise behind your voice, like a fan, hum or hiss, and keeps sounds that come and go, like your keyboard. Strong takes out everything but your voice. Changes apply straight away.");
             });
             // Mono: on or off, so a switch, right before its name (as the
             // Limiter's).
