@@ -735,23 +735,12 @@ impl App {
             ui.add_enabled_ui(false, |ui| ui_kit::select(ui, &ratio_label(w, h), 150.0)).inner.on_disabled_hover_text("Your custom size sets it. Pick a resolution in p to choose one.");
             return;
         }
-        let shape = self.settings.shape;
-        let shown = shape.map_or(SAME_AS_SCREEN.to_owned(), |[w, h]| format!("{w}:{h}"));
-        let r = ui_kit::select(ui, &shown, 150.0);
-        ui_kit::menu_popup(&r, false, 250.0, |ui| {
-            let mut same = Item::new(SAME_AS_SCREEN).check(shape.is_none());
-            if let Some((w, h)) = screen {
-                same = same.value(format!("{w}×{h}"));
-            }
-            if same.show(ui).clicked() {
-                self.settings.shape = None;
-            }
-            for &(w, h, note) in &RATIOS {
-                if Item::new(format!("{w}:{h}")).check(shape == Some([w, h])).value(note).show(ui).clicked() {
-                    self.settings.shape = Some([w, h]);
-                }
-            }
-        });
+        // Custom starts from the screen's own shape: nothing changes till it's typed.
+        let same = screen.map_or(String::new(), |(w, h)| format!("{w}×{h}"));
+        let from = screen.map_or([16, 9], |(w, h)| ui_kit::ratio_of(w as f64 / h.max(1) as f64));
+        if let Some(shape) = ui_kit::ratio_field(ui, "video_shape", (SAME_AS_SCREEN, &same), self.settings.shape, from) {
+            self.settings.shape = shape;
+        }
     }
 
     /// The resolution: Native or one in p, in the aspect ratio chosen,
@@ -1413,17 +1402,6 @@ fn blend_shape_field(ui: &mut egui::Ui, now: settings::BlendShape) -> Option<set
 
 /// What the aspect ratio is called when it's the screen's own.
 const SAME_AS_SCREEN: &str = "Same as screen";
-
-/// The aspect ratios offered for recording: width, height, and what it is.
-const RATIOS: [(u32, u32, &str); 7] = [
-    (16, 9, "widescreen"),
-    (21, 9, "ultrawide"),
-    (32, 9, "super ultrawide"),
-    (16, 10, ""),
-    (4, 3, "older games"),
-    (1, 1, "square"),
-    (9, 16, "upright, for phones"),
-];
 
 /// "48 MB", "1.2 GB".
 fn human_bytes(b: f64) -> String {

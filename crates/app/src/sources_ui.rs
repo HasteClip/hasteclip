@@ -1043,11 +1043,11 @@ impl App {
                 // Its shape: the biggest of it there's room for, where it is,
                 // and kept as it's sized (it's the size's link).
                 let (_, c) = l.row(Row::new("Aspect ratio"), |ui| {
-                    let now = crate::ui_kit::size_field_keeps(ui.ctx(), "screen_crop");
-                    match crate::crop_ui::shape_choice(ui, "screen_crop_shape", now, None) {
+                    let now = crate::ui_kit::size_field_keeps(ui.ctx(), "screen_crop").map(crate::ui_kit::ratio_of);
+                    let from = crate::ui_kit::ratio_of(w as f64 / h.max(1) as f64);
+                    match crate::ui_kit::ratio_field(ui, "screen_crop_ratio", ("Any", ""), now, from) {
                         Some(None) => crate::ui_kit::set_size_field_keeps(ui.ctx(), "screen_crop", None),
-                        Some(Some(i)) => {
-                            let (_, aw, ah, _) = crate::crop_ui::SHAPES[i];
+                        Some(Some([aw, ah])) => {
                             crate::ui_kit::set_size_field_keeps(ui.ctx(), "screen_crop", Some(aw as f64 / ah as f64));
                             let centre = (x as f64 + w as f64 / 2.0, y as f64 + h as f64 / 2.0);
                             // All of the display, when it's that shape.

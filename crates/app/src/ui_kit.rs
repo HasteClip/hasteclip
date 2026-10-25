@@ -2091,6 +2091,129 @@ pub fn type_in_size(ctx: &egui::Context, id: &str) {
     ctx.data_mut(|d| d.insert_temp(egui::Id::new((id, "type_in")), true));
 }
 
+/// The common aspect ratios, width and height, and what each is for: every
+/// aspect ratio chosen in the app is one of these or typed ([`ratio_field`]).
+pub const RATIOS: [(u32, u32, &str); 7] = [
+    (16, 9, "widescreen"),
+    (21, 9, "ultrawide"),
+    (32, 9, "super ultrawide"),
+    (16, 10, ""),
+    (4, 3, "older games"),
+    (1, 1, "square"),
+    (9, 16, "upright, for phones"),
+];
+
+/// Which of [`RATIOS`] `w`:`h` is (to half a percent), if one.
+pub fn common_ratio(w: u32, h: u32) -> Option<usize> {
+    let r = w as f64 / h.max(1) as f64;
+    RATIOS.iter().position(|&(rw, rh, _)| (r / (rw as f64 / rh as f64) - 1.0).abs() < 0.005)
+}
+
+/// A shape (width over height) as a ratio in small numbers, each up to 99:
+/// the nearest, in the smallest numbers that are (1.7778 is 16:9).
+pub fn ratio_of(shape: f64) -> [u32; 2] {
+    let shape = if shape.is_finite() && shape > 0.0 { shape } else { 1.0 };
+    let mut best = ([1, 1], f64::MAX);
+    for h in 1..=99u32 {
+        let w = (h as f64 * shape).round().clamp(1.0, 99.0) as u32;
+        let off = (w as f64 / h as f64 / shape - 1.0).abs();
+        if off < best.1 - 1e-9 {
+            best = ([w, h], off);
+        }
+    }
+    best.0
+}
+
+/// An aspect ratio: a menu of `first` (what none is called: "Same as
+/// screen", "Any"; its value beside it, if any), the common ones
+/// ([`RATIOS`]), and Custom…, which shows the ratio's width and height in
+/// two boxes beside the menu, to type any (up to 99 each). Custom starts
+/// from `now`, or `custom_from` while it's none. The one chosen or typed,
+/// when it changes (`Some(None)`: `first`). Settings' Aspect ratio and every
+/// crop's are this.
+pub fn ratio_field(ui: &mut egui::Ui, id: &str, (first, first_value): (&str, &str), now: Option<[u32; 2]>, custom_from: [u32; 2]) -> Option<Option<[u32; 2]>> {
+    let p = theme::pal(ui);
+    let custom_id = egui::Id::new((id, "custom"));
+    let w_id = egui::Id::new((id, "w"));
+    // Custom just picked: typing goes into its width.
+    let type_in = egui::Id::new((id, "type_in"));
+    if ui.data(|d| d.get_temp::<bool>(type_in)).is_some() && !ui.input(|i| i.pointer.any_click()) {
+        ui.data_mut(|d| d.remove::<bool>(type_in));
+        ui.memory_mut(|m| m.request_focus(w_id));
+    }
+    let custom = ratio_custom(ui.ctx(), id, now);
+    let label = match now {
+        _ if custom => "Custom".to_owned(),
+        None => first.to_owned(),
+        Some([w, h]) => format!("{w}:{h}"),
+    };
+    let (select_w, width) = (if custom { 110.0 } else { 150.0 }, ratio_field_width(ui.ctx(), id, now));
+    let mut out = None;
+    let mut from_menu = false;
+    let mut to_custom = false;
+    ui.allocate_ui_with_layout(vec2(width, CONTROL_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let r = select(ui, &label, select_w);
+        menu_popup(&r, false, 250.0, |ui| {
+            let mut item = Item::new(first).check(now.is_none() && !custom);
+            if !first_value.is_empty() {
+                item = item.value(first_value);
+            }
+            if item.show(ui).clicked() {
+                (out, from_menu) = (Some(None), true);
+            }
+            for &(w, h, note) in &RATIOS {
+                let on = !custom && now.is_some_and(|[nw, nh]| common_ratio(nw, nh) == common_ratio(w, h));
+                if Item::new(format!("{w}:{h}")).check(on).value(note).show(ui).clicked() {
+                    (out, from_menu) = (Some(Some([w, h])), true);
+                }
+            }
+            menu_sep(ui);
+            if Item::new("Custom…").check(custom).value("any ratio").show(ui).clicked() {
+                to_custom = true;
+            }
+        });
+        if custom {
+            let [w, h] = now.unwrap_or(custom_from);
+            if let Some(v) = number_box(ui, w_id, w, 1..=99, RATIO_BOX) {
+                out = Some(Some([v, h]));
+            }
+            ui.label(theme::text(":", 13.0, W::Regular).color(p.text3));
+            if let Some(v) = number_box(ui, egui::Id::new((id, "h")), h, 1..=99, RATIO_BOX) {
+                out = Some(Some([w, v]));
+            }
+        }
+    });
+    if to_custom {
+        // Its boxes from the next frame, the width ready to type over.
+        ui.data_mut(|d| {
+            d.insert_temp(custom_id, true);
+            d.insert_temp(type_in, true);
+        });
+        if now.is_none() {
+            out = Some(Some(custom_from));
+        }
+    } else if from_menu {
+        ui.data_mut(|d| d.remove::<bool>(custom_id));
+    }
+    out
+}
+
+/// A [`ratio_field`]'s boxes' width.
+const RATIO_BOX: f32 = 46.0;
+
+/// Whether a [`ratio_field`] shows its boxes: Custom was picked, or its
+/// ratio isn't a common one.
+fn ratio_custom(ctx: &egui::Context, id: &str, now: Option<[u32; 2]>) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(egui::Id::new((id, "custom")))).unwrap_or(false) || now.is_some_and(|[w, h]| common_ratio(w, h).is_none())
+}
+
+/// How wide a [`ratio_field`] is drawn, showing `now`: its menu, and its
+/// boxes when it's custom.
+pub fn ratio_field_width(ctx: &egui::Context, id: &str, now: Option<[u32; 2]>) -> f32 {
+    if ratio_custom(ctx, id, now) { 110.0 + RATIO_BOX * 2.0 + 8.0 + 6.0 * 3.0 } else { 150.0 }
+}
+
 /// A whole number in a box of its own, typed or stepped: clicking it
 /// chooses all of it, so the digits typed replace it; ↑ ↓ (and the wheel
 /// over it) add or take one, with Shift ten. Enter, Tab or clicking away
@@ -2532,6 +2655,23 @@ mod tests {
         frames.extend(then.into_iter().map(|e| vec![e]));
         frames.push(vec![]);
         frames
+    }
+
+    /// A shape as a ratio in small numbers: exact ones in their smallest
+    /// numbers, any other the nearest with both up to 99; and which are common.
+    #[test]
+    fn ratios_in_small_numbers() {
+        assert_eq!(ratio_of(16.0 / 9.0), [16, 9]);
+        assert_eq!(ratio_of(1920.0 / 1080.0), [16, 9]);
+        assert_eq!(ratio_of(5.0 / 4.0), [5, 4]);
+        assert_eq!(ratio_of(9.0 / 16.0), [9, 16]);
+        // Any typed comes back as typed (it's kept as a number): 2.35:1.
+        assert_eq!(ratio_of(47.0 / 20.0), [47, 20]);
+        assert_eq!(ratio_of(3600.0 / 2338.0), [97, 63]);
+        assert_eq!(ratio_of(1000.0), [99, 1]);
+        assert_eq!(common_ratio(1920, 1080), Some(0));
+        assert_eq!(common_ratio(1081, 1920), Some(6));
+        assert_eq!(common_ratio(5, 4), None);
     }
 
     /// Typing replaces the number; arrows add or take one (Shift: ten); Tab

@@ -12,41 +12,8 @@ use media::Crop;
 
 use crate::theme::{self, W};
 
-/// The shapes offered: a name, width to height, and what it's for.
-pub const SHAPES: [(&str, u32, u32, &str); 4] = [
-    ("16:9", 16, 9, "Widescreen, as most videos are: a game out of an ultrawide screen"),
-    ("4:3", 4, 3, "Older games' and screens' aspect ratio"),
-    ("1:1", 1, 1, "Square"),
-    ("9:16", 9, 16, "Upright, for phones: Shorts, TikTok, Reels"),
-];
-
-/// Any, or one of [`SHAPES`], side by side: the one clicked (`Some(None)`:
-/// Any). `now`: the shape kept now (width over height; `None`: any), lit
-/// if it's one of them. As wide as `width`, if given. Every crop has it:
-/// the editor's, the screen's and the webcam's.
-pub fn shape_choice(ui: &mut egui::Ui, id: &str, now: Option<f64>, width: Option<f32>) -> Option<Option<usize>> {
-    use crate::ui_kit::Seg;
-    let opts: Vec<Seg> = std::iter::once(Seg { icon: None, label: "Any", tip: Some("Any aspect ratio: its sides can be dragged too") })
-        .chain(SHAPES.iter().map(|&(name, _, _, tip)| Seg { icon: None, label: name, tip: Some(tip) }))
-        .collect();
-    let chosen = match now {
-        None => 0,
-        Some(r) => SHAPES.iter().position(|&(_, w, h, _)| (r / (w as f64 / h as f64) - 1.0).abs() < 0.005).map_or(usize::MAX, |i| i + 1),
-    };
-    let enabled = ui.is_enabled();
-    crate::ui_kit::segmented_opts(ui, id, &opts, chosen, width, enabled).map(|i| i.checked_sub(1))
-}
-
-/// Which of [`SHAPES`] `c` is (to a pixel or so), if one.
-pub fn shape_of(c: &Crop) -> Option<usize> {
-    let r = c.w as f64 / c.h.max(1) as f64;
-    SHAPES.iter().position(|&(_, w, h, _)| (r / (w as f64 / h as f64) - 1.0).abs() < 0.005)
-}
-
 /// The tool's bar, above the picture.
 const BAR_H: f32 = 48.0;
-/// The shapes' width in it.
-const SHAPES_W: f32 = 300.0;
 /// Room around the picture for the corners.
 const PAD: f32 = 16.0;
 /// How near a corner or side the pointer takes hold of it, in points.
@@ -70,8 +37,8 @@ enum Grip {
 
 /// The crop tool, while it's open.
 pub struct CropTool {
-    /// The shape kept while sizing (of [`SHAPES`]); `None`: any.
-    shape: Option<usize>,
+    /// The shape kept while sizing (an aspect ratio); `None`: any.
+    shape: Option<[u32; 2]>,
     /// While dragging: what's held, the crop then, and where the pointer
     /// took hold.
     drag: Option<(Grip, Crop, Pos2)>,
@@ -91,9 +58,10 @@ pub struct Did {
 }
 
 impl CropTool {
-    /// Opened on `crop`: its shape, if it's one of them.
+    /// Opened on `crop`: its shape, if it's a common one.
     pub fn new(crop: Option<Crop>) -> Self {
-        Self { shape: crop.as_ref().and_then(shape_of), drag: None }
+        let common = crop.and_then(|c| crate::ui_kit::common_ratio(c.w, c.h)).map(|i| [crate::ui_kit::RATIOS[i].0, crate::ui_kit::RATIOS[i].1]);
+        Self { shape: common, drag: None }
     }
 
     /// The tool in `rect` (where the editor's picture goes): its bar along
@@ -132,7 +100,7 @@ impl CropTool {
         }
         if let (Some((grip, from, at)), Some(p)) = (self.drag, resp.interact_pointer_pos()) {
             let d = (p - at) / scale;
-            let shape = self.shape.map(|i| (SHAPES[i].1, SHAPES[i].2));
+            let shape = self.shape.map(|[w, h]| (w, h));
             *crop = dragged(grip, from, (d.x as f64, d.y as f64), (fw, fh), shape, (SNAP / scale) as f64).within(fw, fh);
         }
         if resp.drag_stopped() && self.drag.take().is_some() {
@@ -186,23 +154,24 @@ impl CropTool {
         }
     }
 
-    /// Along the top: the crop's size, the shapes, and Reset and Done.
+    /// Along the top: the crop's size, its aspect ratio, and Reset and Done.
     fn bar(&mut self, ui: &mut egui::Ui, rect: Rect, (fw, fh): (u32, u32), crop: &mut Option<Crop>, did: &mut Did) {
         use crate::ui_kit::Btn;
         let pal = theme::pal(ui);
         let c = crop.unwrap_or(Crop::whole(fw, fh));
-        let middle = Rect::from_center_size(rect.center(), vec2(SHAPES_W, rect.height()));
+        let field_w = crate::ui_kit::ratio_field_width(ui.ctx(), "crop_shape", self.shape);
+        let middle = Rect::from_center_size(rect.center(), vec2(field_w, rect.height()));
         if middle.left() - rect.left() - PAD >= 90.0 {
             let size = format!("{} × {}", c.w, c.h);
             ui.painter().text(pos2(rect.left() + PAD, rect.center().y), egui::Align2::LEFT_CENTER, size, theme::font(13.0, W::Medium), pal.text2);
         }
         let mut mid = ui.new_child(egui::UiBuilder::new().max_rect(middle).layout(egui::Layout::left_to_right(egui::Align::Center)));
-        let now = self.shape.map(|s| SHAPES[s].1 as f64 / SHAPES[s].2 as f64);
-        if let Some(pick) = shape_choice(&mut mid, "crop_shape", now, Some(SHAPES_W)) {
+        let from = crate::ui_kit::ratio_of(c.w as f64 / c.h.max(1) as f64);
+        if let Some(pick) = crate::ui_kit::ratio_field(&mut mid, "crop_shape", ("Any", "its sides drag too"), self.shape, from) {
             self.shape = pick;
             // The biggest of the shape there's room for, where the crop is.
-            if let Some(s) = self.shape {
-                *crop = Crop::largest(fw, fh, SHAPES[s].1, SHAPES[s].2, c.centre()).within(fw, fh);
+            if let Some([w, h]) = self.shape {
+                *crop = Crop::largest(fw, fh, w, h, c.centre()).within(fw, fh);
                 did.changed = true;
             }
         }
@@ -335,10 +304,12 @@ mod tests {
 
     #[test]
     fn shapes_are_known() {
-        assert_eq!(shape_of(&Crop::largest(3440, 1440, 16, 9, (1720.0, 720.0))), Some(0));
+        use crate::ui_kit::{RATIOS, common_ratio};
+        let shape = |c: Crop| common_ratio(c.w, c.h).map(|i| (RATIOS[i].0, RATIOS[i].1));
+        assert_eq!(shape(Crop::largest(3440, 1440, 16, 9, (1720.0, 720.0))), Some((16, 9)));
         // 9:16 out of 1080p rounds to 608 wide: still 9:16.
-        assert_eq!(shape_of(&Crop::largest(1920, 1080, 9, 16, (960.0, 540.0)).within(1920, 1080).unwrap()), Some(3));
-        assert_eq!(shape_of(&Crop { x: 0, y: 0, w: 1000, h: 700 }), None);
+        assert_eq!(shape(Crop::largest(1920, 1080, 9, 16, (960.0, 540.0)).within(1920, 1080).unwrap()), Some((9, 16)));
+        assert_eq!(shape(Crop { x: 0, y: 0, w: 1000, h: 700 }), None);
     }
 
     #[test]
