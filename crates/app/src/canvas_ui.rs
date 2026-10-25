@@ -64,13 +64,46 @@ pub(crate) enum Layer {
 enum Drag {
     /// The webcam: what's held, where it was taken hold of, its placement then.
     Webcam(Handle, Pos2, Placement),
-    /// The screen's box: what's held, where, the box then (fractions of the video).
-    Screen(Handle, Pos2, Rect),
-    /// The screen, cropped: what's held, where, its box then, and the part
-    /// of the display it showed (in its pixels, of a display this big).
-    ScreenCrop(Handle, Pos2, Rect, Rect, (u32, u32)),
+    /// The screen: moved, resized, or (Alt) cropped.
+    Screen(ScreenHold),
     /// A source filling the video, held in its middle: it has nowhere to move.
     Stuck(Layer),
+}
+
+/// The screen, held: what's held, where, and how it was then, to resize it
+/// from (its box, as fractions of the video, its crop and its picture's
+/// shape) and, held by a handle, to crop it from (its box, the part of the
+/// display it showed, in its pixels, and the display's size; none for games
+/// and apps). Each frame is worked out from these as the keys held say, so
+/// Alt (crop) and Shift (stretch, or keep the crop's shape) can be pressed
+/// or let go mid-drag.
+#[derive(Debug, Clone, Copy)]
+struct ScreenHold {
+    handle: Handle,
+    from: Pos2,
+    start: Rect,
+    crop: Option<ScreenCrop>,
+    picture: Option<f32>,
+    cropping_from: Option<(Rect, Rect, (u32, u32))>,
+}
+
+impl ScreenHold {
+    /// Dragged by `(dx, dy)` (fractions of the video) with these keys: its
+    /// box, its crop, and its picture's shape. Cropping (`mods.crop`, by a
+    /// handle of a display), from how it was: the picture keeps its scale
+    /// (`mods.keep`: the crop its shape). Else moved or resized from how it
+    /// was (`mods.keep`: stretched), its crop as it was.
+    fn dragged(&self, dx: f32, dy: f32, mods: Mods, lines: &Lines) -> (Rect, Option<ScreenCrop>, Option<f32>) {
+        match self.cropping_from.filter(|_| mods.crop) {
+            Some((start, part, display)) => {
+                let (b, crop) = screen_crop_drag(start, part, display, self.handle, dx, dy, mods.keep);
+                // Its picture's what's kept of the display now.
+                let (w, h) = crop.map_or(display, |c| (c.w, c.h));
+                (b, crop, Some(w as f32 / h.max(1) as f32))
+            }
+            None => (screen_drag(self.start, self.handle, dx, dy, mods.snap, mods.keep, lines), self.crop, self.picture),
+        }
+    }
 }
 
 /// The preview's own state on the Sources page.
@@ -400,11 +433,9 @@ impl App {
             let origin = ui.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos());
             if let Some(((layer, handle), from)) = origin.and_then(|p| hit(&layers, &shown, p).map(|h| (h, p))) {
                 let was = self.arrangement();
-                let crop = (layer == Layer::Screen && modifiers.alt && handle != Handle::Move).then(|| self.screen_crop_hold(aspect)).flatten();
-                let drag = match (layer, crop) {
-                    (Layer::Webcam, _) => Drag::Webcam(handle, from, self.webcam_placement().unwrap_or_else(Placement::hidden)),
-                    (Layer::Screen, Some((start, part, display))) => Drag::ScreenCrop(handle, from, start, part, display),
-                    (Layer::Screen, None) => self.take_screen(handle, from, aspect),
+                let drag = match layer {
+                    Layer::Webcam => Drag::Webcam(handle, from, self.webcam_placement().unwrap_or_else(Placement::hidden)),
+                    Layer::Screen => self.take_screen(handle, from, aspect),
                 };
                 // Something that moves can be put back (one held that can't, can't).
                 if !matches!(drag, Drag::Stuck(_)) {
@@ -432,28 +463,21 @@ impl App {
                             guides = snapped(Rect::from_min_size(Pos2::new(moved.x, moved.y), vec2(moved.w, moved.h)), &lines);
                         }
                     }
-                    Drag::Screen(handle, from, start) => {
+                    Drag::Screen(h) => {
+                        let (dx, dy) = d(h.from);
                         let lines = lines_of(&layers, Layer::Screen);
-                        let (dx, dy) = d(from);
-                        let r = screen_drag(start, handle, dx, dy, snap, modifiers.shift, &lines);
-                        self.place_screen(r, aspect);
-                        if handle == Handle::Move && snap {
+                        let (r, crop, picture) = h.dragged(dx, dy, Mods { crop: modifiers.alt, snap, keep: modifiers.shift }, &lines);
+                        self.settings.screen.placed = Some(BoxCfg::new([r.min.x, r.min.y, r.width(), r.height()], aspect, picture));
+                        self.settings.screen_crop = crop;
+                        if h.handle == Handle::Move && snap {
                             guides = snapped(r, &lines);
                         }
-                    }
-                    Drag::ScreenCrop(handle, from, start, part, display) => {
-                        let (dx, dy) = d(from);
-                        let (b, crop) = screen_crop_drag(start, part, display, handle, dx, dy, modifiers.shift);
-                        // Its picture's what's kept of the display now.
-                        let (w, h) = crop.map_or(display, |c| (c.w, c.h));
-                        self.settings.screen.placed = Some(BoxCfg::new([b.min.x, b.min.y, b.width(), b.height()], aspect, Some(w as f32 / h.max(1) as f32)));
-                        self.settings.screen_crop = crop;
                     }
                     Drag::Stuck(_) => {}
                 }
                 ui.ctx().set_cursor_icon(match drag {
-                    Drag::Webcam(Handle::Move, ..) | Drag::Screen(Handle::Move, ..) => CursorIcon::Grabbing,
-                    Drag::Webcam(h, ..) | Drag::Screen(h, ..) | Drag::ScreenCrop(h, ..) => h.cursor(),
+                    Drag::Webcam(Handle::Move, ..) | Drag::Screen(ScreenHold { handle: Handle::Move, .. }) => CursorIcon::Grabbing,
+                    Drag::Webcam(h, ..) | Drag::Screen(ScreenHold { handle: h, .. }) => h.cursor(),
                     Drag::Stuck(_) => CursorIcon::NotAllowed,
                 });
             }
@@ -486,7 +510,7 @@ impl App {
         let layers = self.layers(aspect);
         let held = self.canvas.drag.map(|d| match d {
             Drag::Webcam(h, ..) => (Layer::Webcam, Some(h)),
-            Drag::Screen(h, ..) | Drag::ScreenCrop(h, ..) => (Layer::Screen, Some(h)),
+            Drag::Screen(h) => (Layer::Screen, Some(h.handle)),
             Drag::Stuck(l) => (l, None),
         });
         let over = pointer.and_then(|p| hit(&layers, &shown, p));
@@ -507,7 +531,7 @@ impl App {
         // display's size, when it can be cropped (a display, not games and apps).
         let screen = (active == Layer::Screen).then(|| self.screen_crop_hold(aspect)).flatten();
         let croppable = webcam.is_some() || screen.is_some();
-        let cropping = modifiers.alt && croppable && handle.is_some_and(|h| h != Handle::Move) || matches!(self.canvas.drag, Some(Drag::ScreenCrop(..)));
+        let cropping = modifiers.alt && croppable && handle.is_some_and(|h| h != Handle::Move);
 
         // Cropping: where the whole camera picture (or display) would be,
         // dashed, so it's clear what's cut off and how far it can grow back.
@@ -587,13 +611,14 @@ impl App {
         let moves = !stuck(rect);
         let hint = match (self.canvas.drag, active) {
             (Some(Drag::Stuck(_)), _) => "It fills the video: drag a corner to make it smaller".to_owned(),
-            (Some(Drag::Webcam(Handle::Move, ..) | Drag::Screen(Handle::Move, ..)), _) => format!("{ctrl}: place freely"),
-            (Some(Drag::Webcam(..) | Drag::ScreenCrop(..)), _) if cropping && modifiers.shift => "Cropping, keeping the shape".to_owned(),
-            (Some(Drag::Webcam(..) | Drag::ScreenCrop(..)), _) if cropping => "Cropping · Shift keeps the shape".to_owned(),
+            (Some(Drag::Webcam(Handle::Move, ..) | Drag::Screen(ScreenHold { handle: Handle::Move, .. })), _) => format!("{ctrl}: place freely"),
+            (Some(Drag::Webcam(..) | Drag::Screen(..)), _) if cropping && modifiers.shift => "Cropping, keeping the shape".to_owned(),
+            (Some(Drag::Webcam(..) | Drag::Screen(..)), _) if cropping => "Cropping · Shift keeps the shape".to_owned(),
             (Some(Drag::Webcam(..)), _) => format!("{alt}: crop · past the other side: flip"),
+            (Some(Drag::Screen(h)), _) if modifiers.shift && h.cropping_from.is_some() => format!("Stretching · {alt}: crop"),
             (Some(Drag::Screen(..)), _) if modifiers.shift => "Stretching · let go of Shift to keep its shape".to_owned(),
+            (Some(Drag::Screen(h)), _) if h.cropping_from.is_some() => format!("Shift: stretch · {alt}: crop"),
             (Some(Drag::Screen(..)), _) => "Shift: stretch".to_owned(),
-            (Some(Drag::ScreenCrop(..)), _) => return,
             (None, Layer::Webcam) => format!("Drag to move · {alt} + handle to crop · right-click for more"),
             (None, Layer::Screen) if croppable && moves => format!("Drag to move · {alt} + handle to crop · right-click for more"),
             (None, Layer::Screen) if croppable => format!("Drag a corner to make it smaller · {alt} + handle to crop"),
@@ -616,7 +641,8 @@ impl App {
     /// Stretch, into a box of its own where it shows, so nothing jumps
     /// (Fill's past the video's edges, Stretch's all of it, stretched). Over
     /// all of the video exactly, it has nowhere to move: held in the
-    /// middle, it stays.
+    /// middle, it stays. Held by a handle, a display can be cropped too
+    /// (Alt), from how it shows (see `screen_crop_hold`).
     fn take_screen(&mut self, handle: Handle, from: Pos2, aspect: f32) -> Drag {
         let shown = self.screen_rect(aspect);
         if self.settings.screen.placed.is_none() {
@@ -625,7 +651,9 @@ impl App {
             }
             self.place_screen(shown, aspect);
         }
-        Drag::Screen(handle, from, shown)
+        let picture = self.settings.screen.placed.and_then(|b| b.picture_aspect);
+        let cropping_from = (handle != Handle::Move).then(|| self.screen_crop_hold(aspect)).flatten();
+        Drag::Screen(ScreenHold { handle, from, start: shown, crop: self.settings.screen_crop, picture, cropping_from })
     }
 
     /// The screen's crop as it is (left, top, width, height in the
@@ -866,6 +894,38 @@ mod tests {
         assert_eq!(c, crop(64, 64, 0, 0));
         let (_, c) = screen_crop_drag(rect(0.0, 0.0, 1.0, 1.0), rect(0.0, 0.0, 2560.0, 1440.0), (2560, 1440), Handle::N, 0.0, 0.10011, false);
         assert_eq!(c, crop(2560, 1296, 0, 144));
+    }
+
+    /// Alt pressed while a corner's resizing the screen crops it instead,
+    /// from how it was when it was taken hold of (the picture at its own
+    /// scale), and let go, it's resized again, its crop as it was; as Shift
+    /// stretches it and lets it keep its shape again.
+    #[test]
+    fn alt_mid_drag_crops_and_lets_go() {
+        let none = Lines::default();
+        let start = rect(0.0, 0.0, 1.0, 1.0);
+        let hold = ScreenHold { handle: Handle::SE, from: Pos2::ZERO, start, crop: None, picture: Some(16.0 / 9.0), cropping_from: Some((start, rect(0.0, 0.0, 1920.0, 1080.0), (1920, 1080))) };
+        let mods = |crop: bool, keep: bool| Mods { crop, snap: false, keep };
+        // Made half as big, from its top-left corner.
+        let (r, crop, picture) = hold.dragged(-0.5, -0.5, mods(false, false), &none);
+        assert!(close(r, rect(0.0, 0.0, 0.5, 0.5)) && crop.is_none() && picture == Some(16.0 / 9.0), "{r:?}");
+        // Alt: the same corner crops instead: its right and bottom halves cut off.
+        let (r, crop, picture) = hold.dragged(-0.5, -0.5, mods(true, false), &none);
+        assert!(close(r, rect(0.0, 0.0, 0.5, 0.5)), "{r:?}");
+        assert_eq!(crop, Some(ScreenCrop { w: 960, h: 540, at: Some([0, 0]) }));
+        assert_eq!(picture, Some(960.0 / 540.0));
+        // Alt let go: resized again, uncropped.
+        let (r, crop, _) = hold.dragged(-0.3, -0.3, mods(false, false), &none);
+        assert!(close(r, rect(0.0, 0.0, 0.7, 0.7)) && crop.is_none(), "{r:?}");
+        // Shift: stretched; and cropping, it keeps the crop's shape.
+        let (r, _, _) = hold.dragged(-0.5, -0.2, mods(false, true), &none);
+        assert!(close(r, rect(0.0, 0.0, 0.5, 0.8)), "{r:?}");
+        let (r, _, _) = hold.dragged(-0.5, -0.2, mods(true, true), &none);
+        assert!((r.width() / r.height() - 1.0).abs() < 0.01, "{r:?}");
+        // Games and apps can't be cropped: Alt resizes.
+        let apps = ScreenHold { cropping_from: None, ..hold };
+        let (r, crop, _) = apps.dragged(-0.5, -0.5, mods(true, false), &none);
+        assert!(close(r, rect(0.0, 0.0, 0.5, 0.5)) && crop.is_none(), "{r:?}");
     }
 
     /// Guides show for the lines a box is on.
