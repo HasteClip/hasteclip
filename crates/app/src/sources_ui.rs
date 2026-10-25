@@ -69,7 +69,11 @@ pub(crate) struct SourcesView {
     pub(crate) crop_open: bool,
     crop_drag: Option<(crate::webcam_ui::Handle, egui::Rect, egui::Pos2)>,
     /// The picture's sources whose cards are open, showing their settings.
-    open_cards: Vec<crate::canvas_ui::Layer>,
+    pub(crate) open_cards: Vec<crate::canvas_ui::Layer>,
+    /// The sources whose Placement numbers are open, under that row of
+    /// their cards; and one to bring into view (opened from its menu).
+    pub(crate) placement_open: Vec<crate::canvas_ui::Layer>,
+    pub(crate) placement_shown: Option<crate::canvas_ui::Layer>,
     /// A card dragged by its handle to put it in front or behind: which,
     /// how far below its top it was taken hold of, and how the sources were
     /// before (to undo it).
@@ -80,13 +84,15 @@ pub(crate) struct SourcesView {
 }
 
 impl SourcesView {
-    /// Dev aid: the cards named open (`screen`, `webcam`), or the crop's page.
+    /// Dev aid: the cards named open (`screen`, `webcam`), their Placement
+    /// numbers (`placement`), or the crop's page (`crop`).
     pub(crate) fn open_dev(&mut self, names: &str) {
         use crate::canvas_ui::Layer;
         for name in names.split(',').map(str::trim) {
             match name {
                 "screen" => self.open_cards.push(Layer::Screen),
                 "webcam" => self.open_cards.push(Layer::Webcam),
+                "placement" => self.placement_open.extend([Layer::Screen, Layer::Webcam]),
                 "crop" => self.crop_open = true,
                 _ => {}
             }
@@ -162,44 +168,58 @@ impl App {
             }
         }
         self.page_head(ui, "Sources", |_, _| {});
-        crate::ui_kit::arrive(ui, |ui| crate::ui_kit::scroll(ui, "sources_page", |ui| {
+        // The preview stays in view: what's under it scrolls (each column on
+        // its own), so the cards' settings show on it as they change.
+        crate::ui_kit::arrive(ui, |ui| {
             // The headings' tops level with the other pages' first heading
             // (these are bigger, in a taller row).
             ui.add_space(4.0);
-            let w = ui.available_width();
+            let (w, h) = (ui.available_width(), ui.available_height());
             // Picture on the left, sound on the right, when there's room;
             // one above the other when there isn't.
             if w >= TWO_COLUMNS && capture::preview::AVAILABLE {
                 let col = (w - 28.0) / 2.0;
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = 28.0;
-                    ui.allocate_ui_with_layout(egui::vec2(col, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.allocate_ui_with_layout(egui::vec2(col, h), egui::Layout::top_down(egui::Align::Min), |ui| {
                         ui.set_width(col);
-                        self.picture_column(ui);
+                        let frame = self.picture_top(ui);
+                        crate::ui_kit::scroll(ui, "sources_cards", |ui| {
+                            self.layer_cards(ui, frame.as_deref());
+                            ui.add_space(28.0);
+                        });
                     });
-                    ui.allocate_ui_with_layout(egui::vec2(col, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.allocate_ui_with_layout(egui::vec2(col, h), egui::Layout::top_down(egui::Align::Min), |ui| {
                         ui.set_width(col);
-                        self.sound_column(ui, now, dt);
+                        self.sound_head(ui);
+                        crate::ui_kit::scroll(ui, "sources_sound", |ui| {
+                            self.sound_column(ui, now, dt);
+                            ui.add_space(28.0);
+                        });
                     });
                 });
             } else {
                 ui.vertical(|ui| {
                     ui.set_width(w);
-                    if capture::preview::AVAILABLE {
-                        self.picture_column(ui);
-                        ui.add_space(24.0);
-                    }
-                    self.sound_column(ui, now, dt);
+                    let frame = capture::preview::AVAILABLE.then(|| self.picture_top(ui)).flatten();
+                    crate::ui_kit::scroll(ui, "sources_page", |ui| {
+                        if capture::preview::AVAILABLE {
+                            self.layer_cards(ui, frame.as_deref());
+                            ui.add_space(24.0);
+                        }
+                        self.sound_head(ui);
+                        self.sound_column(ui, now, dt);
+                        ui.add_space(28.0);
+                    });
                 });
             }
-            ui.add_space(28.0);
-        }));
+        });
         self.live_audio.set_limiter(self.settings.limiter);
     }
 
-    /// What you see: the preview of the video, and its sources under it,
-    /// one card each, the one in front first.
-    fn picture_column(&mut self, ui: &mut egui::Ui) {
+    /// What you see: the preview of the video, under its heading (its
+    /// sources' cards go under it, see `layer_cards`). The frame shown.
+    fn picture_top(&mut self, ui: &mut egui::Ui) -> Option<std::sync::Arc<capture::preview::PreviewFrame>> {
         capture::preview::request();
         // The capture's newest frame; while it's starting, the last one of the
         // same picture (the page looks as it did straight away).
@@ -230,19 +250,24 @@ impl App {
         });
         self.preview_picture(ui, frame.as_deref());
         crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
-        self.layer_cards(ui, frame.as_deref());
+        frame
     }
 
-    /// What you hear: the clip's mix, then each source, then adding one.
-    fn sound_column(&mut self, ui: &mut egui::Ui, now: Instant, dt: f32) {
+    /// What you hear's heading, with Refresh.
+    fn sound_head(&mut self, ui: &mut egui::Ui) {
         use crate::ui_kit::Btn;
-        let pal = crate::theme::pal(ui);
         column_head(ui, "Sound", |ui| {
             if Btn::ghost("Refresh").with_icon(egui_phosphor::regular::ARROWS_CLOCKWISE).small().tip("Look again for microphones you've plugged in").show(ui).clicked() {
                 self.refresh_audio_devices();
                 self.toast_icon(egui_phosphor::regular::ARROWS_CLOCKWISE, "Looked for microphones again");
             }
         });
+    }
+
+    /// What you hear (under `sound_head`): the clip's mix, then each
+    /// source, then adding one.
+    fn sound_column(&mut self, ui: &mut egui::Ui, now: Instant, dt: f32) {
+        let pal = crate::theme::pal(ui);
         // The mix first: it's what people hear, and where it gets too loud.
         self.master_strip(ui, now, dt);
         crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
@@ -755,10 +780,14 @@ impl App {
                         });
                     });
                 });
+                if capture::SCREEN_CROP {
+                    crate::ui_kit::divider(ui, 0.0);
+                    self.crop_row(ui);
+                }
             }
         }
-        // Its crop, position, size, turn and flip, in a few words, and its
-        // page; and how the video puts it in (a video of a shape of its own).
+        // Where it is in the video, in a few words (and how the video puts
+        // it in, in a shape of its own); its numbers under it.
         crate::ui_kit::divider(ui, 0.0);
         self.placement_row(ui, crate::canvas_ui::Layer::Screen);
     }
@@ -898,6 +927,27 @@ impl App {
         });
     }
 
+    /// The Crop row: what's kept of the screen, and a way to its page.
+    fn crop_row(&mut self, ui: &mut egui::Ui) {
+        use crate::ui_kit::Btn;
+        let pal = crate::theme::pal(ui);
+        let kept = self.crop_whole().zip(self.settings.screen_crop.filter(|c| !c.is_none())).map(|((w, h), c)| capture::Crop::from(c).rect(w, h));
+        ui.horizontal(|ui| {
+            ui.set_min_height(GROUP_ROW_H);
+            ui.spacing_mut().item_spacing.x = 5.0;
+            ui.label(crate::theme::text("Crop", 13.5, crate::theme::W::Regular).color(pal.text));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                let b = Btn::normal("Adjust").trail(egui_phosphor::regular::CARET_RIGHT).small().tip("Show only part of your screen: a game at a lower resolution than your display, with black around it");
+                if b.show(ui).clicked() {
+                    self.sources_view.crop_open = true;
+                }
+                let text = kept.map_or("Off".to_owned(), |[_, _, w, h]| format!("{w}×{h}"));
+                ui.label(crate::theme::text(text, 12.5, crate::theme::W::Regular).color(pal.text3));
+            });
+        });
+    }
+
     /// The size a video would be to show the screen's crop as it is (even,
     /// as big as a video can be; turned, as it shows), when it's cropped and
     /// fills the video.
@@ -917,14 +967,11 @@ impl App {
         }
     }
 
-    /// The screen's Placement page, in Sources' place: all of the screen
-    /// with what's kept drawn on it to drag, and its size and place as
-    /// numbers. It starts centred, and stays so as its size changes, until
-    /// it's put somewhere. It's only what's shown of the screen, so it
-    /// changes while clipping too; the video's size can be made the crop's,
-    /// for every pixel of it. Under the crop, where the screen is in the
-    /// video, and how it's turned (see `placement_lists`); for games and
-    /// apps, which aren't cropped, only that.
+    /// The crop's page, in Sources' place: all of the screen with what's
+    /// kept drawn on it to drag, and its size and place as numbers. It starts
+    /// centred, and stays so as its size changes, until it's put somewhere.
+    /// It's only what's shown of the screen, so it changes while clipping
+    /// too; the video's size can be made the crop's, for every pixel of it.
     fn screen_crop_page(&mut self, ui: &mut egui::Ui) {
         use crate::settings::ScreenCrop;
         use crate::theme::{self, W};
@@ -939,23 +986,12 @@ impl App {
         // Its size's link keeps the shape as its edges are dragged too.
         let keep = crate::ui_kit::size_field_keeps(ui.ctx(), "screen_crop").is_some();
         let mut back = false;
-        let apps = matches!(self.settings.capture, CaptureTarget::Apps { .. });
         self.page_head(ui, "", |_, ui| {
             back = Btn::icon(crate::ui_kit::Kind::Ghost, egui_phosphor::regular::CARET_LEFT).tip("Back to Sources  (Esc)").show(ui).clicked();
-            ui.label(theme::text("Placement", 20.0, W::Semibold).color(pal.text));
-            ui.label(theme::text(if apps { "Games and apps" } else { "Screen" }, 13.0, W::Regular).color(pal.text3));
+            ui.label(theme::text("Crop", 20.0, W::Semibold).color(pal.text));
         });
         if back {
             self.sources_view.crop_open = false;
-            return;
-        }
-        // Games and apps aren't cropped: where they are, and how they're turned.
-        if apps || !capture::SCREEN_CROP {
-            ui.add_space(4.0);
-            crate::ui_kit::scroll(ui, "screen_placement_page", |ui| {
-                ui.set_max_width(ui.available_width().min(560.0));
-                self.placement_lists(ui, crate::canvas_ui::Layer::Screen);
-            });
             return;
         }
         capture::preview::request();
@@ -1030,7 +1066,6 @@ impl App {
                 });
             };
             const BOX: f32 = 64.0;
-            crate::ui_kit::section_head(ui, "Crop", true, |_| {});
             crate::ui_kit::list(ui, "screen_crop", |l| {
                 // Its shape: the biggest of it there's room for, where it is,
                 // and kept as it's sized (it's the size's link).
@@ -1140,11 +1175,7 @@ impl App {
                 });
                 ui.allocate_ui_with_layout(egui::vec2(col, avail_h), egui::Layout::top_down(egui::Align::Min), |ui| {
                     ui.set_width(col);
-                    egui::ScrollArea::vertical().id_salt("screen_placement_numbers").auto_shrink([false, true]).show(ui, |ui| {
-                        numbers(ui, &mut set, &mut locked_click, &mut match_crop);
-                        self.placement_lists(ui, crate::canvas_ui::Layer::Screen);
-                        ui.add_space(16.0);
-                    });
+                    numbers(ui, &mut set, &mut locked_click, &mut match_crop);
                 });
             });
         } else {
@@ -1152,7 +1183,6 @@ impl App {
                 picture(ui, self, avail_h * 0.4, &mut set);
                 ui.add_space(16.0);
                 numbers(ui, &mut set, &mut locked_click, &mut match_crop);
-                self.placement_lists(ui, crate::canvas_ui::Layer::Screen);
             });
         }
         if locked_click && let Some(why) = &size_lock {

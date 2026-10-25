@@ -852,13 +852,13 @@ impl App {
     }
 
     /// A source's menu (right-click it on the preview, or its card's ⋯),
-    /// the same for both as far as each goes: its Placement page, how the
+    /// the same for both as far as each goes: its Placement numbers, how the
     /// video puts the screen in (a video of a shape of its own), its
     /// position, size and crop back, turning, mirroring and flipping it,
     /// which is in front, and taking the webcam out.
     pub(crate) fn layer_menu(&mut self, ui: &mut egui::Ui, layer: Layer, aspect: f32) {
         let screen = layer == Layer::Screen;
-        if Item::new("Edit placement…").icon(icon::SLIDERS_HORIZONTAL).tip("Its crop, position, size, turn and flip, as numbers").show(ui).clicked() {
+        if Item::new("Edit placement…").icon(icon::SLIDERS_HORIZONTAL).tip("Its position, size, turn and flip as numbers, on its card").show(ui).clicked() {
             self.open_placement(layer);
             ui.close();
         }
