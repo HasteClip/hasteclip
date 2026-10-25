@@ -144,8 +144,9 @@ impl App {
     }
 
     /// A source's position and size in the video's pixels, how it's turned
-    /// and flipped, and putting its position and size back: rows of its
-    /// card under its Placement row, a little in from its others.
+    /// and flipped, and putting its position and size back: in a well under
+    /// its Placement row, as settings that belong to the one above them are
+    /// in Settings (`ui_kit::well`), its edges and text where theirs are.
     fn placement_numbers(&mut self, ui: &mut egui::Ui, layer: Layer) {
         use egui_phosphor::regular as icon;
         let Some(((vw, vh), aspect, rect)) = self.placed_in(layer) else { return };
@@ -166,15 +167,27 @@ impl App {
         }
         let pal = theme::pal(ui);
         let small = |ui: &mut egui::Ui, t: &str| ui.label(theme::text(t, 12.5, W::Regular).color(pal.text3));
-        // A row of the card's, a little in: its name, then what's at its end.
-        let row = |ui: &mut egui::Ui, label: &str, add: &mut dyn FnMut(&mut egui::Ui)| {
-            ui_kit::divider(ui, 0.0);
+        // The well: 8 from the card's edges (into its padding), its rows 8
+        // in from its own, so their text is a little in from the card's
+        // other rows (as a Settings well's is). Painted under them once
+        // they're laid out.
+        let reach = crate::sources_ui::GROUP_PAD - 8.0;
+        let (well, top) = (ui.painter().add(egui::Shape::Noop), ui.cursor().min.y);
+        ui.add_space(2.0);
+        let mut first = true;
+        // A row of the well: its name, then what's at its end; hairlines
+        // between them, along the text.
+        let mut row = |ui: &mut egui::Ui, label: &str, add: &mut dyn FnMut(&mut egui::Ui)| {
+            if !std::mem::take(&mut first) {
+                ui_kit::divider(ui, 8.0 - reach);
+            }
             ui.horizontal(|ui| {
-                ui.set_min_height(crate::sources_ui::GROUP_ROW_H);
-                ui.add_space(12.0);
-                ui.label(theme::text(label, 13.5, W::Regular).color(pal.text2));
+                ui.set_min_height(ui_kit::CONTROL_H + 12.0);
+                ui.add_space(8.0 - reach);
+                ui.label(theme::text(label, 13.5, W::Regular).color(pal.text));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.add_space(8.0 - reach);
                     add(ui);
                 });
             });
@@ -226,11 +239,12 @@ impl App {
             ui_kit::switch(ui, &mut u);
         });
         // Its first place and size again, each on its own.
-        ui_kit::divider(ui, 0.0);
+        ui_kit::divider(ui, 8.0 - reach);
         ui.horizontal(|ui| {
-            ui.set_min_height(crate::sources_ui::GROUP_ROW_H);
+            ui.set_min_height(ui_kit::CONTROL_H + 12.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
+                ui.add_space(8.0 - reach);
                 let size_tip = match layer {
                     Layer::Screen if self.video_shaped() => "Back to the size the video gives it, where it is",
                     Layer::Screen => "As big as the video again, where it is",
@@ -241,6 +255,11 @@ impl App {
                 reset_place = Btn::ghost("Reset position").small().enabled(can_place).tip(place_tip).show(ui).clicked();
             });
         });
+        ui.add_space(2.0);
+        let r = Rect::from_x_y_ranges(ui.max_rect().x_range().expand(reach), top..=ui.cursor().min.y);
+        ui.painter().set(well, egui::epaint::RectShape::filled(r, ui_kit::RADIUS, pal.well));
+        // As far from the card's bottom as from its sides.
+        ui.add_space((8.0 - (crate::sources_ui::GROUP_PAD - (crate::sources_ui::GROUP_ROW_H - ui_kit::CONTROL_H) / 2.0)).max(0.0));
 
         if reset_place {
             if screen { self.screen_reset_position(aspect) } else { self.webcam_reset_position(aspect) }
