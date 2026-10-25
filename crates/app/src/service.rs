@@ -74,6 +74,8 @@ pub struct QuickSave {
     games: crate::games::Tracker,
     /// While the replay buffer runs: how to save.
     armed: Arc<Mutex<Option<Armed>>>,
+    /// While recording: the sound that says a moment's marked.
+    marking: Arc<Mutex<Option<crate::settings::SaveSound>>>,
     /// Where screenshots can be taken: how.
     shot: Arc<Mutex<Option<ShotArmed>>>,
 }
@@ -110,6 +112,15 @@ impl QuickSave {
     }
 
     /// Kept up to date by the app, every frame.
+    pub fn arm_marking(&self, to: Option<crate::settings::SaveSound>) {
+        if let Ok(mut armed) = self.marking.lock()
+            && *armed != to
+        {
+            *armed = to;
+        }
+    }
+
+    /// Kept up to date by the app, every frame.
     pub fn arm_screenshot(&self, to: Option<ShotArmed>) {
         if let Ok(mut armed) = self.shot.lock()
             && *armed != to
@@ -132,14 +143,27 @@ impl QuickSave {
     }
 
     /// Save a clip now, if the replay buffer runs. Whether it was asked for.
+    /// While recording, the moment's marked in the recording instead (no
+    /// clip: false).
     pub fn save(&self) -> bool {
-        let Some(a) = self.armed.lock().ok().and_then(|a| a.clone()) else { return false };
+        let Some(a) = self.armed.lock().ok().and_then(|a| a.clone()) else {
+            self.mark();
+            return false;
+        };
         let dir = crate::games::folder_for(&a.library, a.folder_per_game, &a.game_folders, self.games.clip_game().as_deref());
         if self.tx.send(Cmd::SaveClip(dir, self.games.clip_details())).is_err() {
             return false;
         }
         crate::sound::play_saved(&a.sound);
         true
+    }
+
+    /// Mark this moment in the recording, if one runs.
+    fn mark(&self) {
+        let Some(sound) = self.marking.lock().ok().and_then(|s| s.clone()) else { return };
+        if self.games.mark() {
+            crate::sound::play_saved(&sound);
+        }
     }
 }
 
@@ -249,7 +273,7 @@ impl CaptureService {
     /// A way to save a clip from another thread (a shortcut's).
     pub fn quick_save(&self, games: crate::games::Tracker) -> QuickSave {
         let tx = self.cmd_tx.clone().expect("the capture thread runs while the service lives");
-        QuickSave { tx, games, armed: Default::default(), shot: Default::default() }
+        QuickSave { tx, games, armed: Default::default(), marking: Default::default(), shot: Default::default() }
     }
 
     pub fn save_clip(&self, dir: PathBuf, details: Details) {
@@ -326,8 +350,20 @@ fn send(tx: &Sender<Evt>, evt: Evt) {
 /// kept with it.
 pub(crate) fn landed(path: PathBuf, details: Details) -> PathBuf {
     let path = named(path, details.summary);
-    if !details.moments.is_empty() {
-        crate::moments::keep(&path, &details.moments);
+    // Marks are known from the end: where they are takes the file's length.
+    let markers = if details.marks.is_empty() {
+        Vec::new()
+    } else {
+        match media::probe(&path) {
+            Ok(info) => crate::moments::marks_at(info.duration, &details.marks),
+            Err(e) => {
+                eprintln!("couldn't place the marks in {}: {e:#}", path.display());
+                Vec::new()
+            }
+        }
+    };
+    if !details.moments.is_empty() || !markers.is_empty() {
+        crate::moments::keep(&path, &details.moments, &markers);
     }
     path
 }

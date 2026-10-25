@@ -1402,7 +1402,8 @@ impl App {
         }
         // Not while samples are played on the speakers: the detector would hear them.
         // (Never in a demo recording: it clips nothing, and the mic stays shut.)
-        let listen = self.settings.voice_clip && self.rec_state == RecState::Buffering && self.recording_shortcut.is_none() && self.page != Page::VoiceReview && self.demo.is_none();
+        // While recording, it marks the moment.
+        let listen = self.settings.voice_clip && self.rec_state != RecState::Idle && self.recording_shortcut.is_none() && self.page != Page::VoiceReview && self.demo.is_none();
         self.voice.collect(self.settings.voice_samples);
         let mic = listen.then(|| self.voice_mic()).flatten();
         self.voice.listen(mic.as_deref());
@@ -1421,6 +1422,8 @@ impl App {
             sound: self.settings.save_sound.clone(),
         });
         self.quick_save.arm(armed);
+        let marking = (self.rec_state == RecState::Recording && self.recording_shortcut.is_none()).then(|| self.settings.save_sound.clone());
+        self.quick_save.arm_marking(marking);
         let shot = (capture::SCREENSHOTS && self.recording_shortcut.is_none() && self.demo.is_none()).then(|| self.shot_armed());
         self.quick_save.arm_screenshot(shot);
         self.updater.set_auto(self.settings.auto_update);
