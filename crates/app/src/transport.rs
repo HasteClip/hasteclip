@@ -358,7 +358,13 @@ fn short_clock(t: f64, step: f64) -> String {
 
 /// The playhead: a line with a tab at its top.
 pub fn playhead(painter: &egui::Painter, x: f32, top: f32, bottom: f32, color: Color32) {
-    painter.vline(x, top + 4.0..=bottom, Stroke::new(2.0, color));
+    // The line is drawn on whole pixels (egui puts it there); the tab goes
+    // where the line goes. Drawn where it fell, it shimmered beside the line
+    // as it moved.
+    let line = Stroke::new(2.0, color);
+    let mut x = x;
+    line.round_center_to_pixel(painter.pixels_per_point(), &mut x);
+    painter.vline(x, top + 4.0..=bottom, line);
     let pts = vec![Pos2::new(x - 6.0, top - 2.0), Pos2::new(x + 6.0, top - 2.0), Pos2::new(x + 6.0, top + 3.5), Pos2::new(x, top + 8.0), Pos2::new(x - 6.0, top + 3.5)];
     painter.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
 }
