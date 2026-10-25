@@ -1,6 +1,5 @@
 name: Feature request
 description: Something HasteClip could do, or do better.
-type: Feature
 labels: [enhancement]
 body:
   - type: markdown
