@@ -246,7 +246,6 @@ impl App {
         let size_text = size.map_or_else(|| format!("{} fps", self.settings.fps), |(w, h)| format!("{w}×{h} at {} fps", self.settings.fps));
         column_head(ui, "Picture", |ui| {
             self.size_button(ui, &size_text);
-            self.undo_buttons(ui);
         });
         self.preview_picture(ui, frame.as_deref());
         crate::ui_kit::gap(ui, crate::ui_kit::STACK_GAP);
@@ -454,12 +453,20 @@ impl App {
         if self.settings.webcam.is_some() {
             self.webcam_fit_pending(ui.ctx(), aspect);
         }
+        // Over the cards: undo and redo on the left (where the sources are),
+        // which is in front on the right. Its height is kept while the
+        // buttons come and go, so the cards don't move.
         let order = self.layer_order();
-        if order.len() > 1 {
+        if order.len() > 1 || self.arrangement_history() {
             ui.horizontal(|ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(theme::text("The top one's in front", 12.5, W::Regular).color(pal.text3));
-                });
+                ui.set_min_height(crate::ui_kit::SMALL_H);
+                ui.spacing_mut().item_spacing.x = 2.0;
+                self.undo_buttons(ui);
+                if order.len() > 1 {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(theme::text("The top one's in front", 12.5, W::Regular).color(pal.text3));
+                    });
+                }
             });
             ui.add_space(2.0);
         }

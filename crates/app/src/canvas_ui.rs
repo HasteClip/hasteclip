@@ -493,21 +493,27 @@ impl App {
         }
     }
 
-    /// Undo and redo, over the preview: shown once there's something to
-    /// undo (or redo), ready for a change that went wrong.
+    /// Whether there's a change to where the sources are to undo or redo.
+    pub(crate) fn arrangement_history(&self) -> bool {
+        !self.canvas.undo.is_empty() || !self.canvas.redo.is_empty()
+    }
+
+    /// Undo and redo, left to right over the sources' cards: shown once
+    /// there's something to undo (or redo), ready for a change that went
+    /// wrong.
     pub(crate) fn undo_buttons(&mut self, ui: &mut egui::Ui) {
         use crate::ui_kit::{Btn, Kind};
-        if self.canvas.undo.is_empty() && self.canvas.redo.is_empty() {
+        if !self.arrangement_history() {
             return;
         }
         let ctrl = crate::shortcuts::ctrl_name();
-        let redo = Btn::icon(Kind::Ghost, icon::ARROW_CLOCKWISE).small().enabled(!self.canvas.redo.is_empty()).tip(format!("Redo  ({ctrl}+Shift+Z)"));
-        if redo.show(ui).clicked() {
-            self.redo_arrangement();
-        }
         let undo = Btn::icon(Kind::Ghost, icon::ARROW_COUNTER_CLOCKWISE).small().enabled(!self.canvas.undo.is_empty()).tip(format!("Undo where your sources are  ({ctrl}+Z)"));
         if undo.show(ui).clicked() {
             self.undo_arrangement();
+        }
+        let redo = Btn::icon(Kind::Ghost, icon::ARROW_CLOCKWISE).small().enabled(!self.canvas.redo.is_empty()).tip(format!("Redo  ({ctrl}+Shift+Z)"));
+        if redo.show(ui).clicked() {
+            self.redo_arrangement();
         }
     }
 
