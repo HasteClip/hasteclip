@@ -307,7 +307,6 @@ impl Shared {
 
 pub struct Player {
     source: PathBuf,
-    stamp: Option<media::Stamp>,
     info: ClipInfo,
     shared: Arc<Shared>,
     _stream: Option<cpal::Stream>,
@@ -510,7 +509,6 @@ impl Player {
         let _ = scrubs;
         Self {
             source: source.to_path_buf(),
-            stamp: media::stamp(source),
             info,
             shared,
             _stream: stream,
@@ -565,16 +563,16 @@ impl Player {
     /// reloads, nothing stops.
     pub fn renamed(&mut self, ctx: &egui::Context, to: &Path) {
         self.source = to.to_path_buf();
-        self.stamp = media::stamp(to);
         (self.still_tx, self.still_rx) = still_worker(ctx, to, nv12_size(&self.info));
     }
 
-    pub fn unchanged(&self) -> bool {
-        self.stamp.is_some() && self.stamp == media::stamp(&self.source)
-    }
-
+    /// Take over the other screen's player (see `handoff.rs`), if it plays
+    /// `source` (a clip never edited: the player and the editor play the
+    /// same file): it plays on, with `pcm`'s tracks mixed by `gains`; speed,
+    /// scrubbing and cuts start afresh. Its file is as it was: the handoff is
+    /// dropped when the clip's files change.
     pub fn adopt(&mut self, source: &Path, pcm: Arc<Pcm>, gains: Vec<TrackEdit>) -> bool {
-        if self.source != source || !self.unchanged() {
+        if self.source != source {
             return false;
         }
         let n = pcm.len();

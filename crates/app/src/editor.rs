@@ -17,6 +17,7 @@ use egui::{Align2, Color32, FontId, Key, Pos2, Rect, Sense, Stroke, Vec2};
 use media::{ClipInfo, Edit};
 
 use crate::filmstrip::Filmstrip;
+use crate::handoff::{Handoff, Kept};
 use crate::player::Player;
 use crate::store::{self, EditTarget};
 use crate::viewer::Resume;
@@ -64,25 +65,31 @@ struct Loaded {
     pcm: Arc<media::pcm::Pcm>,
 }
 
-fn load(source: &Path) -> Result<Loaded, String> {
-    let info = media::probe(source).map_err(|e| e.to_string())?;
+/// Read the clip and start decoding every source track, but for what's
+/// `kept`. Every track at once, playable as it's decoded; the waveforms
+/// follow once it's all there.
+fn load(source: &Path, kept: &mut Kept) -> Result<Loaded, String> {
+    let info = kept.probe(source).map_err(|e| e.to_string())?;
     let tracks: Vec<usize> = info.source_tracks().iter().map(|t| t.index).collect();
     if crate::player::debug() {
         eprintln!("{:>8.3} editor: clip read, decoding {} tracks", crate::player::uptime(), tracks.len());
     }
-    let pcm = media::pcm::decode_streaming(source, &tracks, info.duration, |_, result| {
-        if let Err(e) = result {
-            eprintln!("decoding the sound: {e:#}");
-        }
-        if crate::player::debug() {
-            eprintln!("{:>8.3} editor: sound all decoded", crate::player::uptime());
-        }
+    let pcm = kept.sound(source, &tracks, || {
+        media::pcm::decode_streaming(source, &tracks, info.duration, |_, result| {
+            if let Err(e) = result {
+                eprintln!("decoding the sound: {e:#}");
+            }
+            if crate::player::debug() {
+                eprintln!("{:>8.3} editor: sound all decoded", crate::player::uptime());
+            }
+        })
     });
     Ok(Loaded { info, pcm })
 }
 
 enum State {
-    Loading(Receiver<Result<Loaded, String>>),
+    /// Being read (what's kept comes back with it).
+    Loading(Receiver<(Result<Loaded, String>, Kept)>),
     Failed(String),
     Ready(Box<Ready>),
 }
@@ -241,20 +248,22 @@ pub struct Editor {
     /// Where the player was when the editor was opened from it (the clip
     /// preview), to start the timeline there.
     from: Option<Resume>,
-    handoff: Option<Player>,
+    /// What the player handed over, until the clip has loaded; then what's
+    /// kept, to hand back.
+    handoff: Handoff,
 }
 
 impl Editor {
     /// Edit the clip at `clip`. An edited clip is decoded from its original, so
-    /// every earlier decision can still be changed.
-    pub fn open(ctx: &egui::Context, clip: &Path, preview_share: f32, snap: bool, from: Option<Resume>, mut handoff: Option<Player>) -> Self {
+    /// every earlier decision can still be changed. Opened from the player:
+    /// `from` where it was, with what it handed over.
+    pub fn open(ctx: &egui::Context, clip: &Path, preview_share: f32, snap: bool, from: Option<Resume>, mut handoff: Handoff) -> Self {
         let target = EditTarget::of(clip);
-        let state = if media::probed(&target.source).is_some() {
-            match load(&target.source) {
-                Ok(l) => State::Ready(Box::new(Ready::new(ctx, &target, l, snap, from, handoff.take()))),
+        let state = if handoff.kept.info(&target.source).is_some() {
+            match load(&target.source, &mut handoff.kept) {
+                Ok(l) => State::Ready(Box::new(Ready::new(ctx, &target, l, snap, from, &mut handoff))),
                 Err(e) => {
-                    // The player handed over would play on behind the message.
-                    handoff = None;
+                    handoff.let_go();
                     State::Failed(e)
                 }
             }
@@ -262,8 +271,10 @@ impl Editor {
             let (tx, rx) = mpsc::channel();
             let src = target.source.clone();
             let repaint = ctx.clone();
+            let mut kept = std::mem::take(&mut handoff.kept);
             std::thread::spawn(move || {
-                let _ = tx.send(load(&src));
+                let result = load(&src, &mut kept);
+                let _ = tx.send((result, kept));
                 repaint.request_repaint();
             });
             State::Loading(rx)
@@ -271,18 +282,18 @@ impl Editor {
         Self { target, state, preview_share, snap, from, handoff }
     }
 
-    pub fn into_handoff(self) -> (Option<Player>, Option<Filmstrip>) {
-        let State::Ready(mut r) = self.state else { return (None, None) };
-        let player = if r.player.size().is_none() && r.curtain.as_ref().is_some_and(|c| c.size().is_some()) {
-            r.curtain.take()
-        } else if r.saved_crop().is_some() {
-            // The saved clip is cropped, and this plays its original: as the
-            // player's curtain, the whole picture would show for a moment.
-            None
-        } else {
-            Some(r.player)
+    /// Going back to the player: what it takes over (see `handoff.rs`).
+    pub fn into_handoff(self) -> Handoff {
+        let mut handoff = self.handoff;
+        let State::Ready(r) = self.state else {
+            handoff.let_go();
+            return handoff;
         };
-        (player, Some(r.strip))
+        // The saved clip is cropped, and this plays its original: as the
+        // player's curtain, the whole picture would show for a moment.
+        let cropped = r.saved_crop().is_some();
+        let player = (!cropped).then_some(r.player);
+        Handoff::from_screen(player, r.curtain, r.strip, handoff.kept)
     }
 
     /// The clip was renamed from `from` to `to`: saved under the new name.
@@ -293,6 +304,7 @@ impl Editor {
             return;
         }
         self.target.clip = to.to_path_buf();
+        self.handoff.kept.renamed(from, to);
         if self.target.source != from {
             return;
         }
@@ -304,7 +316,7 @@ impl Editor {
                 r.player.renamed(ctx, to);
                 r.strip.renamed(to);
             }
-            _ => *self = Self::open(ctx, to, self.preview_share, self.snap(), self.from, None),
+            _ => *self = Self::open(ctx, to, self.preview_share, self.snap(), self.from, Handoff::default()),
         }
     }
 
@@ -336,12 +348,12 @@ impl Editor {
 
     pub fn ui(&mut self, ui: &mut egui::Ui) -> EditorOutcome {
         if let State::Loading(rx) = &self.state {
-            if let Ok(result) = rx.try_recv() {
+            if let Ok((result, kept)) = rx.try_recv() {
+                self.handoff.kept = kept;
                 self.state = match result {
-                    Ok(l) => State::Ready(Box::new(Ready::new(ui.ctx(), &self.target, l, self.snap, self.from, self.handoff.take()))),
+                    Ok(l) => State::Ready(Box::new(Ready::new(ui.ctx(), &self.target, l, self.snap, self.from, &mut self.handoff))),
                     Err(e) => {
-                        // The player handed over would play on behind the message.
-                        self.handoff = None;
+                        self.handoff.let_go();
                         State::Failed(e)
                     }
                 };
@@ -381,7 +393,7 @@ impl Editor {
 }
 
 impl Ready {
-    fn new(ctx: &egui::Context, target: &EditTarget, l: Loaded, snap: bool, from: Option<Resume>, handoff: Option<Player>) -> Self {
+    fn new(ctx: &egui::Context, target: &EditTarget, l: Loaded, snap: bool, from: Option<Resume>, handoff: &mut Handoff) -> Self {
         let source = &target.source;
         let mut edit = store::load_edit(target).unwrap_or_else(|| Edit::new(&l.info));
         // Sidecar from an older layout or a hand-edited file: make it fit.
@@ -393,7 +405,7 @@ impl Ready {
         let n = l.pcm.len();
         let waves = (0..n).map(|i| crate::waveform::follow(l.pcm.clone(), i, ctx)).collect();
         let playhead = from.map_or(edit.start, |r| settle(&edit.kept(), r.at, l.info.frame_duration()));
-        let (mut player, curtain, taken) = Player::handed_over(ctx, source, &l.info, l.pcm.clone(), gains, handoff);
+        let (mut player, curtain, taken) = Player::handed_over(ctx, source, &l.info, l.pcm.clone(), gains, handoff.player.take());
         if !taken {
             player.seek(playhead);
         }
@@ -404,7 +416,7 @@ impl Ready {
         }
 
         let full = l.info.duration.max(1e-6);
-        let strip = Filmstrip::for_clip(ctx, source, &l.info);
+        let strip = handoff.strip(source).unwrap_or_else(|| Filmstrip::build(ctx, source, &l.info));
         Self {
             info: l.info,
             player,

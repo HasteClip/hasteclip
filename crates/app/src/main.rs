@@ -29,6 +29,7 @@ mod library_view;
 mod library_grid;
 mod links;
 mod glass;
+mod handoff;
 mod hover_play;
 #[cfg(target_os = "macos")]
 mod key_tap;
@@ -89,6 +90,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use egui::Color32;
+use handoff::Handoff;
 use service::{CaptureService, Evt};
 use settings::{Encoder, RecordSettings, SourceKind};
 
@@ -1765,35 +1767,20 @@ impl App {
 // --- Editing: open the editor, render saved edits in the background ---
 impl App {
     pub(crate) fn open_editor(&mut self, clip: PathBuf) {
-        self.open_editor_at(clip, None, None);
+        self.open_editor_at(clip, None, Handoff::default());
     }
 
-    pub(crate) fn open_editor_at(&mut self, clip: PathBuf, from: Option<viewer::Resume>, handoff: Option<player::Player>) {
+    /// Open the editor on `clip`; from the player, `from` where it was, with
+    /// what it hands over (refused while recording: then that's dropped).
+    pub(crate) fn open_editor_at(&mut self, clip: PathBuf, from: Option<viewer::Resume>, handoff: Handoff) {
         if self.rec_state == RecState::Recording {
             self.toast_error("Stop recording before editing a clip.");
             return;
         }
         self.listen_as_set();
-        Self::warm_view(&clip);
         Self::warm_keys(&clip);
         self.editor = Some(editor::Editor::open(&self.ctx(), &clip, self.settings.editor_preview_share, self.settings.editor_snap, from, handoff));
         self.page = Page::Edit;
-    }
-
-    fn warm_edit(clip: &std::path::Path) {
-        let clip = clip.to_path_buf();
-        std::thread::spawn(move || {
-            let _ = media::probe(&store::EditTarget::of(&clip).source);
-        });
-    }
-
-    fn warm_view(clip: &std::path::Path) {
-        let clip = clip.to_path_buf();
-        std::thread::spawn(move || {
-            if store::EditTarget::of(&clip).source != clip {
-                let _ = media::probe(&clip);
-            }
-        });
     }
 
     fn warm_keys(clip: &std::path::Path) {
@@ -1811,19 +1798,20 @@ impl App {
 
     /// Play a clip in the app's own viewer.
     pub(crate) fn open_viewer(&mut self, clip: PathBuf) {
-        self.open_viewer_at(clip, None, None);
+        self.open_viewer_at(clip, None, Handoff::default());
     }
 
-    pub(crate) fn open_viewer_at(&mut self, clip: PathBuf, resume: Option<viewer::Resume>, handoff: Option<player::Player>) {
+    /// Play `clip`: at `resume`, with what the editor hands over.
+    pub(crate) fn open_viewer_at(&mut self, clip: PathBuf, resume: Option<viewer::Resume>, handoff: Handoff) {
         self.listen_as_set();
-        Self::warm_edit(&clip);
         self.viewer = Some(self.viewer_for(&clip, resume, handoff));
         self.page = Page::View;
     }
 
     /// A viewer for this clip: its "Saving your edit" screen while an edit
-    /// of it is still being written, the clip otherwise.
-    fn viewer_for(&self, clip: &std::path::Path, resume: Option<viewer::Resume>, handoff: Option<player::Player>) -> viewer::Viewer {
+    /// of it is still being written (what was handed over goes: the clip's
+    /// file is about to be replaced), the clip otherwise.
+    fn viewer_for(&self, clip: &std::path::Path, resume: Option<viewer::Resume>, handoff: Handoff) -> viewer::Viewer {
         if self.renders.iter().any(|j| !j.as_new && j.source == clip) {
             viewer::Viewer::saving(clip, resume)
         } else {
@@ -1884,17 +1872,14 @@ impl App {
             viewer::ViewerOutcome::Edit => {
                 let clip = v.clip().to_path_buf();
                 self.reveal_clip = Some(clip.clone());
-                let (handoff, strip) = self.viewer.take().map_or((None, None), viewer::Viewer::into_handoff);
-                if let Some(strip) = strip {
-                    filmstrip::Filmstrip::hand_over(strip);
-                }
+                let handoff = self.viewer.take().map(viewer::Viewer::into_handoff).unwrap_or_default();
                 self.page = Page::Clips;
                 self.open_editor_at(clip.clone(), from, handoff);
                 if self.page == Page::Edit {
                     self.edit_return = Some(clip);
                 }
             }
-            viewer::ViewerOutcome::Open(clip) => self.viewer = Some(self.viewer_for(&clip, None, None)),
+            viewer::ViewerOutcome::Open(clip) => self.viewer = Some(self.viewer_for(&clip, None, Handoff::default())),
             viewer::ViewerOutcome::InCollection(id, add) => {
                 let clip = v.clip().to_path_buf();
                 self.put_in_collection(&[clip], &id, add);
@@ -1948,13 +1933,15 @@ impl App {
         match outcome {
             editor::EditorOutcome::Stay => {}
             editor::EditorOutcome::Keys => self.show_keys = Some(shell::Keys::Editor),
-            editor::EditorOutcome::Close => self.close_editor(),
+            editor::EditorOutcome::Close => self.close_editor(true),
             editor::EditorOutcome::Reverted(target) => {
                 match store::revert(&target) {
                     Ok(()) => self.toast("Reverted to the original clip"),
                     Err(e) => self.toast_error(format!("Couldn't revert: {e}")),
                 }
-                self.close_editor();
+                // The original is the clip again: nothing the editor read of
+                // either file is what's there now.
+                self.close_editor(false);
             }
             editor::EditorOutcome::Rename => {
                 if let Some(ed) = &self.editor {
@@ -1964,17 +1951,21 @@ impl App {
             }
             editor::EditorOutcome::Saved { target, info, edit, new_name, then } => {
                 self.start_render(target, info, edit, new_name, then);
-                self.close_editor();
+                self.close_editor(true);
             }
             editor::EditorOutcome::FreeUp(target, how) => {
-                // Closed first: the editor reads the original.
-                self.close_editor();
+                // Closed first: the editor reads the original (about to
+                // change, so nothing of it is handed on).
+                self.close_editor(false);
                 self.start_free_up(target, how);
             }
         }
     }
 
-    fn close_editor(&mut self) {
+    /// Close the editor. Opened from the player: back to it, which takes over
+    /// what the editor had (`hand_on`; not when the clip's files are about to
+    /// change).
+    fn close_editor(&mut self, hand_on: bool) {
         let Some(ed) = self.editor.take() else {
             self.page = Page::Clips;
             return;
@@ -1982,15 +1973,17 @@ impl App {
         let clip = ed.clip().to_path_buf();
         // Where its playhead is, to put the player there too.
         let resume = ed.resume();
-        let (handoff, strip) = ed.into_handoff();
+        let handoff = if hand_on {
+            ed.into_handoff()
+        } else {
+            drop(ed); // stops its audio and decoders
+            Handoff::default()
+        };
         self.page = Page::Clips;
         self.refresh_clips();
         // Opened from the player: back to it, on this clip (renamed meanwhile,
         // it's the new name). While its edit saves, the player waits for it.
         if self.edit_return.take().is_some() {
-            if let Some(strip) = strip {
-                filmstrip::Filmstrip::hand_over(strip);
-            }
             self.open_viewer_at(clip, resume, handoff);
         }
     }
@@ -2120,7 +2113,7 @@ impl App {
                     proxy::prebuild(&self.ctx(), &path);
                     if !job.as_new && self.viewer.as_ref().is_some_and(|v| v.is_saving() && v.clip() == job.source) {
                         let resume = self.viewer.as_ref().and_then(|v| v.resume());
-                        self.open_viewer_at(job.source.clone(), resume, None);
+                        self.open_viewer_at(job.source.clone(), resume, Handoff::default());
                     }
                     // Highlight the card that changed: the new clip, or the edited one.
                     let card = if job.as_new { path } else { job.source };
@@ -2135,7 +2128,7 @@ impl App {
                     // The player waiting for it shows the clip as it was.
                     if self.viewer.as_ref().is_some_and(|v| v.is_saving() && v.clip() == job.source) {
                         let resume = self.viewer.as_ref().and_then(|v| v.resume());
-                        self.open_viewer_at(job.source.clone(), resume, None);
+                        self.open_viewer_at(job.source.clone(), resume, Handoff::default());
                     }
                 }
             }

@@ -17,7 +17,6 @@
 //! clip's keyframes, from `media::keyframe_strip`: the ones to show are
 //! decided before any is decoded, so each appears once.
 
-use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 
@@ -30,8 +29,9 @@ const HEIGHT: u32 = 112;
 const MAX_THUMBS: usize = 160;
 
 pub struct Filmstrip {
+    /// The file it shows (the player and the editor hand it on, to the one
+    /// showing the same file).
     source: PathBuf,
-    stamp: Option<media::Stamp>,
     kind: Kind,
 }
 
@@ -41,14 +41,10 @@ enum Kind {
     Keys(Keys),
 }
 
-thread_local! {
-    static HANDED_OVER: RefCell<Option<Filmstrip>> = const { RefCell::new(None) };
-}
-
 impl Filmstrip {
     pub fn build(ctx: &egui::Context, source: &Path, info: &ClipInfo) -> Self {
         let kind = Self::kind(ctx, source, info);
-        Self { source: source.to_path_buf(), stamp: media::stamp(source), kind }
+        Self { source: source.to_path_buf(), kind }
     }
 
     fn kind(ctx: &egui::Context, source: &Path, info: &ClipInfo) -> Kind {
@@ -60,19 +56,8 @@ impl Filmstrip {
         Kind::Keys(Keys::build(ctx, source))
     }
 
-    pub fn for_clip(ctx: &egui::Context, source: &Path, info: &ClipInfo) -> Self {
-        match HANDED_OVER.with(|h| h.borrow_mut().take()) {
-            Some(strip) if strip.source.as_path() == source && strip.unchanged() => strip,
-            _ => Self::build(ctx, source, info),
-        }
-    }
-
-    pub fn hand_over(strip: Filmstrip) {
-        HANDED_OVER.with(|h| *h.borrow_mut() = Some(strip));
-    }
-
-    fn unchanged(&self) -> bool {
-        self.stamp.is_some() && self.stamp == media::stamp(&self.source)
+    pub fn source(&self) -> &Path {
+        &self.source
     }
 
     /// Paint into `lane`, which shows `from..to` seconds of a clip `dur` long.
@@ -95,7 +80,6 @@ impl Filmstrip {
     /// a fallback that opens it again needs the new name.
     pub fn renamed(&mut self, to: &Path) {
         self.source = to.to_path_buf();
-        self.stamp = media::stamp(to);
         match &mut self.kind {
             #[cfg(hw_decode)]
             Kind::Exact(e) => e.source = to.to_path_buf(),
