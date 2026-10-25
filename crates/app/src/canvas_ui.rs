@@ -84,7 +84,11 @@ struct ScreenHold {
     start: Rect,
     crop: Option<ScreenCrop>,
     picture: Option<f32>,
+    /// As it shows: turned and flipped (the part and the display's size
+    /// are as they show; its crop is kept in the display's own pixels, this big).
     cropping_from: Option<(Rect, Rect, (u32, u32))>,
+    turned: Turned,
+    display: (u32, u32),
 }
 
 impl ScreenHold {
@@ -97,12 +101,21 @@ impl ScreenHold {
         match self.cropping_from.filter(|_| mods.crop) {
             Some((start, part, display)) => {
                 let (b, crop) = screen_crop_drag(start, part, display, self.handle, dx, dy, mods.keep);
-                // Its picture's what's kept of the display now.
+                // Its picture's what's kept of the display now, as it shows.
                 let (w, h) = crop.map_or(display, |c| (c.w, c.h));
-                (b, crop, Some(w as f32 / h.max(1) as f32))
+                (b, crop.map(|c| self.own_crop(c, display)), Some(w as f32 / h.max(1) as f32))
             }
             None => (screen_drag(self.start, self.handle, dx, dy, mods.snap, mods.keep, lines), self.crop, self.picture),
         }
+    }
+
+    /// A crop as it shows (of a display `shown` big, as it shows) in the
+    /// display's own pixels, on even ones.
+    fn own_crop(&self, c: ScreenCrop, shown: (u32, u32)) -> ScreenCrop {
+        let [x, y] = c.at.unwrap_or([shown.0.saturating_sub(c.w) / 2, shown.1.saturating_sub(c.h) / 2]);
+        let r = self.turned.part(Rect::from_min_size(Pos2::new(x as f32, y as f32), vec2(c.w as f32, c.h as f32)), self.display, true);
+        let even = |v: f32| ((v.max(0.0) / 2.0).round() as u32) * 2;
+        ScreenCrop { w: even(r.width()), h: even(r.height()), at: Some([even(r.min.x), even(r.min.y)]) }
     }
 }
 
@@ -230,6 +243,61 @@ pub(crate) fn in_video(shown: Rect, part: Rect) -> (Rect, Rect) {
     (seen, Rect::from_min_max(at(seen.min), at(seen.max)))
 }
 
+/// How the screen's picture is turned and flipped (its settings'), to map
+/// a part of the display between its own pixels (where its crop is kept)
+/// and the picture as it shows (what's dragged on the preview).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(crate) struct Turned {
+    turns: u8,
+    flip_h: bool,
+    flip_v: bool,
+}
+
+impl Turned {
+    pub(crate) fn of(s: &crate::settings::ScreenCfg) -> Self {
+        Self { turns: s.turns % 4, flip_h: s.flip_h, flip_v: s.flip_v }
+    }
+
+    fn placement(self) -> capture::ScreenPlacement {
+        capture::ScreenPlacement { turns: self.turns, flip_h: self.flip_h, flip_v: self.flip_v, ..capture::ScreenPlacement::whole(capture::Framing::Stretch) }
+    }
+
+    /// A picture `size` big, as it shows.
+    pub(crate) fn size(self, size: (u32, u32)) -> (u32, u32) {
+        self.placement().turned(size)
+    }
+
+    /// A point of the picture (0 to 1 across and down it, its own way
+    /// round) where it shows: turned, then flipped (`unturn` the other way).
+    fn show(self, (s, t): (f32, f32)) -> (f32, f32) {
+        let (mut u, mut v) = match self.turns % 4 {
+            1 => (1.0 - t, s),
+            2 => (1.0 - s, 1.0 - t),
+            3 => (t, 1.0 - s),
+            _ => (s, t),
+        };
+        if self.flip_h {
+            u = 1.0 - u;
+        }
+        if self.flip_v {
+            v = 1.0 - v;
+        }
+        (u, v)
+    }
+
+    /// Part `r` of a picture `own` pixels big (its own pixels) in the
+    /// picture as it shows (its pixels), or (`back`) the other way.
+    pub(crate) fn part(self, r: Rect, own: (u32, u32), back: bool) -> Rect {
+        let (from, to) = if back { (self.size(own), own) } else { (own, self.size(own)) };
+        let map = |p: Pos2| {
+            let q = (p.x / from.0.max(1) as f32, p.y / from.1.max(1) as f32);
+            let (u, v) = if back { self.placement().unturn(q) } else { self.show(q) };
+            Pos2::new(u * to.0 as f32, v * to.1 as f32)
+        };
+        Rect::from_two_pos(map(r.min), map(r.max))
+    }
+}
+
 /// A box in the middle of the video, its size kept.
 pub(crate) fn centred(r: Rect) -> Rect {
     Rect::from_min_size(Pos2::new((1.0 - r.width()) / 2.0, (1.0 - r.height()) / 2.0), r.size())
@@ -299,7 +367,8 @@ pub(crate) fn screen_crop_drag(start: Rect, part: Rect, (dw, dh): (u32, u32), ha
 
 impl App {
     /// The screen's picture's size: what's kept of it, cropped (the main
-    /// display's, for games and apps). The display's is asked for now and then.
+    /// display's, for games and apps), as it shows (turned). The display's
+    /// is asked for now and then.
     pub(crate) fn screen_picture(&mut self) -> Option<(u32, u32)> {
         let source = self.video_source();
         if self.canvas.picture.as_ref().is_none_or(|(s, _, at)| *s != source || at.elapsed() > std::time::Duration::from_secs(2)) {
@@ -307,7 +376,8 @@ impl App {
             self.canvas.picture = Some((source, size, std::time::Instant::now()));
         }
         let crop = self.settings.screen_placement().crop;
-        self.canvas.picture.as_ref().and_then(|(_, size, _)| *size).map(|size| capture::cropped_size(crop, size))
+        let turned = Turned::of(&self.settings.screen);
+        self.canvas.picture.as_ref().and_then(|(_, size, _)| *size).map(|size| turned.size(capture::cropped_size(crop, size)))
     }
 
     /// The screen's picture's shape (width / height), as `screen_picture`.
@@ -635,9 +705,9 @@ impl App {
         // mirrored picture's left is the camera's right), and the display's,
         // are green if cropped (not one past the video: the video's edge
         // is drawn there).
-        let [cl, ct, cr, cb] = match (webcam, self.screen_crop_rect()) {
+        let [cl, ct, cr, cb] = match (webcam, self.screen_crop_shown()) {
             (Some(p), _) => p.crop.map(|c| c > 0.0),
-            (None, Some(([x, y, w, h], (dw, dh)))) if active == Layer::Screen => [x > 0, y > 0, x + w < dw & !1, y + h < dh & !1],
+            (None, Some((r, (dw, dh)))) if active == Layer::Screen => [r.min.x > 0.5, r.min.y > 0.5, r.max.x < (dw & !1) as f32 - 0.5, r.max.y < (dh & !1) as f32 - 0.5],
             _ => [false; 4],
         };
         let (flip_h, flip_v) = webcam.map_or((false, false), |p| (p.flip_h, p.flip_v));
@@ -714,7 +784,8 @@ impl App {
         }
         let picture = self.settings.screen.placed.and_then(|b| b.picture_aspect);
         let cropping_from = (handle != Handle::Move).then(|| self.screen_crop_hold(aspect)).flatten();
-        Drag::Screen(ScreenHold { handle, from, start: shown, crop: self.settings.screen_crop, picture, cropping_from })
+        let (turned, display) = (Turned::of(&self.settings.screen), self.crop_whole().unwrap_or_default());
+        Drag::Screen(ScreenHold { handle, from, start: shown, crop: self.settings.screen_crop, picture, cropping_from, turned, display })
     }
 
     /// The screen's crop as it is (left, top, width, height in the
@@ -726,6 +797,15 @@ impl App {
         Some((rect, (dw, dh)))
     }
 
+    /// [`screen_crop_rect`](Self::screen_crop_rect) as the screen shows,
+    /// turned and flipped: the part kept, and the display's size.
+    fn screen_crop_shown(&self) -> Option<(Rect, (u32, u32))> {
+        let ([x, y, w, h], display) = self.screen_crop_rect()?;
+        let turned = Turned::of(&self.settings.screen);
+        let part = Rect::from_min_size(Pos2::new(x as f32, y as f32), vec2(w as f32, h as f32));
+        Some((turned.part(part, display, false), turned.size(display)))
+    }
+
     /// The screen as it's taken hold of to crop it (Alt with a handle): its
     /// box, the part of the display it shows, and the display's size. Past
     /// the video's edges (Fill's middle, a screen bigger than the video),
@@ -733,10 +813,32 @@ impl App {
     /// what's cropped is what's seen. `None` when it can't be cropped (see
     /// `screen_crop_rect`).
     fn screen_crop_hold(&mut self, aspect: f32) -> Option<(Rect, Rect, (u32, u32))> {
-        let ([x, y, w, h], display) = self.screen_crop_rect()?;
-        let part = Rect::from_min_size(Pos2::new(x as f32, y as f32), vec2(w as f32, h as f32));
+        let (part, display) = self.screen_crop_shown()?;
         let (shown, part) = in_video(self.screen_rect(aspect), part);
         Some((shown, part, display))
+    }
+
+    /// The screen turned a quarter more, clockwise (`by` 1) or anticlockwise
+    /// (-1), as it's seen (mirrored, it turns the other way under its
+    /// mirror, as the webcam's does). Its box takes the new shape around its
+    /// middle, shrunk to stay in the video if it was in it; put in by Fill,
+    /// Fit or Stretch, it's put in again. Its crop stays on the same part of
+    /// the display.
+    pub(crate) fn screen_turn(&mut self, by: i8, aspect: f32) {
+        let s = &mut self.settings.screen;
+        let by = if s.flip_h != s.flip_v { -by } else { by };
+        s.turns = (s.turns as i8 + by).rem_euclid(4) as u8;
+        let Some(b) = s.placed else { return };
+        let r = Rect::from_min_size(Pos2::new(b.x, b.y), vec2(b.w, b.h));
+        let mut size = vec2(r.height() / aspect, r.width() * aspect);
+        if r.width() <= 1.0 + 1e-4 && r.height() <= 1.0 + 1e-4 {
+            size *= (1.0 / size.x).min(1.0 / size.y).min(1.0);
+        }
+        let mut t = Rect::from_center_size(r.center(), size);
+        if size.x <= 1.0 && size.y <= 1.0 {
+            t = t.translate(vec2((-t.min.x).max(0.0) - (t.max.x - 1.0).max(0.0), (-t.min.y).max(0.0) - (t.max.y - 1.0).max(0.0)));
+        }
+        s.placed = Some(BoxCfg::new([t.min.x, t.min.y, t.width(), t.height()], aspect, b.picture_aspect.map(|a| 1.0 / a)));
     }
 
     /// The screen back over all of the video (Reset).
@@ -756,83 +858,68 @@ impl App {
         self.settings.screen.placed = None;
     }
 
-    /// A source's menu (right-click it on the preview, or its card's ⋯):
-    /// its place back as it was, the webcam's turns and flips, which is in
-    /// front, and taking the webcam out.
+    /// A source's menu (right-click it on the preview, or its card's ⋯),
+    /// the same for both as far as each goes: how the video puts the screen
+    /// in (a video of a shape of its own), its position, size and crop
+    /// back, turning, mirroring and flipping it, which is in front, and
+    /// taking the webcam out.
     pub(crate) fn layer_menu(&mut self, ui: &mut egui::Ui, layer: Layer, aspect: f32) {
-        match layer {
-            Layer::Screen => {
-                // How it fills a video of its own shape: its position and size both.
-                if self.video_shaped() {
-                    let now = self.settings.screen.placed.is_none().then_some(self.settings.framing);
-                    for (framing, _, label, tip) in FRAMINGS {
-                        if Item::new(label).check(now == Some(framing)).tip(tip).show(ui).clicked() {
-                            self.screen_framed(framing);
-                            ui.close();
-                        }
-                    }
-                    crate::ui_kit::menu_sep(ui);
-                }
-                // Each on its own: both are where the video puts it.
-                let (position, size) = self.screen_resettable(aspect);
-                if Item::new("Reset position").icon(icon::ARROWS_OUT_CARDINAL).enabled(position).tip("Back in the middle of the video, its size kept").show(ui).clicked() {
-                    self.screen_reset_position(aspect);
-                    ui.close();
-                }
-                let tip = if self.video_shaped() { "Back to the size the video gives it, where it is" } else { "As big as the video again, where it is" };
-                if Item::new("Reset size").icon(icon::RESIZE).enabled(size).tip(tip).show(ui).clicked() {
-                    self.screen_reset_size(aspect);
-                    ui.close();
-                }
-                if self.crop_whole().is_some() {
-                    let cropped = self.settings.screen_crop.is_some_and(|c| !c.is_none());
-                    if Item::new("Reset crop").icon(icon::CROP).enabled(cropped).tip("All of the screen again").show(ui).clicked() {
-                        self.settings.screen_crop = None;
-                        ui.close();
-                    }
-                }
-            }
-            Layer::Webcam => {
-                // Each on its own: both are the bottom-right corner, a quarter of the video wide.
-                let (position, size) = self.webcam_resettable();
-                if Item::new("Reset position").icon(icon::ARROWS_OUT_CARDINAL).enabled(position).tip("Back to the bottom-right corner, its size kept").show(ui).clicked() {
-                    self.webcam_reset_position(aspect);
-                    ui.close();
-                }
-                if Item::new("Reset size").icon(icon::RESIZE).enabled(size).tip("A quarter of the video wide again, where it is").show(ui).clicked() {
-                    self.webcam_reset_size(aspect);
-                    ui.close();
-                }
-                let cropped = self.webcam_placement().is_some_and(|p| p.crop.iter().any(|c| *c > 0.0));
-                if Item::new("Reset crop").icon(icon::CROP).enabled(cropped).tip("All of the camera's picture again").show(ui).clicked() {
-                    self.webcam_uncropped(aspect);
-                    ui.close();
-                }
-                crate::ui_kit::menu_sep(ui);
-                let change = |this: &mut Self, f: &dyn Fn(Placement) -> Placement| {
-                    if let Some(w) = this.settings.webcam.as_mut() {
-                        w.placement = PlacementCfg::laid_out(f(w.placement.into()), aspect);
-                    }
-                };
-                if Item::new("Turn clockwise").icon(icon::ARROW_CLOCKWISE).show(ui).clicked() {
-                    change(self, &|p| webcam_ui::contain(p.turn(1, aspect)));
-                    ui.close();
-                }
-                if Item::new("Turn anticlockwise").icon(icon::ARROW_COUNTER_CLOCKWISE).show(ui).clicked() {
-                    change(self, &|p| webcam_ui::contain(p.turn(-1, aspect)));
-                    ui.close();
-                }
-                crate::ui_kit::menu_sep(ui);
-                let p: Option<Placement> = self.webcam_placement();
-                if Item::new("Mirror").icon(icon::FLIP_HORIZONTAL).check(p.is_some_and(|p| p.flip_h)).tip("Flip left to right").show(ui).clicked() {
-                    change(self, &|p| Placement { flip_h: !p.flip_h, ..p });
-                    ui.close();
-                }
-                if Item::new("Flip upside down").icon(icon::FLIP_VERTICAL).check(p.is_some_and(|p| p.flip_v)).show(ui).clicked() {
-                    change(self, &|p| Placement { flip_v: !p.flip_v, ..p });
+        let screen = layer == Layer::Screen;
+        // How the video puts the screen in: its position and size both.
+        if screen && self.video_shaped() {
+            let now = self.settings.screen.placed.is_none().then_some(self.settings.framing);
+            for (framing, _, label, tip) in FRAMINGS {
+                if Item::new(label).check(now == Some(framing)).tip(tip).show(ui).clicked() {
+                    self.screen_framed(framing);
                     ui.close();
                 }
             }
+            crate::ui_kit::menu_sep(ui);
+        }
+        // Each on its own; both are its first place and size.
+        let (position, size) = if screen { self.screen_resettable(aspect) } else { self.webcam_resettable() };
+        let (place_tip, size_tip) = match layer {
+            Layer::Screen if self.video_shaped() => ("Back in the middle of the video, its size kept", "Back to the size the video gives it, where it is"),
+            Layer::Screen => ("Back in the middle of the video, its size kept", "As big as the video again, where it is"),
+            Layer::Webcam => ("Back to the bottom-right corner, its size kept", "A quarter of the video wide again, where it is"),
+        };
+        if Item::new("Reset position").icon(icon::ARROWS_OUT_CARDINAL).enabled(position).tip(place_tip).show(ui).clicked() {
+            if screen { self.screen_reset_position(aspect) } else { self.webcam_reset_position(aspect) }
+            ui.close();
+        }
+        if Item::new("Reset size").icon(icon::RESIZE).enabled(size).tip(size_tip).show(ui).clicked() {
+            if screen { self.screen_reset_size(aspect) } else { self.webcam_reset_size(aspect) }
+            ui.close();
+        }
+        // Its crop: a display's or the camera's (games and apps have none).
+        if !screen || self.crop_whole().is_some() {
+            let cropped = if screen { self.settings.screen_crop.is_some_and(|c| !c.is_none()) } else { self.webcam_placement().is_some_and(|p| p.crop.iter().any(|c| *c > 0.0)) };
+            let tip = if screen { "All of the screen again" } else { "All of the camera's picture again" };
+            if Item::new("Reset crop").icon(icon::CROP).enabled(cropped).tip(tip).show(ui).clicked() {
+                if screen { self.settings.screen_crop = None } else { self.webcam_uncropped(aspect) }
+                ui.close();
+            }
+        }
+        crate::ui_kit::menu_sep(ui);
+        // Turned a quarter at a time, as it's seen.
+        for (label, ic, by) in [("Turn clockwise", icon::ARROW_CLOCKWISE, 1), ("Turn anticlockwise", icon::ARROW_COUNTER_CLOCKWISE, -1)] {
+            if Item::new(label).icon(ic).show(ui).clicked() {
+                self.turn_layer(layer, by, aspect);
+                ui.close();
+            }
+        }
+        crate::ui_kit::menu_sep(ui);
+        let (mirrored, upside_down) = match layer {
+            Layer::Screen => (self.settings.screen.flip_h, self.settings.screen.flip_v),
+            Layer::Webcam => self.webcam_placement().map_or((false, false), |p| (p.flip_h, p.flip_v)),
+        };
+        if Item::new("Mirror").icon(icon::FLIP_HORIZONTAL).check(mirrored).tip("Flip left to right").show(ui).clicked() {
+            self.flip_layer(layer, true, aspect);
+            ui.close();
+        }
+        if Item::new("Flip upside down").icon(icon::FLIP_VERTICAL).check(upside_down).show(ui).clicked() {
+            self.flip_layer(layer, false, aspect);
+            ui.close();
         }
         // Which is in front: only with both in the video.
         let both = self.settings.screen.enabled && self.settings.webcam.as_ref().is_some_and(|w| w.enabled);
@@ -850,6 +937,38 @@ impl App {
             if Item::new("Remove the webcam").icon(icon::TRASH).danger().tip("Take it out of your clips, and forget its place").show(ui).clicked() {
                 self.settings.webcam = None;
                 ui.close();
+            }
+        }
+    }
+
+    /// A source turned a quarter more, clockwise (`by` 1) or
+    /// anticlockwise, as it's seen.
+    fn turn_layer(&mut self, layer: Layer, by: i8, aspect: f32) {
+        match layer {
+            Layer::Screen => self.screen_turn(by, aspect),
+            Layer::Webcam => {
+                if let Some(w) = self.settings.webcam.as_mut() {
+                    let p: Placement = w.placement.into();
+                    w.placement = PlacementCfg::laid_out(webcam_ui::contain(p.turn(by, aspect)), aspect);
+                }
+            }
+        }
+    }
+
+    /// A source mirrored (`across`: left and right swapped), or flipped
+    /// upside down; again, back.
+    fn flip_layer(&mut self, layer: Layer, across: bool, aspect: f32) {
+        match layer {
+            Layer::Screen => {
+                let s = &mut self.settings.screen;
+                if across { s.flip_h = !s.flip_h } else { s.flip_v = !s.flip_v }
+            }
+            Layer::Webcam => {
+                if let Some(w) = self.settings.webcam.as_mut() {
+                    let p: Placement = w.placement.into();
+                    let p = if across { Placement { flip_h: !p.flip_h, ..p } } else { Placement { flip_v: !p.flip_v, ..p } };
+                    w.placement = PlacementCfg::laid_out(p, aspect);
+                }
             }
         }
     }
@@ -980,7 +1099,7 @@ mod tests {
     fn alt_mid_drag_crops_and_lets_go() {
         let none = Lines::default();
         let start = rect(0.0, 0.0, 1.0, 1.0);
-        let hold = ScreenHold { handle: Handle::SE, from: Pos2::ZERO, start, crop: None, picture: Some(16.0 / 9.0), cropping_from: Some((start, rect(0.0, 0.0, 1920.0, 1080.0), (1920, 1080))) };
+        let hold = ScreenHold { handle: Handle::SE, from: Pos2::ZERO, start, crop: None, picture: Some(16.0 / 9.0), cropping_from: Some((start, rect(0.0, 0.0, 1920.0, 1080.0), (1920, 1080))), turned: Turned::default(), display: (1920, 1080) };
         let mods = |crop: bool, keep: bool| Mods { crop, snap: false, keep };
         // Made half as big, from its top-left corner.
         let (r, crop, picture) = hold.dragged(-0.5, -0.5, mods(false, false), &none);
@@ -1018,6 +1137,33 @@ mod tests {
         assert!(close(resized_in_place(rect(0.3, 0.3, 0.4, 0.4), quarter), rect(0.375, 0.375, 0.25, 0.25)));
         // All of the video, at Fill's size (bigger): over it, in the middle.
         assert!(close(resized_in_place(rect(0.0, 0.0, 1.0, 1.0), vec2(1.0, 1.2)), rect(0.0, -0.1, 1.0, 1.2)));
+    }
+
+    /// A part of a turned or flipped screen, between the display's own
+    /// pixels (where its crop is kept) and the picture as it shows: turned a
+    /// quarter clockwise, its left half is the top half; back, it's the left
+    /// half again; mirrored, the left is the right.
+    #[test]
+    fn a_part_of_a_turned_screen() {
+        let turned = Turned { turns: 1, ..Default::default() };
+        assert_eq!(turned.size((1920, 1080)), (1080, 1920));
+        let left = rect(0.0, 0.0, 960.0, 1080.0);
+        let top = turned.part(left, (1920, 1080), false);
+        assert!(close(top, rect(0.0, 0.0, 1080.0, 960.0)), "{top:?}");
+        assert!(close(turned.part(top, (1920, 1080), true), left));
+        let mirrored = Turned { flip_h: true, ..Default::default() };
+        assert!(close(mirrored.part(left, (1920, 1080), false), rect(960.0, 0.0, 960.0, 1080.0)));
+        // A crop dragged as it shows (its top half), kept in the display's pixels.
+        let hold = ScreenHold { handle: Handle::S, from: Pos2::ZERO, start: rect(0.0, 0.0, 1.0, 1.0), crop: None, picture: None, cropping_from: None, turned, display: (1920, 1080) };
+        assert_eq!(hold.own_crop(ScreenCrop { w: 1080, h: 960, at: Some([0, 0]) }, (1080, 1920)), ScreenCrop { w: 960, h: 1080, at: Some([0, 0]) });
+        // Every way round, there and back.
+        for turns in 0..4 {
+            for (flip_h, flip_v) in [(false, false), (true, false), (false, true), (true, true)] {
+                let t = Turned { turns, flip_h, flip_v };
+                let part = rect(100.0, 200.0, 300.0, 400.0);
+                assert!(close(t.part(t.part(part, (1920, 1080), false), (1920, 1080), true), part), "{t:?}");
+            }
+        }
     }
 
     /// Guides show for the lines a box is on.

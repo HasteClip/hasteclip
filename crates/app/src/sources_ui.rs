@@ -926,12 +926,14 @@ impl App {
     }
 
     /// The size a video would be to show the screen's crop as it is (even,
-    /// as big as a video can be), when it's cropped and fills the video.
+    /// as big as a video can be; turned, as it shows), when it's cropped and
+    /// fills the video.
     fn crop_size(&self) -> Option<(u32, u32)> {
         let (sw, sh) = self.crop_whole()?;
         let crop = self.settings.screen_crop.filter(|c| !c.is_none() && self.settings.screen.placed.is_none())?;
         let [_, _, w, h] = capture::Crop::from(crop).rect(sw, sh);
-        ((w, h) != (sw & !1, sh & !1)).then(|| capture::output_size(w, h, None))
+        let (w, h) = crate::canvas_ui::Turned::of(&self.settings.screen).size((w, h));
+        ((w, h) != crate::canvas_ui::Turned::of(&self.settings.screen).size((sw & !1, sh & !1))).then(|| capture::output_size(w, h, None))
     }
 
     /// The display's own size, uncropped, when it's known.
@@ -985,7 +987,9 @@ impl App {
         // What the video does with it, when it fills the video: the video's
         // size, the crop's (as a video can be), and why that can't change now.
         let video = capture::frame_size(&self.video_source(), self.settings.video_size());
-        let matched = capture::output_size(w, h, None);
+        // The crop as it shows in the video: turned, if the screen is.
+        let (tw, th) = crate::canvas_ui::Turned::of(&self.settings.screen).size((w, h));
+        let matched = capture::output_size(tw, th, None);
         let filling = self.settings.screen.placed.is_none() && (w, h) != (sw & !1, sh & !1);
         let size_lock = (self.rec_state != crate::RecState::Idle).then(|| "Stop clipping to change your video's size: it's set when clipping starts".to_owned());
         let mut match_crop = false;
@@ -1095,8 +1099,8 @@ impl App {
                     let note = if (vw, vh) == matched {
                         "The crop's size: every pixel as it is".to_owned()
                     } else {
-                        let (crop_shape, video_shape) = (w as f32 / h.max(1) as f32, vw as f32 / vh.max(1) as f32);
-                        let scale = vh as f32 / capture::Shape { w: vw, h: vh, framing: capture::Framing::Fill }.of(w, h).1.max(1) as f32;
+                        let (crop_shape, video_shape) = (tw as f32 / th.max(1) as f32, vw as f32 / vh.max(1) as f32);
+                        let scale = vh as f32 / capture::Shape { w: vw, h: vh, framing: capture::Framing::Fill }.of(tw, th).1.max(1) as f32;
                         let does = if (crop_shape / video_shape - 1.0).abs() > 0.01 {
                             if crop_shape > video_shape { "the crop's sides are cut off to fit it" } else { "the crop's top and bottom are cut off to fit it" }
                         } else if scale > 1.01 {

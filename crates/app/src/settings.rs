@@ -188,11 +188,16 @@ pub struct ScreenCfg {
     /// Placed by hand: its box. `None`: it fills the video (its middle,
     /// with a shape of the video's own).
     pub placed: Option<BoxCfg>,
+    /// Quarter turns clockwise, then mirrored or flipped upside down, as the
+    /// webcam's: see `capture::ScreenPlacement`.
+    pub turns: u8,
+    pub flip_h: bool,
+    pub flip_v: bool,
 }
 
 impl Default for ScreenCfg {
     fn default() -> Self {
-        Self { enabled: true, in_front: false, placed: None }
+        Self { enabled: true, in_front: false, placed: None, turns: 0, flip_h: false, flip_v: false }
     }
 }
 
@@ -1160,7 +1165,7 @@ impl RecordSettings {
             None => ([0.0, 0.0, 1.0, 1.0], capture::Framing::Fit),
         };
         let crop = self.screen_crop.filter(|c| capture::SCREEN_CROP && !apps && !c.is_none()).map(Into::into);
-        capture::ScreenPlacement { rect, framing, in_front: s.in_front, hidden: !s.enabled, crop, ..capture::ScreenPlacement::whole(framing) }
+        capture::ScreenPlacement { rect, framing, in_front: s.in_front, hidden: !s.enabled, crop, turns: s.turns % 4, flip_h: s.flip_h, flip_v: s.flip_v }
     }
 
     pub fn blend_samples(&self) -> u32 {
