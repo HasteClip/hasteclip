@@ -317,20 +317,33 @@ fn run(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, fps: u32, stop: &Atom
             }
             // The display's picture changed kind (a mode change, a desktop
             // switch, a game going exclusive fullscreen): start again.
-            Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST || e.code() == DXGI_ERROR_INVALID_CALL => again = Some(e.message()),
+            // (Windows words access lost as "The keyed mutex was abandoned.")
+            Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => again = Some("access lost".to_string()),
+            Err(e) if e.code() == DXGI_ERROR_INVALID_CALL => again = Some(e.message()),
             Err(e) => return Err(e).context("Desktop Duplication failed"),
         }
         if let Some(why) = again {
             eprintln!("desktop duplication: lost ({why}); starting again");
+            // Still lost after as long as starting again may take (each one
+            // started is lost too, or sends nothing): given up for now, as
+            // when it can't start, for Windows' capture to stand in.
+            if lost.is_some_and(|l| l.elapsed() > RESTART_FOR) {
+                bail!("Desktop Duplication keeps being lost ({why})");
+            }
+            // Let go of before another starts: one started while it was still
+            // held was lost at its first ask, and so was each one after it,
+            // for good (measured after a mode change: a new one every 100 ms,
+            // the picture frozen; issue #16).
+            drop(d);
             // Not at once when the one before never worked: Windows may be
             // taking each away as it starts.
             if lost.is_some() {
                 thread::sleep(Duration::from_millis(100));
             }
-            match reopen(gpu, monitor, stop, lost.get_or_insert_with(Instant::now))? {
-                Some(new) => d = new,
+            d = match reopen(gpu, monitor, stop, lost.get_or_insert_with(Instant::now))? {
+                Some(new) => new,
                 None => return Ok(()),
-            }
+            };
             // Its first picture, whether or not anything changed.
             first = true;
             held = None;
@@ -366,7 +379,9 @@ fn run(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, fps: u32, stop: &Atom
             }
             if first {
                 first = false;
-                lost = None;
+                if lost.take().is_some() {
+                    eprintln!("desktop duplication: working again ({}×{})", d.size.0, d.size.1);
+                }
                 let _ = ready.send(Ok(()));
             }
         }

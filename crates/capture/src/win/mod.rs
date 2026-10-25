@@ -1832,4 +1832,170 @@ mod tests {
         assert_eq!((img.width, img.height), (w, h));
         assert!(img.bgra.chunks_exact(4).any(|p| p[0] > 16 || p[1] > 16 || p[2] > 16), "all black");
     }
+
+    /// A display's mode, changed for as long as this lives: not saved, so
+    /// dropping it puts back the one in the registry.
+    struct ModeChange(Vec<u16>);
+
+    impl ModeChange {
+        fn to(id: &str, w: u32, h: u32) -> Result<Self> {
+            use windows::Win32::Graphics::Gdi::{CDS_TYPE, ChangeDisplaySettingsExW, DEVMODEW, DISP_CHANGE_SUCCESSFUL, DM_PELSHEIGHT, DM_PELSWIDTH};
+            let name: Vec<u16> = id.encode_utf16().chain([0]).collect();
+            let mut mode = DEVMODEW { dmSize: std::mem::size_of::<DEVMODEW>() as u16, ..Default::default() };
+            mode.dmPelsWidth = w;
+            mode.dmPelsHeight = h;
+            mode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
+            let r = unsafe { ChangeDisplaySettingsExW(windows::core::PCWSTR(name.as_ptr()), Some(&mode), None, CDS_TYPE(0), None) };
+            if r != DISP_CHANGE_SUCCESSFUL {
+                bail!("couldn't change {id} to {w}×{h}: {r:?}");
+            }
+            Ok(Self(name))
+        }
+    }
+
+    impl Drop for ModeChange {
+        fn drop(&mut self) {
+            use windows::Win32::Graphics::Gdi::{CDS_TYPE, ChangeDisplaySettingsExW};
+            unsafe { ChangeDisplaySettingsExW(windows::core::PCWSTR(self.0.as_ptr()), None, None, CDS_TYPE(0), None) };
+        }
+    }
+
+    /// A small square whose grey keeps changing, at `left`, `top` on the
+    /// desktop, so its display's capture always has a new picture. Closed
+    /// once `stop` is set.
+    fn changing_square(left: i32, top: i32, stop: Arc<AtomicBool>) -> JoinHandle<()> {
+        thread::spawn(move || unsafe {
+            use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+            use windows::Win32::Graphics::Gdi::{CreateSolidBrush, DeleteObject, FillRect, GetDC, ReleaseDC};
+            use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+            use windows::Win32::UI::WindowsAndMessaging::*;
+            extern "system" fn proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+                unsafe { DefWindowProcW(h, m, w, l) }
+            }
+            // Where it goes is in the display's own pixels.
+            windows::Win32::UI::HiDpi::SetThreadDpiAwarenessContext(windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            let instance = GetModuleHandleW(None).unwrap();
+            let class = WNDCLASSW { lpfnWndProc: Some(proc), hInstance: instance.into(), lpszClassName: windows::core::w!("hc_changing_square"), ..Default::default() };
+            RegisterClassW(&class);
+            // On top, but never in focus or on the taskbar.
+            let hwnd = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                windows::core::w!("hc_changing_square"),
+                windows::core::w!(""),
+                WS_POPUP | WS_VISIBLE,
+                left,
+                top,
+                96,
+                96,
+                None,
+                None,
+                Some(instance.into()),
+                None,
+            )
+            .unwrap();
+            let dc = GetDC(Some(hwnd));
+            let mut n = 0u32;
+            while !stop.load(Ordering::Relaxed) {
+                let mut msg = MSG::default();
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    DispatchMessageW(&msg);
+                }
+                // A slow ramp of greys, up and down: nothing flashes.
+                let g = 64 + (n % 128).abs_diff(64);
+                let brush = CreateSolidBrush(COLORREF(g | g << 8 | g << 16));
+                FillRect(dc, &RECT { left: 0, top: 0, right: 96, bottom: 96 }, brush);
+                let _ = DeleteObject(brush.into());
+                n += 1;
+                thread::sleep(Duration::from_millis(16));
+            }
+            ReleaseDC(Some(hwnd), dc);
+            let _ = DestroyWindow(hwnd);
+        })
+    }
+
+    /// Issue #16: a display's mode changing while it's recorded (there from
+    /// 1920×1080 to 1440×1080) froze the picture with Desktop Duplication
+    /// until the app was started again: each duplication started again was
+    /// lost at once. Pictures must keep coming, at the new size, and again
+    /// once the mode is back, from Desktop Duplication itself (not Windows'
+    /// capture standing in). `SCREEN=<id>`: a display whose mode may change
+    /// for half a minute; `MODE=WxH`: a mode the system lists for it (turned,
+    /// on a turned display); `METHOD=dupl|wgc`; `HOLD=<s>` in each mode (15).
+    #[test]
+    #[ignore = "changes a display's mode: SCREEN=\\\\.\\DISPLAY2 MODE=1080x1440 METHOD=dupl cargo test -p capture display_mode_change -- --ignored --nocapture"]
+    fn display_mode_change() {
+        let env = |k: &str| std::env::var(k).ok();
+        let mode = env("MODE").and_then(|m| {
+            let (w, h) = m.split_once('x')?;
+            Some((w.parse().ok()?, h.parse().ok()?))
+        });
+        let (Some(id), Some((w, h))) = (env("SCREEN"), mode) else {
+            eprintln!("SCREEN and MODE not set: skipped");
+            return;
+        };
+        // Never the main display instead.
+        assert!(system::list_screens().iter().any(|s| s.id == id), "no display {id}");
+        let hold = Duration::from_secs_f64(env("HOLD").and_then(|s| s.parse().ok()).unwrap_or(15.0));
+        let duplication = env("METHOD").as_deref() != Some("wgc");
+        let method = if duplication { crate::ScreenCapture::Duplication } else { crate::ScreenCapture::Wgc };
+        let settings = EncodeSettings {
+            output_dir: std::env::temp_dir().join("hc-mode-test"),
+            container_ext: "mp4".into(),
+            fps: 30,
+            blend_samples: 1,
+            blend_shape: crate::BlendShape::Even,
+            video_bitrate_kbps: 2000,
+            size: crate::VideoSize { short_side: Some(360), shape: None, exact: None },
+            use_hardware: true,
+            replay_seconds: 5,
+            video: VideoSource::Screen { id: id.clone(), hook: crate::GameHook { auto: false, allowed: Vec::new() }, method },
+            away_screen: None,
+            webcam: None,
+            screen: Arc::new(std::sync::Mutex::new(crate::ScreenPlacement::whole(crate::Framing::Fit))),
+            sources: Vec::new(),
+        };
+        unsafe { windows::Win32::UI::HiDpi::SetThreadDpiAwarenessContext(windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        let mut info = windows::Win32::Graphics::Gdi::MONITORINFO { cbSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::MONITORINFO>() as u32, ..Default::default() };
+        unsafe { windows::Win32::Graphics::Gdi::GetMonitorInfoW(system::find_monitor(&id), &mut info) }.ok().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let square = changing_square(info.rcMonitor.left + 40, info.rcMonitor.top + 40, stop.clone());
+
+        let mut rec = WinRecorder::new(Arc::new(LiveAudio::default()));
+        rec.start(Mode::ReplayBuffer, &settings).unwrap();
+        let latest = rec.session.as_ref().unwrap().switch.as_ref().unwrap().latest.clone();
+        let t0 = Instant::now();
+        let mut seen = latest.arrivals().0;
+        // Pictures a second, over each half second for `for_`, and how the
+        // display was captured at the end.
+        let mut watch = |phase: &str, for_: Duration| {
+            let mut rates = Vec::new();
+            let end = Instant::now() + for_;
+            while Instant::now() < end {
+                thread::sleep(Duration::from_millis(500));
+                let n = latest.arrivals().0;
+                rates.push((n - seen) * 2);
+                eprintln!("{:5.1} s {phase}: {:3} pictures/s, {:?}, {:?}", t0.elapsed().as_secs_f64(), (n - seen) * 2, latest.content(), crate::screen_capture_in_use());
+                seen = n;
+            }
+            (rates, crate::screen_capture_in_use())
+        };
+        let (before, _) = watch("before", Duration::from_secs(3));
+        let changed = ModeChange::to(&id, w, h).unwrap();
+        let (during, during_in_use) = watch("changed", hold);
+        let changed_content = latest.content();
+        drop(changed);
+        let (back, back_in_use) = watch("back", hold);
+        rec.stop(None).unwrap();
+        stop.store(true, Ordering::Relaxed);
+        let _ = square.join();
+
+        // The last 3 s of each.
+        let rate = |v: &[u64]| v[v.len().saturating_sub(6)..].iter().sum::<u64>() as f64 / v.len().clamp(1, 6) as f64;
+        eprintln!("pictures/s: before {:.0}, changed {:.0}, back {:.0}", rate(&before), rate(&during), rate(&back));
+        assert!(rate(&during) > 5.0, "no pictures since the mode changed");
+        assert!(rate(&back) > 5.0, "no pictures since the mode came back");
+        assert_eq!(changed_content, (w, h), "the picture isn't the new mode's size");
+        let own = Some(crate::ScreenCaptureInUse { duplication, fell_back: false });
+        assert_eq!((during_in_use, back_in_use), (own, own), "not captured the way it was asked to be");
+    }
 }
