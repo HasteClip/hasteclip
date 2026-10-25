@@ -1019,7 +1019,7 @@ impl App {
             let sr = overlay_icon(&mut qui, icon::EXPORT, true, "Share");
             let sr = egui::Response { id: share_id, ..sr };
             let linked = self.links.get(&clip.path).is_some();
-            if let Some(c) = ui_kit::menu_popup(&sr, false, 250.0, |ui| share_items(ui, sr.rect.left_bottom(), false, linked, image)).flatten() {
+            if let Some(c) = ui_kit::menu_popup(&sr, false, 250.0, |ui| share_items(ui, sr.rect.left_bottom(), linked, image)).flatten() {
                 action = Some(Action::Share(clip.path.clone(), c));
             }
         }
@@ -1148,7 +1148,7 @@ impl App {
         let at = ui.ctx().pointer_latest_pos().unwrap_or_default();
         let linked = self.links.get(&clip.path).is_some();
         ui_kit::submenu(ui, Item::new("Share").icon(icon::EXPORT), |ui| {
-            if let Some(c) = share_items(ui, at, true, linked, image) {
+            if let Some(c) = share_items(ui, at, linked, image) {
                 action = Some(Action::Share(clip.path.clone(), c));
             }
         });
@@ -1553,10 +1553,11 @@ fn vrule(ui: &mut egui::Ui) {
     ui.painter().vline(r.center().x, r.y_range(), Stroke::new(1.0, p.line2));
 }
 
-/// The ways to get a clip out. `full`: the right-click menu's longer list.
-/// `linked`: the clip has a share link already. `image`: it's a screenshot
-/// (its picture, its file, or where it is).
-pub(crate) fn share_items(ui: &mut egui::Ui, anchor: Pos2, full: bool, linked: bool, image: bool) -> Option<crate::library::ShareChoice> {
+/// The ways to get a clip out, the same from the Share button and the
+/// right-click menu, and that it can be dragged out too. `linked`: the clip
+/// has a share link already. `image`: it's a screenshot (its picture, its
+/// file, or where it is).
+pub(crate) fn share_items(ui: &mut egui::Ui, anchor: Pos2, linked: bool, image: bool) -> Option<crate::library::ShareChoice> {
     use crate::library::ShareChoice;
     let mut choice = None;
     if image {
@@ -1573,7 +1574,7 @@ pub(crate) fn share_items(ui: &mut egui::Ui, anchor: Pos2, full: bool, linked: b
         if Item::new(crate::reveal_label()).icon(icon::FOLDER_OPEN).show(ui).clicked() {
             choice = Some(ShareChoice::Reveal);
         }
-        if !full && share::can_drag_out() {
+        if share::can_drag_out() {
             ui_kit::menu_sep(ui);
             ui_kit::menu_head(ui, "Or drag the screenshot into any app");
         }
@@ -1611,7 +1612,7 @@ pub(crate) fn share_items(ui: &mut egui::Ui, anchor: Pos2, full: bool, linked: b
     if Item::new(crate::reveal_label()).icon(icon::FOLDER_OPEN).show(ui).clicked() {
         choice = Some(ShareChoice::Reveal);
     }
-    if !full && share::can_drag_out() {
+    if share::can_drag_out() {
         ui_kit::menu_sep(ui);
         ui_kit::menu_head(ui, "Or drag the clip into any app");
     }

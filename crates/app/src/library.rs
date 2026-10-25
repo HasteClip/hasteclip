@@ -807,7 +807,7 @@ pub(crate) enum ShareChoice {
 /// right-click menu and the player's Share button. `linked`: the clip has a
 /// share link. `image`: it's a screenshot.
 pub(crate) fn share_menu(ui: &mut egui::Ui, anchor: Pos2, linked: bool, image: bool) -> Option<ShareChoice> {
-    crate::library_view::share_items(ui, anchor, false, linked, image)
+    crate::library_view::share_items(ui, anchor, linked, image)
 }
 
 impl App {
