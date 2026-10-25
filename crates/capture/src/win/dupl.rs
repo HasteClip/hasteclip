@@ -29,7 +29,7 @@ use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 use windows::core::Interface;
 
 use super::d3d::{Gpu, Latest, Shared};
-use super::quad::{Placement, Quad};
+use super::quad::{Placement, Quad, fit_within};
 
 /// How a display is captured (see [`crate::ScreenCapture`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -360,8 +360,8 @@ fn run(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, fps: u32, stop: &Atom
             last_cursor = Some((pos.x, pos.y));
             changed = Instant::now();
             let at = got.unwrap_or_else(super::system::host_now);
-            draw(gpu, &quad, &target, latest, texture, view, &d);
-            cursor.draw_on_screen(gpu, &quad, latest, &target, d.origin, d.size);
+            let drawn = draw(gpu, &quad, &target, latest, texture, view, &d);
+            cursor.draw_on_screen(gpu, &quad, latest, &target, d.origin, d.size, drawn);
             // The same picture with the cursor moved only counts as a new one
             // for frame blending once nothing else has changed for a while (a
             // still screen), as with the game capture hook: else a moving
@@ -370,7 +370,7 @@ fn run(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, fps: u32, stop: &Atom
             if counts {
                 last_new = at;
             }
-            latest.mark(d.size, at, counts);
+            latest.mark(drawn, at, counts);
             unsafe { gpu.context.Flush() };
             if got.is_some() {
                 counted.2 += 1;
@@ -460,7 +460,9 @@ fn copy_frame(
 
 /// Draw the held picture into `latest`, upright, in SDR: a 16-bit float one
 /// is light (an HDR desktop's, or a fullscreen game's that scans out in it),
-/// whatever the display said when the duplication started.
+/// whatever the display said when the duplication started. Shrunk to fit,
+/// keeping its shape, when the display has grown bigger than `latest` (its
+/// mode changed after the capture started). Its size there.
 fn draw(
     gpu: &Gpu,
     quad: &Quad,
@@ -469,11 +471,11 @@ fn draw(
     texture: &ID3D11Texture2D,
     view: &windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
     d: &Duplication,
-) {
+) -> (u32, u32) {
     let mut desc = windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC::default();
     unsafe { texture.GetDesc(&mut desc) };
     let light = desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
-    let (w, h) = (d.size.0.min(latest.width), d.size.1.min(latest.height));
+    let (w, h) = fit_within(d.size.0, d.size.1, latest.width, latest.height);
     let at = Placement {
         dest: [0.0, 0.0, w as f32, h as f32],
         uv: [0.0, 0.0, 1.0, 1.0],
@@ -486,6 +488,7 @@ fn draw(
     } else {
         quad.draw(gpu, target, (latest.width, latest.height), view, &at, true);
     }
+    (w, h)
 }
 
 /// A QueryPerformanceCounter reading in host seconds (see `host_now`).

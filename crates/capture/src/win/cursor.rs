@@ -49,10 +49,13 @@ impl CursorLayer {
 
     /// Draw the cursor over a display's picture in `latest` (through
     /// `target`; `size` of it, from the top-left corner, showing the display
-    /// whose top-left corner is at `origin` on the desktop), wherever it is on
-    /// it, if Windows shows one. Physical pixels: the calling thread is per-monitor DPI aware.
-    pub(crate) fn draw_on_screen(&mut self, gpu: &Gpu, quad: &Quad, latest: &Latest, target: &ID3D11RenderTargetView, origin: (i32, i32), size: (u32, u32)) {
-        if let Err(e) = self.try_place(gpu, quad, latest, target, POINT { x: origin.0, y: origin.1 }, (1.0, 1.0), size) {
+    /// whose top-left corner is at `origin` on the desktop, `display` big:
+    /// smaller when it's shrunk to fit), wherever it is on it, if Windows
+    /// shows one. Physical pixels: the calling thread is per-monitor DPI aware.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn draw_on_screen(&mut self, gpu: &Gpu, quad: &Quad, latest: &Latest, target: &ID3D11RenderTargetView, origin: (i32, i32), display: (u32, u32), size: (u32, u32)) {
+        let scale = (size.0 as f32 / display.0.max(1) as f32, size.1 as f32 / display.1.max(1) as f32);
+        if let Err(e) = self.try_place(gpu, quad, latest, target, POINT { x: origin.0, y: origin.1 }, scale, size) {
             eprintln!("cursor: {e:#}");
         }
     }

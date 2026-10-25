@@ -493,7 +493,8 @@ impl PictureSource {
         // What's captured is copied 1:1 before it's scaled into the frame, so the
         // copy must hold all of it. A display is its own size; an app's window
         // can be on any display — on a portrait one, taller than the frame — so
-        // it gets room for a window on the biggest of them.
+        // it gets room for a window on the biggest of them. A picture bigger
+        // still (a display whose mode grew since) is shrunk to fit it.
         // Room for a window whatever it records now: it can switch to games
         // and apps while it runs.
         let (copy_w, copy_h) = {
@@ -1997,5 +1998,59 @@ mod tests {
         assert_eq!(changed_content, (w, h), "the picture isn't the new mode's size");
         let own = Some(crate::ScreenCaptureInUse { duplication, fell_back: false });
         assert_eq!((during_in_use, back_in_use), (own, own), "not captured the way it was asked to be");
+    }
+
+    /// The pixel at `x`, `y`, as BGRA.
+    fn pixel(gpu: &d3d::Gpu, latest: &d3d::Latest, x: u32, y: u32) -> [u8; 4] {
+        let staging = gpu.texture(1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, 0, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ.0 as u32).unwrap();
+        let region = D3D11_BOX { left: x, top: y, front: 0, right: x + 1, bottom: y + 1, back: 1 };
+        unsafe {
+            gpu.context.CopySubresourceRegion(&staging, 0, 0, 0, 0, &latest.texture, 0, Some(&region));
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            gpu.context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).unwrap();
+            let p = *(mapped.pData as *const [u8; 4]);
+            gpu.context.Unmap(&staging, 0);
+            p
+        }
+    }
+
+    /// A display bigger than the picture it's captured into (its mode grew
+    /// after the capture started) is shrunk to fit, keeping its shape: drawn
+    /// where it fits and nowhere else, not squeezed into all of it (Desktop
+    /// Duplication) or cut off (Windows' capture). Nothing of the screen is
+    /// kept. `SCREEN=<id>` (the main display).
+    #[test]
+    #[ignore = "captures the screen: cargo test -p capture shrinks_a_display_too_big -- --ignored"]
+    fn shrinks_a_display_too_big() {
+        let id = std::env::var("SCREEN").unwrap_or_else(|_| system::list_screens().into_iter().next().expect("a screen").id);
+        let monitor = system::find_monitor(&id);
+        let (w, h) = system::display_pixels(Some(&id)).expect("its size");
+        let gpu = d3d::Gpu::new().unwrap();
+        // Half its size, with room left under it.
+        let (tw, th) = (w / 2, h / 2 + 64);
+        let fitted = quad::fit_within(w, h, tw, th);
+        let magenta = [255, 0, 255, 255];
+        for duplication in [true, false] {
+            let latest = d3d::Latest::new(&gpu, tw, th).unwrap();
+            let target = quad::target_view(&gpu, &latest.texture).unwrap();
+            unsafe { gpu.context.ClearRenderTargetView(&target, &[1.0, 0.0, 1.0, 1.0]) };
+            let method = if duplication { "Desktop Duplication" } else { "Windows' capture" };
+            // Kept until its picture's been looked at.
+            let (dupl, wgc) = if duplication {
+                (Some(dupl::DuplCapture::start(&gpu, monitor, &latest, 30).unwrap()), None)
+            } else {
+                (None, Some(d3d::Capture::start(&gpu, &d3d::monitor_item(monitor).unwrap(), &latest, None, 30).unwrap()))
+            };
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !latest.has_frame() {
+                assert!(Instant::now() < deadline, "{method}: no picture");
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(latest.content(), fitted, "{method}");
+            assert_ne!(pixel(&gpu, &latest, fitted.0 / 2, fitted.1 / 2), magenta, "{method}: nothing drawn where it fits");
+            assert_eq!(pixel(&gpu, &latest, fitted.0 / 2, fitted.1 + 32), magenta, "{method}: drawn past where it fits");
+            eprintln!("{method}: {w}×{h} into {tw}×{th}, as {}×{}", fitted.0, fitted.1);
+            drop((dupl, wgc));
+        }
     }
 }

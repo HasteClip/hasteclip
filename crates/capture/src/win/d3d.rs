@@ -596,6 +596,9 @@ impl Capture {
         let last_frame = Arc::new(Mutex::new(std::time::Instant::now()));
         let last_frame2 = last_frame.clone();
         let counted2 = Mutex::new((std::time::Instant::now(), 0u32));
+        let shrink = Mutex::new(None::<Shrink>);
+        // A frame that couldn't be copied, so it's said once.
+        let failed = AtomicBool::new(false);
         pool.FrameArrived(&TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new(move |pool, _| {
             // Whole captures: the wrappers are what make these Send.
             let (gpu2, device2, window2) = (&gpu2, &device2, &window2);
@@ -606,7 +609,7 @@ impl Capture {
             // exact than when it reaches us; not if it's far off.
             let now = super::system::host_now();
             let shown = frame.SystemRelativeTime().map(|t| t.Duration as f64 / 1e7).ok().filter(|&t| t <= now && t > now - 0.1).unwrap_or(now);
-            let copied = (|| -> windows::core::Result<Option<(u32, u32)>> {
+            let copied = (|| -> Result<Option<(u32, u32)>> {
                 let access: IDirect3DDxgiInterfaceAccess = frame.Surface()?.cast()?;
                 let tex: ID3D11Texture2D = unsafe { access.GetInterface()? };
                 let mut desc = D3D11_TEXTURE2D_DESC::default();
@@ -627,15 +630,31 @@ impl Capture {
                     .map(|(x, y, w, h)| (x.min(cw), y.min(ch), w.min(cw.saturating_sub(x)), h.min(ch.saturating_sub(y))))
                     .filter(|&(_, _, w, h)| w >= 2 && h >= 2)
                     .unwrap_or((0, 0, cw, ch));
-                let (w, h) = (w.min(latest2.width), h.min(latest2.height));
                 if w < 2 || h < 2 {
                     return Ok(None);
                 }
                 let region = D3D11_BOX { left: x, top: y, front: 0, right: x + w, bottom: y + h, back: 1 };
-                unsafe { gpu2.context.CopySubresourceRegion(&latest2.texture, 0, 0, 0, 0, &tex, 0, Some(&region)) };
-                Ok(Some((w, h)))
+                // Too big for `latest` (a display whose mode grew after the
+                // capture started, a window bigger than every display):
+                // shrunk to fit, keeping its shape, not cut off.
+                let fitted = super::quad::fit_within(w, h, latest2.width, latest2.height);
+                if fitted == (w, h) {
+                    unsafe { gpu2.context.CopySubresourceRegion(&latest2.texture, 0, 0, 0, 0, &tex, 0, Some(&region)) };
+                } else {
+                    let mut shrink = shrink.lock().unwrap();
+                    if shrink.is_none() {
+                        *shrink = Some(Shrink::new(gpu2, &latest2)?);
+                    }
+                    shrink.as_mut().unwrap().draw(gpu2, &tex, region, fitted, &latest2)?;
+                }
+                Ok(Some(fitted))
             })();
             let _ = frame.Close();
+            if let Err(e) = &copied
+                && !failed.swap(true, Ordering::Relaxed)
+            {
+                eprintln!("windows' capture: couldn't copy a frame: {e:#}");
+            }
             if let Ok(Some(size)) = copied {
                 // `HASTECLIP_WGC_LOG=1`: how many frames arrive each second.
                 static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -687,6 +706,47 @@ impl Drop for Capture {
         let _ = self.item.RemoveClosed(self.closed_token);
         let _ = self.session.Close();
         let _ = self.pool.Close();
+    }
+}
+
+/// Draws a frame of Windows' capture that's too big for a [`Latest`] into
+/// it, shrunk to fit: its texture is made for the displays as they are when
+/// the capture starts, and a display's mode can grow after. The part kept is
+/// copied out of the frame first, for the shader to read. Made the first
+/// time a frame is too big.
+struct Shrink {
+    quad: super::quad::Quad,
+    /// Draws into the `Latest`.
+    target: ID3D11RenderTargetView,
+    /// The copy, a view to read it through, and its size (made again when
+    /// that changes).
+    copy: Option<(ID3D11Texture2D, ID3D11ShaderResourceView, (u32, u32))>,
+}
+unsafe impl Send for Shrink {}
+
+impl Shrink {
+    fn new(gpu: &Gpu, latest: &Latest) -> Result<Self> {
+        Ok(Self { quad: super::quad::Quad::new(gpu)?, target: super::quad::target_view(gpu, &latest.texture)?, copy: None })
+    }
+
+    /// Draw `region` of `frame` into `latest`, `size` big, from its top-left corner.
+    fn draw(&mut self, gpu: &Gpu, frame: &ID3D11Texture2D, region: D3D11_BOX, size: (u32, u32), latest: &Latest) -> Result<()> {
+        let part = (region.right - region.left, region.bottom - region.top);
+        if self.copy.as_ref().is_none_or(|(_, _, s)| *s != part) {
+            let texture = gpu.texture(part.0, part.1, DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_BIND_SHADER_RESOURCE.0 as u32, D3D11_USAGE_DEFAULT, 0)?;
+            let view = super::quad::shader_view(gpu, &texture)?;
+            self.copy = Some((texture, view, part));
+        }
+        let Some((texture, view, _)) = &self.copy else { return Ok(()) };
+        unsafe { gpu.context.CopySubresourceRegion(texture, 0, 0, 0, 0, frame, 0, Some(&region)) };
+        let at = super::quad::Placement {
+            dest: [0.0, 0.0, size.0 as f32, size.1 as f32],
+            uv: [0.0, 0.0, 1.0, 1.0],
+            clip: RECT { left: 0, top: 0, right: size.0 as i32, bottom: size.1 as i32 },
+            turns: 0,
+        };
+        self.quad.draw(gpu, &self.target, (latest.width, latest.height), view, &at, true);
+        Ok(())
     }
 }
 
