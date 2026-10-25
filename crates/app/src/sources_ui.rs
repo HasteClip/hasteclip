@@ -558,7 +558,8 @@ impl App {
                     }
                 } else {
                     let display = self.screens.get(self.display_at()).map_or_else(|| "Main display".to_owned(), |d| d.name.clone());
-                    let cropped = self.crop_whole().zip(self.settings.screen_crop.filter(|c| !c.is_none())).map(|((w, h), c)| capture::Crop::from(c).rect(w, h));
+                    // Open, its rows say how it's cropped.
+                    let cropped = self.crop_whole().zip(self.settings.screen_crop.filter(|c| !c.is_none() && !open)).map(|((w, h), c)| capture::Crop::from(c).rect(w, h));
                     match cropped {
                         Some([_, _, w, h]) => format!("{display} · cropped to {w}×{h}"),
                         None => display,
@@ -573,6 +574,7 @@ impl App {
                 (icon::WEBCAM, "Webcam", cam.map(|w| w.name.clone()).unwrap_or_default(), state, cam.is_some_and(|w| w.enabled))
             }
         };
+        let state = state.or_else(|| (!on).then_some(("Off", pal.text3)));
         group_rows(ui, ("layer_card", layer), |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             // All of its line opens and closes it, but for its handle and switch.
@@ -623,7 +625,7 @@ impl App {
                 crate::ui_kit::switch(&mut rui, &mut self.settings.screen.enabled).on_hover_text(tip);
             }
             rui.add_space(-4.0);
-            let more = crate::ui_kit::Btn::icon(crate::ui_kit::Kind::Ghost, icon::DOTS_THREE).small().tip(if layer == Layer::Webcam { "Turn, flip, put in front or behind, remove" } else { "Reset, put in front or behind" }).show(&mut rui);
+            let more = crate::ui_kit::Btn::icon(crate::ui_kit::Kind::Ghost, icon::DOTS_THREE).small().tip(if layer == Layer::Webcam { "Reset, turn, flip, put in front or behind, remove" } else { "Fill or fit, reset, turn, flip, put in front or behind" }).show(&mut rui);
             let was = self.arrangement();
             crate::ui_kit::menu_popup(&more, false, 230.0, |ui| self.layer_menu(ui, layer, aspect));
             crate::ui_kit::context_menu(&resp, 230.0, |ui| self.layer_menu(ui, layer, aspect));
@@ -646,10 +648,16 @@ impl App {
             }
             if open {
                 crate::ui_kit::divider(ui, 0.0);
-                match layer {
-                    Layer::Screen => self.screen_rows(ui, frame),
-                    Layer::Webcam => self.webcam_rows(ui, aspect),
-                }
+                // Off, its settings are kept (and can be changed): dimmed.
+                ui.scope(|ui| {
+                    if !on {
+                        ui.multiply_opacity(0.55);
+                    }
+                    match layer {
+                        Layer::Screen => self.screen_rows(ui, frame),
+                        Layer::Webcam => self.webcam_rows(ui, aspect),
+                    }
+                });
             }
         });
     }
@@ -673,13 +681,18 @@ impl App {
         // make the video another size (see below; where the desktop's dialog
         // picks the screen, that waits too).
         if capture::app_capture() {
-            ui.add_space(8.0);
             let opts = [
                 crate::ui_kit::Seg { icon: Some(egui_phosphor::regular::MONITOR), label: "Whole screen", tip: Some("Everything on one display") },
                 crate::ui_kit::Seg { icon: Some(egui_phosphor::regular::APP_WINDOW), label: "Games and apps", tip: Some("Only the games and apps you pick, following whichever you're using") },
             ];
-            let w = ui.available_width();
-            if let Some(i) = crate::ui_kit::segmented_opts(ui, "capture_kind", &opts, usize::from(apps_mode), Some(w), true) {
+            let mut picked = None;
+            row(ui, &mut |ui| {
+                ui.label(crate::theme::text("Record", 13.5, crate::theme::W::Regular).color(pal.text));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    picked = crate::ui_kit::segmented_opts(ui, "capture_kind", &opts, usize::from(apps_mode), None, true);
+                });
+            });
+            if let Some(i) = picked {
                 if i == 0 && apps_mode {
                     let apps = std::mem::replace(&mut self.settings.capture, CaptureTarget::Screen);
                     if matches!(apps, CaptureTarget::Apps { .. }) {
@@ -690,7 +703,6 @@ impl App {
                     self.windowed_apps = capture::list_windowed_apps();
                 }
             }
-            ui.add_space(8.0);
             crate::ui_kit::divider(ui, 0.0);
         }
         match self.settings.capture.clone() {
