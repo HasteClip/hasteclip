@@ -655,7 +655,7 @@ impl App {
                     }
                     match layer {
                         Layer::Screen => self.screen_rows(ui, frame),
-                        Layer::Webcam => self.webcam_rows(ui, aspect),
+                        Layer::Webcam => self.webcam_rows(ui),
                     }
                 });
             }
@@ -755,42 +755,12 @@ impl App {
                         });
                     });
                 });
-                if capture::SCREEN_CROP {
-                    crate::ui_kit::divider(ui, 0.0);
-                    self.crop_row(ui);
-                }
             }
         }
-        // Its position and size: as Fill, Fit or Stretch put it, in a video
-        // of a shape of its own (else all of the video); or placed by hand
-        // on the preview, when picking one puts it back.
+        // Its crop, position, size, turn and flip, in a few words, and its
+        // page; and how the video puts it in (a video of a shape of its own).
         crate::ui_kit::divider(ui, 0.0);
-        let placed = self.settings.screen.placed.is_some();
-        let shaped = self.video_shaped();
-        let was = self.arrangement();
-        row(ui, &mut |ui| {
-            ui.label(crate::theme::text("Position and size", 13.5, crate::theme::W::Regular).color(pal.text));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
-                if shaped {
-                    if let Some(f) = crate::canvas_ui::framing_choice(ui, "screen_card_framing", (!placed).then_some(self.settings.framing)) {
-                        self.screen_framed(f);
-                    }
-                    if placed {
-                        ui.label(crate::theme::text("Placed by hand", 12.5, crate::theme::W::Regular).color(pal.text3));
-                    }
-                } else {
-                    if crate::ui_kit::Btn::normal("Reset").small().enabled(placed).tip("Its position and size: over all of the video again").show(ui).clicked() {
-                        self.screen_to_whole();
-                    }
-                    let state = if placed { "Placed by hand on the preview" } else { "Fills the video" };
-                    ui.label(crate::theme::text(state, 12.5, crate::theme::W::Regular).color(pal.text3));
-                }
-            });
-        });
-        if self.arrangement() != was {
-            self.keep_for_undo(was);
-        }
+        self.placement_row(ui, crate::canvas_ui::Layer::Screen);
     }
 
     /// The video's size, as recorded, over the preview: a button opening the
@@ -928,27 +898,6 @@ impl App {
         });
     }
 
-    /// The Crop row: what's kept of the screen, and a way to its page.
-    fn crop_row(&mut self, ui: &mut egui::Ui) {
-        use crate::ui_kit::Btn;
-        let pal = crate::theme::pal(ui);
-        let kept = self.crop_whole().zip(self.settings.screen_crop.filter(|c| !c.is_none())).map(|((w, h), c)| capture::Crop::from(c).rect(w, h));
-        ui.horizontal(|ui| {
-            ui.set_min_height(GROUP_ROW_H);
-            ui.spacing_mut().item_spacing.x = 5.0;
-            ui.label(crate::theme::text("Crop", 13.5, crate::theme::W::Regular).color(pal.text));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
-                let b = Btn::normal("Adjust").trail(egui_phosphor::regular::CARET_RIGHT).small().tip("Show only part of your screen: a game at a lower resolution than your display, with black around it");
-                if b.show(ui).clicked() {
-                    self.sources_view.crop_open = true;
-                }
-                let text = kept.map_or("Off".to_owned(), |[_, _, w, h]| format!("{w}×{h}"));
-                ui.label(crate::theme::text(text, 12.5, crate::theme::W::Regular).color(pal.text3));
-            });
-        });
-    }
-
     /// The size a video would be to show the screen's crop as it is (even,
     /// as big as a video can be; turned, as it shows), when it's cropped and
     /// fills the video.
@@ -968,11 +917,14 @@ impl App {
         }
     }
 
-    /// The crop's page, in Sources' place: all of the screen with what's
-    /// kept drawn on it to drag, and its size and place as numbers. It starts
-    /// centred, and stays so as its size changes, until it's put somewhere.
-    /// It's only what's shown of the screen, so it changes while clipping
-    /// too; the video's size can be made the crop's, for every pixel of it.
+    /// The screen's Placement page, in Sources' place: all of the screen
+    /// with what's kept drawn on it to drag, and its size and place as
+    /// numbers. It starts centred, and stays so as its size changes, until
+    /// it's put somewhere. It's only what's shown of the screen, so it
+    /// changes while clipping too; the video's size can be made the crop's,
+    /// for every pixel of it. Under the crop, where the screen is in the
+    /// video, and how it's turned (see `placement_lists`); for games and
+    /// apps, which aren't cropped, only that.
     fn screen_crop_page(&mut self, ui: &mut egui::Ui) {
         use crate::settings::ScreenCrop;
         use crate::theme::{self, W};
@@ -987,12 +939,23 @@ impl App {
         // Its size's link keeps the shape as its edges are dragged too.
         let keep = crate::ui_kit::size_field_keeps(ui.ctx(), "screen_crop").is_some();
         let mut back = false;
+        let apps = matches!(self.settings.capture, CaptureTarget::Apps { .. });
         self.page_head(ui, "", |_, ui| {
             back = Btn::icon(crate::ui_kit::Kind::Ghost, egui_phosphor::regular::CARET_LEFT).tip("Back to Sources  (Esc)").show(ui).clicked();
-            ui.label(theme::text("Crop", 20.0, W::Semibold).color(pal.text));
+            ui.label(theme::text("Placement", 20.0, W::Semibold).color(pal.text));
+            ui.label(theme::text(if apps { "Games and apps" } else { "Screen" }, 13.0, W::Regular).color(pal.text3));
         });
         if back {
             self.sources_view.crop_open = false;
+            return;
+        }
+        // Games and apps aren't cropped: where they are, and how they're turned.
+        if apps || !capture::SCREEN_CROP {
+            ui.add_space(4.0);
+            crate::ui_kit::scroll(ui, "screen_placement_page", |ui| {
+                ui.set_max_width(ui.available_width().min(560.0));
+                self.placement_lists(ui, crate::canvas_ui::Layer::Screen);
+            });
             return;
         }
         capture::preview::request();
@@ -1067,6 +1030,7 @@ impl App {
                 });
             };
             const BOX: f32 = 64.0;
+            crate::ui_kit::section_head(ui, "Crop", true, |_| {});
             crate::ui_kit::list(ui, "screen_crop", |l| {
                 // Its shape: the biggest of it there's room for, where it is,
                 // and kept as it's sized (it's the size's link).
@@ -1176,7 +1140,11 @@ impl App {
                 });
                 ui.allocate_ui_with_layout(egui::vec2(col, avail_h), egui::Layout::top_down(egui::Align::Min), |ui| {
                     ui.set_width(col);
-                    numbers(ui, &mut set, &mut locked_click, &mut match_crop);
+                    egui::ScrollArea::vertical().id_salt("screen_placement_numbers").auto_shrink([false, true]).show(ui, |ui| {
+                        numbers(ui, &mut set, &mut locked_click, &mut match_crop);
+                        self.placement_lists(ui, crate::canvas_ui::Layer::Screen);
+                        ui.add_space(16.0);
+                    });
                 });
             });
         } else {
@@ -1184,6 +1152,7 @@ impl App {
                 picture(ui, self, avail_h * 0.4, &mut set);
                 ui.add_space(16.0);
                 numbers(ui, &mut set, &mut locked_click, &mut match_crop);
+                self.placement_lists(ui, crate::canvas_ui::Layer::Screen);
             });
         }
         if locked_click && let Some(why) = &size_lock {

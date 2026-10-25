@@ -398,14 +398,14 @@ impl App {
     /// Where the screen goes as the video puts it, its first place and size:
     /// Fill, Fit or Stretch's, in a video of a shape of its own, else all of
     /// it (see [`framed`]).
-    fn screen_first_rect(&mut self, frame_aspect: f32) -> Rect {
+    pub(crate) fn screen_first_rect(&mut self, frame_aspect: f32) -> Rect {
         let framing = if self.video_shaped() { self.settings.framing.into() } else { capture::Framing::Fit };
         self.screen_aspect().map_or(Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), |picture| framed(framing, picture, frame_aspect))
     }
 
     /// The screen in box `r`, or put in as the video puts it when that's
     /// where `r` is (so it follows the video's shape again).
-    fn place_or_frame(&mut self, r: Rect, aspect: f32) {
+    pub(crate) fn place_or_frame(&mut self, r: Rect, aspect: f32) {
         if same(r, self.screen_first_rect(aspect)) {
             self.settings.screen.placed = None;
         } else {
@@ -512,7 +512,7 @@ impl App {
     }
 
     /// Where the webcam goes.
-    fn webcam_placement(&self) -> Option<Placement> {
+    pub(crate) fn webcam_placement(&self) -> Option<Placement> {
         self.settings.webcam.as_ref().map(|w| w.placement.into())
     }
 
@@ -839,11 +839,6 @@ impl App {
         s.placed = Some(BoxCfg::new([t.min.x, t.min.y, t.width(), t.height()], aspect, b.picture_aspect.map(|a| 1.0 / a)));
     }
 
-    /// The screen back over all of the video (Reset).
-    pub(crate) fn screen_to_whole(&mut self) {
-        self.settings.screen.placed = None;
-    }
-
     /// Whether the video has a shape of its own (an aspect ratio, or a size
     /// of its own): then the screen fills it as Fill, Fit or Stretch say.
     pub(crate) fn video_shaped(&self) -> bool {
@@ -857,12 +852,17 @@ impl App {
     }
 
     /// A source's menu (right-click it on the preview, or its card's ⋯),
-    /// the same for both as far as each goes: how the video puts the screen
-    /// in (a video of a shape of its own), its position, size and crop
-    /// back, turning, mirroring and flipping it, which is in front, and
-    /// taking the webcam out.
+    /// the same for both as far as each goes: its Placement page, how the
+    /// video puts the screen in (a video of a shape of its own), its
+    /// position, size and crop back, turning, mirroring and flipping it,
+    /// which is in front, and taking the webcam out.
     pub(crate) fn layer_menu(&mut self, ui: &mut egui::Ui, layer: Layer, aspect: f32) {
         let screen = layer == Layer::Screen;
+        if Item::new("Edit placement…").icon(icon::SLIDERS_HORIZONTAL).tip("Its crop, position, size, turn and flip, as numbers").show(ui).clicked() {
+            self.open_placement(layer);
+            ui.close();
+        }
+        crate::ui_kit::menu_sep(ui);
         // How the video puts the screen in: its position and size both.
         if screen && self.video_shaped() {
             let now = self.settings.screen.placed.is_none().then_some(self.settings.framing);
@@ -941,7 +941,7 @@ impl App {
 
     /// A source turned a quarter more, clockwise (`by` 1) or
     /// anticlockwise, as it's seen.
-    fn turn_layer(&mut self, layer: Layer, by: i8, aspect: f32) {
+    pub(crate) fn turn_layer(&mut self, layer: Layer, by: i8, aspect: f32) {
         match layer {
             Layer::Screen => self.screen_turn(by, aspect),
             Layer::Webcam => {
@@ -955,7 +955,7 @@ impl App {
 
     /// A source mirrored (`across`: left and right swapped), or flipped
     /// upside down; again, back.
-    fn flip_layer(&mut self, layer: Layer, across: bool, aspect: f32) {
+    pub(crate) fn flip_layer(&mut self, layer: Layer, across: bool, aspect: f32) {
         match layer {
             Layer::Screen => {
                 let s = &mut self.settings.screen;

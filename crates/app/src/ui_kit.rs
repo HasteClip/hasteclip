@@ -2251,6 +2251,12 @@ pub fn ratio_field_width(ctx: &egui::Context, id: &str, now: Option<[u32; 2]>) -
 /// applies what's typed; Esc puts it back. Kept within `range`. The new
 /// number, when it changes.
 pub fn number_box(ui: &mut egui::Ui, id: egui::Id, value: u32, range: std::ops::RangeInclusive<u32>, width: f32) -> Option<u32> {
+    signed_box(ui, id, i64::from(value), i64::from(*range.start())..=i64::from(*range.end()), width).map(|v| v as u32)
+}
+
+/// A [`number_box`] that can go below zero (a minus typed first), where
+/// `range` does.
+pub fn signed_box(ui: &mut egui::Ui, id: egui::Id, value: i64, range: std::ops::RangeInclusive<i64>, width: f32) -> Option<i64> {
     use egui::{Event, EventFilter, Key};
     let p = theme::pal(ui);
     let (rect, _) = ui.allocate_exact_size(vec2(width, CONTROL_H), Sense::hover());
@@ -2260,20 +2266,25 @@ pub fn number_box(ui: &mut egui::Ui, id: egui::Id, value: u32, range: std::ops::
     }
     let key = id.with("typed");
     let mut typed: Option<String> = ui.data(|d| d.get_temp(key));
-    let kept = |v: i64| v.clamp(i64::from(*range.start()), i64::from(*range.end())) as u32;
+    let kept = |v: i64| v.clamp(*range.start(), *range.end());
+    // As many digits as the longest number it can be.
+    let digits = range.start().unsigned_abs().max(range.end().unsigned_abs()).to_string().len();
     let mut out = None;
     if resp.has_focus() {
         ui.memory_mut(|m| m.set_focus_lock_filter(id, EventFilter { tab: false, horizontal_arrows: false, vertical_arrows: true, escape: true }));
         let t = typed.get_or_insert_with(String::new);
-        let now = |t: &String, out: Option<u32>| t.parse::<i64>().unwrap_or(i64::from(out.unwrap_or(value)));
+        let now = |t: &String, out: Option<i64>| t.parse::<i64>().unwrap_or(out.unwrap_or(value));
         let mut done = false;
         for ev in ui.input(|i| i.events.clone()) {
             match ev {
                 Event::Text(s) => {
-                    for c in s.chars().filter(char::is_ascii_digit) {
-                        // No zeros in front, and no more digits than the
-                        // biggest has.
-                        if !(c == '0' && t.is_empty()) && t.len() < range.end().to_string().len() {
+                    for c in s.chars() {
+                        let sign = usize::from(t.starts_with('-'));
+                        // A minus first, where it can go below zero; no zeros
+                        // in front, and no more digits than the biggest has.
+                        if c == '-' && t.is_empty() && *range.start() < 0 {
+                            t.push(c);
+                        } else if c.is_ascii_digit() && !(c == '0' && t.len() == sign) && t.len() - sign < digits {
                             t.push(c);
                         }
                     }

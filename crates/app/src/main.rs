@@ -41,6 +41,7 @@ mod meter;
 mod moments;
 mod nav;
 mod picture;
+mod placement_ui;
 mod player;
 #[cfg(target_os = "linux")]
 mod portal_shortcuts;
