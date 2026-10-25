@@ -1413,6 +1413,16 @@ impl App {
                 crate::ui_kit::switch(ui, &mut away);
             });
         });
+        crate::ui_kit::divider(ui, 0.0);
+        ui.horizontal(|ui| {
+            ui.set_min_height(GROUP_ROW_H);
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.label(theme::text("Record the whole time a game is open", 13.5, W::Regular).color(pal.text));
+            crate::ui_kit::info(ui, "Whole sessions", "When a game or app on this list opens, HasteClip records until it closes, then saves the recording. Clipping waits meanwhile, and starts again after. While it records, Save clip and “HasteClip that” mark the moment in the recording. Stop the recording yourself and it waits until the game opens again.");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                crate::ui_kit::switch(ui, &mut self.settings.record_sessions);
+            });
+        });
         if let Some(i) = remove {
             let name = list.remove(i).name;
             self.toast_icon(icon::X_CIRCLE, format!("Stopped recording {name}"));

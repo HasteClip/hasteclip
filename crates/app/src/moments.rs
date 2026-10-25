@@ -69,10 +69,23 @@ fn change(clip: &Path, f: impl FnOnce(&mut HashMap<String, Moments>, &str)) {
     save(&lib, &file);
 }
 
-/// A clip just saved: the kills in it, each how long before its end.
-pub fn keep(clip: &Path, kills: &[(Duration, String)]) {
+/// A clip just saved: the kills in it, each how long before its end, and
+/// the markers put in while it was recorded (seconds into it).
+pub fn keep(clip: &Path, kills: &[(Duration, String)], markers: &[f64]) {
     let kills: Vec<(f64, String)> = kills.iter().map(|(ago, what)| (ago.as_secs_f64(), what.clone())).collect();
-    change(clip, |clips, key| clips.entry(key.to_owned()).or_default().kills = kills);
+    change(clip, |clips, key| {
+        let m = clips.entry(key.to_owned()).or_default();
+        m.kills = kills;
+        m.markers = markers.to_vec();
+    });
+}
+
+/// Moments marked while recording, each how long before the end, as markers
+/// on a recording `length` seconds long.
+pub fn marks_at(length: f64, marks: &[Duration]) -> Vec<f64> {
+    let mut at: Vec<f64> = marks.iter().map(|ago| length - ago.as_secs_f64()).filter(|t| (0.0..=length).contains(t)).collect();
+    at.sort_by(f64::total_cmp);
+    at
 }
 
 /// The clip's moments (none kept: empty).
@@ -181,6 +194,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn marks_land_before_the_end() {
+        let s = Duration::from_secs_f64;
+        // Pressed 10 s and 70.5 s before the end of a 600 s recording; one
+        // from before it started is left out.
+        assert_eq!(marks_at(600.0, &[s(10.0), s(70.5), s(601.0)]), vec![529.5, 590.0]);
+    }
+
+    #[test]
     fn kills_land_before_the_end() {
         let m = Moments { kills: vec![(5.0, "Headshot".into()), (90.0, "Kill".into())], markers: vec![2.0] };
         let pins = m.pins(60.0);
@@ -198,8 +219,7 @@ mod tests {
         std::fs::create_dir_all(&lib).unwrap();
         let (a, b) = (lib.join("a.mp4"), lib.join("b.mp4"));
         // A 60 s recording: kills at 10 s and 50 s, a marker at 30 s.
-        keep(&a, &[(Duration::from_secs(50), "Kill".into()), (Duration::from_secs(10), "Ace".into())]);
-        add_marker(&a, 30.0);
+        keep(&a, &[(Duration::from_secs(50), "Kill".into()), (Duration::from_secs(10), "Ace".into())], &[30.0]);
         // Saved as a new clip of 20..45 s.
         rebase(&a, &b, 60.0, &[(20.0, 45.0)]);
         let pins = of(&b).pins(25.0);
@@ -227,7 +247,7 @@ mod tests {
         let lib = std::env::temp_dir().join(format!("hc-moments-{}", std::process::id()));
         std::fs::create_dir_all(&lib).unwrap();
         let (a, b) = (lib.join("a.mp4"), lib.join("b.mp4"));
-        keep(&a, &[(Duration::from_secs(3), "Kill".into())]);
+        keep(&a, &[(Duration::from_secs(3), "Kill".into())], &[]);
         add_marker(&a, 1.5);
         follow(&a, &b);
         assert_eq!(of(&a), Moments::default());

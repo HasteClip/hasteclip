@@ -49,6 +49,7 @@ mod portal_shortcuts;
 mod proxy;
 mod screenshot;
 mod service;
+mod sessions;
 mod settings;
 mod settings_ui;
 #[cfg(target_os = "macos")]
@@ -601,6 +602,8 @@ struct App {
     clipped_game: Option<(String, discord::Game, Instant)>,
     /// What's in focus while capturing, for the folder clips go in.
     games: games::Tracker,
+    /// Record whole sessions: when a game on the list opens and closes.
+    sessions: sessions::Sessions,
     /// The game Discord shows, and since when, as its "elapsed" timer counts.
     presence_since: Option<(String, SystemTime)>,
 }
@@ -780,6 +783,7 @@ impl App {
             presence: discord::Presence::new(),
             clipped_game: None,
             games,
+            sessions: Default::default(),
             presence_since: None,
         };
         // Dev aid: `HASTECLIP_OPEN_EDITOR=<clip>` opens the editor at launch, so the
@@ -1402,11 +1406,13 @@ impl App {
         }
         // Not while samples are played on the speakers: the detector would hear them.
         // (Never in a demo recording: it clips nothing, and the mic stays shut.)
-        let listen = self.settings.voice_clip && self.rec_state == RecState::Buffering && self.recording_shortcut.is_none() && self.page != Page::VoiceReview && self.demo.is_none();
+        // While recording, it marks the moment.
+        let listen = self.settings.voice_clip && self.rec_state != RecState::Idle && self.recording_shortcut.is_none() && self.page != Page::VoiceReview && self.demo.is_none();
         self.voice.collect(self.settings.voice_samples);
         let mic = listen.then(|| self.voice_mic()).flatten();
         self.voice.listen(mic.as_deref());
         self.pump_capture_events();
+        self.follow_sessions();
         let capturing = match self.rec_state {
             RecState::Idle => games::Capturing::Off,
             RecState::Buffering => games::Capturing::Buffer(self.settings.replay_seconds),
@@ -1421,6 +1427,8 @@ impl App {
             sound: self.settings.save_sound.clone(),
         });
         self.quick_save.arm(armed);
+        let marking = (self.rec_state == RecState::Recording && self.recording_shortcut.is_none()).then(|| self.settings.save_sound.clone());
+        self.quick_save.arm_marking(marking);
         let shot = (capture::SCREENSHOTS && self.recording_shortcut.is_none() && self.demo.is_none()).then(|| self.shot_armed());
         self.quick_save.arm_screenshot(shot);
         self.updater.set_auto(self.settings.auto_update);
@@ -2334,7 +2342,8 @@ impl App {
 
     fn stop(&mut self) {
         let (mut dir, mut details) = (None, games::Details::default());
-        if self.rec_state == RecState::Recording {
+        let recording = self.rec_state == RecState::Recording;
+        if recording {
             self.saving += 1; // finishing the file
             dir = Some(self.clip_folder());
             details = self.games.recording_details();
@@ -2342,6 +2351,25 @@ impl App {
         self.service.stop(dir, details);
         self.rec_state = RecState::Idle;
         self.rec_started = None;
+        // A session's recording took clipping's place: it comes back.
+        if recording && self.sessions.let_go() {
+            self.start_replay_buffer();
+        }
+    }
+
+    /// Record whole sessions: a game on the list opening starts a recording,
+    /// the last one closing stops it (see `sessions.rs`). Never in a test
+    /// instance, or before capture can work.
+    fn follow_sessions(&mut self) {
+        let watching = self.settings.record_sessions && self.persist_settings && self.demo.is_none() && !self.setup_open && self.permission != capture::Permission::Denied;
+        self.games.watch(watching);
+        let (recording, buffering) = (self.rec_state == RecState::Recording, self.rec_state == RecState::Buffering);
+        match self.sessions.step(watching, self.games.listed_open(), recording, buffering, Instant::now()) {
+            // Clipping gives way, as it does for the shortcut.
+            sessions::Do::Record => self.toggle_record(),
+            sessions::Do::Stop => self.stop(),
+            sessions::Do::Nothing => {}
+        }
     }
 
     /// What to record (games and apps, the whole screen, which display)

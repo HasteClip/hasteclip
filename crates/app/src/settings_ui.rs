@@ -532,8 +532,8 @@ impl App {
                 }
                 let off = self.settings.shortcuts.get(action).is_empty();
                 let note = match action {
-                    ShortcutAction::SaveClip if desktop => "Works everywhere. Your desktop looks after it, and may ask you to confirm.",
-                    ShortcutAction::SaveClip => "Works everywhere, even in a game",
+                    ShortcutAction::SaveClip if desktop => "Works everywhere. Your desktop looks after it, and may ask you to confirm. While recording, it marks the moment.",
+                    ShortcutAction::SaveClip => "Works everywhere, even in a game. While recording, it marks the moment.",
                     // Off says itself: its keys read Off.
                     ShortcutAction::Screenshot if off => "",
                     ShortcutAction::Screenshot => "Works everywhere, even in a game",
@@ -611,7 +611,7 @@ impl App {
         let mut review = false;
         ui_kit::list(ui, "voice", |l| {
             if f.shows(&["save by voice", "hasteclip that", "speech", "command", "voice"]) {
-                l.row(Row::new("Save by voice").tip("Save by voice", "While clipping, say “HasteClip that” to save a clip. Listening happens on this computer, for this phrase only.").note(note), |ui| ui_kit::switch(ui, &mut self.settings.voice_clip));
+                l.row(Row::new("Save by voice").tip("Save by voice", "While clipping, say “HasteClip that” to save a clip; while recording, to mark the moment. Listening happens on this computer, for this phrase only.").note(note), |ui| ui_kit::switch(ui, &mut self.settings.voice_clip));
             }
             if f.shows(&["voice samples", "keep", "review", "improve"]) {
                 l.row(Row::new("Keep voice samples").tip("Keep voice samples", "Keeps about 6 seconds of your microphone each time the command saves a clip or nearly does. You can listen to them and mark which should have saved a clip, to help improve the detector. They stay on this computer."), |ui| ui_kit::switch(ui, &mut self.settings.voice_samples));

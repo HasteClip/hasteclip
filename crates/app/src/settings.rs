@@ -895,6 +895,9 @@ pub struct RecordSettings {
     pub replay_seconds: u32,
     /// Start the replay buffer as soon as the app opens, so you never miss a moment.
     pub auto_start_buffer: bool,
+    /// Record a game on the games and apps list the whole time it's open
+    /// (see `sessions.rs`).
+    pub record_sessions: bool,
     /// Download new versions in the background and install them on quit.
     pub auto_update: bool,
     /// Show what you're clipping on your Discord profile (Rich Presence).
@@ -1001,6 +1004,7 @@ impl Default for RecordSettings {
 
             replay_seconds: 60,
             auto_start_buffer: true,
+            record_sessions: false,
             auto_update: true,
             // On to begin with: friends see what you clip, and where to get
             // HasteClip. Settings saved before keep theirs (off).

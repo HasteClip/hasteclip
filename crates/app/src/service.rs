@@ -74,6 +74,8 @@ pub struct QuickSave {
     games: crate::games::Tracker,
     /// While the replay buffer runs: how to save.
     armed: Arc<Mutex<Option<Armed>>>,
+    /// While recording: the sound that says a moment's marked.
+    marking: Arc<Mutex<Option<crate::settings::SaveSound>>>,
     /// Where screenshots can be taken: how.
     shot: Arc<Mutex<Option<ShotArmed>>>,
 }
@@ -110,6 +112,15 @@ impl QuickSave {
     }
 
     /// Kept up to date by the app, every frame.
+    pub fn arm_marking(&self, to: Option<crate::settings::SaveSound>) {
+        if let Ok(mut armed) = self.marking.lock()
+            && *armed != to
+        {
+            *armed = to;
+        }
+    }
+
+    /// Kept up to date by the app, every frame.
     pub fn arm_screenshot(&self, to: Option<ShotArmed>) {
         if let Ok(mut armed) = self.shot.lock()
             && *armed != to
@@ -132,8 +143,13 @@ impl QuickSave {
     }
 
     /// Save a clip now, if the replay buffer runs. Whether it was asked for.
+    /// While recording, the moment's marked in the recording instead (no
+    /// clip: false).
     pub fn save(&self) -> bool {
-        let Some(a) = self.armed.lock().ok().and_then(|a| a.clone()) else { return false };
+        let Some(a) = self.armed.lock().ok().and_then(|a| a.clone()) else {
+            self.mark();
+            return false;
+        };
         let dir = crate::games::folder_for(&a.library, a.folder_per_game, &a.game_folders, self.games.clip_game().as_deref());
         if self.tx.send(Cmd::SaveClip(dir, self.games.clip_details())).is_err() {
             return false;
@@ -141,12 +157,42 @@ impl QuickSave {
         crate::sound::play_saved(&a.sound);
         true
     }
+
+    /// Mark this moment in the recording, if one runs.
+    fn mark(&self) {
+        let Some(sound) = self.marking.lock().ok().and_then(|s| s.clone()) else { return };
+        if self.games.mark() {
+            crate::sound::play_saved(&sound);
+        }
+    }
 }
 
 pub struct CaptureService {
     cmd_tx: Option<Sender<Cmd>>,
     evt_rx: Receiver<Evt>,
     thread: Option<thread::JoinHandle<()>>,
+    in_flight: InFlight,
+}
+
+/// Starts and stops not answered yet. Each gets one `Evt::State`, in the
+/// order they were sent, so only the answer to the last one says what runs
+/// now: one to a start or stop that another has followed is out of date.
+/// (Clipping that started at launch just as a session stopped it for a
+/// recording showed clipping again, then nothing, then recording.)
+#[derive(Default)]
+struct InFlight(std::sync::atomic::AtomicU32);
+
+impl InFlight {
+    fn sent(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// An answer came: whether it's to the last one sent.
+    fn replied(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let was = self.0.fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_sub(1))).unwrap_or(0);
+        was <= 1
+    }
 }
 
 impl CaptureService {
@@ -159,7 +205,7 @@ impl CaptureService {
         // A demo recording clips nothing: its stand-in hands over prepared clips.
         if crate::demo::on() {
             let thread = crate::demo::capture_thread(cmd_rx, evt_tx);
-            return Self { cmd_tx: Some(cmd_tx), evt_rx, thread: Some(thread) };
+            return Self { cmd_tx: Some(cmd_tx), evt_rx, thread: Some(thread), in_flight: InFlight::default() };
         }
         let thread = thread::spawn(move || {
             // The backend lives entirely on this thread.
@@ -240,16 +286,17 @@ impl CaptureService {
             }
         });
 
-        Self { cmd_tx: Some(cmd_tx), evt_rx, thread: Some(thread) }
+        Self { cmd_tx: Some(cmd_tx), evt_rx, thread: Some(thread), in_flight: InFlight::default() }
     }
 
     pub fn start(&self, mode: Mode, settings: EncodeSettings) {
+        self.in_flight.sent();
         self.send(Cmd::Start(mode, settings));
     }
     /// A way to save a clip from another thread (a shortcut's).
     pub fn quick_save(&self, games: crate::games::Tracker) -> QuickSave {
         let tx = self.cmd_tx.clone().expect("the capture thread runs while the service lives");
-        QuickSave { tx, games, armed: Default::default(), shot: Default::default() }
+        QuickSave { tx, games, armed: Default::default(), marking: Default::default(), shot: Default::default() }
     }
 
     pub fn save_clip(&self, dir: PathBuf, details: Details) {
@@ -259,6 +306,7 @@ impl CaptureService {
         self.send(Cmd::Screenshot(dir, video, options));
     }
     pub fn stop(&self, dir: Option<PathBuf>, details: Details) {
+        self.in_flight.sent();
         self.send(Cmd::Stop(dir, details));
     }
     pub fn update_video(&self, video: capture::VideoSource) {
@@ -277,11 +325,15 @@ impl CaptureService {
         }
     }
 
-    /// Drain the next event, if any (non-blocking).
+    /// Drain the next event, if any (non-blocking). A state that's out of
+    /// date (see `InFlight`) is passed over.
     pub fn poll(&self) -> Option<Evt> {
-        match self.evt_rx.try_recv() {
-            Ok(evt) => Some(evt),
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
+        loop {
+            match self.evt_rx.try_recv() {
+                Ok(Evt::State(_)) if !self.in_flight.replied() => continue,
+                Ok(evt) => return Some(evt),
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return None,
+            }
         }
     }
 }
@@ -326,8 +378,20 @@ fn send(tx: &Sender<Evt>, evt: Evt) {
 /// kept with it.
 pub(crate) fn landed(path: PathBuf, details: Details) -> PathBuf {
     let path = named(path, details.summary);
-    if !details.moments.is_empty() {
-        crate::moments::keep(&path, &details.moments);
+    // Marks are known from the end: where they are takes the file's length.
+    let markers = if details.marks.is_empty() {
+        Vec::new()
+    } else {
+        match media::probe(&path) {
+            Ok(info) => crate::moments::marks_at(info.duration, &details.marks),
+            Err(e) => {
+                eprintln!("couldn't place the marks in {}: {e:#}", path.display());
+                Vec::new()
+            }
+        }
+    };
+    if !details.moments.is_empty() || !markers.is_empty() {
+        crate::moments::keep(&path, &details.moments, &markers);
     }
     path
 }
@@ -377,5 +441,22 @@ mod tests {
         let e = Err::<(), _>(io).context(r"couldn't finish E:\.clip.mp4").unwrap_err();
         assert_eq!(super::describe(&e), "Your disk is full. Free up some space and try again.");
         assert_eq!(super::describe(&anyhow::anyhow!("nothing was recorded")), "nothing was recorded");
+    }
+
+    /// Clipping started at launch, then stopped for a recording right away:
+    /// only the recording's reply says what runs.
+    #[test]
+    fn only_the_last_reply_counts() {
+        let f = super::InFlight::default();
+        f.sent(); // start clipping
+        f.sent(); // stop it
+        f.sent(); // start recording
+        assert!(!f.replied(), "clipping started: out of date");
+        assert!(!f.replied(), "clipping stopped: out of date");
+        assert!(f.replied(), "recording started");
+        f.sent();
+        assert!(f.replied());
+        // A reply nothing was sent for (never expected) still counts.
+        assert!(f.replied());
     }
 }
