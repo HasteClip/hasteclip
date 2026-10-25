@@ -405,6 +405,13 @@ impl BoxCfg {
         }
         true
     }
+
+    /// Whether it's another shape than its picture, by more than rounding:
+    /// stretched on purpose (Shift on the preview).
+    pub fn stretched(&self) -> bool {
+        let shape = self.w * self.frame_aspect / self.h.max(1e-6);
+        self.picture_aspect.is_some_and(|p| p > 0.0 && (shape / p - 1.0).abs() > 0.02)
+    }
 }
 
 impl From<PlacementCfg> for capture::webcam::Placement {
@@ -1159,8 +1166,10 @@ impl RecordSettings {
     pub fn screen_placement(&self) -> capture::ScreenPlacement {
         let s = &self.screen;
         let apps = matches!(self.capture, CaptureTarget::Apps { .. });
+        // A game's or app's window can change shape: fitted in its box, so
+        // it's never squashed, unless the box was stretched on purpose.
         let (rect, framing) = match s.placed {
-            Some(b) => ([b.x, b.y, b.w, b.h], if apps { capture::Framing::Fit } else { capture::Framing::Stretch }),
+            Some(b) => ([b.x, b.y, b.w, b.h], if apps && !b.stretched() { capture::Framing::Fit } else { capture::Framing::Stretch }),
             None if self.capture_shape().is_some() => ([0.0, 0.0, 1.0, 1.0], self.framing.into()),
             None => ([0.0, 0.0, 1.0, 1.0], capture::Framing::Fit),
         };
@@ -1401,6 +1410,28 @@ mod shape_tests {
         // box, stretched as the box is.
         let boxed = framed(Some([4, 3]), Framing::Fill, true);
         assert_eq!((boxed.framing, boxed.rect), (capture::Framing::Stretch, [0.1, -0.1, 0.5, 1.5]));
+    }
+
+    /// A game in a box of its own shape fits in it (its window can change
+    /// shape); stretched with Shift, it's stretched, as a display is.
+    #[test]
+    fn a_game_stretched_by_hand() {
+        let (wide, four_three) = (16.0 / 9.0, 4.0 / 3.0);
+        let game = |placed: BoxCfg| {
+            let screen = ScreenCfg { placed: Some(placed), ..Default::default() };
+            let capture = CaptureTarget::Apps { apps: Vec::new(), away_screen: true };
+            RecordSettings { shape: Some([16, 9]), capture, screen, ..Default::default() }.screen_placement().framing
+        };
+        // A 4:3 game in a 4:3 box in a 16:9 video.
+        let own = BoxCfg::new([0.125, 0.0, 0.75, 1.0], wide, Some(four_three));
+        assert!(!own.stretched());
+        assert_eq!(game(own), capture::Framing::Fit);
+        // Stretched over all of the video.
+        let stretched = BoxCfg::new([0.0, 0.0, 1.0, 1.0], wide, Some(four_three));
+        assert!(stretched.stretched());
+        assert_eq!(game(stretched), capture::Framing::Stretch);
+        // From before boxes could stretch: the picture's own shape.
+        assert_eq!(game(BoxCfg::new([0.0, 0.0, 1.0, 1.0], wide, None)), capture::Framing::Fit);
     }
 
     /// An exact size is its own shape, whatever aspect ratio was chosen, and
