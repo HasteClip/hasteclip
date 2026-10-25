@@ -2127,7 +2127,8 @@ pub fn ratio_of(shape: f64) -> [u32; 2] {
 /// An aspect ratio: a menu of `first` (what none is called: "Same as
 /// screen", "Any"; its value beside it, if any), the common ones
 /// ([`RATIOS`]), and Custom…, which shows the ratio's width and height in
-/// two boxes beside the menu, to type any (up to 99 each). Custom starts
+/// two boxes on the menu's left (as Resolution's Custom size… shows its
+/// size), to type any (up to 99 each). Custom starts
 /// from `now`, or `custom_from` while it's none. The one chosen or typed,
 /// when it changes (`Some(None)`: `first`). Settings' Aspect ratio and every
 /// crop's are this.
@@ -2151,8 +2152,22 @@ pub fn ratio_field(ui: &mut egui::Ui, id: &str, (first, first_value): (&str, &st
     let mut out = None;
     let mut from_menu = false;
     let mut to_custom = false;
+    // The boxes on the menu's left, as a custom size's are beside
+    // Resolution's (the menu stays where it was), in reading order for Tab.
     ui.allocate_ui_with_layout(vec2(width, CONTROL_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
+        if custom {
+            let [w, h] = now.unwrap_or(custom_from);
+            if let Some(v) = number_box(ui, w_id, w, 1..=99, RATIO_BOX) {
+                out = Some(Some([v, h]));
+            }
+            // In a slot of its own width, so the menu ends where it does without the boxes.
+            let (slot, _) = ui.allocate_exact_size(vec2(8.0, CONTROL_H), Sense::hover());
+            ui.painter().text(slot.center(), Align2::CENTER_CENTER, ":", theme::font(13.0, W::Regular), p.text3);
+            if let Some(v) = number_box(ui, egui::Id::new((id, "h")), h, 1..=99, RATIO_BOX) {
+                out = Some(Some([w, v]));
+            }
+        }
         let r = select(ui, &label, select_w);
         menu_popup(&r, false, 250.0, |ui| {
             let mut item = Item::new(first).check(now.is_none() && !custom);
@@ -2173,16 +2188,6 @@ pub fn ratio_field(ui: &mut egui::Ui, id: &str, (first, first_value): (&str, &st
                 to_custom = true;
             }
         });
-        if custom {
-            let [w, h] = now.unwrap_or(custom_from);
-            if let Some(v) = number_box(ui, w_id, w, 1..=99, RATIO_BOX) {
-                out = Some(Some([v, h]));
-            }
-            ui.label(theme::text(":", 13.0, W::Regular).color(p.text3));
-            if let Some(v) = number_box(ui, egui::Id::new((id, "h")), h, 1..=99, RATIO_BOX) {
-                out = Some(Some([w, v]));
-            }
-        }
     });
     if to_custom {
         // Its boxes from the next frame, the width ready to type over.
