@@ -734,9 +734,9 @@ impl App {
             painter.circle(h.pos(line), r, fill, Stroke::new(1.0, Color32::from_black_alpha(140)));
         }
 
-        // What the keys do, along the picture's foot (or top, if the box is
-        // down there). (Alt is Option on a Mac, Ctrl Control: the keys as
-        // they're named there.)
+        // What the keys do, along the picture's top: always there, so it
+        // doesn't jump about as the box is dragged past the middle. (Alt is
+        // Option on a Mac, Ctrl Control: the keys as they're named there.)
         let (alt, ctrl) = (crate::shortcuts::alt_name(), crate::shortcuts::ctrl_name());
         // All of the video exactly, it has nowhere to move.
         let moves = !stuck(rect);
@@ -761,9 +761,7 @@ impl App {
         if size.x > frame_rect.width() - 8.0 {
             return;
         }
-        let low = bx.center().y > frame_rect.center().y && !fills(rect);
-        let y = if low { frame_rect.top() + 8.0 + size.y / 2.0 } else { frame_rect.bottom() - 8.0 - size.y / 2.0 };
-        let pill = Rect::from_center_size(Pos2::new(frame_rect.center().x, y), size);
+        let pill = Rect::from_center_size(Pos2::new(frame_rect.center().x, frame_rect.top() + 8.0 + size.y / 2.0), size);
         painter.rect_filled(pill, pill.height() / 2.0, Color32::from_black_alpha(170));
         painter.galley(pill.center() - galley.size() / 2.0, galley, Color32::WHITE);
     }
