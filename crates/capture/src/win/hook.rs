@@ -36,7 +36,7 @@ use windows::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor, GetWindowThr
 use windows::core::PCWSTR;
 
 use super::d3d::{Gpu, Latest};
-use super::quad::{Placement, Quad};
+use super::quad::{Placement, Quad, fit_within};
 
 /// The hook's files, next to the app (`game-hook\`), or in `target\game-hook`
 /// for a development build (`scripts/fetch-game-hook.ps1`).
@@ -630,15 +630,6 @@ impl Source {
     }
 }
 
-/// `w`×`h` shrunk (keeping its shape) to fit in `max_w`×`max_h`, if it's bigger.
-fn fit_within(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
-    if w <= max_w && h <= max_h {
-        return (w, h);
-    }
-    let scale = (max_w as f64 / w as f64).min(max_h as f64 / h as f64);
-    (((w as f64 * scale) as u32).max(2) & !1, ((h as f64 * scale) as u32).max(2) & !1)
-}
-
 /// The hook's log, which it writes to a pipe named after the game's process:
 /// passed on to ours (`game hook: …`).
 struct LogPipe {
@@ -742,11 +733,5 @@ mod tests {
         assert_eq!(std::mem::offset_of!(HookInfo, frame_interval), 56);
         assert_eq!(std::mem::offset_of!(HookInfo, offsets), 68);
         assert_eq!(std::mem::size_of::<GraphicsOffsets>(), 76);
-    }
-
-    #[test]
-    fn fits() {
-        assert_eq!(fit_within(1920, 1080, 2560, 1440), (1920, 1080));
-        assert_eq!(fit_within(3840, 2160, 1920, 1080), (1920, 1080));
     }
 }

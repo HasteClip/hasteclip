@@ -1,8 +1,9 @@
 //! Drawing one texture onto another with the GPU: a rectangle of it, placed
 //! anywhere, optionally blended over what's there. For the game capture
-//! hook's pictures (any format, upside down from OpenGL, shrunk to fit), a
-//! duplicated display's (turned upright, an HDR one brought to SDR) and the
-//! cursor drawn over them.
+//! hook's pictures (any format, upside down from OpenGL), a duplicated
+//! display's (turned upright, an HDR one brought to SDR), each shrunk to fit
+//! when it's too big for where it goes, as Windows' capture's are too, and
+//! the cursor drawn over them.
 
 use anyhow::{Context, Result};
 use windows::Win32::Foundation::RECT;
@@ -349,6 +350,15 @@ impl Quad {
     }
 }
 
+/// `w`×`h` shrunk (keeping its shape) to fit in `max_w`×`max_h`, if it's bigger.
+pub(crate) fn fit_within(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+    if w <= max_w && h <= max_h {
+        return (w, h);
+    }
+    let scale = (max_w as f64 / w as f64).min(max_h as f64 / h as f64);
+    (((w as f64 * scale) as u32).max(2) & !1, ((h as f64 * scale) as u32).max(2) & !1)
+}
+
 /// All of a target `size` pixels big.
 fn whole(size: (u32, u32)) -> Placement {
     Placement {
@@ -386,4 +396,20 @@ pub(crate) fn target_view(gpu: &Gpu, texture: &ID3D11Texture2D) -> Result<ID3D11
     let mut view = None;
     unsafe { gpu.device.CreateRenderTargetView(texture, None, Some(&mut view)) }?;
     view.context("no render target view")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_within;
+
+    #[test]
+    fn fits() {
+        assert_eq!(fit_within(1920, 1080, 2560, 1440), (1920, 1080));
+        assert_eq!(fit_within(3840, 2160, 1920, 1080), (1920, 1080));
+        // A display whose mode grew past what was made for it: from
+        // 1440×1080 to 1920×1080, and a portrait one from 1080×1440 to
+        // 1080×1920 beside a 2560×1440 one.
+        assert_eq!(fit_within(1920, 1080, 1440, 1080), (1440, 810));
+        assert_eq!(fit_within(1080, 1920, 2560, 1440), (810, 1440));
+    }
 }
