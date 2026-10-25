@@ -124,6 +124,9 @@ struct Ready {
     grab_offset: f64,
     /// The timeline's pixels per second, as last drawn.
     px_per_s: f64,
+    /// Where the timeline was laid out last frame: what the pointer does on
+    /// it is read there, first thing in the next (see [`Ready::timeline_input`]).
+    timeline_at: Option<Rect>,
     /// The dragged playhead sits on a snap target (an edge, a marker, an
     /// end): it stays there, its own frame fetched.
     playhead_snapped: bool,
@@ -438,6 +441,7 @@ impl Ready {
             resume: false,
             grab_offset: 0.0,
             px_per_s: 0.0,
+            timeline_at: None,
             playhead_snapped: false,
             lane_scroll: 0.0,
             glide: Default::default(),
@@ -475,6 +479,18 @@ impl Ready {
         let source = target.clip.as_path();
         let ctx = ui.ctx().clone();
         self.keyboard(&ctx);
+        // A click or drag on the timeline before anything that shows the
+        // playhead or the edit: the picture, the time, the playhead and the
+        // parts' edges follow the pointer on the frame it moves, as in the
+        // player. (Read after them, every frame of a drag showed where the
+        // move before had put them.) The timeline is where it was laid out
+        // last frame, as egui finds what's under the pointer.
+        let timeline = self.timeline_at.take().map(|outer| {
+            let l = self.layout(outer);
+            let resp = ui.interact(l.hit_area, ui.id().with("timeline"), Sense::click_and_drag());
+            self.timeline_input(ui, &l, &resp);
+            resp
+        });
         // What's heard: the edit, with only the soloed track if there is one.
         let mut mix = self.edit.tracks.clone();
         if let Some(solo) = self.solo {
@@ -728,7 +744,7 @@ impl Ready {
         self.transport(ui, bar);
 
         // --- Timeline: ruler, video and sound lanes on one time axis ---
-        self.timeline(ui);
+        self.timeline(ui, timeline);
         if let Some(e) = &self.player.audio_error {
             ui.colored_label(crate::theme::pal(ui).warn, format!("No sound preview: {e}"));
         }
@@ -1543,6 +1559,313 @@ impl Ready {
         self.edit.parts().iter().flat_map(|&(a, b)| [a, (b - fd).max(a)]).collect()
     }
 
+    /// What the pointer does on the timeline (`resp`, laid out as `l`, as
+    /// it was drawn last frame): a drag takes hold of what's under it (a
+    /// part's edge, a split, a part, a volume line or point, else the
+    /// playhead) and moves it; a click goes there; a double-click adds a
+    /// volume point or takes one away; a right-click picks what the menu is
+    /// for. Read first thing in the frame, so the picture, the time, the
+    /// playhead and the parts' edges all follow the pointer on the frame it
+    /// moves, as in the player.
+    fn timeline_input(&mut self, ui: &egui::Ui, l: &Layout, resp: &egui::Response) {
+        let (lanes, lane_rects, audio_view, splits) = (l.lanes, &l.lane_rects, l.audio_view, &l.splits);
+        let parts = &l.parts;
+        let n = parts.len();
+        let (dur, fd, px_per_s) = (l.dur, self.info.frame_duration(), l.px_per_s());
+        let t_of = |x: f32| l.t_of(x);
+        let near_grip = |pos: Pos2| l.near_grip(pos);
+        let vol_at = |pos: Pos2, this: &Self| l.vol_at(pos, &this.edit.tracks);
+        let hit = |pos: Pos2, this: &Self| l.hit(pos, &this.edit.tracks);
+
+        if resp.drag_started() {
+            // Hit-test where the button went down, not where the pointer is now: a
+            // drag only starts after a few pixels of movement, by which time a
+            // vertical drag has already left the thin volume line or point.
+            if let Some(pos) = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos()) {
+                let d = match hit(pos, self) {
+                    // A split opens the way it's pulled: the part after it
+                    // starts later, or the one before ends sooner.
+                    Some(Drag::Split(k)) => {
+                        if resp.interact_pointer_pos().unwrap_or(pos).x >= pos.x {
+                            Drag::Start(k + 1)
+                        } else {
+                            Drag::End(k)
+                        }
+                    }
+                    d => d.unwrap_or(Drag::Playhead),
+                };
+                self.dragging = Some(d);
+                if d != Drag::Playhead {
+                    self.before_drag = Some(self.edit.clone());
+                }
+                (self.vol_moved, self.vol_grab, self.vol_guide) = (Vec2::ZERO, t_of(pos.x), None);
+                // Where it was grabbed (in a part, or beside an edge), so it
+                // moves with the pointer instead of jumping to it.
+                let at = t_of(pos.x);
+                self.grab_offset = match d {
+                    Drag::Start(k) => at - parts[k].0,
+                    Drag::End(k) => at - parts[k].1,
+                    Drag::Range(k) => self.info.snap(at) - parts[k].0,
+                    _ => self.info.snap(at) - self.edit.start,
+                };
+                // Moving the playhead or a trim pauses while you drag and carries on
+                // after; shaping the volume never interrupts playback.
+                if matches!(d, Drag::Start(_) | Drag::End(_) | Drag::Range(_) | Drag::Playhead) {
+                    self.resume = self.player.is_playing();
+                    self.player.pause();
+                }
+            }
+        }
+        if let (Some(pos), Some(d)) = (resp.interact_pointer_pos(), self.dragging) {
+            // Dragging the playhead or a trim past either end scrolls a zoomed timeline.
+            if matches!(d, Drag::Start(_) | Drag::End(_) | Drag::Range(_) | Drag::Playhead) && resp.dragged() {
+                let over = if pos.x > lanes.right() { pos.x - lanes.right() } else if pos.x < lanes.left() { pos.x - lanes.left() } else { 0.0 };
+                if over != 0.0 {
+                    self.view.0 = (self.view.0 + (over / lanes.width()) as f64 * self.view.1 * 0.1).clamp(0.0, (dur - self.view.1).max(0.0));
+                    ui.ctx().request_repaint();
+                }
+            }
+            if resp.dragged() || resp.drag_started() {
+                // A volume drag goes a fifth as far with Shift held, for fine
+                // steps (the first frame takes in the movement before the drag
+                // registered); Ctrl keeps it from snapping.
+                let (fine, no_snap) = ui.input(|i| (if i.modifiers.shift { 0.2 } else { 1.0 }, i.modifiers.ctrl));
+                if matches!(d, Drag::Line(_) | Drag::Point(..)) {
+                    let moved = match ui.input(|i| i.pointer.press_origin()) {
+                        Some(origin) if resp.drag_started() => pos - origin,
+                        _ => resp.drag_delta(),
+                    };
+                    self.vol_moved += moved * fine;
+                }
+                let t = self.info.snap(t_of(pos.x));
+                let mut parts = self.edit.parts();
+                // A part's edges go no further than the parts beside it (or
+                // the clip's ends), and keep it a frame long.
+                let lo = |k: usize, parts: &[(f64, f64)]| if k > 0 { parts[k - 1].1 } else { 0.0 };
+                let hi = |k: usize, parts: &[(f64, f64)]| parts.get(k + 1).map_or(self.info.duration, |p| p.0);
+                match d {
+                    Drag::Start(k) if k < parts.len() => {
+                        let t = self.info.snap(self.snapped(t_of(pos.x) - self.grab_offset, px_per_s, Some(d)));
+                        parts[k].0 = t.min(parts[k].1 - fd).max(lo(k, &parts));
+                        self.edit.set_parts(&parts);
+                        self.player.seek(parts[k].0);
+                    }
+                    Drag::End(k) if k < parts.len() => {
+                        let t = self.snapped(t_of(pos.x) - self.grab_offset, px_per_s, Some(d));
+                        parts[k].1 = self.info.snap(t).clamp(parts[k].0 + fd, hi(k, &parts).max(parts[k].0 + fd));
+                        self.edit.set_parts(&parts);
+                        self.player.seek(parts[k].1 - fd);
+                    }
+                    Drag::Range(k) if k < parts.len() => {
+                        // Same length, slid along the clip, stopping at the
+                        // parts beside it (or the clip's ends).
+                        let len = parts[k].1 - parts[k].0;
+                        let (lo, hi) = (lo(k, &parts), hi(k, &parts));
+                        let start = self.info.snap((t - self.grab_offset).clamp(lo, (hi - len).max(lo)));
+                        parts[k] = (start, (start + len).min(hi));
+                        self.edit.set_parts(&parts);
+                        self.player.seek(start);
+                    }
+                    Drag::Start(_) | Drag::End(_) | Drag::Range(_) | Drag::Split(_) => {}
+                    Drag::Playhead => {
+                        let target = self.snap_target(t, px_per_s, Some(Drag::Playhead));
+                        // On an edge, a marker or an end: that frame exactly,
+                        // not a picture near it (letting go doesn't land).
+                        self.playhead_snapped = target.is_some();
+                        self.player.seek(self.info.snap(target.unwrap_or(t)) + 1e-6);
+                    }
+                    Drag::Line(i) => {
+                        // The whole curve, up or down by how far it's been
+                        // dragged (along the fader, so it follows the pointer).
+                        // Level, it snaps to 0 dB as it passes (Ctrl: it doesn't).
+                        let lane = lane_rects[i];
+                        let travel = lane.height() - 8.0;
+                        let was = self.before_drag.as_ref().and_then(|e| e.tracks.get(i)).cloned();
+                        let mut guide = None;
+                        if let Some(was) = was {
+                            let d = -self.vol_moved.y / travel;
+                            let track = &mut self.edit.tracks[i];
+                            if was.points.is_empty() {
+                                let mut db = media::fader_db(media::fader_pos(media::to_db(was.gain)) + d);
+                                // Unchanged, or silent at the bottom.
+                                if let Some(to) = [0.0, media::SILENT_DB].into_iter().find(|&to| !no_snap && (y_of_db(lane, db) - y_of_db(lane, to)).abs() < SNAP_PX) {
+                                    db = to;
+                                    guide = Some((i, to));
+                                }
+                                track.gain = media::from_db(db);
+                            } else {
+                                for (pt, from) in track.points.iter_mut().zip(&was.points) {
+                                    pt.db = media::fader_db(media::fader_pos(from.db) + d);
+                                }
+                            }
+                        }
+                        self.vol_guide = guide;
+                    }
+                    Drag::Point(i, k) => {
+                        // From where it was by how far it's been dragged (taken
+                        // hold of off its middle, it doesn't jump to the
+                        // pointer), between its neighbours. Its level snaps to
+                        // 0 dB and to theirs as it passes (Ctrl: it doesn't).
+                        let lane = lane_rects[i];
+                        let from = self.before_drag.as_ref().and_then(|e| e.tracks.get(i)).and_then(|t| t.points.get(k)).map(|p| (p.t, p.db));
+                        let mut guide = None;
+                        if let Some((t0, db0)) = from.filter(|_| k < self.edit.tracks[i].points.len()) {
+                            let track = &mut self.edit.tracks[i];
+                            // Keep points in time order: clamp between neighbours.
+                            let lo = if k > 0 { track.points[k - 1].t + fd } else { 0.0 };
+                            let hi = track.points.get(k + 1).map_or(self.info.duration, |n| n.t - fd);
+                            let t = self.info.snap(t0 + self.vol_moved.x as f64 / px_per_s).clamp(lo, hi.max(lo));
+                            let mut db = media::fader_db(media::fader_pos(db0) - self.vol_moved.y / (lane.height() - 8.0));
+                            if !no_snap {
+                                let levels = [Some(0.0), Some(media::SILENT_DB), k.checked_sub(1).map(|j| track.points[j].db), track.points.get(k + 1).map(|n| n.db)];
+                                let nearest = levels
+                                    .into_iter()
+                                    .flatten()
+                                    .map(|to| (to, (y_of_db(lane, db) - y_of_db(lane, to)).abs()))
+                                    .filter(|(_, off)| *off < SNAP_PX)
+                                    .min_by(|a, b| a.1.total_cmp(&b.1));
+                                if let Some((to, _)) = nearest {
+                                    db = to;
+                                    guide = Some((i, to));
+                                }
+                            }
+                            track.points[k].t = t;
+                            track.points[k].db = db;
+                            if !self.player.is_playing() {
+                                self.player.seek(t + 1e-6);
+                            }
+                        }
+                        self.vol_guide = guide;
+                    }
+                }
+            }
+        }
+        if resp.drag_stopped() {
+            self.vol_guide = None;
+            if let Some(was) = self.before_drag.take()
+                && !same_edit(&was, &self.edit)
+            {
+                self.push_undo(was);
+            }
+            // The playhead on the frame you see, not one decoded after.
+            if self.dragging == Some(Drag::Playhead) {
+                self.player.land();
+            }
+            self.dragging = None;
+            self.playhead_snapped = false;
+            if std::mem::take(&mut self.resume) && self.player.time() < self.edit.end - fd {
+                self.player.play(self.edit.end);
+            }
+        }
+
+        if resp.double_clicked() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                if let Some(Drag::Point(i, k)) = vol_at(pos, self) {
+                    // On a point: it goes.
+                    self.remove_point(i, k);
+                } else if let Some(i) = lane_rects.iter().position(|l| l.contains(pos) && audio_view.contains(pos)) {
+                    // Add a point on the curve at this time (keeps the sound unchanged
+                    // until it's dragged). The first one adopts the track's flat level.
+                    let t = self.info.snap(t_of(pos.x));
+                    let was = self.edit.clone();
+                    let track = &mut self.edit.tracks[i];
+                    let db = track.db_at(t);
+                    if track.points.is_empty() {
+                        track.gain = 1.0;
+                    }
+                    if !track.points.iter().any(|pt| (pt.t - t).abs() < fd / 2.0) {
+                        let at = track.points.partition_point(|pt| pt.t < t);
+                        track.points.insert(at, media::VolumePoint { t, db });
+                        self.push_undo(was);
+                    }
+                }
+            }
+        } else if resp.clicked() {
+            // Jump there; playing carries on from the new spot.
+            if let Some(pos) = resp.interact_pointer_pos() {
+                let t = self.snapped(t_of(pos.x), px_per_s, Some(Drag::Playhead));
+                self.player.seek(self.info.snap(t) + 1e-6);
+            }
+        }
+        // Right-click: a menu for what's there (a part's handle is the part's).
+        if resp.secondary_clicked() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                {
+                    let t = t_of(pos.x);
+                    let spot = if let Some(Drag::Point(i, k)) = vol_at(pos, self) {
+                        Spot::Point(i, k)
+                    } else if let Some(Drag::Start(k) | Drag::End(k)) = near_grip(pos) {
+                        Spot::Part(k)
+                    } else if let Some(Drag::Line(i)) = vol_at(pos, self) {
+                        Spot::Volume(i)
+                    } else if let Some(&(_, Drag::Split(k))) = splits.iter().find(|(r, _)| r.contains(pos)) {
+                        Spot::Split(k)
+                    } else if let Some(k) = parts.iter().position(|&(a, b)| t >= a && t < b) {
+                        Spot::Part(k)
+                    } else if t < parts[0].0 {
+                        Spot::Before
+                    } else if t >= parts[n - 1].1 {
+                        Spot::After
+                    } else {
+                        Spot::Gap(parts.iter().rposition(|&(_, b)| b <= t).unwrap_or(0))
+                    };
+                    self.menu_at = Some((spot, t));
+                }
+            }
+        }
+    }
+
+    /// The timeline laid out in `outer`, as the view, the sound lanes'
+    /// scroll and the edit are now (see [`Layout`]).
+    fn layout(&self, outer: Rect) -> Layout {
+        let n_audio = self.edit.tracks.len();
+        let lane_step = AUDIO_H + 4.0;
+        // Under the lanes, the line saying how long the parts are.
+        let body_bottom = outer.bottom() - LENGTH_H;
+        let audio_view = Rect::from_x_y_ranges(outer.x_range(), outer.top() + RULER_H + VIDEO_H..=body_bottom);
+        // The mix's meter stands at the right, as tall as the timeline, as
+        // far in from the edge as the transport's buttons are.
+        let right = outer.right() - crate::transport::BAR_PAD;
+        let meter_col = Rect::from_min_max(Pos2::new(right - MIX_W, outer.top()), Pos2::new(right, body_bottom));
+        // Room between for the end handle and the lanes' scrollbar.
+        let lanes_x = outer.left() + HEADER_W..=meter_col.left() - 24.0;
+        let lanes = Rect::from_x_y_ranges(lanes_x.clone(), outer.top()..=body_bottom);
+        let ruler = Rect::from_min_size(Pos2::new(lanes.left(), outer.top()), Vec2::new(lanes.width(), RULER_H));
+        let video = Rect::from_min_size(Pos2::new(lanes.left(), ruler.bottom()), Vec2::new(lanes.width(), VIDEO_H));
+        // The sound lanes, as far as they're scrolled.
+        let top = audio_view.top() - self.lane_scroll + 4.0;
+        let lane_rects = (0..n_audio).map(|i| Rect::from_min_size(Pos2::new(lanes.left(), top + i as f32 * lane_step), Vec2::new(lanes.width(), AUDIO_H))).collect();
+        let body = Rect::from_x_y_ranges(lanes_x, video.top()..=(top + n_audio as f32 * lane_step - 4.0).min(audio_view.bottom()));
+        let hit_area = Rect::from_x_y_ranges(lanes.left() - HANDLE_W - 4.0..=lanes.right() + HANDLE_W + 4.0, ruler.top()..=body_bottom + LENGTH_H);
+        let dur = self.info.duration.max(1e-6);
+        let mut l = Layout { lanes, ruler, video, audio_view, meter_col, body, lane_rects, dur, view: self.view, parts: self.edit.parts(), xs: Vec::new(), splits: Vec::new(), grips: Vec::new(), ranges: Vec::new(), dim_y: body_bottom + LENGTH_H / 2.0, hit_area };
+        l.xs = l.parts.iter().map(|&(a, b)| (l.x_of(a), l.x_of(b))).collect();
+        let n = l.parts.len();
+        // A split: the film cut through, with a grip on the picture's lane to
+        // pull it open with.
+        l.splits = (0..n).filter(|&k| l.split(k)).map(|k| (Rect::from_center_size(Pos2::new(l.xs[k].1, body.center().y), Vec2::new(12.0, body.height())), Drag::Split(k))).collect();
+        // Handles at each part's ends, outside it; between parts, as wide as
+        // half of what's cut out lets them be.
+        for k in 0..n {
+            let (xa, xb) = l.xs[k];
+            if k == 0 || !l.split(k - 1) {
+                let w = if k == 0 { HANDLE_W } else { ((xa - l.xs[k - 1].1) / 2.0).clamp(3.0, HANDLE_W) };
+                l.grips.push((Rect::from_x_y_ranges(xa - w..=xa, body.y_range()), Drag::Start(k)));
+            }
+            if !l.split(k) {
+                let w = if k + 1 == n { HANDLE_W } else { ((l.xs[k + 1].0 - xb) / 2.0).clamp(3.0, HANDLE_W) };
+                l.grips.push((Rect::from_x_y_ranges(xb..=xb + w, body.y_range()), Drag::End(k)));
+            }
+        }
+        l.ranges = (0..n)
+            .map(|k| {
+                let (xa, xb) = l.shown_x(k);
+                Rect::from_x_y_ranges(xa.max(lanes.left())..=xb.min(lanes.right()), l.dim_y - 9.0..=l.dim_y + 9.0)
+            })
+            .collect();
+        l
+    }
+
     /// One shared time axis for everything, like Premiere / Resolve: the
     /// ruler, the video lane (filmstrip) and one lane per sound track, all
     /// lined up so a sound sits right under the frames it belongs to. A
@@ -1553,7 +1876,10 @@ impl Ready {
     /// Volume is edited on the lane itself: drag the line up or down to change
     /// the whole track, double-click it to add a point, drag a point to shape
     /// a ramp, right-click a point to remove it.
-    fn timeline(&mut self, ui: &mut egui::Ui) {
+    ///
+    /// `resp`: what the pointer does on it, read at the start of the frame
+    /// (see [`Ready::timeline_input`]).
+    fn timeline(&mut self, ui: &mut egui::Ui, resp: Option<egui::Response>) {
         let pal = crate::theme::pal(ui);
         let n_audio = self.edit.tracks.len();
         let lane_step = AUDIO_H + 4.0;
@@ -1564,8 +1890,12 @@ impl Ready {
         // Ruler, video lane, the gap above the lanes, the lanes.
         let total_h = (RULER_H + VIDEO_H + 4.0 + lanes_h).min(room);
         let (outer, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), total_h + LENGTH_H), Sense::hover());
-        let body_bottom = outer.top() + total_h;
-        let audio_view = Rect::from_x_y_ranges(outer.x_range(), outer.top() + RULER_H + VIDEO_H..=body_bottom);
+        // What the pointer does on it is read here, first thing next frame.
+        self.timeline_at = Some(outer);
+        // Laid out as it was, for the wheel (where it zooms about): laid out
+        // again below, as the wheel leaves it.
+        let before = self.layout(outer);
+        let (lanes, audio_view, meter_col) = (before.lanes, before.audio_view, before.meter_col);
         // The lanes and the gap above them; a few points over is no reason
         // to scroll.
         let over = 4.0 + lanes_h - audio_view.height();
@@ -1577,13 +1907,6 @@ impl Ready {
         } else if over < -0.5 {
             self.lanes_short = (self.lanes_short + over).max(0.0);
         }
-        // The mix's meter stands at the right, as tall as the timeline, as
-        // far in from the edge as the transport's buttons are.
-        let right = outer.right() - crate::transport::BAR_PAD;
-        let meter_col = Rect::from_min_max(Pos2::new(right - MIX_W, outer.top()), Pos2::new(right, body_bottom));
-        // Room between for the end handle and the lanes' scrollbar.
-        let lanes_x = outer.left() + HEADER_W..=meter_col.left() - 24.0;
-        let lanes = Rect::from_x_y_ranges(lanes_x.clone(), outer.top()..=body_bottom);
         let p = ui.painter_at(outer);
 
         let dur = self.info.duration.max(1e-6);
@@ -1609,17 +1932,20 @@ impl Ready {
         self.lane_scroll = self.lane_scroll.clamp(0.0, max_scroll);
         let pan = -(scroll.x + if lanes_take_vertical { 0.0 } else { scroll.y });
         self.zoom_and_pan(lanes, dur, pointer, pan, zoom);
-        let (v0, span) = self.view;
-        let px_per_s = lanes.width() as f64 / span.max(1e-9);
+        // Laid out as the wheel leaves the view and the lanes' scroll (and as
+        // the pointer left the edit, first thing this frame).
+        let l = self.layout(outer);
+        let (v0, span) = l.view;
+        let px_per_s = l.px_per_s();
         self.px_per_s = px_per_s;
-        let x_of = |t: f64| lanes.left() + ((t - v0) / span) as f32 * lanes.width();
-        let t_of = |x: f32| (v0 + ((x - lanes.left()) / lanes.width()).clamp(0.0, 1.0) as f64 * span).clamp(0.0, dur);
+        let x_of = |t: f64| l.x_of(t);
+        let t_of = |x: f32| l.t_of(x);
         // Everything on the time axis is clipped to the lanes, so a zoomed-in
         // timeline never draws into the headers.
         let lp = ui.painter_at(lanes);
 
         // --- Ruler ---
-        let ruler = Rect::from_min_size(Pos2::new(lanes.left(), outer.top()), Vec2::new(lanes.width(), RULER_H));
+        let ruler = l.ruler;
         // Pins: click one to go there (markers are added and taken away
         // while watching).
         let moments = std::mem::take(&mut self.moments);
@@ -1645,7 +1971,7 @@ impl Ready {
         // --- Header column: each lane's name ---
 
         // --- Video lane ---
-        let video = Rect::from_min_size(Pos2::new(lanes.left(), ruler.bottom()), Vec2::new(lanes.width(), VIDEO_H));
+        let video = l.video;
         let vhead = Rect::from_min_max(Pos2::new(outer.left(), video.top()), Pos2::new(lanes.left() - 8.0, video.bottom()));
         p.text(Pos2::new(vhead.left() + 16.0 + 8.0, vhead.center().y), Align2::CENTER_CENTER, egui_phosphor::regular::FILM_STRIP, FontId::proportional(15.0), pal.text3);
         p.text(Pos2::new(vhead.left() + 40.0, vhead.center().y), Align2::LEFT_CENTER, "Video", crate::theme::font(13.0, crate::theme::W::Medium), pal.text);
@@ -1658,13 +1984,9 @@ impl Ready {
         // Scrolled lanes are clipped to the space under the video lane.
         let ap = ui.painter_at(audio_view);
         let alp = ui.painter_at(lanes.intersect(audio_view));
-        let mut lane_rects = Vec::new();
+        let lane_rects = &l.lane_rects;
         let labels: Vec<String> = self.info.source_tracks().iter().map(|a| a.label()).collect();
-        let mut y = audio_view.top() - self.lane_scroll + 4.0;
-        for i in 0..n_audio {
-            let lane = Rect::from_min_size(Pos2::new(lanes.left(), y), Vec2::new(lanes.width(), AUDIO_H));
-            lane_rects.push(lane);
-            y += lane_step;
+        for (i, &lane) in lane_rects.iter().enumerate() {
             if !lane.intersects(audio_view) {
                 continue;
             }
@@ -1703,12 +2025,10 @@ impl Ready {
 
         // --- What's kept: each part outlined, with handles at its ends; what's
         // cut away (trimmed off the ends, cut out between parts) dimmed ---
-        let body = Rect::from_x_y_ranges(lanes_x, video.top()..=(y - 4.0).min(audio_view.bottom()));
-        let parts = self.edit.parts();
+        let body = l.body;
+        let parts = &l.parts;
         let n = parts.len();
-        let xs: Vec<(f32, f32)> = parts.iter().map(|&(a, b)| (x_of(a), x_of(b))).collect();
-        // Part k and the next touch: split, nothing cut out between them.
-        let split = |k: usize| k + 1 < n && parts[k + 1].0 - parts[k].1 < 1e-6;
+        let xs = &l.xs;
         // A stretch just cut out fades to dim; one put back, from it.
         let now = ctx.input(|i| i.time);
         let fading = self.fading.filter(|f| now - f.since < FADE_S);
@@ -1744,13 +2064,8 @@ impl Ready {
         let outline = theme_fade(&ctx, "ed_trimmed", trimmed || self.dragging.is_some_and(|d| matches!(d, Drag::Start(_) | Drag::End(_))));
         let edge = crate::theme::mix(pal.text3, pal.text, outline);
         let hover_pos = ui.input(|i| i.pointer.hover_pos());
-        // At a split the two parts' outlines stop short of each other: the
-        // film is cut there.
-        const SPLIT_GAP: f32 = 2.0;
-        let shown_x = |k: usize| {
-            let (xa, xb) = xs[k];
-            (if k > 0 && split(k - 1) { xa + SPLIT_GAP } else { xa }, if split(k) { xb - SPLIT_GAP } else { xb })
-        };
+        // At a split the two parts' outlines stop short of each other.
+        let shown_x = |k: usize| l.shown_x(k);
         for k in 0..n {
             let (xa, xb) = shown_x(k);
             let part = Rect::from_x_y_ranges(xa..=xb, body.y_range());
@@ -1771,55 +2086,30 @@ impl Ready {
         }
         // A split: the film cut through, a hair of the page between its
         // parts, and a grip on the picture's lane to pull it open with.
-        let mut splits: Vec<(Rect, Drag)> = Vec::new();
         // Handles and grips stand out past the lanes a little, never over
         // the lanes' names (zoomed in, an edge just out of view).
-        let handle_w = 6.0;
-        let hp = ui.painter_at(lanes.expand2(Vec2::new(handle_w + 3.0, 0.0)).intersect(outer));
-        for k in (0..n).filter(|&k| split(k)) {
+        let hp = ui.painter_at(lanes.expand2(Vec2::new(HANDLE_W + 3.0, 0.0)).intersect(outer));
+        for &(r, d) in &l.splits {
+            let Drag::Split(k) = d else { continue };
             let x = xs[k].1;
-            let r = Rect::from_center_size(Pos2::new(x, body.center().y), Vec2::new(12.0, body.height()));
             let hv = theme_fade(&ctx, &format!("ed_split{k}"), self.dragging.is_none() && hover_pos.is_some_and(|p| r.contains(p)));
             lp.rect_filled(Rect::from_x_y_ranges(x - SPLIT_GAP..=x + SPLIT_GAP, body.y_range()), 0, pal.base);
             let grip = Rect::from_center_size(Pos2::new(x, video.center().y), Vec2::new(6.0 + 2.0 * hv, 26.0 + 6.0 * hv));
             hp.rect_filled(grip.expand(1.5), 4, pal.base);
             hp.rect_filled(grip, 3, crate::theme::mix(edge, pal.text, hv));
             crate::demo::mark(&ctx, || format!("split:{}", k + 1), r);
-            splits.push((r, Drag::Split(k)));
         }
-        // Handles at each part's ends, outside it; between parts, as wide as
-        // half of what's cut out lets them be.
-        let mut grips: Vec<(Rect, Drag)> = Vec::new();
-        for k in 0..n {
-            let (xa, xb) = xs[k];
-            if k == 0 || !split(k - 1) {
-                let w = if k == 0 { handle_w } else { ((xa - xs[k - 1].1) / 2.0).clamp(3.0, handle_w) };
-                grips.push((Rect::from_x_y_ranges(xa - w..=xa, body.y_range()), Drag::Start(k)));
-            }
-            if !split(k) {
-                let w = if k + 1 == n { handle_w } else { ((xs[k + 1].0 - xb) / 2.0).clamp(3.0, handle_w) };
-                grips.push((Rect::from_x_y_ranges(xb..=xb + w, body.y_range()), Drag::End(k)));
-            }
-        }
+        // Handles at each part's ends (see `Ready::layout`).
+        let grips = &l.grips;
         if let Some((r, _)) = grips.first() {
             crate::demo::mark(&ctx, || "trim:in".into(), *r);
         }
         if let Some((r, _)) = grips.last() {
             crate::demo::mark(&ctx, || "trim:out".into(), *r);
         }
-        let near_grip = |pos: Pos2| grips.iter().filter(|(r, _)| r.expand(5.0).contains(pos)).min_by(|a, b| (a.0.center().x - pos.x).abs().total_cmp(&(b.0.center().x - pos.x).abs())).map(|g| g.1);
+        let near_grip = |pos: Pos2| l.near_grip(pos);
         let hovered_grip = hover_pos.filter(|_| self.dragging.is_none()).and_then(near_grip);
-        // A volume point under the pointer, else its lane's line (unless a
-        // handle is nearer): what a drag there takes hold of.
-        let vol_at = |pos: Pos2, this: &Self| -> Option<Drag> {
-            let (i, lane) = lane_rects.iter().enumerate().find(|(_, l)| l.contains(pos) && audio_view.contains(pos))?;
-            let track = &this.edit.tracks[i];
-            if let Some(k) = track.points.iter().position(|pt| Pos2::new(x_of(pt.t), y_of_db(*lane, pt.db)).distance(pos) < 8.0) {
-                return Some(Drag::Point(i, k));
-            }
-            let on_line = (pos.y - y_of_db(*lane, track.db_at(t_of(pos.x)))).abs() < 6.0;
-            (on_line && near_grip(pos).is_none()).then_some(Drag::Line(i))
-        };
+        let vol_at = |pos: Pos2, this: &Self| l.vol_at(pos, &this.edit.tracks);
         // The volume line or point pointed at, or taken hold of.
         let vol_hot = match self.dragging {
             Some(d @ (Drag::Line(_) | Drag::Point(..))) => Some(d),
@@ -1841,7 +2131,7 @@ impl Ready {
                 draw_envelope(&alp, pal, *lane, &self.edit.tracks[i], dur, x_of, look);
             }
         }
-        for (h, drag) in &grips {
+        for (h, drag) in grips {
             let (left, k) = match *drag {
                 Drag::Start(k) => (true, k),
                 Drag::End(k) => (false, k),
@@ -1861,7 +2151,7 @@ impl Ready {
         }
         // Each part's length, as a dimension line under the lanes; drag one
         // to slide its part along the clip, its length kept.
-        let dim_y = body_bottom + LENGTH_H / 2.0;
+        let dim_y = l.dim_y;
         // What the timeline says where the pointer rests: on the picture's
         // lane, what a stretch cut out, or the part chosen, is for.
         let mut tip: Option<String> = None;
@@ -1876,12 +2166,7 @@ impl Ready {
                 tip = Some("Cut out: playing skips it. Drag its edges, or right-click to put it back".into());
             }
         }
-        let ranges: Vec<Rect> = (0..n)
-            .map(|k| {
-                let (xa, xb) = shown_x(k);
-                Rect::from_x_y_ranges(xa.max(lanes.left())..=xb.min(lanes.right()), dim_y - 9.0..=dim_y + 9.0)
-            })
-            .collect();
+        let ranges = &l.ranges;
         for (k, range) in ranges.iter().enumerate().filter(|(_, r)| r.width() > 0.0) {
             let hovered = self.dragging.is_none() && hover_pos.is_some_and(|p| range.contains(p));
             let lit = self.dragging == Some(Drag::Range(k)) || self.menu_at.is_some_and(|(s, _)| s == Spot::Part(k)) || hovered;
@@ -2034,10 +2319,9 @@ impl Ready {
             }
         }
 
-        // --- Interaction ---
-        let hit_area = Rect::from_x_y_ranges(lanes.left() - handle_w - 4.0..=lanes.right() + handle_w + 4.0, ruler.top()..=body_bottom + LENGTH_H);
-        let mut resp = ui.interact(hit_area, ui.id().with("timeline"), Sense::click_and_drag());
-        let pointer = resp.hover_pos();
+        // --- The pointer: what's under it, what it holds (what it does to
+        // them was read first thing, see `Ready::timeline_input`) ---
+        let pointer = resp.as_ref().and_then(egui::Response::hover_pos);
         if let Some(label) = len_label {
             if n == 1 {
                 self.length_field(ui, label, &len_text);
@@ -2054,37 +2338,17 @@ impl Ready {
                 }
             }
         }
-        if let Some(tip) = tip.filter(|_| self.dragging.is_none()) {
-            resp = resp.on_hover_text(tip);
-        }
+        let resp = resp.map(|resp| match tip.filter(|_| self.dragging.is_none()) {
+            Some(tip) => resp.on_hover_text(tip),
+            None => resp,
+        });
         // (A click on the length is its own; a drag that starts on it is
         // the timeline's, sliding the kept part: egui gives each its widget.)
 
-        // What's under the pointer, in priority order.
-        let hit = |pos: Pos2, this: &Self| -> Option<Drag> {
-            // A volume point over a handle is the point's.
-            let vol = vol_at(pos, this);
-            if let Some(d @ Drag::Point(..)) = vol {
-                return Some(d);
-            }
-            // The nearest handle, then a split, then a part's length, then a
-            // volume line.
-            if let Some(d) = near_grip(pos) {
-                return Some(d);
-            }
-            if let Some(&(_, d)) = splits.iter().find(|(r, _)| r.contains(pos)) {
-                return Some(d);
-            }
-            if let Some(k) = ranges.iter().position(|r| r.width() > 0.0 && r.expand2(Vec2::new(0.0, 4.0)).contains(pos)) {
-                return Some(Drag::Range(k));
-            }
-            vol
-        };
-
         // The cursor says what a drag takes hold of; while dragging, what's
         // held (wherever the pointer has gone).
-        let held = self.dragging.filter(|_| resp.dragged());
-        if let Some(d) = held.or_else(|| pointer.and_then(|pos| hit(pos, self))) {
+        let held = self.dragging.filter(|_| resp.as_ref().is_some_and(egui::Response::dragged));
+        if let Some(d) = held.or_else(|| pointer.and_then(|pos| l.hit(pos, &self.edit.tracks))) {
             let icon = match d {
                 Drag::Start(_) | Drag::End(_) | Drag::Split(_) => Some(egui::CursorIcon::ResizeHorizontal),
                 Drag::Range(_) | Drag::Point(..) => Some(if held.is_some() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab }),
@@ -2105,7 +2369,7 @@ impl Ready {
             }
         }
         // Dragging the volume: the level as it goes (a point's time too).
-        if let Some(pos) = resp.interact_pointer_pos() {
+        if let Some(pos) = resp.as_ref().and_then(egui::Response::interact_pointer_pos) {
             let text = match self.dragging {
                 Some(Drag::Line(i)) => self.edit.tracks.get(i).map(|t| db_label(t.db_at(self.vol_grab))),
                 Some(Drag::Point(i, k)) => self.edit.tracks.get(i).and_then(|t| t.points.get(k)).map(|pt| format!("{}  ·  {}", db_label(pt.db), crate::transport::clock(pt.t))),
@@ -2116,250 +2380,7 @@ impl Ready {
             }
         }
 
-        if resp.drag_started() {
-            // Hit-test where the button went down, not where the pointer is now: a
-            // drag only starts after a few pixels of movement, by which time a
-            // vertical drag has already left the thin volume line or point.
-            if let Some(pos) = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos()) {
-                let d = match hit(pos, self) {
-                    // A split opens the way it's pulled: the part after it
-                    // starts later, or the one before ends sooner.
-                    Some(Drag::Split(k)) => {
-                        if resp.interact_pointer_pos().unwrap_or(pos).x >= pos.x {
-                            Drag::Start(k + 1)
-                        } else {
-                            Drag::End(k)
-                        }
-                    }
-                    d => d.unwrap_or(Drag::Playhead),
-                };
-                self.dragging = Some(d);
-                if d != Drag::Playhead {
-                    self.before_drag = Some(self.edit.clone());
-                }
-                (self.vol_moved, self.vol_grab, self.vol_guide) = (Vec2::ZERO, t_of(pos.x), None);
-                // Where it was grabbed (in a part, or beside an edge), so it
-                // moves with the pointer instead of jumping to it.
-                let at = t_of(pos.x);
-                self.grab_offset = match d {
-                    Drag::Start(k) => at - parts[k].0,
-                    Drag::End(k) => at - parts[k].1,
-                    Drag::Range(k) => self.info.snap(at) - parts[k].0,
-                    _ => self.info.snap(at) - self.edit.start,
-                };
-                // Moving the playhead or a trim pauses while you drag and carries on
-                // after; shaping the volume never interrupts playback.
-                if matches!(d, Drag::Start(_) | Drag::End(_) | Drag::Range(_) | Drag::Playhead) {
-                    self.resume = self.player.is_playing();
-                    self.player.pause();
-                }
-            }
-        }
-        if let (Some(pos), Some(d)) = (resp.interact_pointer_pos(), self.dragging) {
-            // Dragging the playhead or a trim past either end scrolls a zoomed timeline.
-            if matches!(d, Drag::Start(_) | Drag::End(_) | Drag::Range(_) | Drag::Playhead) && resp.dragged() {
-                let over = if pos.x > lanes.right() { pos.x - lanes.right() } else if pos.x < lanes.left() { pos.x - lanes.left() } else { 0.0 };
-                if over != 0.0 {
-                    self.view.0 = (self.view.0 + (over / lanes.width()) as f64 * self.view.1 * 0.1).clamp(0.0, (dur - self.view.1).max(0.0));
-                    ui.ctx().request_repaint();
-                }
-            }
-            let before = self.player.time();
-            if resp.dragged() || resp.drag_started() {
-                // A volume drag goes a fifth as far with Shift held, for fine
-                // steps (the first frame takes in the movement before the drag
-                // registered); Ctrl keeps it from snapping.
-                let (fine, no_snap) = ui.input(|i| (if i.modifiers.shift { 0.2 } else { 1.0 }, i.modifiers.ctrl));
-                if matches!(d, Drag::Line(_) | Drag::Point(..)) {
-                    let moved = match ui.input(|i| i.pointer.press_origin()) {
-                        Some(origin) if resp.drag_started() => pos - origin,
-                        _ => resp.drag_delta(),
-                    };
-                    self.vol_moved += moved * fine;
-                }
-                let t = self.info.snap(t_of(pos.x));
-                let mut parts = self.edit.parts();
-                // A part's edges go no further than the parts beside it (or
-                // the clip's ends), and keep it a frame long.
-                let lo = |k: usize, parts: &[(f64, f64)]| if k > 0 { parts[k - 1].1 } else { 0.0 };
-                let hi = |k: usize, parts: &[(f64, f64)]| parts.get(k + 1).map_or(self.info.duration, |p| p.0);
-                match d {
-                    Drag::Start(k) if k < parts.len() => {
-                        let t = self.info.snap(self.snapped(t_of(pos.x) - self.grab_offset, px_per_s, Some(d)));
-                        parts[k].0 = t.min(parts[k].1 - fd).max(lo(k, &parts));
-                        self.edit.set_parts(&parts);
-                        self.player.seek(parts[k].0);
-                    }
-                    Drag::End(k) if k < parts.len() => {
-                        let t = self.snapped(t_of(pos.x) - self.grab_offset, px_per_s, Some(d));
-                        parts[k].1 = self.info.snap(t).clamp(parts[k].0 + fd, hi(k, &parts).max(parts[k].0 + fd));
-                        self.edit.set_parts(&parts);
-                        self.player.seek(parts[k].1 - fd);
-                    }
-                    Drag::Range(k) if k < parts.len() => {
-                        // Same length, slid along the clip, stopping at the
-                        // parts beside it (or the clip's ends).
-                        let len = parts[k].1 - parts[k].0;
-                        let (lo, hi) = (lo(k, &parts), hi(k, &parts));
-                        let start = self.info.snap((t - self.grab_offset).clamp(lo, (hi - len).max(lo)));
-                        parts[k] = (start, (start + len).min(hi));
-                        self.edit.set_parts(&parts);
-                        self.player.seek(start);
-                    }
-                    Drag::Start(_) | Drag::End(_) | Drag::Range(_) | Drag::Split(_) => {}
-                    Drag::Playhead => {
-                        let target = self.snap_target(t, px_per_s, Some(Drag::Playhead));
-                        // On an edge, a marker or an end: that frame exactly,
-                        // not a picture near it (letting go doesn't land).
-                        self.playhead_snapped = target.is_some();
-                        self.player.seek(self.info.snap(target.unwrap_or(t)) + 1e-6);
-                    }
-                    Drag::Line(i) => {
-                        // The whole curve, up or down by how far it's been
-                        // dragged (along the fader, so it follows the pointer).
-                        // Level, it snaps to 0 dB as it passes (Ctrl: it doesn't).
-                        let lane = lane_rects[i];
-                        let travel = lane.height() - 8.0;
-                        let was = self.before_drag.as_ref().and_then(|e| e.tracks.get(i)).cloned();
-                        let mut guide = None;
-                        if let Some(was) = was {
-                            let d = -self.vol_moved.y / travel;
-                            let track = &mut self.edit.tracks[i];
-                            if was.points.is_empty() {
-                                let mut db = media::fader_db(media::fader_pos(media::to_db(was.gain)) + d);
-                                // Unchanged, or silent at the bottom.
-                                if let Some(to) = [0.0, media::SILENT_DB].into_iter().find(|&to| !no_snap && (y_of_db(lane, db) - y_of_db(lane, to)).abs() < SNAP_PX) {
-                                    db = to;
-                                    guide = Some((i, to));
-                                }
-                                track.gain = media::from_db(db);
-                            } else {
-                                for (pt, from) in track.points.iter_mut().zip(&was.points) {
-                                    pt.db = media::fader_db(media::fader_pos(from.db) + d);
-                                }
-                            }
-                        }
-                        self.vol_guide = guide;
-                    }
-                    Drag::Point(i, k) => {
-                        // From where it was by how far it's been dragged (taken
-                        // hold of off its middle, it doesn't jump to the
-                        // pointer), between its neighbours. Its level snaps to
-                        // 0 dB and to theirs as it passes (Ctrl: it doesn't).
-                        let lane = lane_rects[i];
-                        let from = self.before_drag.as_ref().and_then(|e| e.tracks.get(i)).and_then(|t| t.points.get(k)).map(|p| (p.t, p.db));
-                        let mut guide = None;
-                        if let Some((t0, db0)) = from.filter(|_| k < self.edit.tracks[i].points.len()) {
-                            let track = &mut self.edit.tracks[i];
-                            // Keep points in time order: clamp between neighbours.
-                            let lo = if k > 0 { track.points[k - 1].t + fd } else { 0.0 };
-                            let hi = track.points.get(k + 1).map_or(self.info.duration, |n| n.t - fd);
-                            let t = self.info.snap(t0 + self.vol_moved.x as f64 / px_per_s).clamp(lo, hi.max(lo));
-                            let mut db = media::fader_db(media::fader_pos(db0) - self.vol_moved.y / (lane.height() - 8.0));
-                            if !no_snap {
-                                let levels = [Some(0.0), Some(media::SILENT_DB), k.checked_sub(1).map(|j| track.points[j].db), track.points.get(k + 1).map(|n| n.db)];
-                                let nearest = levels
-                                    .into_iter()
-                                    .flatten()
-                                    .map(|to| (to, (y_of_db(lane, db) - y_of_db(lane, to)).abs()))
-                                    .filter(|(_, off)| *off < SNAP_PX)
-                                    .min_by(|a, b| a.1.total_cmp(&b.1));
-                                if let Some((to, _)) = nearest {
-                                    db = to;
-                                    guide = Some((i, to));
-                                }
-                            }
-                            track.points[k].t = t;
-                            track.points[k].db = db;
-                            if !self.player.is_playing() {
-                                self.player.seek(t + 1e-6);
-                            }
-                        }
-                        self.vol_guide = guide;
-                    }
-                }
-            }
-            // The drag moved the playhead: drawn on the next frame, not on the next pointer event.
-            if self.player.time() != before {
-                ctx.request_repaint();
-            }
-        }
-        if resp.drag_stopped() {
-            self.vol_guide = None;
-            if let Some(was) = self.before_drag.take()
-                && !same_edit(&was, &self.edit)
-            {
-                self.push_undo(was);
-            }
-            // The playhead on the frame you see, not one decoded after.
-            if self.dragging == Some(Drag::Playhead) {
-                self.player.land();
-            }
-            self.dragging = None;
-            self.playhead_snapped = false;
-            if std::mem::take(&mut self.resume) && self.player.time() < self.edit.end - fd {
-                self.player.play(self.edit.end);
-            }
-            // Letting go can move the playhead onto the frame shown: drawn now.
-            ctx.request_repaint();
-        }
-
-        if resp.double_clicked() {
-            if let Some(pos) = resp.interact_pointer_pos() {
-                if let Some(Drag::Point(i, k)) = vol_at(pos, self) {
-                    // On a point: it goes.
-                    self.remove_point(i, k);
-                } else if let Some(i) = lane_rects.iter().position(|l| l.contains(pos) && audio_view.contains(pos)) {
-                    // Add a point on the curve at this time (keeps the sound unchanged
-                    // until it's dragged). The first one adopts the track's flat level.
-                    let t = self.info.snap(t_of(pos.x));
-                    let was = self.edit.clone();
-                    let track = &mut self.edit.tracks[i];
-                    let db = track.db_at(t);
-                    if track.points.is_empty() {
-                        track.gain = 1.0;
-                    }
-                    if !track.points.iter().any(|pt| (pt.t - t).abs() < fd / 2.0) {
-                        let at = track.points.partition_point(|pt| pt.t < t);
-                        track.points.insert(at, media::VolumePoint { t, db });
-                        self.push_undo(was);
-                    }
-                }
-            }
-        } else if resp.clicked() {
-            // Jump there; playing carries on from the new spot.
-            if let Some(pos) = resp.interact_pointer_pos() {
-                let t = self.snapped(t_of(pos.x), px_per_s, Some(Drag::Playhead));
-                self.player.seek(self.info.snap(t) + 1e-6);
-            }
-        }
-        // Right-click: a menu for what's there (a part's handle is the part's).
-        if resp.secondary_clicked() {
-            if let Some(pos) = resp.interact_pointer_pos() {
-                {
-                    let t = t_of(pos.x);
-                    let spot = if let Some(Drag::Point(i, k)) = vol_at(pos, self) {
-                        Spot::Point(i, k)
-                    } else if let Some(Drag::Start(k) | Drag::End(k)) = near_grip(pos) {
-                        Spot::Part(k)
-                    } else if let Some(Drag::Line(i)) = vol_at(pos, self) {
-                        Spot::Volume(i)
-                    } else if let Some(&(_, Drag::Split(k))) = splits.iter().find(|(r, _)| r.contains(pos)) {
-                        Spot::Split(k)
-                    } else if let Some(k) = parts.iter().position(|&(a, b)| t >= a && t < b) {
-                        Spot::Part(k)
-                    } else if t < parts[0].0 {
-                        Spot::Before
-                    } else if t >= parts[n - 1].1 {
-                        Spot::After
-                    } else {
-                        Spot::Gap(parts.iter().rposition(|&(_, b)| b <= t).unwrap_or(0))
-                    };
-                    self.menu_at = Some((spot, t));
-                }
-            }
-        }
-        if let Some((spot, t)) = self.menu_at {
+        if let (Some((spot, t)), Some(resp)) = (self.menu_at, resp.as_ref()) {
             enum Act {
                 Split,
                 CutOut(usize),
@@ -2374,7 +2395,7 @@ impl Ready {
             let can_split = self.split_at(t).is_some();
             let at_playhead = self.part_at(self.player.time());
             let mut act = None;
-            let open = crate::ui_kit::context_menu(&resp, 220.0, |ui| {
+            let open = crate::ui_kit::context_menu(resp, 220.0, |ui| {
                 use crate::ui_kit::Item;
                 use egui_phosphor::regular as icon;
                 match spot {
@@ -2508,6 +2529,109 @@ enum Drag {
     Line(usize),
     /// Keyframe k of track i.
     Point(usize, usize),
+}
+
+/// The handles at the parts' ends: this wide, outside them.
+const HANDLE_W: f32 = 6.0;
+/// At a split the two parts' outlines stop this short of each other: the
+/// film is cut there.
+const SPLIT_GAP: f32 = 2.0;
+
+/// Where everything on the timeline is, for a frame: laid out from the
+/// space it has, the view, the sound lanes' scroll and the edit as they are
+/// then. What the pointer does is read against where things were drawn last
+/// frame, first thing (see [`Ready::timeline_input`]); then they're laid out
+/// again where they're drawn, with what the pointer moved.
+struct Layout {
+    /// On the time axis, the ruler's top to the last sound lane's bottom.
+    lanes: Rect,
+    ruler: Rect,
+    video: Rect,
+    /// Where the sound lanes show (they scroll in it).
+    audio_view: Rect,
+    /// The mix's meter, on the right.
+    meter_col: Rect,
+    /// From the video lane down through the sound lanes: what the parts span.
+    body: Rect,
+    lane_rects: Vec<Rect>,
+    /// The clip's length, and the part of it shown (start, length).
+    dur: f64,
+    view: (f64, f64),
+    parts: Vec<(f64, f64)>,
+    /// Where each part starts and ends on screen.
+    xs: Vec<(f32, f32)>,
+    splits: Vec<(Rect, Drag)>,
+    grips: Vec<(Rect, Drag)>,
+    /// Each part's length, as a bar on the line under the lanes (`dim_y`).
+    ranges: Vec<Rect>,
+    dim_y: f32,
+    /// Where the pointer takes hold of the timeline.
+    hit_area: Rect,
+}
+
+impl Layout {
+    fn x_of(&self, t: f64) -> f32 {
+        let (v0, span) = self.view;
+        self.lanes.left() + ((t - v0) / span) as f32 * self.lanes.width()
+    }
+
+    fn t_of(&self, x: f32) -> f64 {
+        let (v0, span) = self.view;
+        (v0 + ((x - self.lanes.left()) / self.lanes.width()).clamp(0.0, 1.0) as f64 * span).clamp(0.0, self.dur)
+    }
+
+    fn px_per_s(&self) -> f64 {
+        self.lanes.width() as f64 / self.view.1.max(1e-9)
+    }
+
+    /// Part `k` and the next touch: split, nothing cut out between them.
+    fn split(&self, k: usize) -> bool {
+        k + 1 < self.parts.len() && self.parts[k + 1].0 - self.parts[k].1 < 1e-6
+    }
+
+    /// Where part `k`'s outline starts and ends: short of a split.
+    fn shown_x(&self, k: usize) -> (f32, f32) {
+        let (xa, xb) = self.xs[k];
+        (if k > 0 && self.split(k - 1) { xa + SPLIT_GAP } else { xa }, if self.split(k) { xb - SPLIT_GAP } else { xb })
+    }
+
+    /// The handle nearest `pos`, if it's on one (or almost).
+    fn near_grip(&self, pos: Pos2) -> Option<Drag> {
+        self.grips.iter().filter(|(r, _)| r.expand(5.0).contains(pos)).min_by(|a, b| (a.0.center().x - pos.x).abs().total_cmp(&(b.0.center().x - pos.x).abs())).map(|g| g.1)
+    }
+
+    /// A volume point under the pointer, else its lane's line (unless a
+    /// handle is nearer): what a drag there takes hold of.
+    fn vol_at(&self, pos: Pos2, tracks: &[media::TrackEdit]) -> Option<Drag> {
+        let (i, lane) = self.lane_rects.iter().enumerate().find(|(_, l)| l.contains(pos) && self.audio_view.contains(pos))?;
+        let track = &tracks[i];
+        if let Some(k) = track.points.iter().position(|pt| Pos2::new(self.x_of(pt.t), y_of_db(*lane, pt.db)).distance(pos) < 8.0) {
+            return Some(Drag::Point(i, k));
+        }
+        let on_line = (pos.y - y_of_db(*lane, track.db_at(self.t_of(pos.x)))).abs() < 6.0;
+        (on_line && self.near_grip(pos).is_none()).then_some(Drag::Line(i))
+    }
+
+    /// What's under the pointer, in priority order.
+    fn hit(&self, pos: Pos2, tracks: &[media::TrackEdit]) -> Option<Drag> {
+        // A volume point over a handle is the point's.
+        let vol = self.vol_at(pos, tracks);
+        if let Some(d @ Drag::Point(..)) = vol {
+            return Some(d);
+        }
+        // The nearest handle, then a split, then a part's length, then a
+        // volume line.
+        if let Some(d) = self.near_grip(pos) {
+            return Some(d);
+        }
+        if let Some(&(_, d)) = self.splits.iter().find(|(r, _)| r.contains(pos)) {
+            return Some(d);
+        }
+        if let Some(k) = self.ranges.iter().position(|r| r.width() > 0.0 && r.expand2(Vec2::new(0.0, 4.0)).contains(pos)) {
+            return Some(Drag::Range(k));
+        }
+        vol
+    }
 }
 
 /// The bar between the picture and the timeline: drag it to give either more

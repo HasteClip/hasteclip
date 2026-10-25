@@ -180,6 +180,10 @@ struct Ready {
     /// Where the wheel has taken the playhead, unsnapped: the glide's last
     /// small steps add up instead of each being rounded back to its frame.
     scroll_to: Option<f64>,
+    /// Where the timeline was laid out last frame (not at all, the
+    /// fullscreen controls hidden): its clicks and drags are read there,
+    /// first thing in the next.
+    timeline_at: Option<Rect>,
     /// Hover preview: the frame shown and its texture.
     hover: Option<(u64, egui::TextureHandle)>,
     /// How fast it plays (1.0 as recorded).
@@ -573,6 +577,7 @@ impl Ready {
             glide: Default::default(),
             last_activity: Instant::now(),
             scroll_to: None,
+            timeline_at: None,
             hover: None,
             speed: speed(ctx),
             drag_out: false,
@@ -665,7 +670,6 @@ impl Ready {
             }
             None => {}
         }
-        let scrubbing = self.dragging.is_some() || self.scrolled.is_some();
 
         let full = is_fullscreen(&ctx);
 
@@ -675,6 +679,22 @@ impl Ready {
         let preview_h = if full { ui.available_height() } else { (ui.available_height() - controls_h).max(160.0) };
         // Click to play or pause; drag out of the window to share the clip.
         let (preview, preview_resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), preview_h), Sense::click_and_drag());
+
+        // A click or drag on the timeline, and the wheel, before anything
+        // that shows where the playhead is: the picture, the time and the
+        // playhead itself follow the pointer on the frame it moves. (Read
+        // after them, every frame of a drag showed where the move before had
+        // put it.) The timeline is taken where it was laid out last frame, as
+        // egui finds what's under the pointer; over the picture, as in
+        // fullscreen, it's on top (taken after it).
+        let timeline = self.timeline_at.take().map(|outer| (outer, ui.interact(outer, egui::Id::new("viewer_timeline"), Sense::click_and_drag())));
+        if let Some((outer, resp)) = &timeline {
+            self.timeline_input(ui, resp, timeline_lanes(*outer));
+        }
+        let timeline_w = timeline.as_ref().map_or(preview.width(), |(outer, _)| timeline_lanes(*outer).width());
+        self.wheel(&ctx, preview, timeline_w);
+        let scrubbing = self.dragging.is_some() || self.scrolled.is_some();
+
         self.player.set_stepping(self.stepping_back);
         // Scrubbing the playhead: held still, the picture stays, and letting
         // go lands on it, if it's within a dozen pixels of the timeline (the
@@ -713,7 +733,7 @@ impl Ready {
             ctx.request_repaint();
         }
 
-        let mut timeline_w = preview.width();
+        let timeline = timeline.as_ref().map(|(_, resp)| resp);
         if full {
             // Over the bottom of the picture while the mouse moves (and a few
             // seconds after) or rests on them; hidden otherwise, cursor too,
@@ -746,12 +766,12 @@ impl Ready {
                 child.multiply_opacity(shown);
                 // White on the shade, whatever the look.
                 child.visuals_mut().dark_mode = true;
-                timeline_w = self.controls(&mut child, preview, true);
+                self.controls(&mut child, preview, true, timeline);
             } else if pointer_over(&ctx, preview) {
                 ctx.set_cursor_icon(egui::CursorIcon::None);
             }
         } else {
-            timeline_w = self.controls(ui, preview, false);
+            self.controls(ui, preview, false, timeline);
         }
 
         let preview_resp = preview_resp.on_hover_cursor(if full { egui::CursorIcon::Default } else { egui::CursorIcon::PointingHand });
@@ -766,28 +786,6 @@ impl Ready {
         } else if preview_resp.clicked() {
             self.toggle_play();
             self.flash_play = Some((self.player.is_playing(), Instant::now()));
-        }
-
-        // Scroll over the picture (or the timeline, over or under it) to
-        // scrub through the clip.
-        let over = pointer_over(&ctx, preview) || (!crate::ui_kit::overlay_open(&ctx) && ctx.pointer_hover_pos().is_some_and(|p| p.y > preview.bottom()));
-        let mut input = if over { crate::wheel::read(&ctx).scroll } else { Vec2::ZERO };
-        input.y += dev_wheel();
-        // Down or left (towards you, or swiping left) goes forward, like reading on.
-        let d = self.glide.step(&ctx, input);
-        let px = -(d.x + d.y);
-        if px.abs() > 0.0 {
-            let was = match self.scrolled {
-                Some((_, was)) => was,
-                None => self.player.is_playing(),
-            };
-            self.player.pause();
-            let dt = px as f64 / timeline_w.max(1.0) as f64 * self.info.duration;
-            // Unsnapped, so the glide's last small steps add up.
-            let to = (self.scroll_to.unwrap_or_else(|| self.player.time()) + dt).clamp(0.0, self.info.duration);
-            self.scroll_to = Some(to);
-            self.seek(to);
-            self.scrolled = Some((Instant::now(), was));
         }
         if let Some(e) = &self.player.audio_error {
             ui.colored_label(ui.visuals().warn_fg_color, format!("No sound: {e}"));
@@ -813,8 +811,9 @@ impl Ready {
     }
 
     /// The transport bar and the timeline under it, from the top of `ui`.
-    /// Returns the timeline's width (wheel scrubbing scales by it).
-    fn controls(&mut self, ui: &mut egui::Ui, preview: Rect, over_picture: bool) -> f32 {
+    /// `timeline`: what the pointer does on the timeline (read at the start
+    /// of the frame, see [`Ready::ui`]).
+    fn controls(&mut self, ui: &mut egui::Ui, preview: Rect, over_picture: bool, timeline: Option<&egui::Response>) {
         use crate::ui_kit::{Btn, Kind};
         let ctx = ui.ctx().clone();
         let bar = Rect::from_min_size(ui.cursor().min, Vec2::new(ui.available_width(), crate::transport::BAR_H));
@@ -875,16 +874,69 @@ impl Ready {
             self.seek(t);
         }
         let _ = ctx;
-        let (outer, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), TIMELINE_H), Sense::click_and_drag());
-        let lanes = outer.shrink2(Vec2::new(14.0, 0.0)).with_max_y(outer.bottom() - 14.0);
-        self.timeline(ui, lanes, &resp, preview, &moments);
-        lanes.width()
+        // Laid out here, where it's drawn; what the pointer does on it is read
+        // at the start of the next frame, here (`timeline_at`).
+        let (_, outer) = ui.allocate_space(Vec2::new(ui.available_width(), TIMELINE_H));
+        self.timeline_at = Some(outer);
+        self.timeline(ui, timeline_lanes(outer), timeline, preview, &moments);
+    }
+
+    /// A click or a drag on the timeline (`resp`; `lanes` where it was
+    /// drawn) goes there. Click or drag below the ruler, whose pins are
+    /// clicked; a drag follows the pointer wherever it goes until it's let
+    /// go, over the picture or out of the window too. Playing pauses while
+    /// you drag and carries on after.
+    fn timeline_input(&mut self, ui: &egui::Ui, resp: &egui::Response, lanes: Rect) {
+        let dur = self.info.duration.max(1e-6);
+        let t_of = |x: f32| ((x - lanes.left()) / lanes.width()).clamp(0.0, 1.0) as f64 * dur;
+        let below_ruler = |pos: Pos2| pos.y > lanes.top() + crate::transport::RULER_H - 6.0;
+        if resp.drag_started() && ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos()).is_some_and(below_ruler) {
+            self.dragging = Some(self.player.is_playing());
+            self.player.pause();
+        }
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let scrubbing = self.dragging.is_some() && (resp.dragged() || resp.drag_started());
+            if scrubbing || (resp.clicked() && below_ruler(pos)) {
+                self.seek(t_of(pos.x));
+            }
+        }
+        if resp.drag_stopped() {
+            // On the frame you see, not one decoded after.
+            self.player.land();
+            if self.dragging.take() == Some(true) {
+                self.play();
+            }
+        }
+    }
+
+    /// Scroll over the picture (or the timeline, over or under it) to scrub
+    /// through the clip: `timeline_w` points of scrolling go through all of it.
+    fn wheel(&mut self, ctx: &egui::Context, preview: Rect, timeline_w: f32) {
+        let over = pointer_over(ctx, preview) || (!crate::ui_kit::overlay_open(ctx) && ctx.pointer_hover_pos().is_some_and(|p| p.y > preview.bottom()));
+        let mut input = if over { crate::wheel::read(ctx).scroll } else { Vec2::ZERO };
+        input.y += dev_wheel();
+        // Down or left (towards you, or swiping left) goes forward, like reading on.
+        let d = self.glide.step(ctx, input);
+        let px = -(d.x + d.y);
+        if px.abs() > 0.0 {
+            let was = match self.scrolled {
+                Some((_, was)) => was,
+                None => self.player.is_playing(),
+            };
+            self.player.pause();
+            let dt = px as f64 / timeline_w.max(1.0) as f64 * self.info.duration;
+            // Unsnapped, so the glide's last small steps add up.
+            let to = (self.scroll_to.unwrap_or_else(|| self.player.time()) + dt).clamp(0.0, self.info.duration);
+            self.scroll_to = Some(to);
+            self.seek(to);
+            self.scrolled = Some((Instant::now(), was));
+        }
     }
 
     /// The ruler with the clip's moments, the filmstrip, then the sound,
     /// with the playhead through them all. The played part is bright, the
-    /// rest dimmed. Hover to see a moment; click or drag to go there.
-    fn timeline(&mut self, ui: &mut egui::Ui, outer: Rect, resp: &egui::Response, preview: Rect, moments: &[crate::transport::Moment]) {
+    /// rest dimmed. Hover to see a moment (`resp`, the pointer on it).
+    fn timeline(&mut self, ui: &mut egui::Ui, outer: Rect, resp: Option<&egui::Response>, preview: Rect, moments: &[crate::transport::Moment]) {
         let p = crate::theme::pal(ui);
         let painter = ui.painter_at(outer.expand(8.0));
         let dur = self.info.duration.max(1e-6);
@@ -903,29 +955,6 @@ impl Ready {
             None => {}
         }
 
-        let below_ruler = |pos: Pos2| pos.y > ruler.bottom() - 6.0;
-        if resp.drag_started() && ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos()).is_some_and(below_ruler) {
-            self.dragging = Some(self.player.is_playing());
-            self.player.pause();
-        }
-        if let Some(pos) = resp.interact_pointer_pos() {
-            let scrubbing = self.dragging.is_some() && (resp.dragged() || resp.drag_started());
-            if scrubbing || (resp.clicked() && below_ruler(pos)) {
-                let before = self.player.time();
-                self.seek(t_of(pos.x));
-                if self.player.time() != before {
-                    ui.ctx().request_repaint();
-                }
-            }
-        }
-        if resp.drag_stopped() {
-            self.player.land();
-            if self.dragging.take() == Some(true) {
-                self.play();
-            }
-            ui.ctx().request_repaint();
-        }
-
         painter.rect_filled(video, 5, p.raise2);
         self.strip.paint(ui, video, 0.0, dur, dur);
         painter.rect_filled(audio, 5, p.raise);
@@ -938,7 +967,7 @@ impl Ready {
             self.wave.paint(&ui.painter_at(audio.shrink2(Vec2::new(0.0, 2.0))), audio.shrink2(Vec2::new(0.0, 2.0)), (0.0, dur), u64::from(p.dark), |_| 1.0, |_, _| wave_hi);
         }
         // What's left to play, dimmed: where you are reads at a glance.
-        let xp = egui::emath::GuiRounding::round_to_pixels(x_of(self.info.snap(self.player.time())), ui.pixels_per_point());
+        let xp = x_of(self.info.snap(self.player.time()));
         let dim = Color32::from_rgba_unmultiplied(10, 11, 14, if p.dark { 115 } else { 0 });
         let dim = if p.dark { dim } else { Color32::from_rgba_unmultiplied(248, 248, 249, 128) };
         let rest = Rect::from_min_max(Pos2::new(xp, video.top()), Pos2::new(outer.right(), audio.bottom()));
@@ -946,7 +975,8 @@ impl Ready {
         painter.rect_filled(rest.intersect(audio), egui::CornerRadius { nw: 0, sw: 0, ne: 5, se: 5 }, dim);
 
         // Hover: a line, and that moment's picture and time.
-        if let Some(pos) = resp.hover_pos().filter(|_| self.dragging.is_none() && pos_in(video.union(audio), resp.hover_pos())) {
+        let hover = resp.and_then(egui::Response::hover_pos);
+        if let Some(pos) = hover.filter(|_| self.dragging.is_none() && pos_in(video.union(audio), hover)) {
             let t = self.info.snap(t_of(pos.x));
             self.hover_preview(ui, t, pos.x, video, preview);
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -954,6 +984,7 @@ impl Ready {
             self.hover = None;
         }
 
+        // Playhead.
         crate::transport::playhead(&painter, xp, ruler.bottom() - 4.0, audio.bottom(), p.text);
     }
 
@@ -1105,6 +1136,12 @@ impl Ready {
 
 fn pos_in(rect: Rect, pos: Option<Pos2>) -> bool {
     pos.is_some_and(|p| rect.contains(p))
+}
+
+/// The timeline's lanes (ruler, filmstrip, sound) in the space laid out for
+/// it: in from the sides, clear of the bottom.
+fn timeline_lanes(outer: Rect) -> Rect {
+    outer.shrink2(Vec2::new(14.0, 0.0)).with_max_y(outer.bottom() - 14.0)
 }
 
 fn is_fullscreen(ctx: &egui::Context) -> bool {
