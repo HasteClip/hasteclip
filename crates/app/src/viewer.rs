@@ -31,6 +31,7 @@ use media::pcm::Pcm;
 use media::ClipInfo;
 
 use crate::filmstrip::Filmstrip;
+use crate::handoff::{Handoff, Kept};
 use crate::player::Player;
 
 /// The timeline: ruler, filmstrip and sound, and the space under it.
@@ -91,11 +92,47 @@ struct Loaded {
     span: Span,
 }
 
+/// Whether opening the clip would wait on nothing: it's been read, and so
+/// has its original (an edited clip reads both: the file, and where it sits
+/// in the recording), as when it's back from the editor.
+fn already_read(path: &Path, kept: &Kept) -> bool {
+    if kept.info(path).is_none() {
+        return false;
+    }
+    let target = crate::store::EditTarget::of(path);
+    target.source == path || kept.info(&target.source).is_some()
+}
+
+/// Read the clip and start decoding its sound, but for what's `kept`.
+fn load(source: &Path, kept: &mut Kept) -> Result<Loaded, String> {
+    let info = kept.probe(source).map_err(|e| e.to_string())?;
+    // Track 1 is the mix in our clips; in any other file it's simply the
+    // first. Playing starts with what's decoded: no waiting for the whole
+    // file to be read.
+    let tracks: Vec<usize> = info.audio.first().map(|a| a.index).into_iter().collect();
+    if crate::player::debug() {
+        eprintln!("{:>8.3} viewer: clip read", crate::player::uptime());
+    }
+    let pcm = kept.sound(source, &tracks, || {
+        media::pcm::decode_streaming(source, &tracks, info.duration, |_, result| {
+            if let Err(e) = result {
+                eprintln!("decoding the sound: {e:#}");
+            }
+            if crate::player::debug() {
+                eprintln!("{:>8.3} viewer: sound all decoded", crate::player::uptime());
+            }
+        })
+    });
+    let span = recording_span(source, info.duration, kept);
+    Ok(Loaded { info, pcm, span })
+}
+
 enum State {
     /// The clip's edit is being saved: it opens once it's done (its file
     /// is about to be replaced, which an open file would block).
     Saving,
-    Loading(Receiver<Result<Loaded, String>>),
+    /// Being read (what's kept comes back with it).
+    Loading(Receiver<(Result<Loaded, String>, Kept)>),
     Failed(String),
     Ready(Box<Ready>),
     /// A screenshot, being read, and shown.
@@ -106,11 +143,26 @@ enum State {
 pub struct Viewer {
     clip: PathBuf,
     state: State,
+    resume: Option<Resume>,
+    /// What the editor handed over, until the clip has loaded; then what's
+    /// kept, to hand on again.
+    handoff: Handoff,
+}
+
+/// A player opening again: the moment to carry on at (the recording's time),
+/// and whether it was playing then.
+#[derive(Clone, Copy)]
+pub struct Resume {
+    pub at: f64,
+    pub playing: bool,
 }
 
 struct Ready {
     info: ClipInfo,
     player: Player,
+    /// The last screen's player, hushed: its picture shows until this one
+    /// has one (see `handoff.rs`).
+    curtain: Option<Player>,
     strip: Filmstrip,
     /// The mix's waveform, growing as the sound is decoded.
     wave: Arc<crate::waveform::Live>,
@@ -146,54 +198,76 @@ struct Ready {
 }
 
 impl Viewer {
-    pub fn open(ctx: &egui::Context, clip: &Path) -> Self {
+    /// Play `clip`: at `resume` (opened from the editor, or after its edit
+    /// was saved), else from the start; with what the editor handed over.
+    pub fn open(ctx: &egui::Context, clip: &Path, resume: Option<Resume>, mut handoff: Handoff) -> Self {
         if crate::clips::is_image(clip) {
-            return Self { clip: clip.to_path_buf(), state: State::LoadingPicture(crate::picture::load(ctx, clip)) };
+            return Self { clip: clip.to_path_buf(), state: State::LoadingPicture(crate::picture::load(ctx, clip)), resume: None, handoff: Handoff::default() };
         }
         if crate::player::debug() {
             eprintln!("{:>8.3} viewer: opening {}", crate::player::uptime(), clip.display());
         }
-        let (tx, rx) = mpsc::channel();
-        let src = clip.to_path_buf();
-        let repaint = ctx.clone();
-        std::thread::spawn(move || {
-            let result = (|| -> Result<Loaded, String> {
-                let info = media::probe(&src).map_err(|e| e.to_string())?;
-                // Track 1 is the mix in our clips; in any other file it's simply
-                // the first. Playing starts with what's decoded: no waiting for
-                // the whole file to be read.
-                let tracks: Vec<usize> = info.audio.first().map(|a| a.index).into_iter().collect();
-                if crate::player::debug() {
-                    eprintln!("{:>8.3} viewer: clip read", crate::player::uptime());
+        let state = if already_read(clip, &handoff.kept) {
+            match load(clip, &mut handoff.kept) {
+                Ok(l) => State::Ready(Box::new(Ready::new(ctx, clip, l, resume, &mut handoff))),
+                Err(e) => {
+                    handoff.let_go();
+                    State::Failed(e)
                 }
-                let pcm = media::pcm::decode_streaming(&src, &tracks, info.duration, move |_, result| {
-                    if let Err(e) = result {
-                        eprintln!("decoding the sound: {e:#}");
-                    }
-                    if crate::player::debug() {
-                        eprintln!("{:>8.3} viewer: sound all decoded", crate::player::uptime());
-                    }
-                });
-                let span = recording_span(&src, info.duration);
-                Ok(Loaded { info, pcm, span })
-            })();
-            if let Err(e) = &result {
-                eprintln!("couldn't open {} in the player: {e}", src.display());
             }
-            let _ = tx.send(result);
-            repaint.request_repaint();
-        });
-        Self { clip: clip.to_path_buf(), state: State::Loading(rx) }
+        } else {
+            let (tx, rx) = mpsc::channel();
+            let src = clip.to_path_buf();
+            let repaint = ctx.clone();
+            let mut kept = std::mem::take(&mut handoff.kept);
+            std::thread::spawn(move || {
+                let result = load(&src, &mut kept);
+                if let Err(e) = &result {
+                    eprintln!("couldn't open {} in the player: {e}", src.display());
+                }
+                let _ = tx.send((result, kept));
+                repaint.request_repaint();
+            });
+            State::Loading(rx)
+        };
+        Self { clip: clip.to_path_buf(), state, resume, handoff }
+    }
+
+    /// Opening the editor from here: what it takes over (see `handoff.rs`).
+    pub fn into_handoff(self) -> Handoff {
+        let mut handoff = self.handoff;
+        match self.state {
+            State::Ready(r) => Handoff::from_screen(Some(r.player), r.curtain, r.strip, handoff.kept),
+            _ => {
+                handoff.let_go();
+                handoff
+            }
+        }
     }
 
     pub fn clip(&self) -> &Path {
         &self.clip
     }
 
+    /// Where it is (in the recording) and whether it's playing: for the
+    /// editor opened from here to carry on there.
+    pub fn at(&self) -> Option<Resume> {
+        match &self.state {
+            State::Ready(r) => Some(Resume { at: media::source_time(&r.span.parts, r.player.time()), playing: r.player.is_playing() }),
+            _ => None,
+        }
+    }
+
+    /// Where it was opened to carry on: kept while its edit saves, to open
+    /// there once it's done.
+    pub fn resume(&self) -> Option<Resume> {
+        self.resume
+    }
+
     /// The clip, while its edit is being saved: the app opens it with
     /// [`Viewer::open`] when that's done.
-    pub fn saving(clip: &Path) -> Self {
-        Self { clip: clip.to_path_buf(), state: State::Saving }
+    pub fn saving(clip: &Path, resume: Option<Resume>) -> Self {
+        Self { clip: clip.to_path_buf(), state: State::Saving, resume, handoff: Handoff::default() }
     }
 
     pub fn is_saving(&self) -> bool {
@@ -207,6 +281,7 @@ impl Viewer {
             return;
         }
         self.clip = to.to_path_buf();
+        self.handoff.kept.renamed(from, to);
         match &mut self.state {
             // Everything open keeps playing; only reopening by name follows.
             State::Ready(r) => {
@@ -216,16 +291,20 @@ impl Viewer {
             // On screen already: nothing reads it again.
             State::Picture(_) => {}
             // Still loading from the old name: start again.
-            _ => *self = Self::open(ctx, to),
+            _ => *self = Self::open(ctx, to, self.resume, Handoff::default()),
         }
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, nav: &Nav) -> ViewerOutcome {
         if let State::Loading(rx) = &self.state {
-            if let Ok(result) = rx.try_recv() {
+            if let Ok((result, kept)) = rx.try_recv() {
+                self.handoff.kept = kept;
                 self.state = match result {
-                    Ok(l) => State::Ready(Box::new(Ready::new(ui.ctx(), &self.clip, l))),
-                    Err(e) => State::Failed(e),
+                    Ok(l) => State::Ready(Box::new(Ready::new(ui.ctx(), &self.clip, l, self.resume, &mut self.handoff))),
+                    Err(e) => {
+                        self.handoff.let_go();
+                        State::Failed(e)
+                    }
                 };
             }
         }
@@ -461,20 +540,32 @@ impl Viewer {
 }
 
 impl Ready {
-    fn new(ctx: &egui::Context, clip: &Path, l: Loaded) -> Self {
+    fn new(ctx: &egui::Context, clip: &Path, l: Loaded, resume: Option<Resume>, handoff: &mut Handoff) -> Self {
         let wave = crate::waveform::follow(l.pcm.clone(), 0, ctx);
-        let mut player = Player::new(ctx, clip, l.info.clone(), l.pcm, Vec::new());
+        let (mut player, curtain, taken) = Player::handed_over(ctx, clip, &l.info, l.pcm, Vec::new(), handoff.player.take());
         // Dev aid: `HASTECLIP_START_AT=<seconds>` starts there (to check a
         // stretch of a clip without scrubbing to it).
         if let Some(t) = std::env::var("HASTECLIP_START_AT").ok().and_then(|s| s.parse::<f64>().ok()) {
             player.seek(t);
         }
-        // Opened to watch: start right away.
-        player.play(l.info.duration);
+        if let Some(r) = resume
+            && let Some(at) = media::output_time(&l.span.parts, r.at)
+        {
+            if !taken {
+                player.seek(at.min(l.info.duration));
+            }
+            if r.playing {
+                player.play_on(l.info.duration);
+            }
+        } else {
+            // Opened to watch: start right away.
+            player.play_on(l.info.duration);
+        }
         let r = Self {
-            strip: Filmstrip::build(ctx, clip, &l.info),
+            strip: handoff.strip(clip).unwrap_or_else(|| Filmstrip::build(ctx, clip, &l.info)),
             info: l.info,
             player,
+            curtain,
             wave,
             dragging: None,
             scrolled: None,
@@ -591,8 +682,21 @@ impl Ready {
         let reach = (12.0 * self.info.duration / preview.width().max(1.0) as f64).min(0.5);
         self.player.set_landing(scrubbing.then_some(reach));
         let size = self.player.update(&ctx, scrubbing);
+        if size.is_some() {
+            self.curtain = None;
+        }
+        let curtain = self.curtain.as_ref().filter(|_| size.is_none());
+        let size = curtain.and_then(Player::size).or(size);
         let player = &self.player;
-        let picture = crate::transport::stage(ui, preview, size, |p, cover| player.paint_glow(p, cover, egui::Id::new("viewer_stage")), |r| player.paint(ui.painter(), r));
+        let stage = egui::Id::new("viewer_stage");
+        let glow = |p: &egui::Painter, cover: Rect| match curtain {
+            Some(c) => c.paint_glow(p, cover, stage),
+            None => player.paint_glow(p, cover, stage),
+        };
+        let picture = crate::transport::stage(ui, preview, size, glow, |r| match curtain {
+            Some(c) => c.paint(ui.painter(), r),
+            None => player.paint(ui.painter(), r),
+        });
         // As loud as you listen, in the editor too (they share it).
         self.player.set_listening(crate::transport::listening_gain(&ctx));
         if let Some(picture) = picture.filter(|_| self.player.is_playing()) {
@@ -798,6 +902,30 @@ impl Ready {
             }
             None => {}
         }
+
+        let below_ruler = |pos: Pos2| pos.y > ruler.bottom() - 6.0;
+        if resp.drag_started() && ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos()).is_some_and(below_ruler) {
+            self.dragging = Some(self.player.is_playing());
+            self.player.pause();
+        }
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let scrubbing = self.dragging.is_some() && (resp.dragged() || resp.drag_started());
+            if scrubbing || (resp.clicked() && below_ruler(pos)) {
+                let before = self.player.time();
+                self.seek(t_of(pos.x));
+                if self.player.time() != before {
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
+        if resp.drag_stopped() {
+            self.player.land();
+            if self.dragging.take() == Some(true) {
+                self.play();
+            }
+            ui.ctx().request_repaint();
+        }
+
         painter.rect_filled(video, 5, p.raise2);
         self.strip.paint(ui, video, 0.0, dur, dur);
         painter.rect_filled(audio, 5, p.raise);
@@ -810,7 +938,7 @@ impl Ready {
             self.wave.paint(&ui.painter_at(audio.shrink2(Vec2::new(0.0, 2.0))), audio.shrink2(Vec2::new(0.0, 2.0)), (0.0, dur), u64::from(p.dark), |_| 1.0, |_, _| wave_hi);
         }
         // What's left to play, dimmed: where you are reads at a glance.
-        let xp = x_of(self.info.snap(self.player.time()));
+        let xp = egui::emath::GuiRounding::round_to_pixels(x_of(self.info.snap(self.player.time())), ui.pixels_per_point());
         let dim = Color32::from_rgba_unmultiplied(10, 11, 14, if p.dark { 115 } else { 0 });
         let dim = if p.dark { dim } else { Color32::from_rgba_unmultiplied(248, 248, 249, 128) };
         let rest = Rect::from_min_max(Pos2::new(xp, video.top()), Pos2::new(outer.right(), audio.bottom()));
@@ -826,31 +954,7 @@ impl Ready {
             self.hover = None;
         }
 
-        // Playhead.
         crate::transport::playhead(&painter, xp, ruler.bottom() - 4.0, audio.bottom(), p.text);
-
-        // Click or drag to go there (below the ruler, whose pins are clicked).
-        // A drag follows the pointer wherever it goes until it's let go, over
-        // the picture or out of the window too. Playing pauses while you drag
-        // and carries on after.
-        let below_ruler = |pos: Pos2| pos.y > ruler.bottom() - 6.0;
-        if resp.drag_started() && ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos()).is_some_and(below_ruler) {
-            self.dragging = Some(self.player.is_playing());
-            self.player.pause();
-        }
-        if let Some(pos) = resp.interact_pointer_pos() {
-            let scrubbing = self.dragging.is_some() && (resp.dragged() || resp.drag_started());
-            if scrubbing || (resp.clicked() && below_ruler(pos)) {
-                self.seek(t_of(pos.x));
-            }
-        }
-        if resp.drag_stopped() {
-            // On the frame you see, not one decoded after.
-            self.player.land();
-            if self.dragging.take() == Some(true) {
-                self.play();
-            }
-        }
     }
 
     /// The picture at `t` in a small frame over the bottom of the preview, above
@@ -1129,15 +1233,20 @@ struct Span {
 }
 
 /// Where the clip at `path` is in its recording: all of it, `duration`
-/// long, unless it's been edited.
-fn recording_span(path: &Path, duration: f64) -> Span {
+/// long, unless it's been edited. The original is read for it, not kept
+/// (unless the editor kept it): freeing up space trims it with the player
+/// open, and the editor would then find what it was.
+fn recording_span(path: &Path, duration: f64, kept: &Kept) -> Span {
     let whole = Span { parts: vec![(0.0, duration)], recording: duration };
     let target = crate::store::EditTarget::of(path);
     if target.source == target.clip {
         return whole;
     }
     let Some(edit) = crate::store::load_edit(&target) else { return whole };
-    let recording = media::probe(&target.source).map_or(edit.end, |i| i.duration);
+    let recording = match kept.info(&target.source) {
+        Some(info) => info.duration,
+        None => media::probe(&target.source).map_or(edit.end, |i| i.duration),
+    };
     Span { parts: edit.kept(), recording }
 }
 

@@ -17,8 +17,10 @@ use egui::{Align2, Color32, FontId, Key, Pos2, Rect, Sense, Stroke, Vec2};
 use media::{ClipInfo, Edit};
 
 use crate::filmstrip::Filmstrip;
+use crate::handoff::{Handoff, Kept};
 use crate::player::Player;
 use crate::store::{self, EditTarget};
+use crate::viewer::Resume;
 
 /// Timeline geometry, in points.
 const RULER_H: f32 = crate::transport::RULER_H;
@@ -63,8 +65,31 @@ struct Loaded {
     pcm: Arc<media::pcm::Pcm>,
 }
 
+/// Read the clip and start decoding every source track, but for what's
+/// `kept`. Every track at once, playable as it's decoded; the waveforms
+/// follow once it's all there.
+fn load(source: &Path, kept: &mut Kept) -> Result<Loaded, String> {
+    let info = kept.probe(source).map_err(|e| e.to_string())?;
+    let tracks: Vec<usize> = info.source_tracks().iter().map(|t| t.index).collect();
+    if crate::player::debug() {
+        eprintln!("{:>8.3} editor: clip read, decoding {} tracks", crate::player::uptime(), tracks.len());
+    }
+    let pcm = kept.sound(source, &tracks, || {
+        media::pcm::decode_streaming(source, &tracks, info.duration, |_, result| {
+            if let Err(e) = result {
+                eprintln!("decoding the sound: {e:#}");
+            }
+            if crate::player::debug() {
+                eprintln!("{:>8.3} editor: sound all decoded", crate::player::uptime());
+            }
+        })
+    });
+    Ok(Loaded { info, pcm })
+}
+
 enum State {
-    Loading(Receiver<Result<Loaded, String>>),
+    /// Being read (what's kept comes back with it).
+    Loading(Receiver<(Result<Loaded, String>, Kept)>),
     Failed(String),
     Ready(Box<Ready>),
 }
@@ -72,6 +97,9 @@ enum State {
 struct Ready {
     info: ClipInfo,
     player: Player,
+    /// The last screen's player, hushed: its picture shows until this one
+    /// has one (see `handoff.rs`).
+    curtain: Option<Player>,
     edit: Edit,
     /// What was last saved, to know whether there are unsaved changes.
     saved: Edit,
@@ -219,39 +247,55 @@ pub struct Editor {
     preview_share: f32,
     /// Snapping, as the app keeps it (settings), until the clip has loaded.
     snap: bool,
+    /// Where the player was when the editor was opened from it (the clip
+    /// preview), to start the timeline there.
+    from: Option<Resume>,
+    /// What the player handed over, until the clip has loaded; then what's
+    /// kept, to hand back.
+    handoff: Handoff,
 }
 
 impl Editor {
     /// Edit the clip at `clip`. An edited clip is decoded from its original, so
-    /// every earlier decision can still be changed.
-    pub fn open(ctx: &egui::Context, clip: &Path, preview_share: f32, snap: bool) -> Self {
+    /// every earlier decision can still be changed. Opened from the player:
+    /// `from` where it was, with what it handed over.
+    pub fn open(ctx: &egui::Context, clip: &Path, preview_share: f32, snap: bool, from: Option<Resume>, mut handoff: Handoff) -> Self {
         let target = EditTarget::of(clip);
-        let (tx, rx) = mpsc::channel();
-        let src = target.source.clone();
-        let repaint = ctx.clone();
-        std::thread::spawn(move || {
-            let result = (|| -> Result<Loaded, String> {
-                let info = media::probe(&src).map_err(|e| e.to_string())?;
-                // Every track at once, playable as it's decoded; the
-                // waveforms follow once it's all there.
-                let tracks: Vec<usize> = info.source_tracks().iter().map(|t| t.index).collect();
-                if crate::player::debug() {
-                    eprintln!("{:>8.3} editor: clip read, decoding {} tracks", crate::player::uptime(), tracks.len());
+        let state = if handoff.kept.info(&target.source).is_some() {
+            match load(&target.source, &mut handoff.kept) {
+                Ok(l) => State::Ready(Box::new(Ready::new(ctx, &target, l, snap, from, &mut handoff))),
+                Err(e) => {
+                    handoff.let_go();
+                    State::Failed(e)
                 }
-                let pcm = media::pcm::decode_streaming(&src, &tracks, info.duration, |_, result| {
-                    if let Err(e) = result {
-                        eprintln!("decoding the sound: {e:#}");
-                    }
-                    if crate::player::debug() {
-                        eprintln!("{:>8.3} editor: sound all decoded", crate::player::uptime());
-                    }
-                });
-                Ok(Loaded { info, pcm })
-            })();
-            let _ = tx.send(result);
-            repaint.request_repaint();
-        });
-        Self { target, state: State::Loading(rx), preview_share, snap }
+            }
+        } else {
+            let (tx, rx) = mpsc::channel();
+            let src = target.source.clone();
+            let repaint = ctx.clone();
+            let mut kept = std::mem::take(&mut handoff.kept);
+            std::thread::spawn(move || {
+                let result = load(&src, &mut kept);
+                let _ = tx.send((result, kept));
+                repaint.request_repaint();
+            });
+            State::Loading(rx)
+        };
+        Self { target, state, preview_share, snap, from, handoff }
+    }
+
+    /// Going back to the player: what it takes over (see `handoff.rs`).
+    pub fn into_handoff(self) -> Handoff {
+        let mut handoff = self.handoff;
+        let State::Ready(r) = self.state else {
+            handoff.let_go();
+            return handoff;
+        };
+        // The saved clip is cropped, and this plays its original: as the
+        // player's curtain, the whole picture would show for a moment.
+        let cropped = r.saved_crop().is_some();
+        let player = (!cropped).then_some(r.player);
+        Handoff::from_screen(player, r.curtain, r.strip, handoff.kept)
     }
 
     /// The clip was renamed from `from` to `to`: saved under the new name.
@@ -262,6 +306,7 @@ impl Editor {
             return;
         }
         self.target.clip = to.to_path_buf();
+        self.handoff.kept.renamed(from, to);
         if self.target.source != from {
             return;
         }
@@ -273,7 +318,7 @@ impl Editor {
                 r.player.renamed(ctx, to);
                 r.strip.renamed(to);
             }
-            _ => *self = Self::open(ctx, to, self.preview_share, self.snap()),
+            _ => *self = Self::open(ctx, to, self.preview_share, self.snap(), self.from, Handoff::default()),
         }
     }
 
@@ -295,12 +340,26 @@ impl Editor {
         }
     }
 
+    /// Where the playhead is, in what's kept, and whether it's playing: for
+    /// the player to carry on there, back from the editor.
+    pub fn resume(&self) -> Option<Resume> {
+        let State::Ready(r) = &self.state else { return None };
+        Some(Resume {
+            at: settle(&r.edit.kept(), r.player.time(), r.info.frame_duration()),
+            playing: r.player.is_playing(),
+        })
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui) -> EditorOutcome {
         if let State::Loading(rx) = &self.state {
-            if let Ok(result) = rx.try_recv() {
+            if let Ok((result, kept)) = rx.try_recv() {
+                self.handoff.kept = kept;
                 self.state = match result {
-                    Ok(l) => State::Ready(Box::new(Ready::new(ui.ctx(), &self.target, l, self.snap))),
-                    Err(e) => State::Failed(e),
+                    Ok(l) => State::Ready(Box::new(Ready::new(ui.ctx(), &self.target, l, self.snap, self.from, &mut self.handoff))),
+                    Err(e) => {
+                        self.handoff.let_go();
+                        State::Failed(e)
+                    }
                 };
             }
         }
@@ -338,7 +397,7 @@ impl Editor {
 }
 
 impl Ready {
-    fn new(ctx: &egui::Context, target: &EditTarget, l: Loaded, snap: bool) -> Self {
+    fn new(ctx: &egui::Context, target: &EditTarget, l: Loaded, snap: bool, from: Option<Resume>, handoff: &mut Handoff) -> Self {
         let source = &target.source;
         let mut edit = store::load_edit(target).unwrap_or_else(|| Edit::new(&l.info));
         // Sidecar from an older layout or a hand-edited file: make it fit.
@@ -349,14 +408,23 @@ impl Ready {
         let gains = edit.tracks.clone();
         let n = l.pcm.len();
         let waves = (0..n).map(|i| crate::waveform::follow(l.pcm.clone(), i, ctx)).collect();
-        let mut player = Player::new(ctx, source, l.info.clone(), l.pcm, gains);
-        player.seek(edit.start);
+        let playhead = from.map_or(edit.start, |r| settle(&edit.kept(), r.at, l.info.frame_duration()));
+        let (mut player, curtain, taken) = Player::handed_over(ctx, source, &l.info, l.pcm.clone(), gains, handoff.player.take());
+        if !taken {
+            player.seek(playhead);
+        }
+        if from.is_some_and(|r| r.playing) {
+            player.set_cuts(&edit.kept());
+            player.set_listening(crate::transport::listening_gain(ctx));
+            player.play_on(edit.end);
+        }
 
         let full = l.info.duration.max(1e-6);
-        let strip = Filmstrip::build(ctx, source, &l.info);
+        let strip = handoff.strip(source).unwrap_or_else(|| Filmstrip::build(ctx, source, &l.info));
         Self {
             info: l.info,
             player,
+            curtain,
             saved: edit.clone(),
             edit,
             waves,
@@ -603,11 +671,19 @@ impl Ready {
         let free = matches!(self.dragging, Some(Drag::Playhead)) && !self.playhead_snapped;
         self.player.set_landing(free.then_some(reach));
         let size = self.player.update(&ctx, self.dragging.is_some());
+        if size.is_some() {
+            self.curtain = None;
+        }
+        let curtain = self.curtain.as_ref().filter(|_| size.is_none());
+        let size = curtain.and_then(Player::size).or(size);
         let player = &self.player;
         let frame = (self.info.width, self.info.height);
         if let Some(tool) = &mut self.crop_tool {
             let before = self.edit.clone();
-            let did = tool.ui(ui, preview_rect, size, frame, &mut self.edit.output.crop, |painter, r| player.paint(painter, r));
+            let did = tool.ui(ui, preview_rect, size, frame, &mut self.edit.output.crop, |painter, r| match curtain {
+                Some(c) => c.paint(painter, r),
+                None => player.paint(painter, r),
+            });
             if did.took_hold {
                 self.before_drag = Some(before.clone());
             }
@@ -625,11 +701,17 @@ impl Ready {
             }
         } else {
             // Just the part kept, as the saved clip will be.
-            let crop = self.crop();
+            let crop = self.crop().filter(|_| curtain.is_none());
             let shown = size.map(|s| crop.map_or(s, |c| crate::crop_ui::cropped_size(s, &c, frame)));
-            let picture = crate::transport::stage(ui, preview_rect, shown, |p, cover| player.paint_glow(p, cover, egui::Id::new("editor_stage")), |r| match crop {
-                Some(c) => crate::crop_ui::paint_cropped(ui, r, &c, frame, |painter, whole| player.paint(painter, whole)),
-                None => player.paint(ui.painter(), r),
+            let stage = egui::Id::new("editor_stage");
+            let glow = |p: &egui::Painter, cover: Rect| match curtain {
+                Some(c) => c.paint_glow(p, cover, stage),
+                None => player.paint_glow(p, cover, stage),
+            };
+            let picture = crate::transport::stage(ui, preview_rect, shown, glow, |r| match (curtain, crop) {
+                (Some(c), _) => c.paint(ui.painter(), r),
+                (None, Some(c)) => crate::crop_ui::paint_cropped(ui, r, &c, frame, |painter, whole| player.paint(painter, whole)),
+                (None, None) => player.paint(ui.painter(), r),
             });
             if let Some(picture) = picture.filter(|_| self.player.is_playing()) {
                 crate::transport::muted_note(ui, picture);
@@ -984,6 +1066,11 @@ impl Ready {
     /// The part of the picture kept, if not all of it.
     fn crop(&self) -> Option<media::Crop> {
         self.edit.output.crop.and_then(|c| c.within(self.info.width, self.info.height))
+    }
+
+    /// The part of the picture the saved clip keeps, if not all of it.
+    fn saved_crop(&self) -> Option<media::Crop> {
+        self.saved.output.crop.and_then(|c| c.within(self.info.width, self.info.height))
     }
 
     /// Open the crop tool, or close it.
@@ -2077,6 +2164,7 @@ impl Ready {
                     ui.ctx().request_repaint();
                 }
             }
+            let before = self.player.time();
             if resp.dragged() || resp.drag_started() {
                 // A volume drag goes a fifth as far with Shift held, for fine
                 // steps (the first frame takes in the movement before the drag
@@ -2191,6 +2279,10 @@ impl Ready {
                     }
                 }
             }
+            // The drag moved the playhead: drawn on the next frame, not on the next pointer event.
+            if self.player.time() != before {
+                ctx.request_repaint();
+            }
         }
         if resp.drag_stopped() {
             self.vol_guide = None;
@@ -2208,6 +2300,8 @@ impl Ready {
             if std::mem::take(&mut self.resume) && self.player.time() < self.edit.end - fd {
                 self.player.play(self.edit.end);
             }
+            // Letting go can move the playhead onto the frame shown: drawn now.
+            ctx.request_repaint();
         }
 
         if resp.double_clicked() {
@@ -2478,6 +2572,18 @@ fn trim_to_length(info: &media::ClipInfo, start: f64, end: f64, secs: f64) -> (f
     (a, (info.snap(a + secs)).min(info.duration).max(a + fd))
 }
 
+/// The playhead at `t` (in the recording), moved into what's kept: where it
+/// is inside a part, else the next part's start (or the last part's last
+/// frame, past them all).
+fn settle(parts: &[(f64, f64)], t: f64, fd: f64) -> f64 {
+    for &(a, b) in parts {
+        if t < b - fd * 0.5 {
+            return t.max(a);
+        }
+    }
+    parts.last().map_or(t, |&(a, b)| (b - fd).max(a))
+}
+
 /// The part of `parts` a split at `t` (a frame's start) splits: one with a
 /// frame or more either side of it.
 fn splits(parts: &[(f64, f64)], t: f64, fd: f64) -> Option<usize> {
@@ -2653,6 +2759,21 @@ mod part_tests {
         // Not in what's cut out or trimmed off.
         assert_eq!(splits(&PARTS, 5.0, FD), None);
         assert_eq!(splits(&PARTS, 0.5, FD), None);
+    }
+
+    /// Opening the editor from the preview: the playhead lands in what's kept,
+    /// wherever the preview was.
+    #[test]
+    fn the_playhead_settles_in_what_is_kept() {
+        // In a kept part: where it was.
+        assert_eq!(settle(&PARTS, 2.5, FD), 2.5);
+        assert_eq!(settle(&PARTS, 3.9, FD), 3.9);
+        // In what's cut out: the next part starts there.
+        assert_eq!(settle(&PARTS, 5.0, FD), 6.0);
+        // Before the first part or after the last: its first frame, its last.
+        assert_eq!(settle(&PARTS, 0.2, FD), 1.0);
+        assert!((settle(&PARTS, 9.5, FD) - 8.9).abs() < 1e-9);
+        assert!((settle(&PARTS, 8.9, FD) - 8.9).abs() < 1e-9);
     }
 
     #[test]

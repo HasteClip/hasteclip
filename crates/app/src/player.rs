@@ -206,6 +206,7 @@ struct Shared {
     /// Where playback stops (in stereo frames).
     end: AtomicU64,
     mix: Mutex<Mix>,
+    pcm: Mutex<Arc<Pcm>>,
     /// When the audio callback last moved `pos` ([`uptime`], µs), and how
     /// much it moves it each time (µs of sound): the clock only moves in
     /// those steps, so this says when the next frame can come up.
@@ -253,13 +254,14 @@ impl Skip {
 }
 
 impl Shared {
-    fn new(mix: Mix) -> Self {
+    fn new(mix: Mix, pcm: Arc<Pcm>) -> Self {
         Self {
             pos: AtomicU64::new(0),
             playing: AtomicBool::new(false),
             scrubbing: AtomicBool::new(false),
             end: AtomicU64::new(u64::MAX),
             mix: Mutex::new(mix),
+            pcm: Mutex::new(pcm),
             moved_at_us: AtomicU64::new(0),
             step_us: AtomicU64::new(0),
             speed: AtomicU32::new(1.0f32.to_bits()),
@@ -490,12 +492,7 @@ impl Player {
     }
 
     fn with_pcm(ctx: &egui::Context, source: &Path, info: ClipInfo, pcm: Arc<Pcm>, gains: Vec<TrackEdit>, scrubs: bool) -> Self {
-        let n = pcm.len();
-        let shared = Arc::new(Shared::new(Mix { tracks: gains, track_levels: vec![(0.0, 0.0); n], master_level: (0.0, 0.0), master_stereo: Default::default() }));
-        let (stream, audio_error) = match start_audio(shared.clone(), pcm.clone()) {
-            Ok(s) => (Some(s), None),
-            Err(e) => (None, Some(e)),
-        };
+        let (shared, stream, audio_error) = sound(pcm, gains);
 
         let (still_tx, still_rx) = still_worker(ctx, source, nv12_size(&info));
 
@@ -569,6 +566,78 @@ impl Player {
         (self.still_tx, self.still_rx) = still_worker(ctx, to, nv12_size(&self.info));
     }
 
+    /// Take over the other screen's player (see `handoff.rs`), if it plays
+    /// `source` (a clip never edited: the player and the editor play the
+    /// same file): it plays on, with `pcm`'s tracks mixed by `gains`; speed,
+    /// scrubbing and cuts start afresh. Its file is as it was: the handoff is
+    /// dropped when the clip's files change.
+    pub fn adopt(&mut self, source: &Path, pcm: Arc<Pcm>, gains: Vec<TrackEdit>) -> bool {
+        if self.source != source {
+            return false;
+        }
+        let n = pcm.len();
+        if let Ok(mut playing) = self.shared.pcm.lock() {
+            *playing = pcm;
+        }
+        if let Ok(mut mix) = self.shared.mix.lock() {
+            mix.tracks = gains;
+            mix.track_levels = vec![(0.0, 0.0); n];
+        }
+        self.shared.speed.store(1.0f32.to_bits(), Ordering::Relaxed);
+        self.shared.scrubbing.store(false, Ordering::Relaxed);
+        self.landing = None;
+        self.stepping = false;
+        self.set_cuts(&[]);
+        // Hushed for a curtain and handed straight back (a quick switch
+        // back): its sound comes back. The sound is what moves the clock;
+        // without it, it would stand still, saying it plays.
+        if self._stream.is_none() {
+            (self._stream, self.audio_error) = match start_audio(self.shared.clone()) {
+                Ok(s) => (Some(s), None),
+                Err(e) => (None, Some(e)),
+            };
+        }
+        true
+    }
+
+    /// Pause and let go of the sound output: a curtain only shows its
+    /// picture, while the player taking its place starts.
+    pub fn hush(&mut self) {
+        self.pause();
+        self._stream = None;
+        self.stepping = false;
+    }
+
+    /// The player for `source`: `handoff` (the other screen's) taken over
+    /// if it can be (see [`Player::adopt`]), else a new one, with the
+    /// handoff hushed into its curtain if it has a picture to show. Says
+    /// whether it was taken over: then it's still where it was, and playing
+    /// if it was.
+    pub fn handed_over(
+        ctx: &egui::Context,
+        source: &Path,
+        info: &ClipInfo,
+        pcm: Arc<Pcm>,
+        gains: Vec<TrackEdit>,
+        handoff: Option<Self>,
+    ) -> (Self, Option<Self>, bool) {
+        let mut handoff = handoff;
+        let taken = handoff.as_mut().is_some_and(|p| p.adopt(source, pcm.clone(), gains.clone()));
+        if taken {
+            return (handoff.expect("just taken over"), None, true);
+        }
+        let curtain = handoff.filter(|p| p.size().is_some()).map(|mut p| {
+            p.hush();
+            p
+        });
+        (Self::new(ctx, source, info.clone(), pcm, gains), curtain, false)
+    }
+
+    /// The picture's size, once there's one on screen.
+    pub fn size(&self) -> Option<egui::Vec2> {
+        self.display.as_ref().map(Display::size)
+    }
+
     pub fn time(&self) -> f64 {
         self.shared.now()
     }
@@ -638,6 +707,16 @@ impl Player {
             return;
         }
         self.shared.playing.store(true, Ordering::Relaxed);
+    }
+
+    /// Play until `until` seconds: playing already (taken over from the
+    /// other screen), it carries on, only stopping there instead.
+    pub fn play_on(&mut self, until: f64) {
+        if self.is_playing() {
+            self.shared.end.store((until * PREVIEW_RATE as f64) as u64, Ordering::Relaxed);
+        } else {
+            self.play(until);
+        }
     }
 
     /// How fast it plays: 1.0 as recorded, 0.5 half speed.
@@ -870,7 +949,7 @@ impl Player {
             }
         }
         self.note_scrub(scrubbing);
-        self.display.as_ref().map(Display::size)
+        self.size()
     }
 
     /// A key held to step back frame by frame (see `stepping`).
@@ -1715,8 +1794,20 @@ impl Scrub {
     }
 }
 
+/// What the audio callback and the player share, for `pcm`'s tracks mixed
+/// by `gains`, and the sound output playing it (or why there's none).
+fn sound(pcm: Arc<Pcm>, gains: Vec<TrackEdit>) -> (Arc<Shared>, Option<cpal::Stream>, Option<String>) {
+    let n = pcm.len();
+    let shared = Arc::new(Shared::new(Mix { tracks: gains, track_levels: vec![(0.0, 0.0); n], master_level: (0.0, 0.0), master_stereo: Default::default() }, pcm));
+    let (stream, audio_error) = match start_audio(shared.clone()) {
+        Ok(s) => (Some(s), None),
+        Err(e) => (None, Some(e)),
+    };
+    (shared, stream, audio_error)
+}
+
 /// Opens the default output device and mixes the tracks into it.
-fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, String> {
+fn start_audio(shared: Arc<Shared>) -> Result<cpal::Stream, String> {
     let device = cpal::default_host().default_output_device().ok_or("no audio output device")?;
     let supported = device.default_output_config().map_err(|e| e.to_string())?;
     let channels = supported.channels() as usize;
@@ -1726,7 +1817,6 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
     // device runs at 48 kHz).
     let base_step = PREVIEW_RATE as f64 / out_rate;
     let mut frac = 0.0f64;
-    let n_tracks = pcm.len();
     let mut was_playing = false;
     let mut scrub = Scrub::new(out_rate);
     let listen = shared.clone();
@@ -1734,6 +1824,11 @@ fn start_audio(shared: Arc<Shared>, pcm: Arc<Pcm>) -> Result<cpal::Stream, Strin
 
     let mut mix = move |out: &mut [f32], info: &cpal::OutputCallbackInfo| {
         out.fill(0.0);
+        let pcm = match shared.pcm.lock() {
+            Ok(p) => p.clone(),
+            Err(_) => return,
+        };
+        let n_tracks = pcm.len();
         let playing = shared.playing.load(Ordering::Relaxed);
         if playing != was_playing {
             was_playing = playing;
@@ -1930,8 +2025,8 @@ impl SoundPlayer {
     /// `pcm`'s one track is stereo at [`PREVIEW_RATE`], `duration` seconds long.
     pub fn new(pcm: Arc<Pcm>, duration: f64) -> Self {
         let tracks = vec![TrackEdit { index: 0, gain: 1.0, muted: false, points: Vec::new() }];
-        let shared = Arc::new(Shared::new(Mix { tracks, track_levels: vec![(0.0, 0.0)], master_level: (0.0, 0.0), master_stereo: Default::default() }));
-        let (stream, error) = match start_audio(shared.clone(), pcm) {
+        let shared = Arc::new(Shared::new(Mix { tracks, track_levels: vec![(0.0, 0.0)], master_level: (0.0, 0.0), master_stereo: Default::default() }, pcm));
+        let (stream, error) = match start_audio(shared.clone()) {
             Ok(s) => (Some(s), None),
             Err(e) => (None, Some(e)),
         };
@@ -2153,6 +2248,45 @@ mod tests {
         }
         let hz = pitch(&out);
         assert!((hz - 880.0).abs() < 30.0, "after the jump: {hz:.0} Hz");
+    }
+
+    /// A player hushed into a curtain and handed straight back (switching
+    /// back before the new screen's picture came up) is taken over with its
+    /// sound back: its clock moves, as a player handed over as it is does.
+    #[test]
+    #[ignore = "needs a sound output"]
+    fn a_curtain_handed_back_plays() {
+        let clip = std::env::temp_dir().join(format!("hc-curtain-{}.mp4", std::process::id()));
+        let made = media::ffmpeg()
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=30:duration=3"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&clip)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let ctx = egui::Context::default();
+        let info = media::probe(&clip).unwrap();
+        let pcm = Pcm::from_tracks(vec![tone(440.0, 3.0)]);
+        // What `update` does once the first frame is there: the sound starts.
+        let moves = |p: &Player| {
+            p.shared.playing.store(true, Ordering::Relaxed);
+            let t0 = p.time();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let moved = p.time() - t0;
+            p.shared.playing.store(false, Ordering::Relaxed);
+            moved
+        };
+        let player = Player::new(&ctx, &clip, info.clone(), pcm.clone(), Vec::new());
+        let (mut player, _, taken) = Player::handed_over(&ctx, &clip, &info, pcm.clone(), Vec::new(), Some(player));
+        assert!(taken, "the same file is taken over");
+        let moved = moves(&player);
+        assert!(moved > 0.2, "handed over as it is, its clock moved {moved:.3} s in 0.4 s");
+        player.hush();
+        let (player, _, taken) = Player::handed_over(&ctx, &clip, &info, pcm, Vec::new(), Some(player));
+        assert!(taken, "a curtain on the same file is taken over");
+        let moved = moves(&player);
+        assert!(moved > 0.2, "handed back from a curtain, its clock moved {moved:.3} s in 0.4 s");
+        std::fs::remove_file(&clip).unwrap();
     }
 
     /// Noise (like game sound: no two slices alike), stereo, at the source rate.
