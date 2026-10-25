@@ -17,9 +17,15 @@ use super::image::{CameraPicture, Canvas};
 use super::screen::{Frame, Order};
 use crate::webcam::Placement;
 
+/// How the screen's flipped, for the shaders' `unturn`: 1 mirrored, 2 upside down.
+fn flips(p: &crate::ScreenPlacement) -> u32 {
+    u32::from(p.flip_h) | u32::from(p.flip_v) << 1
+}
+
 const SCALE_SHADER: &str = r#"
 struct Scale {
-    // The part of the source shown (x, y, w, h), and where in the frame (x, y, w, h).
+    // The part of the source shown (x, y, w, h, in its own pixels), and
+    // where in the frame (x, y, w, h).
     src: vec4<f32>,
     dst: vec4<f32>,
     // The frame's size, whether a webcam layer is laid over it, and whether
@@ -27,6 +33,10 @@ struct Scale {
     size: vec2<u32>,
     layer: u32,
     front: u32,
+    // How the picture's turned and flipped (see `unturn`).
+    turns: u32,
+    flips: u32,
+    _pad: vec2<u32>,
 }
 
 @group(0) @binding(0) var source: texture_2d<f32>;
@@ -34,18 +44,48 @@ struct Scale {
 @group(0) @binding(2) var<uniform> s: Scale;
 @group(0) @binding(3) var overlay: texture_2d<f32>;
 
-// The source interval an output sample covers, at least one sample wide
-// (enlarging then blends the nearest two), as `Taps` does on the CPU.
-fn span(i: f32, scale: f32, n: f32) -> vec2<f32> {
-    var a = i * scale;
-    var b = (i + 1.0) * scale;
+// A point of the picture's box (0 to 1 across and down it) in the part of
+// the source used (0 to 1): flipped back, then turned back, as it's turned
+// and then flipped (`ScreenPlacement::unturn`). `flips`: 1 mirrored, 2 upside down.
+fn unturn(q0: vec2<f32>, turns: u32, flips: u32) -> vec2<f32> {
+    var q = q0;
+    if ((flips & 1u) != 0u) {
+        q.x = 1.0 - q.x;
+    }
+    if ((flips & 2u) != 0u) {
+        q.y = 1.0 - q.y;
+    }
+    switch turns {
+        case 1u: { q = vec2<f32>(q.y, 1.0 - q.x); }
+        case 2u: { q = vec2<f32>(1.0 - q.x, 1.0 - q.y); }
+        case 3u: { q = vec2<f32>(1.0 - q.y, q.x); }
+        default: {}
+    }
+    return q;
+}
+
+// An interval of the source at least one sample wide (enlarging then blends
+// the nearest two), within [lo, hi], as `Taps` does on the CPU.
+fn widen(a0: f32, b0: f32, lo: f32, hi: f32) -> vec2<f32> {
+    var a = a0;
+    var b = b0;
     if (b - a < 1.0) {
         let c = (a + b) / 2.0;
-        a = max(c - 0.5, 0.0);
-        b = min(a + 1.0, n);
+        a = max(c - 0.5, lo);
+        b = min(a + 1.0, hi);
         a = b - 1.0;
     }
     return vec2<f32>(a, b);
+}
+
+// The source area the output pixel at `p` covers (x0, x1, y0, y1): its
+// corners through the turn and flip, into `src` (x, y, w, h) from `dst`.
+fn area(p: vec2<f32>, src: vec4<f32>, dst: vec4<f32>, turns: u32, flips: u32) -> vec4<f32> {
+    let a = src.xy + unturn((p - dst.xy) / dst.zw, turns, flips) * src.zw;
+    let b = src.xy + unturn((p + 1.0 - dst.xy) / dst.zw, turns, flips) * src.zw;
+    let lo = min(a, b);
+    let hi = max(a, b);
+    return vec4<f32>(widen(lo.x, hi.x, src.x, src.x + src.z), widen(lo.y, hi.y, src.y, src.y + src.w));
 }
 
 // Each frame pixel: the average of the source area it covers; black outside
@@ -60,8 +100,9 @@ fn scale(@builtin(global_invocation_id) id: vec3<u32>) {
     let p = vec2<f32>(id.xy);
     let inside = p.x >= s.dst.x && p.y >= s.dst.y && p.x < s.dst.x + s.dst.z && p.y < s.dst.y + s.dst.w;
     if (inside) {
-        let sx = span(p.x - s.dst.x, s.src.z / s.dst.z, s.src.z) + s.src.x;
-        let sy = span(p.y - s.dst.y, s.src.w / s.dst.w, s.src.w) + s.src.y;
+        let a = area(p, s.src, s.dst, s.turns, s.flips);
+        let sx = a.xy;
+        let sy = a.zw;
         var sum = vec3<f32>(0.0);
         var total = 0.0;
         for (var y = floor(sy.x); y < sy.y; y += 1.0) {
@@ -91,22 +132,57 @@ struct Look {
     size: vec2<u32>,
     weight: f32,
     _pad: f32,
+    turns: u32,
+    flips: u32,
+    _pad2: vec2<u32>,
 }
 
 @group(0) @binding(0) var source: texture_2d<f32>;
 @group(0) @binding(1) var<storage, read_write> sum: array<vec4<f32>>;
 @group(0) @binding(2) var<uniform> l: Look;
 
-fn span(i: f32, scale: f32, n: f32) -> vec2<f32> {
-    var a = i * scale;
-    var b = (i + 1.0) * scale;
+// A point of the picture's box (0 to 1 across and down it) in the part of
+// the source used (0 to 1): flipped back, then turned back, as it's turned
+// and then flipped (`ScreenPlacement::unturn`). `flips`: 1 mirrored, 2 upside down.
+fn unturn(q0: vec2<f32>, turns: u32, flips: u32) -> vec2<f32> {
+    var q = q0;
+    if ((flips & 1u) != 0u) {
+        q.x = 1.0 - q.x;
+    }
+    if ((flips & 2u) != 0u) {
+        q.y = 1.0 - q.y;
+    }
+    switch turns {
+        case 1u: { q = vec2<f32>(q.y, 1.0 - q.x); }
+        case 2u: { q = vec2<f32>(1.0 - q.x, 1.0 - q.y); }
+        case 3u: { q = vec2<f32>(1.0 - q.y, q.x); }
+        default: {}
+    }
+    return q;
+}
+
+// An interval of the source at least one sample wide (enlarging then blends
+// the nearest two), within [lo, hi], as `Taps` does on the CPU.
+fn widen(a0: f32, b0: f32, lo: f32, hi: f32) -> vec2<f32> {
+    var a = a0;
+    var b = b0;
     if (b - a < 1.0) {
         let c = (a + b) / 2.0;
-        a = max(c - 0.5, 0.0);
-        b = min(a + 1.0, n);
+        a = max(c - 0.5, lo);
+        b = min(a + 1.0, hi);
         a = b - 1.0;
     }
     return vec2<f32>(a, b);
+}
+
+// The source area the output pixel at `p` covers (x0, x1, y0, y1): its
+// corners through the turn and flip, into `src` (x, y, w, h) from `dst`.
+fn area(p: vec2<f32>, src: vec4<f32>, dst: vec4<f32>, turns: u32, flips: u32) -> vec4<f32> {
+    let a = src.xy + unturn((p - dst.xy) / dst.zw, turns, flips) * src.zw;
+    let b = src.xy + unturn((p + 1.0 - dst.xy) / dst.zw, turns, flips) * src.zw;
+    let lo = min(a, b);
+    let hi = max(a, b);
+    return vec4<f32>(widen(lo.x, hi.x, src.x, src.x + src.z), widen(lo.y, hi.y, src.y, src.y + src.w));
 }
 
 // sRGB's values to light.
@@ -124,8 +200,9 @@ fn accumulate(@builtin(global_invocation_id) id: vec3<u32>) {
     var c = vec3<f32>(0.0);
     let p = vec2<f32>(id.xy);
     if (p.x >= l.dst.x && p.y >= l.dst.y && p.x < l.dst.x + l.dst.z && p.y < l.dst.y + l.dst.w) {
-        let sx = span(p.x - l.dst.x, l.src.z / l.dst.z, l.src.z) + l.src.x;
-        let sy = span(p.y - l.dst.y, l.src.w / l.dst.w, l.src.w) + l.src.y;
+        let a = area(p, l.src, l.dst, l.turns, l.flips);
+        let sx = a.xy;
+        let sy = a.zw;
         var total = 0.0;
         for (var y = floor(sy.x); y < sy.y; y += 1.0) {
             let wy = min(sy.y, y + 1.0) - max(sy.x, y);
@@ -408,7 +485,7 @@ impl GpuPicture {
         };
         let (sw, sh) = (texture.width(), texture.height());
         let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = self.screen.place((sw, sh), (self.width, self.height));
-        let flags = [self.width, self.height, u32::from(self.layer.on), u32::from(self.screen.in_front)];
+        let flags = [self.width, self.height, u32::from(self.layer.on), u32::from(self.screen.in_front), u32::from(self.screen.turns % 4), flips(&self.screen), 0, 0];
         let floats: Vec<u8> = [sx, sy, sw, sh, dx, dy, dw, dh].iter().flat_map(|v| (*v as f32).to_le_bytes()).chain(flags.iter().flat_map(|v| v.to_le_bytes())).collect();
         self.gpu.queue.write_buffer(&self.uniforms, 0, &floats);
         let device = &self.gpu.device;
@@ -564,6 +641,7 @@ impl GpuPicture {
                 .chain(height.to_le_bytes())
                 .chain(slot.pending.to_le_bytes())
                 .chain(0f32.to_le_bytes())
+                .chain([u32::from(screen.turns % 4), flips(&screen), 0, 0].iter().flat_map(|v| v.to_le_bytes()))
                 .collect();
             self.gpu.queue.write_buffer(&slot.uniforms, 0, &bytes);
             let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {

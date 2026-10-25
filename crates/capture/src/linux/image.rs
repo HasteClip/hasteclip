@@ -46,21 +46,37 @@ impl Canvas {
         let data = &src.data[sy as usize * src.stride + sx as usize * 4..];
         let (size, to) = ((sw as usize, sh as usize), (dw as usize, dh as usize));
         let swap = src.order == Order::Rgb;
-        if !over && (dx, dy, dw, dh) == (0, 0, self.width, self.height) {
+        let turned = place.transformed();
+        if !over && !turned && (dx, dy, dw, dh) == (0, 0, self.width, self.height) {
             resample(data, size, src.stride, swap, &mut self.bgra, to);
             return;
         }
-        // Smaller than the canvas: scaled on its own, then put in its place
-        // (on black, unless it's over what's there).
-        self.part.resize(dw as usize * dh as usize * 4, 0);
-        resample(data, size, src.stride, swap, &mut self.part, to);
+        // Smaller than the canvas, or turned or flipped: scaled on its own
+        // (its own way round), then put in its place, turned and flipped (on
+        // black, unless it's over what's there).
+        let (pw, ph) = if place.turns % 2 == 1 { (dh as usize, dw as usize) } else { (dw as usize, dh as usize) };
+        self.part.resize(pw * ph * 4, 0);
+        resample(data, size, src.stride, swap, &mut self.part, (pw, ph));
         if !over {
             self.clear();
         }
-        let row = dw as usize * 4;
-        for (y, line) in self.part.chunks_exact(row).enumerate() {
-            let at = ((dy as usize + y) * self.width as usize + dx as usize) * 4;
-            self.bgra[at..at + row].copy_from_slice(line);
+        let (dx, dy, dw, dh) = (dx as usize, dy as usize, dw as usize, dh as usize);
+        if !turned {
+            let row = dw * 4;
+            for (y, line) in self.part.chunks_exact(row).enumerate() {
+                let at = ((dy + y) * self.width as usize + dx) * 4;
+                self.bgra[at..at + row].copy_from_slice(line);
+            }
+            return;
+        }
+        // Each pixel from the one it shows of the picture its own way round.
+        for y in 0..dh {
+            for x in 0..dw {
+                let (s, t) = place.unturn(((x as f32 + 0.5) / dw as f32, (y as f32 + 0.5) / dh as f32));
+                let (px, py) = (((s * pw as f32) as usize).min(pw - 1), ((t * ph as f32) as usize).min(ph - 1));
+                let (from, at) = ((py * pw + px) * 4, ((dy + y) * self.width as usize + dx + x) * 4);
+                self.bgra[at..at + 4].copy_from_slice(&self.part[from..from + 4]);
+            }
         }
     }
 
@@ -446,6 +462,29 @@ mod tests {
         // Hidden: nothing of it, over the webcam or on black.
         c.draw_screen(&white, &crate::ScreenPlacement { hidden: true, ..left }, false);
         assert!(c.bgra.chunks_exact(4).all(|p| p == [0, 0, 0, 255]));
+    }
+
+    /// Turned a quarter clockwise, the screen's left (white) is the top;
+    /// mirrored, it's on the right.
+    #[test]
+    fn the_screen_turned_and_mirrored() {
+        let px = |c: &Canvas, x: u32, y: u32| {
+            let at = ((y * c.width + x) * 4) as usize;
+            c.bgra[at..at + 3].to_vec()
+        };
+        let mut f = frame(8, 4, [0, 0, 0, 0], Order::Bgr);
+        for y in 0..4 {
+            for x in 0..4 {
+                f.data[(y * 8 + x) * 4..(y * 8 + x) * 4 + 3].copy_from_slice(&[255, 255, 255]);
+            }
+        }
+        let whole = crate::ScreenPlacement::whole(crate::Framing::Stretch);
+        let mut c = Canvas::new(4, 8);
+        c.draw_screen(&f, &crate::ScreenPlacement { turns: 1, ..whole }, false);
+        assert_eq!((px(&c, 2, 1), px(&c, 2, 6)), (vec![255, 255, 255], vec![0, 0, 0]));
+        let mut c = Canvas::new(8, 4);
+        c.draw_screen(&f, &crate::ScreenPlacement { flip_h: true, ..whole }, false);
+        assert_eq!((px(&c, 1, 2), px(&c, 6, 2)), (vec![0, 0, 0], vec![255, 255, 255]));
     }
 
     #[test]

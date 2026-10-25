@@ -832,10 +832,15 @@ impl Layer {
         result
     }
 
-    /// Draw `source_rect` of the picture into `dest` of target `slot`, leaving
-    /// the rest of the target as it is (only `target` is written).
-    fn draw(&self, video: &ID3D11VideoContext, slot: usize, source_rect: RECT, dest: RECT, target: RECT, mirror: (bool, bool)) -> windows::core::Result<()> {
+    /// Draw `source_rect` of the picture (in its own pixels) into `dest` of
+    /// target `slot`, turned `turns` quarters clockwise then mirrored as
+    /// `mirror` says (left and right, upside down), leaving the rest of the
+    /// target as it is (only `target` is written).
+    #[allow(clippy::too_many_arguments)]
+    fn draw(&self, video: &ID3D11VideoContext, slot: usize, source_rect: RECT, dest: RECT, target: RECT, turns: u8, mirror: (bool, bool)) -> windows::core::Result<()> {
         unsafe {
+            // Turned, then mirrored, as the processor does them.
+            video.VideoProcessorSetStreamRotation(&self.processor, 0, turns % 4 != 0, D3D11_VIDEO_PROCESSOR_ROTATION((turns % 4) as i32));
             if let Ok(video1) = video.cast::<ID3D11VideoContext1>() {
                 video1.VideoProcessorSetStreamMirror(&self.processor, 0, mirror.0 || mirror.1, mirror.0, mirror.1);
             }
@@ -906,7 +911,7 @@ impl Converter {
         // picture), or just the picture's place, over what's there.
         let draw_cam = |target: Option<RECT>| {
             if let Some((layer, source, dest, mirror)) = &cam
-                && let Err(e) = layer.draw(&self.video, slot, *source, *dest, target.unwrap_or(*dest), *mirror)
+                && let Err(e) = layer.draw(&self.video, slot, *source, *dest, target.unwrap_or(*dest), 0, *mirror)
             {
                 eprintln!("couldn't draw the webcam: {e}");
             }
@@ -915,10 +920,10 @@ impl Converter {
             // In front of the webcam: the webcam first, then the screen over it.
             Some((source, dest)) if placed.in_front && cam.is_some() => {
                 draw_cam(Some(full));
-                self.base.draw(&self.video, slot, source, dest, dest, (false, false))
+                self.base.draw(&self.video, slot, source, dest, dest, placed.turns, (placed.flip_h, placed.flip_v))
             }
             Some((source, dest)) => {
-                let drawn = self.base.draw(&self.video, slot, source, dest, full, (false, false));
+                let drawn = self.base.draw(&self.video, slot, source, dest, full, placed.turns, (placed.flip_h, placed.flip_v));
                 if drawn.is_ok() {
                     draw_cam(None);
                 }
