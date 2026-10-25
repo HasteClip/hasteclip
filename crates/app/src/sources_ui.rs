@@ -100,6 +100,18 @@ pub(crate) type PreviewSetup = (capture::VideoSource, capture::VideoSize, u32, O
 
 
 impl App {
+    /// Sources, with the screen's card open (its own page, not a crop's):
+    /// where it's put in the video.
+    pub(crate) fn show_screen_card(&mut self) {
+        use crate::canvas_ui::Layer;
+        self.page = crate::Page::Sources;
+        self.sources_view.crop_open = false;
+        self.webcam_view.crop = None;
+        if !self.sources_view.open_cards.contains(&Layer::Screen) {
+            self.sources_view.open_cards.push(Layer::Screen);
+        }
+    }
+
     pub(crate) fn sources_page(&mut self, ui: &mut egui::Ui) {
         let now = Instant::now();
         // Opening the page: start the meters from silence. Their last state is

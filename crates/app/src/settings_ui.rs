@@ -132,17 +132,17 @@ impl App {
     fn settings_group(&mut self, ui: &mut egui::Ui, name: &'static str, f: &Filter, jump: bool) -> bool {
         // Measure first: a group with no matching rows doesn't show at all.
         let matches = match name {
-            "Clipping" => f.shows(&["clip length", "replay buffer duration", "start clipping when hasteclip opens", "auto start"]),
-            "Video" => f.shows(&["resolution", "height", "size", "frame rate", "fps", "quality", "bitrate", "mbps", "frame blending", "motion blur", "encoder", "hardware", "software", "file format", "mp4", "mov", "game capture", "anti-cheat", "obs"]) || SCREEN_CAPTURE && f.shows(SCREEN_CAPTURE_WORDS),
-            "Clips" => f.shows(&["clips folder", "location", "directory", "folder per game", "name clips after what happened", "game events", "osu", "names", "delete", "trash", "permanently"]),
-            "Screenshots" => capture::SCREENSHOTS && f.shows(&["screenshots", "take a screenshot", "shortcut", "hotkey", "format", "png", "jpg", "jpeg", "copy", "clipboard", "paste"]),
+            "Clipping" => f.shows(&["clip length", "replay buffer duration", "start clipping when hasteclip opens", "auto start", "memory"]),
+            "Video" => VIDEO_WORDS.iter().any(|w| f.shows(w)) || SCREEN_CAPTURE && f.shows(SCREEN_CAPTURE_WORDS),
+            "Clips" => f.shows(&["clips folder", "location", "directory", "folder per game", "name clips after what happened", "game events", "osu", "names", "delete", "trash", "permanently", "output", "titles", "recycle"]),
+            "Screenshots" => capture::SCREENSHOTS && f.shows(&["screenshots", "take a screenshot", "shortcut", "hotkey", "format", "png", "jpg", "jpeg", "copy", "clipboard", "paste", "keyboard"]),
             "Sharing" => f.shows(&["discord", "activity", "rich presence"]),
             "Saved sound" => f.shows(&["play a sound when a clip is saved", "sound", "volume", "record the sound", "in clip", "add your own"]),
-            "Shortcuts" => f.shows(&["shortcuts", "hotkey", "keyboard", "save clip", "take a screenshot", "start or stop clipping", "start or stop recording", "fullscreen games", "input monitoring", "permission"]),
+            "Shortcuts" => f.shows(&["shortcuts", "hotkey", "keyboard", "save clip", "take a screenshot", "start or stop clipping", "start or stop recording", "fullscreen games", "input monitoring", "permission", "system settings"]),
             #[cfg(target_os = "macos")]
             "Permissions" => crate::setup::Need::ALL.iter().any(|n| f.shows(n.words()) || f.shows(&[n.label()])) || f.shows(&["permissions", "privacy", "allow"]),
-            "Voice" => f.shows(&["save by voice", "hasteclip that", "speech", "command", "voice samples", "review"]),
-            "App" => f.shows(&["appearance", "theme", "dark", "light", "open at login", "autostart", "startup", "closing the window", "tray", "menu bar", "update", "version", "license", "licence", "about", "source code", "copyright", "open source", "reset"]),
+            "Voice" => f.shows(&["save by voice", "hasteclip that", "speech", "command", "voice samples", "review", "keep", "improve"]),
+            "App" => f.shows(&["appearance", "theme", "dark", "light", "open at login", "autostart", "startup", "closing the window", "tray", "menu bar", "update", "version", "license", "licence", "about", "source code", "copyright", "open source", "reset", "system", "quit", "what's new", "start with", "defaults"]),
             _ => false,
         };
         if !matches {
@@ -241,28 +241,34 @@ impl App {
         let quality_note = format!("{}about {per_min} per minute", if preset.is_some() { "" } else { "Your own bitrate, " });
         let mut locked_click = false;
         ui_kit::list(ui, "video", |l| {
-            if f.shows(&["resolution", "height", "width", "size", "custom size", "native"]) {
+            if f.shows(RESOLUTION_WORDS) {
                 let (_, c) = l.row(Row::new("Resolution").tip("Resolution", RESOLUTION_TIP).note(res_note.clone()).locked(lock.clone()), |ui| self.resolution_field(ui));
                 locked_click |= c;
             }
-            // What a shape of the video's own does to the screen, said: how
-            // it sits in the video is the screen's, on Sources.
-            if f.shows(&["aspect ratio", "shape", "same as screen", "16:9", "21:9", "9:16", "ultrawide", "vertical", "crop", "fill", "fit", "stretch", "black bars"]) {
+            // What a shape of the video's own does to the screen, said, and
+            // where that's changed: how it sits in the video is the screen's,
+            // on Sources.
+            if f.shows(SHAPE_WORDS) {
                 let placed = self.settings.screen.placed.is_some();
                 let what = if self.settings.screen_placement().crop.is_some() { "crop" } else { "screen" };
-                let note = self.settings.capture_shape().zip(self.screen_picture()).map_or(String::new(), |(shape, size)| framing_note((!placed).then_some(self.settings.framing), shape, size, what));
-                let (_, c) = l.row(Row::new("Aspect ratio").tip("Aspect ratio", SHAPE_TIP).note(note).locked(lock.clone()), |ui| self.shape_field(ui, screen));
+                let shaped = self.settings.capture_shape().zip(self.screen_picture());
+                let note = shaped.map_or(String::new(), |(shape, size)| framing_note((!placed).then_some(self.settings.framing), shape, size, what));
+                let go = shaped.is_some_and(|(shape, size)| !same_shape(shape, size)).then_some(SHAPE_GO);
+                let (_, c) = l.row(Row::new("Aspect ratio").tip("Aspect ratio", SHAPE_TIP).note(note).go(go).locked(lock.clone()), |ui| self.shape_field(ui, screen));
                 locked_click |= c;
+                if ui_kit::take_row_go(l.ui.ctx(), "Aspect ratio") {
+                    self.show_screen_card();
+                }
             }
-            if f.shows(&["frame rate", "fps"]) {
+            if f.shows(FPS_WORDS) {
                 let (_, c) = l.row(Row::new("Frame rate").note(fps_note.clone()).locked(lock.clone()), |ui| self.fps_field(ui));
                 locked_click |= c;
             }
-            if f.shows(&["quality", "bitrate", "mbps"]) {
+            if f.shows(QUALITY_WORDS) {
                 let (_, c) = l.row(Row::new("Quality").tip("Quality", "How much detail each second gets. Fast motion needs more, and files grow with it. Balanced looks good in fast motion at this size and frame rate.").note(quality_note.clone()).locked(lock.clone()), |ui| self.quality_field(ui, rec, preset));
                 locked_click |= c;
             }
-            if capture::frame_blending() && f.shows(&["frame blending", "motion blur"]) {
+            if capture::frame_blending() && f.shows(BLEND_WORDS) {
                 let (_, c) = l.row(Row::new("Frame blending").tip("Frame blending", "Captures faster than the frame rate and averages the pictures into each frame, for smooth motion like motion blur. On macOS and Linux, up to your display's refresh rate.").note(blend_note.clone()).locked(lock.clone()), |ui| self.blend_field(ui, &blends));
                 locked_click |= c;
                 let on = samples > 1;
@@ -275,7 +281,7 @@ impl App {
                     locked_click |= c;
                 });
             }
-            if f.shows(&["encoder", "hardware", "software", "gpu"]) {
+            if f.shows(ENCODER_WORDS) {
                 let (_, c) = l.row(Row::new("Encoder").tip("Encoder", "Hardware encoding barely affects your game's frame rate. Software is slower and uses the CPU.").locked(lock.clone()), |ui| {
                     let r = ui_kit::select(ui, self.settings.encoder.label(), 150.0);
                     ui_kit::menu_popup(&r, false, 260.0, |ui| {
@@ -288,7 +294,7 @@ impl App {
                 });
                 locked_click |= c;
             }
-            if f.shows(&["file format", "mp4", "mov", "container"]) {
+            if f.shows(FORMAT_WORDS) {
                 let (_, c) = l.row(Row::new("File format").tip("File format", "MP4 plays everywhere. MOV is for QuickTime and Final Cut.").locked(lock.clone()), |ui| {
                     let chosen = usize::from(self.settings.container == Container::Mov);
                     if let Some(i) = ui_kit::segmented_opts(ui, "container", &[Seg::from("MP4"), Seg::from("MOV")], chosen, None, ui.is_enabled()) {
@@ -297,7 +303,7 @@ impl App {
                 });
                 locked_click |= c;
             }
-            if capture::game_hook_available() && f.shows(&["game capture", "anti-cheat", "anticheat", "obs", "fullscreen"]) {
+            if capture::game_hook_available() && f.shows(GAME_CAPTURE_WORDS) {
                 let (_, c) = l.row(Row::new("Game capture").tip("Game capture", "For games Windows can't record properly, like exclusive fullscreen games that record frozen, or that lose their cursor. Uses OBS Studio's game capture, only where it's needed.").note("For games that record frozen or without a cursor").locked(lock.clone()), |ui| ui_kit::switch(ui, &mut self.settings.game_capture));
                 locked_click |= c;
                 let on = self.settings.game_capture;
@@ -1336,8 +1342,31 @@ fn ratio_label(w: u32, h: u32) -> String {
     if rw <= 99 && rh <= 99 { format!("{rw}:{rh}") } else { format!("{:.2}:1", w as f64 / h.max(1) as f64) }
 }
 
+/// Aspect ratio's way to Sources, where the screen's put in the video.
+const SHAPE_GO: &str = "Fill, fit or stretch it on Sources";
+
 /// Aspect ratio's tip.
 const SHAPE_TIP: &str = "Record in another aspect ratio than your screen's: 16:9 out of an ultrawide screen, say, or 9:16 for phones. Every recording and clip is made in it. A custom size has a shape of its own. How your screen sits in it is on the Sources page: drag it on the preview to show another part of it or make it smaller (Shift stretches it), or right-click it to fill the video, fit all of it in, or stretch it.";
+
+/// What finds Resolution in the search.
+const RESOLUTION_WORDS: &[&str] = &["resolution", "height", "width", "size", "custom size", "native"];
+/// What finds Aspect ratio in the search.
+const SHAPE_WORDS: &[&str] = &["aspect ratio", "shape", "same as screen", "16:9", "21:9", "9:16", "4:3", "ultrawide", "vertical", "crop", "fill", "fit", "stretched res", "stretch res", "black bars"];
+/// What finds Frame rate in the search.
+const FPS_WORDS: &[&str] = &["frame rate", "fps"];
+/// What finds Quality in the search.
+const QUALITY_WORDS: &[&str] = &["quality", "bitrate", "mbps"];
+/// What finds Frame blending in the search.
+const BLEND_WORDS: &[&str] = &["frame blending", "motion blur"];
+/// What finds Encoder in the search.
+const ENCODER_WORDS: &[&str] = &["encoder", "hardware", "software", "gpu"];
+/// What finds File format in the search.
+const FORMAT_WORDS: &[&str] = &["file format", "mp4", "mov", "container"];
+/// What finds Game capture in the search.
+const GAME_CAPTURE_WORDS: &[&str] = &["game capture", "anti-cheat", "anticheat", "obs", "fullscreen"];
+/// Every Video row's words (but the screen capture's, Windows only): the
+/// group shows when any of its rows does.
+const VIDEO_WORDS: [&[&str]; 8] = [RESOLUTION_WORDS, SHAPE_WORDS, FPS_WORDS, QUALITY_WORDS, BLEND_WORDS, ENCODER_WORDS, FORMAT_WORDS, GAME_CAPTURE_WORDS];
 
 /// The screen capture setting shows: Windows, where there's a choice.
 const SCREEN_CAPTURE: bool = cfg!(target_os = "windows");
@@ -1376,12 +1405,10 @@ fn screen_capture_note(choice: settings::ScreenCapture, apps: bool, in_use: Opti
 /// words: its middle and what's cut off, or where the bars are.
 fn framing_note(framing: Option<settings::Framing>, shape: capture::Shape, (w, h): (u32, u32), what: &str) -> String {
     let Some(framing) = framing else { return "Your screen's placed by hand on the Sources page".to_owned() };
-    let screen = w as f64 / h.max(1) as f64;
-    let wanted = shape.w as f64 / shape.h.max(1) as f64;
-    if (screen / wanted - 1.0).abs() < 0.01 {
+    if same_shape(shape, (w, h)) {
         return format!("Your {w}×{h} {what} is already the video's shape");
     }
-    let wider = screen > wanted;
+    let wider = w as f64 / h.max(1) as f64 > shape.w as f64 / shape.h.max(1) as f64;
     match framing {
         settings::Framing::Fill => {
             let (sw, sh) = capture::Shape { framing: capture::Framing::Fill, ..shape }.of(w, h);
@@ -1391,6 +1418,12 @@ fn framing_note(framing: Option<settings::Framing>, shape: capture::Shape, (w, h
         settings::Framing::Fit => format!("All of your {w}×{h} {what}, with black bars {}", if wider { "above and below" } else { "at its sides" }),
         settings::Framing::Stretch => format!("All of your {w}×{h} {what}, {} to the video's shape", if wider { "squeezed" } else { "stretched" }),
     }
+}
+
+/// Whether a `w`×`h` picture is the shape's shape, near enough.
+fn same_shape(shape: capture::Shape, (w, h): (u32, u32)) -> bool {
+    let wanted = shape.w as f64 / shape.h.max(1) as f64;
+    (w as f64 / h.max(1) as f64 / wanted - 1.0).abs() < 0.01
 }
 
 /// Even or Soft: the one clicked, if one was.
@@ -1453,6 +1486,31 @@ mod length_tests {
         assert_eq!(round_mbps(12.4), 12);
         assert_eq!(round_mbps(26.5), 25);
         assert_eq!(round_mbps(0.4), 2);
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    /// What a stretched-res player types finds the aspect ratio, in the
+    /// Video group (the group used to have a list of its own, without it).
+    #[test]
+    fn searching_finds_the_aspect_ratio() {
+        for q in ["aspect", "4:3", "stretched", "stretch res", "black bars"] {
+            let f = Filter { q: q.to_owned() };
+            assert!(f.shows(SHAPE_WORDS) && VIDEO_WORDS.iter().any(|w| f.shows(w)), "{q}");
+        }
+        // Nothing of Video's finds it.
+        assert!(!VIDEO_WORDS.iter().any(|w| Filter { q: "discord".to_owned() }.shows(w)));
+    }
+
+    /// One aspect ratio and a screen of another shape: the way to Sources.
+    #[test]
+    fn shapes_alike_or_not() {
+        let wide = capture::Shape { w: 16, h: 9, framing: capture::Framing::Fill };
+        assert!(same_shape(wide, (1920, 1080)) && same_shape(wide, (1366, 768)));
+        assert!(!same_shape(wide, (1280, 960)));
     }
 }
 

@@ -692,6 +692,12 @@ impl<'a> Btn<'a> {
 /// Where a locked button's reason waits for the app, once it's clicked.
 const LOCKED_CLICK: &str = "locked_click";
 
+/// Whether the [`Row::go`] button of the row named `label` was clicked,
+/// once.
+pub fn take_row_go(ctx: &egui::Context, label: &str) -> bool {
+    ctx.data_mut(|d| d.remove_temp::<bool>(egui::Id::new(("row_go", label)))).is_some()
+}
+
 /// Why a locked button that was clicked is locked, once: the app shows it
 /// in a toast, wherever the button is ([`Btn::locked`]).
 pub fn take_locked_click(ctx: &egui::Context) -> Option<String> {
@@ -1323,11 +1329,14 @@ pub struct Row<'a> {
     pub locked: Option<String>,
     /// A row inside a well ([`well`]): a little smaller.
     pub kid: bool,
+    /// Where what it says is changed, when that's elsewhere: a quiet button
+    /// under its note going there ([`Row::go`]).
+    pub go: Option<&'a str>,
 }
 
 impl<'a> Row<'a> {
     pub fn new(label: &'a str) -> Self {
-        Self { label, note: None, warn: false, tip: None, locked: None, kid: false }
+        Self { label, note: None, warn: false, tip: None, locked: None, kid: false, go: None }
     }
     pub fn note(mut self, n: impl Into<String>) -> Self {
         let n = n.into();
@@ -1348,6 +1357,12 @@ impl<'a> Row<'a> {
     }
     pub fn kid(mut self) -> Self {
         self.kid = true;
+        self
+    }
+    /// A quiet button under its note, named `text`, to where what it says
+    /// is changed (another page): [`take_row_go`] says it was clicked.
+    pub fn go(mut self, text: Option<&'a str>) -> Self {
+        self.go = text;
         self
     }
 
@@ -1388,6 +1403,17 @@ impl<'a> Row<'a> {
             });
             if let Some(n) = &self.note {
                 ui.add(egui::Label::new(theme::text(n, 12.5, W::Regular).color(if self.warn { p.warn } else { p.text3 })).wrap());
+            }
+            // Its words in line with the note's (the button's padding
+            // to their left).
+            if let Some(go) = self.go {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(-9.0);
+                    if Btn::ghost(go).trail(icon::CARET_RIGHT).small().show(ui).clicked() {
+                        ui.data_mut(|d| d.insert_temp(egui::Id::new(("row_go", self.label)), true));
+                    }
+                });
             }
         };
         let mut clicked_locked = false;
@@ -1435,13 +1461,13 @@ impl<'a> Row<'a> {
                 ui.set_min_height(min_h);
                 ui.add_space(pad_x);
                 ui.allocate_ui_with_layout(vec2(label_w, min_h), egui::Layout::top_down(egui::Align::Min), |ui| {
-                    if self.note.is_some() {
+                    if self.note.is_some() || self.go.is_some() {
                         ui.add_space(9.0);
                     } else {
                         ui.add_space(((min_h - label_h) / 2.0).max(0.0));
                     }
                     drawn_label_h = ui.scope(label).response.rect.height();
-                    if self.note.is_some() {
+                    if self.note.is_some() || self.go.is_some() {
                         ui.add_space(8.0);
                     }
                 });
