@@ -199,7 +199,11 @@ impl Viewer {
         let state = if already_read(clip) {
             match load(clip) {
                 Ok(l) => State::Ready(Box::new(Ready::new(ctx, clip, l, resume, handoff.take()))),
-                Err(e) => State::Failed(e),
+                Err(e) => {
+                    // The player handed over would play on behind the message.
+                    handoff = None;
+                    State::Failed(e)
+                }
             }
         } else {
             let (tx, rx) = mpsc::channel();
@@ -278,7 +282,11 @@ impl Viewer {
             if let Ok(result) = rx.try_recv() {
                 self.state = match result {
                     Ok(l) => State::Ready(Box::new(Ready::new(ui.ctx(), &self.clip, l, self.resume, self.handoff.take()))),
-                    Err(e) => State::Failed(e),
+                    Err(e) => {
+                        // The player handed over would play on behind the message.
+                        self.handoff = None;
+                        State::Failed(e)
+                    }
                 };
             }
         }

@@ -252,7 +252,11 @@ impl Editor {
         let state = if media::probed(&target.source).is_some() {
             match load(&target.source) {
                 Ok(l) => State::Ready(Box::new(Ready::new(ctx, &target, l, snap, from, handoff.take()))),
-                Err(e) => State::Failed(e),
+                Err(e) => {
+                    // The player handed over would play on behind the message.
+                    handoff = None;
+                    State::Failed(e)
+                }
             }
         } else {
             let (tx, rx) = mpsc::channel();
@@ -331,7 +335,11 @@ impl Editor {
             if let Ok(result) = rx.try_recv() {
                 self.state = match result {
                     Ok(l) => State::Ready(Box::new(Ready::new(ui.ctx(), &self.target, l, self.snap, self.from, self.handoff.take()))),
-                    Err(e) => State::Failed(e),
+                    Err(e) => {
+                        // The player handed over would play on behind the message.
+                        self.handoff = None;
+                        State::Failed(e)
+                    }
                 };
             }
         }
