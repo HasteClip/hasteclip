@@ -17,6 +17,10 @@ use crate::App;
 use capture::webcam::{CameraControl, ControlKind};
 use crate::settings::{PlacementCfg, WebcamCfg};
 
+/// How wide the webcam's box is at first, as a fraction of the frame (see
+/// `Placement::default_for`).
+const FIRST_WIDTH: f32 = 0.25;
+
 /// Smallest the webcam's box gets, as a fraction of the frame.
 const MIN_SIZE: f32 = 0.03;
 /// Snap distance, as a fraction of the frame.
@@ -542,7 +546,8 @@ impl App {
         let was = self.arrangement();
         row(ui, "Position and size", &mut |ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
-            if Btn::normal("Reset").small().tip("Back to the bottom-right corner").show(ui).clicked() {
+            let (position, size) = self.webcam_resettable();
+            if Btn::normal("Reset").small().enabled(position || size).tip("Its position and size: back to the bottom-right corner, a quarter of the video wide").show(ui).clicked() {
                 self.webcam_to_corner(frame_aspect);
             }
             ui.label(theme::text("Drag it on the preview", 12.5, W::Regular).color(pal.text3)).on_hover_text(format!(
@@ -572,6 +577,35 @@ impl App {
         };
         let corner = Placement { crop: p.crop, flip_h: p.flip_h, flip_v: p.flip_v, turns: p.turns, ..Placement::default_for(shape, frame_aspect) };
         w.placement = PlacementCfg::laid_out(contain(corner), frame_aspect);
+    }
+
+    /// Whether the webcam's position, and its size, can be reset: it's not
+    /// in the bottom-right corner, or not a quarter of the video wide.
+    pub(crate) fn webcam_resettable(&self) -> (bool, bool) {
+        let Some(p) = self.settings.webcam.as_ref().map(|w| w.placement) else { return (false, false) };
+        let at_corner = (p.x - (1.0 - p.w)).abs() < 1e-3 && (p.y - (1.0 - p.h)).abs() < 1e-3;
+        (!at_corner, (p.w - FIRST_WIDTH).abs() > 1e-3)
+    }
+
+    /// The webcam back in the bottom-right corner, its size kept.
+    pub(crate) fn webcam_reset_position(&mut self, frame_aspect: f32) {
+        let Some(w) = self.settings.webcam.as_mut() else { return };
+        let mut p: Placement = w.placement.into();
+        (p.x, p.y) = (1.0 - p.w, 1.0 - p.h);
+        w.placement = PlacementCfg::laid_out(contain(p), frame_aspect);
+    }
+
+    /// The webcam a quarter of the video wide again, in its shape, where it
+    /// is (in a corner, it stays in it).
+    pub(crate) fn webcam_reset_size(&mut self, frame_aspect: f32) {
+        let Some(w) = self.settings.webcam.as_mut() else { return };
+        let mut p: Placement = w.placement.into();
+        if p.w <= 0.0 || p.h <= 0.0 {
+            return;
+        }
+        let r = crate::canvas_ui::resized_in_place(Rect::from_min_size(Pos2::new(p.x, p.y), vec2(p.w, p.h)), vec2(FIRST_WIDTH, FIRST_WIDTH * p.h / p.w));
+        (p.x, p.y, p.w, p.h) = (r.min.x, r.min.y, r.width(), r.height());
+        w.placement = PlacementCfg::laid_out(contain(p), frame_aspect);
     }
 
     /// All of the webcam's picture again: its box grows back around what

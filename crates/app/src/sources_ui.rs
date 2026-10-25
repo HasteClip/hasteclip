@@ -756,7 +756,7 @@ impl App {
                         ui.label(crate::theme::text("Placed by hand", 12.5, crate::theme::W::Regular).color(pal.text3));
                     }
                 } else {
-                    if crate::ui_kit::Btn::normal("Reset").small().enabled(placed).tip("Over all of the video again").show(ui).clicked() {
+                    if crate::ui_kit::Btn::normal("Reset").small().enabled(placed).tip("Its position and size: over all of the video again").show(ui).clicked() {
                         self.screen_to_whole();
                     }
                     let state = if placed { "Placed by hand on the preview" } else { "Fills the video" };

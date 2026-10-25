@@ -230,6 +230,24 @@ pub(crate) fn in_video(shown: Rect, part: Rect) -> (Rect, Rect) {
     (seen, Rect::from_min_max(at(seen.min), at(seen.max)))
 }
 
+/// A box in the middle of the video, its size kept.
+pub(crate) fn centred(r: Rect) -> Rect {
+    Rect::from_min_size(Pos2::new((1.0 - r.width()) / 2.0, (1.0 - r.height()) / 2.0), r.size())
+}
+
+/// A box made `size`, in the same place in the room it has to move in (one
+/// in a corner stays in it; one bigger than the video covers as much of it).
+pub(crate) fn resized_in_place(r: Rect, size: egui::Vec2) -> Rect {
+    let along = |at: f32, s: f32| if (1.0 - s).abs() > 1e-4 { (at / (1.0 - s)).clamp(0.0, 1.0) } else { 0.5 };
+    let (ax, ay) = (along(r.min.x, r.width()), along(r.min.y, r.height()));
+    Rect::from_min_size(Pos2::new(ax * (1.0 - size.x), ay * (1.0 - size.y)), size)
+}
+
+/// Whether two boxes are the same, but for rounding.
+fn same(a: Rect, b: Rect) -> bool {
+    (a.min - b.min).length() < 1e-3 && (a.max - b.max).length() < 1e-3
+}
+
 /// The screen's box after dragging `handle` by `(dx, dy)` (fractions of the
 /// video) from `start`: moved (snapping to the video and to `lines`, unless
 /// `snap` is off), or resized from the opposite corner or side, keeping its
@@ -304,8 +322,51 @@ impl App {
         if let Some(b) = self.settings.screen.placed {
             return Rect::from_min_size(Pos2::new(b.x, b.y), vec2(b.w, b.h));
         }
-        let framing = self.settings.screen_placement().framing;
+        self.screen_first_rect(frame_aspect)
+    }
+
+    /// Where the screen goes as the video puts it, its first place and size:
+    /// Fill, Fit or Stretch's, in a video of a shape of its own, else all of
+    /// it (see [`framed`]).
+    fn screen_first_rect(&mut self, frame_aspect: f32) -> Rect {
+        let framing = if self.video_shaped() { self.settings.framing.into() } else { capture::Framing::Fit };
         self.screen_aspect().map_or(Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), |picture| framed(framing, picture, frame_aspect))
+    }
+
+    /// The screen in box `r`, or put in as the video puts it when that's
+    /// where `r` is (so it follows the video's shape again).
+    fn place_or_frame(&mut self, r: Rect, aspect: f32) {
+        if same(r, self.screen_first_rect(aspect)) {
+            self.settings.screen.placed = None;
+        } else {
+            self.place_screen(r, aspect);
+        }
+    }
+
+    /// Whether the screen's position, and its size, can be reset: it's
+    /// placed by hand, and not in the middle, or not its first size.
+    pub(crate) fn screen_resettable(&mut self, aspect: f32) -> (bool, bool) {
+        if self.settings.screen.placed.is_none() {
+            return (false, false);
+        }
+        let (r, first) = (self.screen_rect(aspect), self.screen_first_rect(aspect));
+        (!same(r, centred(r)), (r.size() - first.size()).length() > 1e-3)
+    }
+
+    /// The screen back in the middle of the video, its size kept.
+    pub(crate) fn screen_reset_position(&mut self, aspect: f32) {
+        if self.settings.screen.placed.is_some() {
+            let r = centred(self.screen_rect(aspect));
+            self.place_or_frame(r, aspect);
+        }
+    }
+
+    /// The screen back to its first size (as the video puts it), where it is.
+    pub(crate) fn screen_reset_size(&mut self, aspect: f32) {
+        if self.settings.screen.placed.is_some() {
+            let r = resized_in_place(self.screen_rect(aspect), self.screen_first_rect(aspect).size());
+            self.place_or_frame(r, aspect);
+        }
     }
 
     /// The screen in the box `r` (fractions of a video of shape `aspect`),
@@ -701,7 +762,7 @@ impl App {
     pub(crate) fn layer_menu(&mut self, ui: &mut egui::Ui, layer: Layer, aspect: f32) {
         match layer {
             Layer::Screen => {
-                // How it fills a video of its own shape; else back over all of it.
+                // How it fills a video of its own shape: its position and size both.
                 if self.video_shaped() {
                     let now = self.settings.screen.placed.is_none().then_some(self.settings.framing);
                     for (framing, _, label, tip) in FRAMINGS {
@@ -710,8 +771,17 @@ impl App {
                             ui.close();
                         }
                     }
-                } else if Item::new("Reset position").icon(icon::ARROWS_OUT).enabled(self.settings.screen.placed.is_some()).tip("Over all of the video again").show(ui).clicked() {
-                    self.screen_to_whole();
+                    crate::ui_kit::menu_sep(ui);
+                }
+                // Each on its own: both are where the video puts it.
+                let (position, size) = self.screen_resettable(aspect);
+                if Item::new("Reset position").icon(icon::ARROWS_OUT_CARDINAL).enabled(position).tip("Back in the middle of the video, its size kept").show(ui).clicked() {
+                    self.screen_reset_position(aspect);
+                    ui.close();
+                }
+                let tip = if self.video_shaped() { "Back to the size the video gives it, where it is" } else { "As big as the video again, where it is" };
+                if Item::new("Reset size").icon(icon::RESIZE).enabled(size).tip(tip).show(ui).clicked() {
+                    self.screen_reset_size(aspect);
                     ui.close();
                 }
                 if self.crop_whole().is_some() {
@@ -723,8 +793,14 @@ impl App {
                 }
             }
             Layer::Webcam => {
-                if Item::new("Reset position").icon(icon::ARROWS_IN).tip("Back to the bottom-right corner").show(ui).clicked() {
-                    self.webcam_to_corner(aspect);
+                // Each on its own: both are the bottom-right corner, a quarter of the video wide.
+                let (position, size) = self.webcam_resettable();
+                if Item::new("Reset position").icon(icon::ARROWS_OUT_CARDINAL).enabled(position).tip("Back to the bottom-right corner, its size kept").show(ui).clicked() {
+                    self.webcam_reset_position(aspect);
+                    ui.close();
+                }
+                if Item::new("Reset size").icon(icon::RESIZE).enabled(size).tip("A quarter of the video wide again, where it is").show(ui).clicked() {
+                    self.webcam_reset_size(aspect);
                     ui.close();
                 }
                 let cropped = self.webcam_placement().is_some_and(|p| p.crop.iter().any(|c| *c > 0.0));
@@ -926,6 +1002,22 @@ mod tests {
         let apps = ScreenHold { cropping_from: None, ..hold };
         let (r, crop, _) = apps.dragged(-0.5, -0.5, mods(true, false), &none);
         assert!(close(r, rect(0.0, 0.0, 0.5, 0.5)) && crop.is_none(), "{r:?}");
+    }
+
+    /// Reset position: in the middle, its size kept (one bigger than the
+    /// video covering it evenly). Reset size: where it is, in its corner or
+    /// edge or the middle, as it was.
+    #[test]
+    fn resetting_position_or_size_alone() {
+        assert!(close(centred(rect(0.1, 0.2, 0.4, 0.4)), rect(0.3, 0.3, 0.4, 0.4)));
+        assert!(close(centred(rect(0.0, 0.0, 1.0, 1.2)), rect(0.0, -0.1, 1.0, 1.2)));
+        let quarter = vec2(0.25, 0.25);
+        // Bottom-right corner, top-left corner, the middle: still there.
+        assert!(close(resized_in_place(rect(0.6, 0.6, 0.4, 0.4), quarter), rect(0.75, 0.75, 0.25, 0.25)));
+        assert!(close(resized_in_place(rect(0.0, 0.0, 0.4, 0.4), quarter), rect(0.0, 0.0, 0.25, 0.25)));
+        assert!(close(resized_in_place(rect(0.3, 0.3, 0.4, 0.4), quarter), rect(0.375, 0.375, 0.25, 0.25)));
+        // All of the video, at Fill's size (bigger): over it, in the middle.
+        assert!(close(resized_in_place(rect(0.0, 0.0, 1.0, 1.0), vec2(1.0, 1.2)), rect(0.0, -0.1, 1.0, 1.2)));
     }
 
     /// Guides show for the lines a box is on.
