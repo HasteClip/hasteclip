@@ -566,6 +566,20 @@ pub(crate) fn window_pid(hwnd: HWND) -> u32 {
     pid
 }
 
+/// Where a window is on the desktop (left, top, right, bottom), to tell
+/// whether it moved or changed size.
+pub(crate) fn window_place(hwnd: HWND) -> (i32, i32, i32, i32) {
+    let mut r = RECT::default();
+    let _ = unsafe { GetWindowRect(hwnd, &mut r) };
+    (r.left, r.top, r.right, r.bottom)
+}
+
+/// The display a window is on (most of it).
+pub(crate) fn window_monitor(hwnd: HWND) -> HMONITOR {
+    use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
+    unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) }
+}
+
 /// Whether a window covers `monitor` (a fullscreen game on it).
 pub(crate) fn fullscreen_on(hwnd: HWND, monitor: HMONITOR) -> bool {
     use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
