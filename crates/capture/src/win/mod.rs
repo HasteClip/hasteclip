@@ -659,11 +659,12 @@ impl WindowCapture {
 }
 
 /// Exclusive fullscreen: a fullscreen game in focus is drawing (on the
-/// graphics card, `gpu`) while Windows' capture has had nothing from it for
-/// this long. Windows' capture gets a frame for every frame a window
-/// presents, the same picture again too (measured: a still window drawn 180
-/// times a second, 180 frames a second), so a game on a still screen isn't
-/// mistaken for this; one that stops drawing isn't busy on the graphics card.
+/// graphics card, `gpu`) while its pictures haven't reached the capture for
+/// this long (see [`Sight`]). Windows' capture gets a frame for every frame a
+/// window presents, the same picture again too (measured: a still window
+/// drawn 180 times a second, 180 frames a second), and Desktop Duplication a
+/// new picture, so a game on a still screen isn't mistaken for this; one that
+/// stops drawing isn't busy on the graphics card.
 const FROZEN: Duration = Duration::from_secs(2);
 
 /// Percent of the graphics card's 3D engine that counts as drawing. A guess:
@@ -671,12 +672,98 @@ const FROZEN: Duration = Duration::from_secs(2);
 /// that doesn't draw 0.
 const DRAWING: f64 = 0.3;
 
-/// Whether a fullscreen game's window that Windows' capture has had
-/// nothing from for `FROZEN` is drawing all the same (`gpu`, sampled every
-/// call while it's watched): exclusive fullscreen.
-fn unseen_but_drawing(gpu: &mut Option<gpu::GpuUse>, window: windows::Win32::Foundation::HWND, since_last_frame: Duration) -> Option<f64> {
-    let percent = gpu.as_mut()?.percent(system::window_pid(window));
-    (since_last_frame > FROZEN && percent > DRAWING).then_some(percent)
+/// How busy a fullscreen game keeps the graphics card drawing, in percent
+/// (`gpu`, sampled every call while it's watched), if that can be told.
+fn drawing(gpu: &mut Option<gpu::GpuUse>, window: windows::Win32::Foundation::HWND) -> Option<f64> {
+    Some(gpu.as_mut()?.percent(system::window_pid(window)))
+}
+
+/// How long after a game comes up, or its window moves, to look at it: a
+/// window just gone fullscreen can still be shown by the compositor for its
+/// first frames (measured: 0.2 s), and the look would end there. A guess.
+const FIRST_LOOK: Duration = Duration::from_secs(1);
+
+/// How long after a look that saw the game to look again: at first, then
+/// twice as long each time, up to the second.
+const LOOK_AGAIN: (Duration, Duration) = (Duration::from_secs(5), Duration::from_secs(60));
+
+/// Whether a fullscreen game in focus that Windows' capture records reaches
+/// it. Windows' capture can't tell by itself: it hands over a frame each time
+/// the cursor moves too, even over a game it can't see (its last picture
+/// again, the cursor moved on it), and a game being played moves one of its
+/// own (Minecraft 1.12 and before an invisible one, put back in the middle
+/// every frame), which brings it frames even with the cursor left out of it.
+/// That kept a frozen Minecraft's recording from ever switching to the hook
+/// (issue #11). Desktop Duplication tells ([`dupl::Probe`]), so one looks:
+/// when the game comes up, when its window moves or changes size (going
+/// exclusive fullscreen), and now and then after (see [`FIRST_LOOK`],
+/// [`LOOK_AGAIN`]), till a new picture shows the game seen. Not one kept
+/// open: that costs the compositor about as much as Windows' capture does
+/// (measured with a game at 540 fps: 15% more of a core on top of Windows'
+/// capture, 37% alone, however seldom it's asked); a look keeps one open a
+/// fifth of a second, and makes a frame or two come a refresh late. Where
+/// the display can't be duplicated, Windows' capture's own frames tell, as
+/// they can.
+#[derive(Default)]
+struct Sight {
+    /// The game's window and when it came up there (another, or moved, is
+    /// looked at soon).
+    window: Option<(WindowAt, Instant)>,
+    /// The look going on.
+    probe: Option<dupl::Probe>,
+    /// The display can't be duplicated.
+    cannot: bool,
+    /// When to look again (none: at once), and how long after that.
+    next: Option<Instant>,
+    wait: Duration,
+}
+
+/// A window, and where it is on the desktop (see [`system::window_place`]).
+type WindowAt = (usize, (i32, i32, i32, i32));
+
+impl Sight {
+    /// How long the game in `window` hasn't reached the capture, since it
+    /// came up: told by looks with a Desktop Duplication of the display
+    /// (`probe`: Windows' capture records it), else by how long the capture's
+    /// had nothing new (`own`: Desktop Duplication's own pictures, or Windows'
+    /// capture's frames where the display can't be duplicated). None: it was
+    /// seen lately, and isn't looked at now.
+    fn unseen(&mut self, gpu: &d3d::Gpu, window: WindowAt, probe: Option<windows::Win32::Graphics::Gdi::HMONITOR>, own: Duration) -> Option<Duration> {
+        let now = Instant::now();
+        if self.window.is_none_or(|(w, _)| w != window) {
+            *self = Sight { window: Some((window, now)), next: Some(now + FIRST_LOOK), ..Default::default() };
+        }
+        let up = self.window.map_or(Duration::ZERO, |(_, at)| now - at);
+        let Some(monitor) = probe.filter(|_| !self.cannot) else {
+            return Some(own.min(up));
+        };
+        if self.probe.is_none() {
+            if self.next.is_some_and(|next| now < next) {
+                return None;
+            }
+            match dupl::Probe::start(gpu, monitor) {
+                Some(probe) => self.probe = Some(probe),
+                None => {
+                    self.cannot = true;
+                    return Some(own.min(up));
+                }
+            }
+        }
+        let (unseen, seen) = self.probe.as_mut()?.since_last_picture();
+        if seen {
+            self.look_later();
+            return None;
+        }
+        Some(unseen)
+    }
+
+    /// The look's over (the game's seen, or doesn't draw: nothing to see):
+    /// the next, later.
+    fn look_later(&mut self) {
+        self.probe = None;
+        self.wait = (self.wait * 2).clamp(LOOK_AGAIN.0, LOOK_AGAIN.1);
+        self.next = Some(Instant::now() + self.wait);
+    }
 }
 
 /// A display's capture: Windows' own, or Desktop Duplication (see `dupl`).
@@ -789,6 +876,7 @@ impl Video {
             let mut hook_failed: std::collections::HashSet<usize> = Default::default();
             // Apps Windows' capture froze on: hooked from then on.
             let mut frozen: std::collections::HashSet<String> = Default::default();
+            let mut sight = Sight::default();
             let mut gpu_use = gpu::GpuUse::new();
             // A window that couldn't be captured, so it's reported once.
             let mut failed = None;
@@ -834,15 +922,31 @@ impl Video {
                     }
                     current = None;
                 }
-                // Windows' capture of a fullscreen game in focus sends nothing:
-                // it can't see the game (exclusive fullscreen). The hook can.
-                if let Some((h, app, WindowCapture::Wgc(capture, true))) = &current
-                    && let Some(percent) = unseen_but_drawing(&mut gpu_use, *h, capture.since_last_frame())
-                    && focused.as_ref().is_some_and(|(f, _, _)| f == h)
-                    && !system::window_hidden(*h)
-                    && system::covers_display(*h)
-                {
-                    eprintln!("{app}: drawing ({percent:.1}% of the graphics card) but Windows' capture has had nothing for {FROZEN:?}: exclusive fullscreen; switching to the game capture hook");
+                // Windows' capture of a fullscreen game in focus gets nothing
+                // from it: it can't see the game (exclusive fullscreen, see
+                // `Sight`). The hook can.
+                let mut unseen = None;
+                match &current {
+                    Some((h, app, WindowCapture::Wgc(capture, true)))
+                        if focused.as_ref().is_some_and(|(f, _, _)| f == h) && !system::window_hidden(*h) && system::covers_display(*h) =>
+                    {
+                        if let Some(percent) = drawing(&mut gpu_use, *h)
+                            && sight
+                                .unseen(&gpu, (h.0 as usize, system::window_place(*h)), Some(system::window_monitor(*h)), capture.since_last_frame())
+                                .is_some_and(|u| u > FROZEN)
+                        {
+                            if percent > DRAWING {
+                                unseen = Some((app.clone(), percent));
+                            } else {
+                                // Nothing to see: it doesn't draw.
+                                sight.look_later();
+                            }
+                        }
+                    }
+                    _ => sight = Sight::default(),
+                }
+                if let Some((app, percent)) = unseen {
+                    eprintln!("{app}: drawing ({percent:.1}% of the graphics card) but Windows' capture has had nothing from it for {FROZEN:?}: exclusive fullscreen; switching to the game capture hook");
                     frozen.insert(app.to_lowercase());
                     current = None;
                 }
@@ -987,6 +1091,7 @@ impl Video {
             let mut plans: std::collections::HashMap<usize, hook::Plan> = Default::default();
             let mut hook_failed: std::collections::HashSet<usize> = Default::default();
             let mut frozen: std::collections::HashSet<String> = Default::default();
+            let mut sight = Sight::default();
             let mut gpu_use = gpu::GpuUse::new();
             while !stop2.load(Ordering::Relaxed) {
                 // A fullscreen window in focus on this display.
@@ -996,7 +1101,7 @@ impl Video {
                 let plan = game.as_ref().map(|(h, exe)| {
                     *plans.entry(h.0 as usize).or_insert_with(|| {
                         let (plan, why) = hook::plan(exe, *h, &settings);
-                        eprintln!("{exe} fullscreen: {} ({why})", if plan == hook::Plan::Hook { "the game capture hook" } else { "Windows' capture" });
+                        eprintln!("{exe} fullscreen: {} ({why})", if plan == hook::Plan::Hook { "the game capture hook" } else { "the display's capture" });
                         plan
                     })
                 });
@@ -1069,14 +1174,30 @@ impl Video {
                     }
                     retry.0 = Instant::now() + retry.1;
                 }
-                // Windows' capture sends nothing new while a fullscreen game
-                // is in focus: it can't see it (exclusive fullscreen).
-                // (Desktop Duplication sees it: it's what the display shows.)
-                if let (Some(DisplayCapture::Wgc(capture) | DisplayCapture::StandIn(capture)), Some((h, exe)), Some(hook::Plan::Watch)) = (&display, &game, plan)
-                    && let Some(percent) = unseen_but_drawing(&mut gpu_use, *h, capture.since_last_frame())
-                    && frozen.insert(exe.to_lowercase())
-                {
-                    eprintln!("{exe}: drawing ({percent:.1}% of the graphics card) but Windows' capture has had nothing for {FROZEN:?}: exclusive fullscreen; switching to the game capture hook");
+                // The display's capture gets nothing new while a fullscreen
+                // game is in focus: it can't see it (exclusive fullscreen, or
+                // a game that goes to the display past the compositor, issue
+                // #11). Desktop Duplication tells; for Windows' capture, one
+                // that looks now and then (see `Sight`).
+                match (&display, &game, plan) {
+                    (Some(capture), Some((h, exe)), Some(hook::Plan::Watch)) if !frozen.contains(&exe.to_lowercase()) => {
+                        if let Some(percent) = drawing(&mut gpu_use, *h) {
+                            let (own, probe) = match capture {
+                                DisplayCapture::Dupl(c) => (c.since_last_picture(), None),
+                                DisplayCapture::Wgc(c) | DisplayCapture::StandIn(c) => (c.since_last_frame(), Some(monitor)),
+                            };
+                            if sight.unseen(&gpu, (h.0 as usize, system::window_place(*h)), probe, own).is_some_and(|u| u > FROZEN) {
+                                if percent > DRAWING {
+                                    eprintln!("{exe}: drawing ({percent:.1}% of the graphics card) but the display's capture has had nothing from it for {FROZEN:?}: exclusive fullscreen; switching to the game capture hook");
+                                    frozen.insert(exe.to_lowercase());
+                                } else {
+                                    // Nothing to see: it doesn't draw.
+                                    sight.look_later();
+                                }
+                            }
+                        }
+                    }
+                    _ => sight = Sight::default(),
                 }
                 let until = Instant::now() + Self::RESCAN;
                 while Instant::now() < until && !stop2.load(Ordering::Relaxed) {
@@ -1771,6 +1892,20 @@ mod tests {
         assert!(first.abs_diff(137) <= 1, "{first}");
         assert!(second.abs_diff(225) <= 1, "{second}");
         assert!(blend.is_empty(2) && blend.is_empty(3), "both start empty again");
+    }
+
+    /// A fullscreen game that's seen is looked at again 5 s on, then twice as
+    /// long each time, up to a minute.
+    #[test]
+    fn looks_again_later_and_later() {
+        let mut sight = Sight::default();
+        let waits: Vec<u64> = (0..6)
+            .map(|_| {
+                sight.look_later();
+                sight.wait.as_secs()
+            })
+            .collect();
+        assert_eq!(waits, [5, 10, 20, 40, 60, 60]);
     }
 
     /// With nothing running, a screenshot of the main screen is taken by a

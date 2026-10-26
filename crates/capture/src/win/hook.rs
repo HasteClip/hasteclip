@@ -65,7 +65,8 @@ const NEEDS_HOOK: &[&str] = &["osu!.exe", "GeometryDash.exe"];
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Plan {
     Hook,
-    /// Windows' capture, switching to the hook if its picture freezes.
+    /// Windows' capture (or Desktop Duplication), switching to the hook if
+    /// the game's pictures stop reaching it.
     Watch,
     Wgc,
 }

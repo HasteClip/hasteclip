@@ -13,6 +13,14 @@
 //!
 //! Windows lets a process duplicate each display only once at a time: a
 //! preview closing as a recording opens is waited for (see [`START_TIMEOUT`]).
+//!
+//! A game that goes to the display past the compositor (Minecraft fullscreen,
+//! OpenGL, on an NVIDIA card: issue #11) it can't see: the duplication is lost
+//! as soon as it starts again, over and over, with no picture. Windows'
+//! capture can't see it either, so the game capture hook is used for such a
+//! game instead; whether a game is one is told by Desktop Duplication, the
+//! recording's (see [`DuplCapture::since_last_picture`]) or one just to look
+//! ([`Probe`]).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -160,6 +168,8 @@ pub(crate) struct DuplCapture {
     stop: Arc<AtomicBool>,
     /// Over: it failed for good (why).
     ended: Arc<Mutex<Option<String>>>,
+    /// When the last new picture came up (see [`DuplCapture::since_last_picture`]).
+    last_picture: Arc<Mutex<Instant>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -170,21 +180,22 @@ impl DuplCapture {
     pub(crate) fn start(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, fps: u32) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let ended = Arc::new(Mutex::new(None));
+        let last_picture = Arc::new(Mutex::new(Instant::now()));
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
-        let (stop2, ended2, gpu, latest) = (stop.clone(), ended.clone(), gpu.clone(), latest.clone());
+        let (stop2, ended2, last_picture2, gpu, latest) = (stop.clone(), ended.clone(), last_picture.clone(), gpu.clone(), latest.clone());
         let monitor = Shared(monitor);
         let thread = thread::Builder::new().name("desktop duplication".into()).spawn(move || {
             // On time, like the pacer: a picture taken late is timed late.
             super::system::multimedia_thread("Capture");
             let monitor = monitor;
-            let result = run(&gpu, monitor.0, &latest, fps, &stop2, &ready_tx);
+            let result = run(&gpu, monitor.0, &latest, fps, &stop2, &last_picture2, &ready_tx);
             if let Err(e) = &result {
                 eprintln!("desktop duplication: {e:#}");
                 let _ = ready_tx.send(Err(format!("{e:#}")));
             }
             *ended2.lock().unwrap() = Some(result.map_or_else(|e| format!("{e:#}"), |()| "stopped".into()));
         })?;
-        let capture = Self { stop, ended, thread: Some(thread) };
+        let capture = Self { stop, ended, last_picture, thread: Some(thread) };
         match ready_rx.recv_timeout(START_TIMEOUT + FIRST_FRAME_TIMEOUT + Duration::from_secs(1)) {
             Ok(Ok(())) => Ok(capture),
             Ok(Err(e)) => bail!("{e}"),
@@ -196,6 +207,94 @@ impl DuplCapture {
     pub(crate) fn ended(&self) -> Option<String> {
         self.ended.lock().unwrap().clone()
     }
+
+    /// How long since the display's last new picture (since it started,
+    /// before one): the cursor moving brings none, nor does a duplication's
+    /// first picture (all there is when it starts again, new or not). A game
+    /// the duplication can't see brings none.
+    pub(crate) fn since_last_picture(&self) -> Duration {
+        self.last_picture.lock().unwrap().elapsed()
+    }
+}
+
+/// Formats a probe takes pictures in: any a fullscreen game may scan out in
+/// (a duplication that doesn't take the one shown is lost over and over).
+const PROBE_FORMATS: [DXGI_FORMAT; 4] = [DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT];
+
+/// Whether the compositor puts new pictures of a display up: a Desktop
+/// Duplication of it, asked now and then and never copied from, to tell
+/// whether a fullscreen game recorded with Windows' capture reaches it (see
+/// `super::Sight`). The cursor moving brings it none, unlike Windows'
+/// capture; a game that goes to the display past the compositor brings none
+/// either (measured with Minecraft frozen in Windows' capture, the cursor
+/// moving: no new picture in 5 s, lost 98 times; shown, 500 a second).
+pub(crate) struct Probe {
+    gpu: Gpu,
+    output: IDXGIOutput,
+    dupl: Option<IDXGIOutputDuplication>,
+    /// The duplication's first picture is still to come: all there is when
+    /// it starts, not new.
+    first: bool,
+    /// When it started, or the last new picture came up, and whether one has.
+    last: Instant,
+    seen: bool,
+}
+
+impl Probe {
+    /// None where the display can't be duplicated: on another graphics card,
+    /// or duplicated by this app already.
+    pub(crate) fn start(gpu: &Gpu, monitor: HMONITOR) -> Option<Self> {
+        let output = output_for(gpu, monitor)?;
+        let dupl = probe_duplicate(gpu, &output).ok()?;
+        Some(Self { gpu: gpu.clone(), output, dupl: Some(dupl), first: true, last: Instant::now(), seen: false })
+    }
+
+    /// How long since a new picture came up (since it started, before one),
+    /// and whether one has.
+    pub(crate) fn since_last_picture(&mut self) -> (Duration, bool) {
+        // What's new since the last ask comes as one picture; a few asks, in
+        // case one more comes meanwhile.
+        for _ in 0..4 {
+            let Some(dupl) = &self.dupl else {
+                // Lost: started again, to ask next time.
+                self.dupl = probe_duplicate(&self.gpu, &self.output).ok();
+                self.first = true;
+                break;
+            };
+            let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+            let mut resource = None;
+            match unsafe { dupl.AcquireNextFrame(0, &mut info, &mut resource) } {
+                Ok(()) => {
+                    drop(resource);
+                    let _ = unsafe { dupl.ReleaseFrame() };
+                    // Without a present time, only the cursor moved.
+                    if info.LastPresentTime != 0 {
+                        if !self.first {
+                            self.last = Instant::now();
+                            self.seen = true;
+                        }
+                        self.first = false;
+                    }
+                }
+                Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => break,
+                Err(_) => self.dupl = None,
+            }
+        }
+        (self.last.elapsed(), self.seen)
+    }
+}
+
+/// A duplication of `output` for a [`Probe`]: the newer call, which takes
+/// any format, wants the thread per-monitor DPI aware; else the old one.
+fn probe_duplicate(gpu: &Gpu, output: &IDXGIOutput) -> windows::core::Result<IDXGIOutputDuplication> {
+    use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext};
+    let previous = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    let dupl = output
+        .cast::<IDXGIOutput5>()
+        .and_then(|o5| unsafe { o5.DuplicateOutput1(&gpu.device, 0, &PROBE_FORMATS) })
+        .or_else(|_| output.cast::<IDXGIOutput1>().and_then(|o1| unsafe { o1.DuplicateOutput(&gpu.device) }));
+    unsafe { SetThreadDpiAwarenessContext(previous) };
+    dupl
 }
 
 impl Drop for DuplCapture {
@@ -221,7 +320,7 @@ fn asks_per_second(fps: u32) -> f64 {
 /// until Desktop Duplication can start (see `Video::follow_screen`).
 const RESTART_FOR: Duration = Duration::from_secs(10);
 
-fn run(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, fps: u32, stop: &AtomicBool, ready: &std::sync::mpsc::Sender<Result<(), String>>) -> Result<()> {
+fn run(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, fps: u32, stop: &AtomicBool, last_picture: &Mutex<Instant>, ready: &std::sync::mpsc::Sender<Result<(), String>>) -> Result<()> {
     super::system::com_init();
     // Needed for the newer duplication call, and for the cursor's position
     // in the display's real pixels.
@@ -297,6 +396,9 @@ fn run(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, fps: u32, stop: &Atom
                         held = Some(h);
                         let shown = qpc_seconds(info.LastPresentTime).filter(|&t| t <= at && t > at - 0.1).unwrap_or(at);
                         got = Some(shown);
+                        if !first {
+                            *last_picture.lock().unwrap() = Instant::now();
+                        }
                     }
                 } else {
                     // Only the hardware cursor changed: drawn below, from
@@ -321,11 +423,13 @@ fn run(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, fps: u32, stop: &Atom
             Err(e) => return Err(e).context("Desktop Duplication failed"),
         }
         if let Some(why) = again {
-            eprintln!("desktop duplication: lost ({why}); starting again");
-            // Not at once when the one before never worked: Windows may be
-            // taking each away as it starts.
-            if lost.is_some() {
-                thread::sleep(Duration::from_millis(100));
+            // Said once for a run of them (a game it can't see takes each one
+            // away as it starts, ten times a second). Not at once when the
+            // one before never worked: Windows may be taking each away as it
+            // starts.
+            match lost {
+                None => eprintln!("desktop duplication: lost ({why}); starting again"),
+                Some(_) => thread::sleep(Duration::from_millis(100)),
             }
             match reopen(gpu, monitor, stop, lost.get_or_insert_with(Instant::now))? {
                 Some(new) => d = new,
