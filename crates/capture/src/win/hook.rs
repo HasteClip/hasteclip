@@ -404,17 +404,22 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
         (*hook_info).frame_interval = 1_000_000_000 / (4 * fps.max(1) as u64);
     }
     let event = |name: &str| open_event(&format!("{name}{pid}")).with_context(|| format!("the hook has no {name} event"));
-    let (hook_stop, hook_init, hook_ready, hook_exit) = (event("CaptureHook_Stop")?, event("CaptureHook_Initialize")?, event("CaptureHook_HookReady")?, event("CaptureHook_Exit")?);
+    let (hook_stop, hook_init, hook_exit) = (event("CaptureHook_Stop")?, event("CaptureHook_Initialize")?, event("CaptureHook_Exit")?);
     unsafe { SetEvent(hook_init.0) }?;
 
+    // Which of the hook's pictures was opened last (see `picture_number`),
+    // and a newer one seen on the look before: opened a look after it shows
+    // up, by when the hook has said how big it is (it says that after).
+    let mut opened = picture_number(hook_info);
+    let mut noticed = None;
     // Already capturing for someone else (a preview closing as a recording
-    // starts): its picture, until the hook says there's a new one.
-    let mut source: Option<Source> = if unsafe { (*hook_info).hook_ver_major } != 0 { Source::open(gpu, unsafe { &*hook_info }, window).ok() } else { None };
+    // starts, or OBS): its picture, until the hook starts over.
+    let mut source: Option<Source> = opened.and_then(|_| Source::open(gpu, unsafe { &*hook_info }, window).ok());
     if let Some(s) = &source {
         eprintln!("game hook: capturing {}×{} ({}), already running", s.cx, s.cy, s.kind());
     }
-    // Nothing yet a few seconds in: the other one may have taken the hook's
-    // "ready" signal. Asking it to stop makes it start over, and signal again.
+    // Nothing yet a few seconds in (a hook that stopped capturing, and
+    // wasn't asked to start again): asking it to stop makes it start over.
     let mut nudged = false;
     let quad = Quad::new(gpu)?;
     let target = super::quad::target_view(gpu, &latest.texture)?;
@@ -432,9 +437,11 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
         if !super::system::window_alive(window) {
             break Ok(());
         }
-        // A new picture to copy from: the first, or after the game resized
-        // or reset its graphics.
-        if hook_ready.signalled() {
+        // A new picture to copy from: the first, or the hook started over
+        // (the game resized or reset its graphics, or a capturer asked).
+        let number = picture_number(hook_info).filter(|n| opened != Some(*n));
+        if number.is_some() && number == noticed {
+            opened = number;
             source = None;
             match Source::open(gpu, unsafe { &*hook_info }, window) {
                 Ok(s) => {
@@ -450,6 +457,8 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
                 }
                 Err(e) => break Err(e),
             }
+        } else if let Some(n) = number {
+            noticed = Some(n);
         } else if source.is_none() {
             if Instant::now() > deadline {
                 break Err(anyhow::anyhow!("the hook loaded but sent no picture (is the game drawing?)"));
@@ -501,9 +510,25 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
             next = now;
         }
     };
-    let _ = unsafe { SetEvent(hook_stop.0) };
+    // Stopped, unless something else still keeps it capturing (OBS, or our
+    // capture taking over from this one): stopping makes it start over, and
+    // that one's picture would stop meanwhile.
     drop(keepalive);
+    if open_mutex(&format!("CaptureHook_KeepAlive{pid}")).is_none() {
+        let _ = unsafe { SetEvent(hook_stop.0) };
+    }
     result
+}
+
+/// The number of the picture the hook copies the game's into, once it has
+/// one: it goes up each time the hook starts over. Told by the hook's info,
+/// not its "ready" signal: only one capturer gets that, and with another one
+/// capturing the game too (OBS, or another HasteClip), this one waited for a
+/// picture that never came, and the recording stayed frozen (issue #11).
+fn picture_number(info: *const HookInfo) -> Option<u32> {
+    // Written by the hook, in the game's process, at any time.
+    let (major, number) = unsafe { ((&raw const (*info).hook_ver_major).read_volatile(), (&raw const (*info).map_id).read_volatile()) };
+    (major != 0).then_some(number)
 }
 
 /// How often to look at the hook's copy of the game's picture, for `fps`
