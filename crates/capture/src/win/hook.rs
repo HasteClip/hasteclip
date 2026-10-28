@@ -75,7 +75,7 @@ pub(crate) enum Plan {
 /// log.
 pub(crate) fn plan(exe: &str, window: HWND, settings: &crate::GameHook) -> (Plan, String) {
     if !available() {
-        return (Plan::Wgc, "the hook's files aren't there".into());
+        return (Plan::Wgc, "the hook's files aren't there; a build of your own gets them with scripts/fetch-game-hook.ps1".into());
     }
     // For testing: `HASTECLIP_FORCE_HOOK=<exe>[,…]` hooks those whatever they are.
     if std::env::var("HASTECLIP_FORCE_HOOK").is_ok_and(|v| v.split(',').any(|e| e.eq_ignore_ascii_case(exe))) {
