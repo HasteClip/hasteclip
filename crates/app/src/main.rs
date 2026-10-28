@@ -154,7 +154,8 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
     // One HasteClip at a time: another launch shows the running one and
-    // exits. (Not for development test instances, which run beside it.)
+    // exits, and a build of your own takes over from it. (Not for
+    // development test instances, which run beside it.)
     let instance = if test_instance {
         None
     } else {
