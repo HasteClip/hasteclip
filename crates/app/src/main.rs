@@ -528,10 +528,10 @@ struct App {
     pub(crate) selection: library::Selection,
     /// What's typed in the library's search.
     pub(crate) library_query: String,
-    /// What's typed in Settings' search, the section to scroll to, and
-    /// whether the Clip names page is open.
+    /// What's typed in Settings' search, the pane shown, and whether the
+    /// Clips pane's Clip names page is open.
     pub(crate) settings_query: String,
-    pub(crate) settings_jump: Option<&'static str>,
+    pub(crate) settings_pane: settings_ui::Pane,
     pub(crate) naming_open: bool,
     /// New clips whose dot has been seen (pointed at).
     pub(crate) seen_new: std::collections::HashSet<PathBuf>,
@@ -571,9 +571,10 @@ struct App {
     close_dialog: bool,
     /// macOS: the permissions screen is up (once, at the first launch).
     setup_open: bool,
-    /// What was shown last frame (page, library filter, Clip names open), to
-    /// scroll a new view back to the top and bring its content in.
-    last_view: Option<(Page, library::Filter, bool)>,
+    /// What was shown last frame (page, library filter, Settings' pane and
+    /// whether Clip names was open), to scroll a new view back to the top and
+    /// bring its content in.
+    last_view: Option<(Page, library::Filter, Option<(settings_ui::Pane, bool)>)>,
     /// Library auto-refresh: last folder poll + when the library's folders
     /// last changed, as last seen.
     last_poll: Option<Instant>,
@@ -748,7 +749,7 @@ impl App {
             selection: library::Selection::default(),
             library_query: String::new(),
             settings_query: String::new(),
-            settings_jump: None,
+            settings_pane: settings_ui::Pane::default(),
             naming_open: false,
             seen_new: Default::default(),
             flash_clip: None,
@@ -868,14 +869,21 @@ impl App {
         if open_review {
             app.open_voice_review();
         }
-        // `HASTECLIP_OPEN_SETTINGS=1` opens on Settings; `=names` on its
+        // `HASTECLIP_OPEN_SETTINGS=1` opens on Settings; `=video` (any
+        // pane's name) on that pane; `=names` on the Clips pane's
         // Clip names page, any other value searches for it.
         if let Some(v) = std::env::var_os("HASTECLIP_OPEN_SETTINGS") {
             app.page = Page::Settings;
             match v.to_string_lossy().as_ref() {
                 "1" | "" => {}
-                "names" => app.naming_open = true,
-                q => app.settings_query = q.to_owned(),
+                "names" => {
+                    app.settings_pane = settings_ui::Pane::Clips;
+                    app.naming_open = true;
+                }
+                q => match settings_ui::Pane::ALL.into_iter().find(|p| p.label().eq_ignore_ascii_case(q)) {
+                    Some(pane) => app.settings_pane = pane,
+                    None => app.settings_query = q.to_owned(),
+                },
             }
         }
         if !recovered.is_empty() {
@@ -1172,16 +1180,20 @@ impl eframe::App for App {
             || ctx.memory(|m| m.top_modal_layer().is_some())
             || ctx.any_popup_open();
         ui_kit::set_overlay_open(&ctx, overlay);
-        // Another page, game or collection starts at the top. Back from the
-        // player or editor, the library stays where it was (and shows the clip).
-        let view = (self.page, self.library_filter.clone(), self.naming_open && self.page == Page::Settings);
-        let reset = self.last_view.as_ref().is_some_and(|(page, filter, _)| {
-            (*page != view.0 && !matches!(page, Page::Edit | Page::View)) || (*filter != view.1 && view.0 == Page::Clips)
+        // Another page, game, collection or Settings pane starts at the top.
+        // Back from the player or editor, the library stays where it was (and
+        // shows the clip).
+        let view = (self.page, self.library_filter.clone(), (self.page == Page::Settings).then_some((self.settings_pane, self.naming_open)));
+        let reset = self.last_view.as_ref().is_some_and(|(page, filter, settings)| {
+            (*page != view.0 && !matches!(page, Page::Edit | Page::View))
+                || (*filter != view.1 && view.0 == Page::Clips)
+                || (settings.map(|s| s.0) != view.2.map(|s| s.0) && view.0 == Page::Settings)
         });
         ui_kit::set_scroll_reset(&ctx, reset);
-        // Another page's content fades in and rises. (Another game or
-        // collection doesn't: the grid rearranges itself.)
-        let arrived = self.last_view.as_ref().is_some_and(|(page, _, naming)| *page != view.0 || *naming != view.2);
+        // Another page's content fades in and rises, and so does another
+        // Settings pane or Clip names. (Another game or collection doesn't:
+        // the grid rearranges itself.)
+        let arrived = self.last_view.as_ref().is_some_and(|(page, _, settings)| *page != view.0 || *settings != view.2);
         if arrived {
             ui_kit::page_changed(&ctx);
         }
@@ -1639,7 +1651,7 @@ impl App {
         ui.add_space(6.0);
         let response = ui.add(label).on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand);
         if response.clicked() {
-            self.page = Page::Settings;
+            self.open_settings(settings_ui::Pane::Video);
         }
     }
 
@@ -1670,7 +1682,7 @@ impl App {
             ui.add_space(6.0);
             let response = ui.add(label).on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand);
             if response.clicked() {
-                self.page = Page::Settings;
+                self.open_settings(settings_ui::Pane::Video);
             }
             return;
         }

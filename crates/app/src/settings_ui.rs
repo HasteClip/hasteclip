@@ -1,27 +1,87 @@
-//! The Settings page, grouped by what you're trying to do rather than by codec
-//! jargon. Changes apply (and save) immediately; there's no Save button.
+//! The Settings page: a panel of panes on the left, as Clips has its games,
+//! and the chosen pane's settings beside it. Panes are grouped by what you're
+//! trying to do rather than by codec jargon, and each is short enough to take
+//! in at once. Changes apply (and save) immediately; there's no Save button.
 //!
 //! Each setting is a row: what it is (and a line on why you'd change it) on the
 //! left, the control on the right. In a narrow window the control moves under
-//! its label. Things that reset or remove live in their own section at the end.
+//! its label, and the panes move into a menu on the heading. The search looks
+//! through every pane: what it finds shows under its group's name, and the
+//! panel dims the panes with nothing found. Things that reset or remove come
+//! last on their pane.
 
 use crate::ui_kit::Dismissed as _;
-use egui::Color32;
+use egui::{Align2, Color32, FontId, Pos2, Rect, vec2};
 
 use crate::settings::{self, Container, Encoder, OutputResolution, ShortcutAction};
 use crate::theme::{self, W, icon};
 use crate::ui_kit::{self, Btn, Item, Kind, Row, Seg, Typed, ValueField};
-use crate::{App, RecState, reveal_label, shortcuts};
+use crate::{App, Page, RecState, reveal_label, shortcuts};
 
 /// Replay lengths offered as one-click choices (seconds).
 pub(crate) const REPLAY_CHOICES: [u32; 8] = [15, 30, 60, 120, 300, 600, 1200, 1800];
 /// The settings column's width.
 const COLUMN: f32 = 680.0;
-/// The groups, in order, for the section list.
-#[cfg(target_os = "macos")]
-const SECTIONS: [&str; 10] = ["Clipping", "Video", "Clips", "Screenshots", "Sharing", "Saved sound", "Shortcuts", "Permissions", "Voice", "App"];
-#[cfg(not(target_os = "macos"))]
-const SECTIONS: [&str; 9] = ["Clipping", "Video", "Clips", "Screenshots", "Sharing", "Saved sound", "Shortcuts", "Voice", "App"];
+
+/// A pane of Settings, as the panel lists them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Pane {
+    #[default]
+    Clipping,
+    Video,
+    Clips,
+    Shortcuts,
+    #[cfg(target_os = "macos")]
+    Permissions,
+    App,
+}
+
+impl Pane {
+    #[cfg(target_os = "macos")]
+    pub(crate) const ALL: [Pane; 6] = [Pane::Clipping, Pane::Video, Pane::Clips, Pane::Shortcuts, Pane::Permissions, Pane::App];
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) const ALL: [Pane; 5] = [Pane::Clipping, Pane::Video, Pane::Clips, Pane::Shortcuts, Pane::App];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Pane::Clipping => "Clipping",
+            Pane::Video => "Video",
+            Pane::Clips => "Clips",
+            Pane::Shortcuts => "Shortcuts",
+            #[cfg(target_os = "macos")]
+            Pane::Permissions => "Permissions",
+            Pane::App => "App",
+        }
+    }
+
+    /// Its icon in the panel (filled, as the library's are).
+    fn icon(self) -> &'static str {
+        use egui_phosphor::fill as f;
+        match self {
+            Pane::Clipping => f::TIMER,
+            Pane::Video => f::VIDEO_CAMERA,
+            Pane::Clips => f::FOLDER_SIMPLE,
+            Pane::Shortcuts => f::KEYBOARD,
+            #[cfg(target_os = "macos")]
+            Pane::Permissions => f::SHIELD_CHECK,
+            Pane::App => f::APP_WINDOW,
+        }
+    }
+
+    /// Its groups, top to bottom: the first goes by the pane's name (on
+    /// the heading), the others under their own.
+    fn groups(self) -> &'static [&'static str] {
+        match self {
+            Pane::Clipping => &["Clipping", "Saved sound", "Voice"],
+            Pane::Video => &["Video"],
+            Pane::Clips => &["Clips", "Screenshots"],
+            Pane::Shortcuts => &["Shortcuts"],
+            #[cfg(target_os = "macos")]
+            Pane::Permissions => &["Permissions"],
+            Pane::App => &["App", "About"],
+        }
+    }
+}
 
 /// A group's rows, filtered by the search: each row says its words, and the
 /// group shows only matching rows.
@@ -35,154 +95,237 @@ impl Filter {
     }
 }
 
+/// Whether a group has rows the search finds (with nothing typed, whether
+/// it's on this system at all).
+fn group_matches(name: &str, f: &Filter) -> bool {
+    match name {
+        "Clipping" => f.shows(&["clip length", "replay buffer duration", "start clipping when hasteclip opens", "auto start", "memory"]),
+        "Video" => VIDEO_WORDS.iter().any(|w| f.shows(w)) || SCREEN_CAPTURE && f.shows(SCREEN_CAPTURE_WORDS),
+        "Clips" => f.shows(&["clips folder", "location", "directory", "folder per game", "name clips after what happened", "game events", "osu", "names", "delete", "trash", "permanently", "output", "titles", "recycle"]),
+        "Screenshots" => capture::SCREENSHOTS && f.shows(&["screenshots", "take a screenshot", "shortcut", "hotkey", "format", "png", "jpg", "jpeg", "copy", "clipboard", "paste", "keyboard"]),
+        "Saved sound" => f.shows(&["play a sound when a clip is saved", "sound", "volume", "record the sound", "in clip", "add your own"]),
+        "Shortcuts" => f.shows(&["shortcuts", "hotkey", "keyboard", "save clip", "take a screenshot", "start or stop clipping", "start or stop recording", "fullscreen games", "input monitoring", "permission", "system settings"]),
+        #[cfg(target_os = "macos")]
+        "Permissions" => crate::setup::Need::ALL.iter().any(|n| f.shows(n.words()) || f.shows(&[n.label()])) || f.shows(&["permissions", "privacy", "allow"]),
+        "Voice" => f.shows(&["save by voice", "hasteclip that", "speech", "command", "voice samples", "review", "keep", "improve"]),
+        "App" => f.shows(&["appearance", "theme", "dark", "light", "system", "open at login", "autostart", "startup", "start with", "closing the window", "tray", "menu bar", "quit", "discord", "activity", "rich presence"]),
+        "About" => f.shows(&["update", "version", "what's new", "license", "licence", "about", "source code", "copyright", "open source", "reset", "defaults"]),
+        _ => false,
+    }
+}
+
 impl App {
+    /// Settings at `pane`, as the panel opens it: the search cleared and
+    /// Clip names closed.
+    pub(crate) fn open_settings(&mut self, pane: Pane) {
+        self.page = Page::Settings;
+        self.settings_pane = pane;
+        self.settings_query.clear();
+        self.naming_open = false;
+    }
+
     pub(crate) fn settings_page(&mut self, ui: &mut egui::Ui) {
-        if self.page == crate::Page::Settings && self.naming_open {
-            self.naming_page(ui);
-            return;
-        }
         // ⌘F: search.
         if !ui_kit::overlay_open(ui.ctx()) && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
             ui.memory_mut(|m| m.request_focus(egui::Id::new("settings_search")));
         }
-        // The column, and room for the section list beside it when it fits;
-        // without the list the column takes the whole page.
-        let page_w = ui.available_width();
-        let width = if page_w >= COLUMN + 180.0 { COLUMN } else { page_w };
-        self.page_head(ui, "Settings", |app, ui| {
-            ui.allocate_ui(egui::vec2(ui_kit::SEARCH_W.min(ui.available_width()), ui_kit::CONTROL_H), |ui| {
-                crate::library_view::search_field(ui, "settings_search", &mut app.settings_query, "Search");
-            });
+        let f = Filter { q: self.settings_query.trim().to_lowercase() };
+        let searching = !f.q.is_empty();
+        // The panel where Clips has its own, from the rail's edge (the
+        // page's margin is inside it); the pane beside it.
+        let full = ui.max_rect();
+        let wide = full.width() >= crate::library_view::PANEL_FROM;
+        let edge = full.left() - ui_kit::PAGE_MARGIN as f32;
+        let panel = Rect::from_min_max(Pos2::new(edge, full.top()), Pos2::new(edge + crate::library_view::PANEL_W, full.bottom()));
+        let page = Rect::from_min_max(Pos2::new(if wide { panel.right() + 24.0 } else { full.left() }, full.top()), full.max);
+        let mut page_ui = ui.new_child(egui::UiBuilder::new().max_rect(page).layout(egui::Layout::top_down(egui::Align::Min)));
+        self.settings_head(&mut page_ui, wide, searching);
+        ui_kit::arrive(&mut page_ui, |ui| {
+            if self.naming_open && !searching {
+                self.naming_page(ui);
+            } else {
+                self.settings_content(ui, &f);
+            }
         });
-        ui_kit::arrive(ui, |ui| self.settings_content(ui, width));
+        if wide {
+            let mut panel_ui = ui.new_child(egui::UiBuilder::new().max_rect(panel).layout(egui::Layout::top_down(egui::Align::Min)));
+            self.settings_panel(&mut panel_ui, &f);
+        }
         self.reset_dialog(ui.ctx());
     }
 
-    /// Settings under the heading: the groups, and the section list.
-    fn settings_content(&mut self, ui: &mut egui::Ui, width: f32) {
-        let filter = Filter { q: self.settings_query.trim().to_lowercase() };
-        let wide = ui.available_width() >= width + 180.0;
-        let page = ui.available_rect_before_wrap();
-        let jump_to = self.settings_jump.take();
-        let mut tops: Vec<(&'static str, f32)> = Vec::new();
-        let mut any = false;
-        let scroll = ui_kit::scroll(ui, "settings_page", |ui| {
-            let origin = ui.cursor().top();
-            // On the page's margin, as every page's content is (the section
-            // list sits on the right).
-            ui.horizontal_top(|ui| {
-            ui.vertical(|ui| {
-                ui.set_width(width);
-                for name in SECTIONS {
-                    let top = ui.cursor().top();
-                    let shown = self.settings_group(ui, name, &filter, jump_to == Some(name));
-                    if shown {
-                        any = true;
-                        tops.push((name, top - origin));
-                    }
-                }
-                if !any {
-                    ui.add_space(40.0);
-                    ui.vertical_centered(|ui| {
-                        let p = theme::pal(ui);
-                        ui.label(theme::text(format!("No settings match “{}”", self.settings_query.trim()), 15.0, W::Semibold).color(p.text));
-                        ui.add_space(4.0);
-                        ui.label(theme::text("Try a word like frame rate, folder or shortcut.", 13.5, W::Regular).color(p.text3));
-                    });
-                }
-                ui.add_space(28.0);
-            });
-            });
-            ui.cursor().top() - origin
-        });
-        let _ = scroll;
-        // The section list: right-aligned under the recorder, its marker on
-        // the right; the one you're at follows as you scroll.
-        if wide && any {
-            let offset = ui_kit::scroll_offset(ui.ctx(), "settings_page");
-            let at = tops.iter().rev().find(|(_, y)| *y <= offset + 40.0).map(|(n, _)| *n).or(tops.first().map(|(n, _)| *n));
-            let x = page.right();
-            let mut y = page.top() + 4.0;
-            let p = theme::pal(ui);
-            let line_top = y;
-            for (name, _) in &tops {
-                let g = ui.painter().layout_no_wrap(name.to_string(), theme::font(13.0, if at == Some(*name) { W::Medium } else { W::Regular }), Color32::PLACEHOLDER);
-                let r = egui::Rect::from_min_max(egui::pos2(x - 12.0 - g.size().x - 12.0, y), egui::pos2(x, y + 28.0));
-                let resp = ui.interact(r, egui::Id::new(("jump", *name)), egui::Sense::click());
-                let on = at == Some(*name);
-                let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered(), theme::FAST);
-                let c = if on { p.text } else { theme::mix(p.text3, p.text, hv) };
-                ui.painter().galley(egui::pos2(x - 12.0 - g.size().x, r.center().y - g.size().y / 2.0), g, c);
-                if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                    self.settings_jump = Some(name);
-                }
-                y += 28.0;
-            }
-            ui.painter().vline(x - 0.75, line_top..=y, egui::Stroke::new(1.5, p.line2));
-            // The marker slides to the section you're at (which section eases,
-            // not where it is: the list moving with the window takes it along).
-            if let Some(i) = tops.iter().position(|(n, _)| Some(*n) == at) {
-                let my = line_top + theme::value(ui.ctx(), egui::Id::new("settings_marker"), i as f32, theme::NORMAL) * 28.0;
-                ui.painter().vline(x - 0.75, my..=my + 28.0, egui::Stroke::new(1.5, p.text));
+    /// The panel: the title and search, then the card of panes. While
+    /// searching, none is chosen and those with nothing found are dimmed.
+    fn settings_panel(&mut self, ui: &mut egui::Ui, f: &Filter) {
+        let p = theme::pal(ui);
+        let rect = ui.max_rect();
+        ui.painter().rect_filled(rect, 0, p.base);
+        // As the library's: the card's rows line up with the page title,
+        // the same gap below the card as beside it.
+        let side = ui_kit::PAGE_MARGIN as f32 - 10.0;
+        let inner = Rect::from_min_max(rect.min + vec2(side, 0.0), rect.max - vec2(0.0, side));
+        let head = Rect::from_min_size(inner.min, vec2(inner.width(), crate::shell::HEAD_H));
+        crate::shell::drag_window_area(ui, Rect::from_min_size(head.min, vec2(70.0, head.height())), "settings_panel_head");
+        let title_x = rect.left() + ui_kit::PAGE_MARGIN as f32;
+        let mut hui = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_max(Pos2::new(title_x, head.top()), head.max)).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        hui.label(theme::text("Settings", 20.0, W::Semibold).color(p.text));
+        hui.add_space(6.0);
+        hui.allocate_ui(vec2(ui_kit::SEARCH_W.min(hui.available_width()), ui_kit::CONTROL_H), |ui| crate::library_view::search_field(ui, "settings_search", &mut self.settings_query, "Search"));
+        let card = Rect::from_min_max(Pos2::new(inner.left(), head.bottom()), inner.max);
+        ui.painter().rect_filled(card, ui_kit::CARD_RADIUS, p.raise);
+        let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(card.shrink(6.0)).layout(egui::Layout::top_down(egui::Align::Min)));
+        cui.spacing_mut().item_spacing.y = 2.0;
+        let searching = !f.q.is_empty();
+        let locked = self.locked_while();
+        for pane in Pane::ALL {
+            let chosen = !searching && self.settings_pane == pane;
+            let found = searching.then(|| pane.groups().iter().any(|g| group_matches(g, f)));
+            let lock = if pane == Pane::Video { locked.as_deref() } else { None };
+            if pane_row(&mut cui, pane, chosen, found, lock).clicked() {
+                self.open_settings(pane);
             }
         }
     }
 
-    /// One group of settings, filtered by the search. Returns whether it shows.
-    fn settings_group(&mut self, ui: &mut egui::Ui, name: &'static str, f: &Filter, jump: bool) -> bool {
-        // Measure first: a group with no matching rows doesn't show at all.
-        let matches = match name {
-            "Clipping" => f.shows(&["clip length", "replay buffer duration", "start clipping when hasteclip opens", "auto start", "memory"]),
-            "Video" => VIDEO_WORDS.iter().any(|w| f.shows(w)) || SCREEN_CAPTURE && f.shows(SCREEN_CAPTURE_WORDS),
-            "Clips" => f.shows(&["clips folder", "location", "directory", "folder per game", "name clips after what happened", "game events", "osu", "names", "delete", "trash", "permanently", "output", "titles", "recycle"]),
-            "Screenshots" => capture::SCREENSHOTS && f.shows(&["screenshots", "take a screenshot", "shortcut", "hotkey", "format", "png", "jpg", "jpeg", "copy", "clipboard", "paste", "keyboard"]),
-            "Sharing" => f.shows(&["discord", "activity", "rich presence"]),
-            "Saved sound" => f.shows(&["play a sound when a clip is saved", "sound", "volume", "record the sound", "in clip", "add your own"]),
-            "Shortcuts" => f.shows(&["shortcuts", "hotkey", "keyboard", "save clip", "take a screenshot", "start or stop clipping", "start or stop recording", "fullscreen games", "input monitoring", "permission", "system settings"]),
-            #[cfg(target_os = "macos")]
-            "Permissions" => crate::setup::Need::ALL.iter().any(|n| f.shows(n.words()) || f.shows(&[n.label()])) || f.shows(&["permissions", "privacy", "allow"]),
-            "Voice" => f.shows(&["save by voice", "hasteclip that", "speech", "command", "voice samples", "review", "keep", "improve"]),
-            "App" => f.shows(&["appearance", "theme", "dark", "light", "open at login", "autostart", "startup", "closing the window", "tray", "menu bar", "update", "version", "license", "licence", "about", "source code", "copyright", "open source", "reset", "system", "quit", "what's new", "start with", "defaults"]),
-            _ => false,
-        };
-        if !matches {
-            return false;
+    /// The heading beside the panel: the pane's name (Video's says it's
+    /// locked while capturing, with the button to stop), Clip names with the
+    /// way back, or Results while searching. Narrow, the panes are in a menu
+    /// on it, beside the search.
+    fn settings_head(&mut self, ui: &mut egui::Ui, wide: bool, searching: bool) {
+        let mut back = false;
+        self.page_head_folding(ui, "", |app, ui, tight| {
+            let p = theme::pal(ui);
+            if app.naming_open && !searching {
+                back = Btn::icon(Kind::Ghost, icon::CARET_LEFT).tip("Back  (Esc)").show(ui).clicked();
+                ui.label(theme::text("Clip names", 15.0, W::Semibold).color(p.text));
+                return;
+            }
+            let title = if searching { "Results" } else { app.settings_pane.label() };
+            if wide {
+                ui.label(theme::text(title, 15.0, W::Semibold).color(p.text));
+            } else {
+                app.pane_menu(ui, title);
+                ui.allocate_ui(vec2(ui_kit::SEARCH_W.min(ui.available_width()), ui_kit::CONTROL_H), |ui| crate::library_view::search_field(ui, "settings_search", &mut app.settings_query, "Search"));
+            }
+            if !searching && app.settings_pane == Pane::Video {
+                app.video_lock(ui, tight);
+            }
+        });
+        if back {
+            self.naming_open = false;
         }
-        let head = self.group_head(ui, name);
-        if jump {
-            head.scroll_to_me(Some(egui::Align::TOP));
+    }
+
+    /// The panes in a menu on the heading, when the window is too narrow for
+    /// the panel.
+    fn pane_menu(&mut self, ui: &mut egui::Ui, title: &str) {
+        let r = Btn::ghost(title).trail(icon::CARET_DOWN).id("settings_pane_menu").show(ui);
+        let searching = !self.settings_query.trim().is_empty();
+        let mut picked = None;
+        ui_kit::menu_popup(&r, true, 200.0, |ui| {
+            for pane in Pane::ALL {
+                if Item::new(pane.label()).check(!searching && self.settings_pane == pane).show(ui).clicked() {
+                    picked = Some(pane);
+                }
+            }
+        });
+        if let Some(pane) = picked {
+            self.open_settings(pane);
         }
+    }
+
+    /// The pane's groups, or what the search finds in every pane, each group
+    /// under its name.
+    fn settings_content(&mut self, ui: &mut egui::Ui, f: &Filter) {
+        let searching = !f.q.is_empty();
+        // Each pane keeps its place, and the results theirs.
+        let id = if searching { "settings_results".to_owned() } else { format!("settings_{}", self.settings_pane.label()) };
+        ui_kit::scroll(ui, &id, |ui| {
+            let width = ui.available_width().min(COLUMN);
+            ui.vertical(|ui| {
+                ui.set_width(width);
+                if searching {
+                    let found: Vec<&str> = Pane::ALL.iter().flat_map(|p| p.groups().iter().copied()).filter(|g| group_matches(g, f)).collect();
+                    for (i, name) in found.iter().enumerate() {
+                        self.group_head(ui, name, i == 0);
+                        self.settings_group(ui, name, f);
+                    }
+                    if found.is_empty() {
+                        ui.add_space(40.0);
+                        ui.vertical_centered(|ui| {
+                            let p = theme::pal(ui);
+                            ui.label(theme::text(format!("No settings match “{}”", self.settings_query.trim()), 15.0, W::Semibold).color(p.text));
+                            ui.add_space(4.0);
+                            ui.label(theme::text("Try a word like frame rate, folder or shortcut.", 13.5, W::Regular).color(p.text3));
+                        });
+                    }
+                } else {
+                    ui_kit::gap(ui, 4.0);
+                    for (i, name) in self.settings_pane.groups().iter().filter(|g| group_matches(g, f)).enumerate() {
+                        if i > 0 {
+                            self.group_head(ui, name, false);
+                        }
+                        self.settings_group(ui, name, f);
+                    }
+                }
+                ui.add_space(28.0);
+            });
+        });
+    }
+
+    /// One group's rows, filtered by the search.
+    fn settings_group(&mut self, ui: &mut egui::Ui, name: &str, f: &Filter) {
         match name {
             "Clipping" => self.clipping_group(ui, f),
             "Video" => self.video_group(ui, f),
             "Clips" => self.clips_group(ui, f),
             "Screenshots" => self.screenshots_group(ui, f),
-            "Sharing" => self.sharing_group(ui, f),
             "Saved sound" => self.sound_group(ui, f),
             "Shortcuts" => self.shortcuts_group(ui, f),
             #[cfg(target_os = "macos")]
             "Permissions" => self.permissions_group(ui, f),
             "Voice" => self.voice_group(ui, f),
             "App" => self.app_group(ui, f),
+            "About" => self.about_group(ui, f),
             _ => {}
         }
-        true
     }
 
-    /// A group's heading. Video says it's locked while capturing, with the
-    /// button to stop.
-    fn group_head(&mut self, ui: &mut egui::Ui, name: &str) -> egui::Response {
+    /// A group's heading (a pane's first group has the pane's own).
+    fn group_head(&mut self, ui: &mut egui::Ui, name: &str, first: bool) {
+        ui_kit::section_head(ui, name, first, |ui| {
+            if name == "Video" {
+                self.video_lock(ui, false);
+            }
+        });
+    }
+
+    /// Video's settings are fixed when capture starts: while capturing, by
+    /// its name, the lock and the button to stop (`tight`: the lock without
+    /// its words).
+    fn video_lock(&mut self, ui: &mut egui::Ui, tight: bool) {
+        let Some(why) = self.locked_while() else { return };
         let p = theme::pal(ui);
-        ui_kit::section_head(ui, name, name == SECTIONS[0], |ui| {
-                if name == "Video" && self.rec_state != RecState::Idle {
-                    let what = if self.rec_state == RecState::Recording { "recording" } else { "clipping" };
-                    ui.label(theme::text(format!("{}  Locked while {what}", icon::LOCK_SIMPLE), 12.5, W::Regular).color(p.text3));
-                    let stop = if self.rec_state == RecState::Recording { "Stop recording" } else { "Stop clipping" };
-                    if Btn::ghost(stop).small().show(ui).clicked() {
-                        self.stop();
-                    }
-                }
-        })
+        ui.add_space(4.0);
+        if tight {
+            ui.label(theme::ic(icon::LOCK_SIMPLE, 13.0).color(p.text3)).on_hover_text(why);
+        } else {
+            ui.label(theme::text(format!("{}  {why}", icon::LOCK_SIMPLE), 12.5, W::Regular).color(p.text3));
+        }
+        let stop = if self.rec_state == RecState::Recording { "Stop recording" } else { "Stop clipping" };
+        if Btn::ghost(stop).small().show(ui).clicked() {
+            self.stop();
+        }
+    }
+
+    /// "Locked while clipping" (or recording), while a setting fixed at
+    /// capture start can't change.
+    fn locked_while(&self) -> Option<String> {
+        match self.rec_state {
+            RecState::Idle => None,
+            RecState::Buffering => Some("Locked while clipping".into()),
+            RecState::Recording => Some("Locked while recording".into()),
+        }
     }
 
     /// Why a setting fixed at capture start is locked now, if it is.
@@ -401,7 +544,7 @@ impl App {
                 l.row(Row::new("Shortcut").note(note), |ui| {
                     if Btn::normal(if keys.is_none() { "Choose a key" } else { "Change" }).small().show(ui).clicked() {
                         self.recording_shortcut = Some((action, None));
-                        self.settings_jump = Some("Shortcuts");
+                        self.open_settings(Pane::Shortcuts);
                     }
                     if let Some(k) = &keys {
                         ui_kit::keycaps(ui, k, false);
@@ -421,22 +564,6 @@ impl App {
             }
             if f.shows(&["screenshots", "copy", "clipboard", "paste"]) {
                 l.row(Row::new("Also copy it").tip("Also copy it", "A screenshot also goes on the clipboard as you take it, to paste right away.").note("Paste it straight into Discord or a chat"), |ui| ui_kit::switch(ui, &mut self.settings.copy_screenshots));
-            }
-        });
-    }
-
-    fn sharing_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
-        ui_kit::list(ui, "sharing", |l| {
-            if f.shows(&["discord", "activity", "rich presence"]) {
-                let clipping_a_game = self.rec_state != RecState::Idle && self.clipped_game.is_some();
-                let note = match (self.settings.discord_presence, clipping_a_game) {
-                    (false, _) => "",
-                    (true, false) => "Shows while you clip a game",
-                    (true, true) if self.presence.connected() => "Showing on Discord",
-                    (true, true) => "Discord isn't running",
-                };
-                let tip = "While HasteClip clips a game, your Discord profile shows “Clipping osu! with HasteClip”, with a button for others to get HasteClip. Needs Discord running.";
-                l.row(Row::new("Discord activity").tip("Discord activity", tip).note(note), |ui| ui_kit::switch(ui, &mut self.settings.discord_presence));
             }
         });
     }
@@ -630,18 +757,6 @@ impl App {
     }
 
     fn app_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
-        use crate::update::Status;
-        let status = self.updater.status();
-        let line = match &status {
-            Status::Unavailable => "Development build: updates only come to the installed app.".to_owned(),
-            Status::Idle => "Updates install when you quit, never mid-game.".to_owned(),
-            Status::Checking => "Checking for updates…".to_owned(),
-            Status::Downloading(p) => format!("Downloading an update… {p}%"),
-            Status::UpToDate => "You have the latest version.".to_owned(),
-            Status::Ready(v) => format!("Version {v} is ready and installs when you quit HasteClip."),
-            Status::Failed(e) => e.clone(),
-        };
-        let idle = self.rec_state == RecState::Idle;
         ui_kit::list(ui, "app", |l| {
             if f.shows(&["appearance", "theme", "dark", "light", "system"]) {
                 l.row(Row::new("Appearance"), |ui| {
@@ -673,6 +788,36 @@ impl App {
                     }
                 });
             }
+            if f.shows(&["discord", "activity", "rich presence"]) {
+                let clipping_a_game = self.rec_state != RecState::Idle && self.clipped_game.is_some();
+                let note = match (self.settings.discord_presence, clipping_a_game) {
+                    (false, _) => "",
+                    (true, false) => "Shows while you clip a game",
+                    (true, true) if self.presence.connected() => "Showing on Discord",
+                    (true, true) => "Discord isn't running",
+                };
+                let tip = "While HasteClip clips a game, your Discord profile shows “Clipping osu! with HasteClip”, with a button for others to get HasteClip. Needs Discord running.";
+                l.row(Row::new("Discord activity").tip("Discord activity", tip).note(note), |ui| ui_kit::switch(ui, &mut self.settings.discord_presence));
+            }
+        });
+    }
+
+    /// The version and its updates, the license, and going back to the
+    /// defaults, last.
+    fn about_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
+        use crate::update::Status;
+        let status = self.updater.status();
+        let line = match &status {
+            Status::Unavailable => "Development build: updates only come to the installed app.".to_owned(),
+            Status::Idle => "Updates install when you quit, never mid-game.".to_owned(),
+            Status::Checking => "Checking for updates…".to_owned(),
+            Status::Downloading(p) => format!("Downloading an update… {p}%"),
+            Status::UpToDate => "You have the latest version.".to_owned(),
+            Status::Ready(v) => format!("Version {v} is ready and installs when you quit HasteClip."),
+            Status::Failed(e) => e.clone(),
+        };
+        let idle = self.rec_state == RecState::Idle;
+        ui_kit::list(ui, "about", |l| {
             if f.shows(&["update", "version", "what's new"]) {
                 let title = format!("HasteClip {}", self.updater.version());
                 l.row(Row::new(&title).note(line.clone()), |ui| {
@@ -1084,31 +1229,17 @@ impl App {
         }
     }
 
-    /// Clip names, its own page: what your clips will be called, then a card
-    /// per game you turn on, with what it needs; osu!'s parts in the order
-    /// they're joined, dragged or moved with the arrows, each on or off.
+    /// Clip names, a page of the Clips pane's (its heading has the way
+    /// back): what your clips will be called, then a card per game you turn
+    /// on, with what it needs; osu!'s parts in the order they're joined,
+    /// dragged or moved with the arrows, each on or off.
     fn naming_page(&mut self, ui: &mut egui::Ui) {
-        // Esc, or the rail, goes back.
+        // Esc, or the panel, goes back.
         if !ui_kit::overlay_open(ui.ctx()) && !ui.ctx().egui_wants_keyboard_input() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             self.naming_open = false;
-            return;
-        }
-        let mut back = false;
-        self.page_head(
-            ui,
-            "",
-            |_, ui| {
-                back = Btn::icon(Kind::Ghost, icon::CARET_LEFT).tip("Back to Settings  (Esc)").show(ui).clicked();
-                let p = theme::pal(ui);
-                ui.label(theme::text("Clip names", 20.0, W::Semibold).color(p.text));
-            },
-        );
-        if back {
-            self.naming_open = false;
-            return;
         }
         let width = ui.available_width().min(COLUMN);
-        ui_kit::arrive(ui, |ui| ui_kit::scroll(ui, "naming_page", |ui| {
+        ui_kit::scroll(ui, "naming_page", |ui| {
             ui.vertical(|ui| {
                 ui.set_width(width);
                 let p = theme::pal(ui);
@@ -1164,7 +1295,41 @@ impl App {
                 }
                 ui.add_space(28.0);
             });
-        }));
+        });
+    }
+}
+
+/// A pane in the panel: its icon and name, as Clips lists its games, the
+/// chosen one a shade darker than the card. `found`, while searching: whether
+/// the search found something in it (it's lit, else dimmed). `locked`: why
+/// its settings can't change now (a lock at its end).
+fn pane_row(ui: &mut egui::Ui, pane: Pane, chosen: bool, found: Option<bool>, locked: Option<&str>) -> egui::Response {
+    let p = theme::pal(ui);
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), egui::Sense::hover());
+    let resp = ui.interact(rect, egui::Id::new(("settings_pane", pane.label())), egui::Sense::click());
+    let hv = theme::toggle(ui.ctx(), resp.id.with("hv"), resp.hovered(), theme::FAST);
+    let on = theme::toggle(ui.ctx(), resp.id.with("on"), chosen, theme::NORMAL);
+    let lit = theme::toggle(ui.ctx(), resp.id.with("lit"), found == Some(true), theme::FAST);
+    let dim = theme::toggle(ui.ctx(), resp.id.with("dim"), found == Some(false), theme::FAST);
+    if hv > 0.0 && !chosen {
+        ui.painter().rect_filled(rect, ui_kit::RADIUS, theme::fade(p.sb_hover, hv));
+    }
+    if on > 0.0 {
+        ui.painter().rect_filled(rect, ui_kit::RADIUS, theme::fade(p.sb_sel, on));
+    }
+    let rest = theme::mix(theme::mix(p.text2, p.text3, dim), p.text, lit);
+    let text = theme::mix(theme::mix(rest, p.text, hv), p.text, on);
+    let lead = Pos2::new(rect.left() + 8.0 + 11.0, rect.center().y);
+    ui.painter().text(lead, Align2::CENTER_CENTER, pane.icon(), FontId::new(17.0, theme::fill_family()), text);
+    let w = if chosen { W::Medium } else { W::Regular };
+    ui.painter().text(Pos2::new(lead.x + 22.0, rect.center().y), Align2::LEFT_CENTER, pane.label(), theme::font(13.5, w), text);
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    match locked {
+        Some(why) => {
+            ui.painter().text(Pos2::new(rect.right() - 12.0, rect.center().y), Align2::RIGHT_CENTER, icon::LOCK_SIMPLE, FontId::proportional(13.0), p.text3);
+            resp.on_hover_text(why)
+        }
+        None => resp,
     }
 }
 
@@ -1503,6 +1668,25 @@ mod search_tests {
         }
         // Nothing of Video's finds it.
         assert!(!VIDEO_WORDS.iter().any(|w| Filter { q: "discord".to_owned() }.shows(w)));
+    }
+
+    /// Every group is on one pane, and the search finds what moved in with
+    /// another group's: Discord activity on App, saving by voice on Clipping.
+    #[test]
+    fn panes_hold_every_group_once() {
+        let groups: Vec<&str> = Pane::ALL.iter().flat_map(|p| p.groups().iter().copied()).collect();
+        let mut unique = groups.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), groups.len());
+        let on = |q: &str| -> Vec<&str> {
+            let f = Filter { q: q.to_owned() };
+            Pane::ALL.into_iter().filter(|p| p.groups().iter().any(|g| group_matches(g, &f))).map(Pane::label).collect()
+        };
+        assert_eq!(on("discord"), ["App"]);
+        assert_eq!(on("hasteclip that"), ["Clipping"]);
+        assert_eq!(on("license"), ["App"]);
+        assert_eq!(on("fps"), ["Video"]);
     }
 
     /// One aspect ratio and a screen of another shape: the way to Sources.

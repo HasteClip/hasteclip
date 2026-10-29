@@ -927,7 +927,7 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let more = crate::ui_kit::Btn::ghost("More in Settings").trail(egui_phosphor::regular::CARET_RIGHT).small().tip("Every resolution, frame rate and quality");
                 if more.show(ui).clicked() {
-                    self.page = crate::Page::Settings;
+                    self.open_settings(crate::settings_ui::Pane::Video);
                     ui.close();
                 }
             });

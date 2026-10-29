@@ -26,13 +26,12 @@ use crate::theme::{self, W, icon};
 use crate::ui_kit::{self, Btn, Item, Kind};
 use crate::{App, RecState, clips, share, thumbs};
 
-/// The panel's width, from the rail's edge (its card's right edge is where
-/// Settings' search ends too).
+/// The panel's width, from the rail's edge (Settings' panel is the same).
 pub const PANEL_W: f32 = 244.0;
 use crate::library_grid::{DAY_H, GridItem};
 /// The window is too narrow for the panel below this page width: its list
-/// moves into a menu on the title.
-const PANEL_FROM: f32 = 700.0;
+/// moves into a menu on the title (Settings' too).
+pub(crate) const PANEL_FROM: f32 = 700.0;
 /// How long a freshly saved clip has its dot.
 const NEW_FOR: Duration = Duration::from_secs(60 * 30);
 

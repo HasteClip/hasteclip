@@ -425,7 +425,7 @@ impl App {
             }
             ui_kit::menu_sep(ui);
             if Item::new("Any length in Settings…").icon(icon::TEXT_T).show(ui).clicked() {
-                self.page = Page::Settings;
+                self.open_settings(crate::settings_ui::Pane::Clipping);
                 ui.close();
             }
         });

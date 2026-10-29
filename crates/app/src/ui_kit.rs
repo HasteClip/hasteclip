@@ -302,13 +302,12 @@ pub fn scroll<R>(ui: &mut egui::Ui, id: &str, add: impl FnOnce(&mut egui::Ui) ->
     } else if let Some(y) = dev_scroll(ui.ctx(), id) {
         scroll = scroll.vertical_scroll_offset(y);
     }
-    let out = scroll.show(&mut area, |ui| {
-        ui.set_max_width(ui.available_width() - gutter);
-        add(ui)
-    });
-    // How far it's scrolled, for anything that follows it (Settings' section list).
-    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(("scroll_offset", id)), out.state.offset.y));
-    out.inner
+    scroll
+        .show(&mut area, |ui| {
+            ui.set_max_width(ui.available_width() - gutter);
+            add(ui)
+        })
+        .inner
 }
 
 /// Dev aid: `HASTECLIP_DEV_SCROLL=<area>:<from s>:<secs>:<points>` scrolls
@@ -332,11 +331,6 @@ fn dev_scroll(ctx: &egui::Context, id: &str) -> Option<f32> {
     }
     ctx.request_repaint();
     Some(points * t)
-}
-
-/// How far the [`scroll`] area `id` was scrolled last frame.
-pub fn scroll_offset(ctx: &egui::Context, id: &str) -> f32 {
-    ctx.data(|d| d.get_temp::<f32>(egui::Id::new(("scroll_offset", id)))).unwrap_or(0.0)
 }
 
 fn overlay_id() -> egui::Id {
