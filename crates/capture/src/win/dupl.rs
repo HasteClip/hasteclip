@@ -255,13 +255,22 @@ pub(crate) struct Probe {
 }
 
 impl Probe {
-    /// None where the display can't be duplicated: on another graphics card,
-    /// or duplicated by this app already.
-    pub(crate) fn start(gpu: &Gpu, monitor: HMONITOR) -> Option<Self> {
-        let output = output_for(gpu, monitor)?;
-        let dupl = probe_duplicate(gpu, &output).ok()?;
+    /// Why not, where the display can't be duplicated: it's on another
+    /// graphics card, or this app duplicates it already, or as many apps as
+    /// Windows allows do. Where Windows refuses for another reason, it's
+    /// asked again at each look, and nothing new is seen meanwhile: the game
+    /// to be looked at may be why (one going to the display past the
+    /// compositor; Windows may refuse the duplication rather than start one
+    /// and take it away).
+    pub(crate) fn start(gpu: &Gpu, monitor: HMONITOR) -> Result<Self, String> {
+        let output = output_for(gpu, monitor).ok_or("the display isn't on the graphics card HasteClip uses")?;
+        let dupl = match probe_duplicate(gpu, &output) {
+            Ok(d) => Some(d),
+            Err(e) if [E_INVALIDARG, DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, DXGI_ERROR_SESSION_DISCONNECTED].contains(&e.code()) => return Err(e.message()),
+            Err(_) => None,
+        };
         let now = Instant::now();
-        Some(Self { gpu: gpu.clone(), output, dupl: Some(dupl), first: true, opened: now, lost: false, last: now, seen: false })
+        Ok(Self { gpu: gpu.clone(), output, lost: dupl.is_none(), dupl, first: true, opened: now, last: now, seen: false })
     }
 
     /// How long since a new picture came up (since it started, before one),

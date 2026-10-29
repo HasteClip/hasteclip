@@ -677,6 +677,18 @@ fn drawing(gpu: &mut Option<gpu::GpuUse>, window: windows::Win32::Foundation::HW
     Some(gpu.as_mut()?.percent(system::window_pid(window)))
 }
 
+/// What tells how busy games keep the graphics card (see [`drawing`]); said
+/// in the log (once) where Windows can't: without it, no fullscreen game is
+/// switched to the game capture hook for going unseen.
+fn gpu_meter() -> Option<gpu::GpuUse> {
+    let found = gpu::GpuUse::new();
+    if found.is_none() {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| eprintln!("can't tell how busy games keep the graphics card (Windows' GPU counters): a fullscreen game Windows can't see won't switch to the game capture hook"));
+    }
+    found
+}
+
 /// How long after a game comes up, or its window moves, to look at it: a
 /// window just gone fullscreen can still be shown by the compositor for its
 /// first frames (measured: 0.2 s), and the look would end there. A guess.
@@ -741,8 +753,11 @@ impl Sight {
                 return None;
             }
             match dupl::Probe::start(gpu, monitor) {
-                Some(probe) => self.probe = Some(probe),
-                None => {
+                Ok(probe) => self.probe = Some(probe),
+                Err(why) => {
+                    // Once: it's the same each time a game comes up.
+                    static SAID: std::sync::Once = std::sync::Once::new();
+                    SAID.call_once(|| eprintln!("can't look at the display with Desktop Duplication ({why}): a fullscreen game Windows' capture can't see is told by its frames alone, which moving the cursor brings too"));
                     self.cannot = true;
                     return Some(own.min(up));
                 }
@@ -876,7 +891,7 @@ impl Video {
             // Apps Windows' capture froze on: hooked from then on.
             let mut frozen: std::collections::HashSet<String> = Default::default();
             let mut sight = Sight::default();
-            let mut gpu_use = gpu::GpuUse::new();
+            let mut gpu_use = gpu_meter();
             // A window that couldn't be captured, so it's reported once.
             let mut failed = None;
             // The away screen is up (so it's uploaded once, not every tick).
@@ -1091,7 +1106,7 @@ impl Video {
             let mut hook_failed: std::collections::HashSet<usize> = Default::default();
             let mut frozen: std::collections::HashSet<String> = Default::default();
             let mut sight = Sight::default();
-            let mut gpu_use = gpu::GpuUse::new();
+            let mut gpu_use = gpu_meter();
             while !stop2.load(Ordering::Relaxed) {
                 // A fullscreen window in focus on this display.
                 let game = system::foreground_app()
