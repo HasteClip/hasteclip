@@ -21,9 +21,12 @@ cd "$root"
 # (dlopen), so the GPU encoders use the distro's own drivers. Pinned by checksum.
 # The app decodes video for playback with the same libavcodec (opened from
 # lib/ at run time), so it's built against this build's headers.
-ffmpeg_build="ffmpeg-n9.0.1-11-ge47273f4d9-linux64-gpl-shared-9.0"
-ffmpeg_url="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-31-13-27/$ffmpeg_build.tar.xz"
-ffmpeg_sha256="30801e00d25f823c6da339378ea63c38e5265f237741909e1d6164b6b5bd3d33"
+# 8.1, not 9.0: BtbN builds 9.0 against the newest NVENC headers, whose
+# encoder needs NVIDIA's driver 610 or newer, and GTX 10-series cards never
+# get past 580. 8.1's headers (SDK 13.0) need 570.
+ffmpeg_build="ffmpeg-n8.1.3-27-g8dca1586f4-linux64-gpl-shared-8.1"
+ffmpeg_url="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-30-13-01/$ffmpeg_build.tar.xz"
+ffmpeg_sha256="bf4a4655c74faca6c6890ee68d2d61af54b1145efdb46d617cb26046f73eabf5"
 
 name="HasteClip-linux-x64"
 work="target/release-package"
@@ -50,6 +53,15 @@ if [ ! -f "$tarball" ] || ! echo "$ffmpeg_sha256  $tarball" | sha256sum -c --sta
 fi
 rm -rf "$work/$ffmpeg_build"
 tar -C "$work" -xf "$tarball"
+# The NVIDIA driver its NVENC needs (the string after this log message in
+# libavcodec): no newer than GTX 10-series cards' last, 580.
+nvenc_driver="$(tr '\0' '\n' < "$work/$ffmpeg_build"/lib/libavcodec.so.[0-9][0-9] \
+    | grep -a -A2 -x 'Loaded Nvenc version %d.%d' | grep -aE '^[0-9]+\.[0-9]+$' | head -1)"
+[ -n "$nvenc_driver" ] || { echo "couldn't find the NVIDIA driver this ffmpeg's NVENC needs" >&2; exit 1; }
+if [ "${nvenc_driver%%.*}" -gt 580 ]; then
+    echo "this ffmpeg's NVENC needs NVIDIA's driver $nvenc_driver, newer than GTX 10-series cards get (580)" >&2
+    exit 1
+fi
 
 sed -i.bak -E "s/^version = \"[^\"]*\"/version = \"$version\"/" Cargo.toml && rm Cargo.toml.bak
 HASTECLIP_FFMPEG_INCLUDE="$root/$work/$ffmpeg_build/include" cargo build --release -p hasteclip
