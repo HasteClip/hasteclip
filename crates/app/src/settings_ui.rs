@@ -388,15 +388,24 @@ impl App {
                 let (_, c) = l.row(Row::new("Resolution").tip("Resolution", RESOLUTION_TIP).note(res_note.clone()).locked(lock.clone()), |ui| self.resolution_field(ui));
                 locked_click |= c;
             }
-            // What a shape of the video's own does to the screen, said, and
-            // where that's changed: how it sits in the video is the screen's,
-            // on Sources.
+            // What Fit, Fill or Stretch does to the screen, said, and where
+            // that's changed: how it sits in the video is the screen's, on
+            // Sources. In the screen's own shape, for when it changes.
             if f.shows(SHAPE_WORDS) {
                 let placed = self.settings.screen.placed.is_some();
                 let what = if self.settings.screen_placement().crop.is_some() { "crop" } else { "screen" };
-                let shaped = self.settings.capture_shape().zip(self.screen_picture());
-                let note = shaped.map_or(String::new(), |(shape, size)| framing_note((!placed).then_some(self.settings.framing), shape, size, what));
-                let go = shaped.is_some_and(|(shape, size)| !same_shape(shape, size)).then_some(SHAPE_GO);
+                let framing = (!placed).then_some(self.settings.framing);
+                let apps = matches!(self.settings.capture, settings::CaptureTarget::Apps { .. });
+                // The video's shape: one of its own, else the screen's.
+                let own = self.settings.capture_shape();
+                let video = own.or_else(|| screen.map(|(w, h)| capture::Shape { w, h, framing: capture::Framing::Fill }));
+                let shaped = video.zip(self.screen_picture());
+                let note = match shaped {
+                    Some((shape, size)) if own.is_none() && same_shape(shape, size) => changed_shape_note(framing, apps),
+                    Some((shape, size)) => framing_note(framing, shape, size, what),
+                    None => String::new(),
+                };
+                let go = shaped.is_some_and(|(shape, size)| own.is_none() || !same_shape(shape, size)).then_some(SHAPE_GO);
                 let (_, c) = l.row(Row::new("Aspect ratio").tip("Aspect ratio", SHAPE_TIP).note(note).go(go).locked(lock.clone()), |ui| self.shape_field(ui, screen));
                 locked_click |= c;
                 if ui_kit::take_row_go(l.ui.ctx(), "Aspect ratio") {
@@ -1508,10 +1517,10 @@ fn ratio_label(w: u32, h: u32) -> String {
 }
 
 /// Aspect ratio's way to Sources, where the screen's put in the video.
-const SHAPE_GO: &str = "Fill, fit or stretch it on Sources";
+const SHAPE_GO: &str = "Fit, fill or stretch it on Sources";
 
 /// Aspect ratio's tip.
-const SHAPE_TIP: &str = "Record in another aspect ratio than your screen's: 16:9 out of an ultrawide screen, say, or 9:16 for phones. Every recording and clip is made in it. A custom size has a shape of its own. How your screen sits in it is on the Sources page: drag it on the preview to show another part of it or make it smaller (Shift stretches it), or right-click it to fill the video, fit all of it in, or stretch it.";
+const SHAPE_TIP: &str = "Record in another aspect ratio than your screen's: 16:9 out of an ultrawide screen, say, or 9:16 for phones. Every recording and clip is made in it. A custom size has a shape of its own. How your screen sits in it is on the Sources page: drag it on the preview to show another part of it or make it smaller (Shift stretches it), or right-click it to fit all of it in, fill the video, or stretch it. With Same as screen, Fit, Fill and Stretch are for when a game changes your screen's resolution while recording, as playing at a stretched resolution does.";
 
 /// What finds Resolution in the search.
 const RESOLUTION_WORDS: &[&str] = &["resolution", "height", "width", "size", "custom size", "native"];
@@ -1583,6 +1592,21 @@ fn framing_note(framing: Option<settings::Framing>, shape: capture::Shape, (w, h
         settings::Framing::Fit => format!("All of your {w}×{h} {what}, with black bars {}", if wider { "above and below" } else { "at its sides" }),
         settings::Framing::Stretch => format!("All of your {w}×{h} {what}, {} to the video's shape", if wider { "squeezed" } else { "stretched" }),
     }
+}
+
+/// What Fit, Fill or Stretch (`None`: placed by hand) does in a video of
+/// the screen's own shape, in words: it's for a game that changes the
+/// screen's resolution while it's recorded, or for a game's window of
+/// another shape (recording games and apps, `apps`).
+fn changed_shape_note(framing: Option<settings::Framing>, apps: bool) -> String {
+    let Some(framing) = framing else { return "Your screen's placed by hand on the Sources page".to_owned() };
+    let game = if apps { "A game's window of another shape than your screen" } else { "A game that changes your screen's resolution while recording" };
+    let how = match framing {
+        settings::Framing::Fit => "is fitted in, with black bars",
+        settings::Framing::Fill => "fills the video, its edges cut off",
+        settings::Framing::Stretch => "is stretched to fill the video",
+    };
+    format!("{game} {how}")
 }
 
 /// Whether a `w`×`h` picture is the shape's shape, near enough.

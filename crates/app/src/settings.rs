@@ -94,6 +94,8 @@ pub enum RateControl {
 
 /// What [`RecordSettings::size_version`] is for settings made now.
 pub const SIZE_VERSION: u32 = 1;
+/// What [`RecordSettings::framing_version`] is for settings made now.
+pub const FRAMING_VERSION: u32 = 1;
 
 /// Output resolution. `Native` records at the capture source's resolution;
 /// the p ones bring its short side down to that many pixels on encode (never
@@ -594,11 +596,11 @@ impl From<ScreenCapture> for capture::ScreenCapture {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Framing {
-    /// Its middle, the edges past the shape cut off.
-    #[default]
-    Fill,
     /// All of it, with black bars.
+    #[default]
     Fit,
+    /// Its middle, the edges past the shape cut off.
+    Fill,
     /// All of it, stretched or squeezed.
     Stretch,
 }
@@ -637,6 +639,12 @@ impl From<NoiseReduction> for capture::mixer::NoiseReduction {
 
 fn yes() -> bool {
     true
+}
+
+/// How the screen went into a shape of the video's own before Fit, Fill
+/// and Stretch could be chosen.
+fn filled() -> Framing {
+    Framing::Fill
 }
 
 impl AudioSourceCfg {
@@ -881,11 +889,21 @@ pub struct RecordSettings {
     /// and leave it out when they save.
     #[serde(rename = "video_size", skip_serializing_if = "Option::is_none")]
     saved_size: Option<SizeCfg>,
-    /// How the screen goes into a video of a shape of its own (an aspect
-    /// ratio, or a size of its own) while it isn't placed by hand: its
-    /// middle covering it, all of it with bars, or all of it stretched. In
-    /// the screen's own shape, all of it goes in (a window too).
+    /// How the screen goes into the video while it isn't placed by hand,
+    /// when they aren't the same shape: all of it with bars, its middle
+    /// covering it, or all of it stretched. In a video of a shape of its
+    /// own (an aspect ratio, or a size of its own), and in the screen's own
+    /// shape too: a display's resolution can change while it's recorded (a
+    /// game at a stretched resolution), and a game's window needn't be the
+    /// screen's shape. A file from before it could be chosen says nothing:
+    /// it's Fill, as the screen went in then.
+    #[serde(default = "filled")]
     pub framing: Framing,
+    /// What `framing` covers in a file: 0 from before it was used in the
+    /// screen's own shape (it was always Fit there), 1 since. Read once,
+    /// on load (see `upgrade_framing`).
+    #[serde(default)]
+    pub framing_version: u32,
     /// The part of the screen kept (a game at a lower resolution than the
     /// display, black around it): set on Sources. It's recorded as a display
     /// that size would be.
@@ -998,7 +1016,8 @@ impl Default for RecordSettings {
             size_version: SIZE_VERSION,
             shape: None,
             saved_size: None,
-            framing: Framing::Fill,
+            framing: Framing::Fit,
+            framing_version: FRAMING_VERSION,
             screen_crop: None,
             video_bitrate_mbps: 40,
 
@@ -1178,9 +1197,8 @@ impl RecordSettings {
     /// Where the screen's picture goes in the video, for the capture: its
     /// box when it's been placed by hand, all of the box (stretched, if
     /// it's been stretched; a game's window that isn't, whatever its shape,
-    /// all of it, as big as fits); else all of the video, as `framing` says
-    /// in a shape of the video's own (else all of the picture). A display's
-    /// crop, if it's cropped.
+    /// all of it, as big as fits); else all of the video, as `framing`
+    /// says. A display's crop, if it's cropped.
     pub fn screen_placement(&self) -> capture::ScreenPlacement {
         let s = &self.screen;
         let apps = matches!(self.capture, CaptureTarget::Apps { .. });
@@ -1188,8 +1206,7 @@ impl RecordSettings {
         // it's never squashed, unless the box was stretched on purpose.
         let (rect, framing) = match s.placed {
             Some(b) => ([b.x, b.y, b.w, b.h], if apps && !b.stretched() { capture::Framing::Fit } else { capture::Framing::Stretch }),
-            None if self.capture_shape().is_some() => ([0.0, 0.0, 1.0, 1.0], self.framing.into()),
-            None => ([0.0, 0.0, 1.0, 1.0], capture::Framing::Fit),
+            None => ([0.0, 0.0, 1.0, 1.0], self.framing.into()),
         };
         let crop = self.screen_crop.filter(|c| capture::SCREEN_CROP && !apps && !c.is_none()).map(Into::into);
         capture::ScreenPlacement { rect, framing, in_front: s.in_front, hidden: !s.enabled, crop, turns: s.turns % 4, flip_h: s.flip_h, flip_v: s.flip_v }
@@ -1312,7 +1329,19 @@ impl RecordSettings {
             Some(size) => (s.resolution, s.shape) = (size.resolution, size.shape),
             None => s.upgrade_sizes(),
         }
+        s.upgrade_framing();
         Some(s)
+    }
+
+    /// How the screen goes in, from a version that only used it in a video
+    /// of a shape of its own: in the screen's own shape it was always Fit,
+    /// whatever was chosen (Fill, unless it was changed), so it's Fit there
+    /// now too. In a shape of the video's own it stays as it was.
+    fn upgrade_framing(&mut self) {
+        if self.framing_version < 1 && self.capture_shape().is_none() {
+            self.framing = Framing::Fit;
+        }
+        self.framing_version = FRAMING_VERSION;
     }
 
     /// The video's size from a version before it was its own, making clips
@@ -1413,8 +1442,10 @@ mod shape_tests {
         assert!(s.to_json().contains(r#""shape": ["#) && s.to_json().contains(r#""framing": "fit""#));
     }
 
-    /// The screen goes into a video of its own shape as Fill, Fit or Stretch
-    /// say, unless it's placed by hand; in the screen's own shape, all of it.
+    /// The screen goes into the video as Fit, Fill or Stretch say, unless
+    /// it's placed by hand: in a video of its own shape, and in the
+    /// screen's too (for a display whose resolution changes while it's
+    /// recorded, a game at a stretched one).
     #[test]
     fn how_the_screen_goes_in() {
         let framed = |shape: Option<[u32; 2]>, framing, placed: bool| {
@@ -1423,11 +1454,31 @@ mod shape_tests {
         };
         assert_eq!(framed(Some([4, 3]), Framing::Stretch, false).framing, capture::Framing::Stretch);
         assert_eq!(framed(Some([4, 3]), Framing::Fit, false).framing, capture::Framing::Fit);
-        assert_eq!(framed(None, Framing::Fill, false).framing, capture::Framing::Fit);
+        assert_eq!(framed(None, Framing::Stretch, false).framing, capture::Framing::Stretch);
+        assert_eq!(framed(None, Framing::Fill, false).framing, capture::Framing::Fill);
+        assert_eq!(RecordSettings::default().screen_placement().framing, capture::Framing::Fit);
         // In its box, past the video's edge too: all of it over all of the
         // box, stretched as the box is.
         let boxed = framed(Some([4, 3]), Framing::Fill, true);
         assert_eq!((boxed.framing, boxed.rect), (capture::Framing::Stretch, [0.1, -0.1, 0.5, 1.5]));
+    }
+
+    /// Settings from before Fit, Fill and Stretch were used in the screen's
+    /// own shape go in as they did: Fit there, whatever they say (Fill, the
+    /// default then), and as they say in a shape of the video's own. Once
+    /// saved since, what's chosen is kept.
+    #[test]
+    fn older_settings_go_in_as_they_did() {
+        let load = |json: &str| RecordSettings::from_json(json.as_bytes()).unwrap();
+        assert_eq!(load(r#"{"framing":"fill"}"#).framing, Framing::Fit);
+        assert_eq!(load(r#"{"framing":"stretch","video_size":{"resolution":"Native","shape":null}}"#).framing, Framing::Fit);
+        assert_eq!(load(r#"{"framing":"fill","shape":[16,9]}"#).framing, Framing::Fill);
+        assert_eq!(load(r#"{"shape":[16,9]}"#).framing, Framing::Fill, "from before it could be chosen");
+        assert_eq!(load(r#"{"framing":"stretch","resolution":{"Exact":[1920,1080]},"size_version":1}"#).framing, Framing::Stretch);
+        let chosen = RecordSettings { framing: Framing::Stretch, ..Default::default() };
+        assert!(chosen.to_json().contains(r#""framing_version": 1"#));
+        assert_eq!(load(&chosen.to_json()).framing, Framing::Stretch);
+        assert_eq!(load("{}").framing, Framing::Fit);
     }
 
     /// A game in a box of its own shape fits in it (its window can change

@@ -32,12 +32,12 @@ const HANDLE: f32 = 8.0;
 /// How the screen can fill a video of another shape: the choices, as
 /// they're named side by side and in a menu, and what each does.
 pub(crate) const FRAMINGS: [(Framing, &str, &str, &str); 3] = [
-    (Framing::Fill, "Fill", "Fill the video", "Its middle covers all of the video: what's past the video's shape is cut off"),
     (Framing::Fit, "Fit", "Fit in the video", "All of it, as big as fits, with black bars where the shapes differ"),
+    (Framing::Fill, "Fill", "Fill the video", "Its middle covers all of the video: what's past the video's shape is cut off"),
     (Framing::Stretch, "Stretch", "Stretch to the video", "All of it over all of the video, stretched or squeezed to its shape"),
 ];
 
-/// Fill, Fit or Stretch, side by side: the one clicked. None is lit while
+/// Fit, Fill or Stretch, side by side: the one clicked. None is lit while
 /// the screen's placed by hand (`now` is `None`).
 pub(crate) fn framing_choice(ui: &mut egui::Ui, id: &str, now: Option<Framing>) -> Option<Framing> {
     let opts: Vec<crate::ui_kit::Seg> = FRAMINGS.iter().map(|(_, label, _, tip)| crate::ui_kit::Seg { icon: None, label, tip: Some(tip) }).collect();
@@ -396,10 +396,9 @@ impl App {
     }
 
     /// Where the screen goes as the video puts it, its first place and size:
-    /// Fill, Fit or Stretch's, in a video of a shape of its own, else all of
-    /// it (see [`framed`]).
+    /// Fit, Fill or Stretch's (see [`framed`]).
     pub(crate) fn screen_first_rect(&mut self, frame_aspect: f32) -> Rect {
-        let framing = if self.video_shaped() { self.settings.framing.into() } else { capture::Framing::Fit };
+        let framing = self.settings.framing.into();
         self.screen_aspect().map_or(Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), |picture| framed(framing, picture, frame_aspect))
     }
 
@@ -847,7 +846,7 @@ impl App {
     }
 
     /// Whether the video has a shape of its own (an aspect ratio, or a size
-    /// of its own): then the screen fills it as Fill, Fit or Stretch say.
+    /// of its own) rather than the screen's.
     pub(crate) fn video_shaped(&self) -> bool {
         self.settings.capture_shape().is_some()
     }
@@ -860,9 +859,9 @@ impl App {
 
     /// A source's menu (right-click it on the preview, or its card's ⋯),
     /// the same for both as far as each goes: its Placement numbers, how the
-    /// video puts the screen in (a video of a shape of its own), its
-    /// position, size and crop back, turning, mirroring and flipping it,
-    /// which is in front, and taking the webcam out.
+    /// video puts the screen in, its position, size and crop back, turning,
+    /// mirroring and flipping it, which is in front, and taking the webcam
+    /// out.
     pub(crate) fn layer_menu(&mut self, ui: &mut egui::Ui, layer: Layer, aspect: f32) {
         let screen = layer == Layer::Screen;
         if Item::new("Edit placement…").icon(icon::SLIDERS_HORIZONTAL).tip("Its position, size, turn and flip as numbers, on its card").show(ui).clicked() {
@@ -870,8 +869,10 @@ impl App {
             ui.close();
         }
         crate::ui_kit::menu_sep(ui);
-        // How the video puts the screen in: its position and size both.
-        if screen && self.video_shaped() {
+        // How the video puts the screen in: its position and size both. In
+        // the screen's own shape too, for when it changes (a game at a
+        // stretched resolution).
+        if screen {
             let now = self.settings.screen.placed.is_none().then_some(self.settings.framing);
             for (framing, _, label, tip) in FRAMINGS {
                 if Item::new(label).check(now == Some(framing)).tip(tip).show(ui).clicked() {

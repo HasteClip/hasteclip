@@ -74,25 +74,18 @@ impl App {
 
     /// A source's Placement row on its card: where it is and what's been
     /// done to it (while its numbers are shut), how the video puts the
-    /// screen in (a video of a shape of its own), and its numbers, opening
-    /// under it.
+    /// screen in, and its numbers, opening under it.
     pub(crate) fn placement_row(&mut self, ui: &mut egui::Ui, layer: Layer) {
         let pal = theme::pal(ui);
         let screen = layer == Layer::Screen;
-        let shaped = screen && self.video_shaped();
         let open = self.sources_view.placement_open.contains(&layer);
         let at = self.placed_in(layer).map(|(video, _, r)| size_at(to_pixels(r, video)));
         let text = match layer {
             _ if open => String::new(),
             Layer::Screen => {
                 let s = self.settings.screen;
-                // Put in by Fill, Fit or Stretch (beside it, in a video of a
-                // shape of its own), or over all of the video.
-                let at = match s.placed {
-                    Some(_) => at.as_deref(),
-                    None if shaped => None,
-                    None => Some("fills the video"),
-                };
+                // Placed by hand, or put in by Fit, Fill or Stretch (beside it).
+                let at = s.placed.and(at.as_deref());
                 summary(at, s.placed.is_some_and(|b| b.stretched()), s.turns, s.flip_h, s.flip_v)
             }
             Layer::Webcam => {
@@ -122,7 +115,7 @@ impl App {
                 let caret = if open { egui_phosphor::regular::CARET_UP } else { egui_phosphor::regular::CARET_DOWN };
                 let tip = if open { "Hide its numbers" } else { "Its position, size, turn and flip, as numbers" };
                 toggle = Btn::normal("Adjust").trail(caret).small().tip(tip).show(ui).clicked();
-                if shaped && let Some(f) = crate::canvas_ui::framing_choice(ui, "screen_card_framing", self.settings.screen.placed.is_none().then_some(self.settings.framing)) {
+                if screen && let Some(f) = crate::canvas_ui::framing_choice(ui, "screen_card_framing", self.settings.screen.placed.is_none().then_some(self.settings.framing)) {
                     self.screen_framed(f);
                 }
             });

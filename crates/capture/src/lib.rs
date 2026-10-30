@@ -128,12 +128,12 @@ pub fn output_size(w: u32, h: u32, short_side: Option<u32>) -> (u32, u32) {
 /// How the screen goes into a recording of another shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Framing {
+    /// All of it, with black bars where the shapes differ.
+    #[default]
+    Fit,
     /// Its middle, as much as fills the shape: what's past that is cut off
     /// (an ultrawide screen's sides, recorded 16:9).
-    #[default]
     Fill,
-    /// All of it, with black bars where the shapes differ.
-    Fit,
     /// All of it, stretched or squeezed into the shape.
     Stretch,
 }
