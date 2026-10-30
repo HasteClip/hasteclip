@@ -180,7 +180,16 @@ fn works(codec: Codec) -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
-    let errors = spawn_stderr(child.stderr.take().unwrap());
+    // All of it: the reason is near the top, under lines ffmpeg prints
+    // whatever went wrong.
+    let errors = {
+        let mut stderr = child.stderr.take().unwrap();
+        thread::spawn(move || {
+            let mut text = String::new();
+            let _ = stderr.read_to_string(&mut text);
+            text
+        })
+    };
     let frame = vec![128u8; (w * h * 3 / 2) as usize];
     let mut stdin = child.stdin.take().unwrap();
     let writer = thread::spawn(move || {
@@ -194,10 +203,32 @@ fn works(codec: Codec) -> bool {
     let _ = child.stdout.take().unwrap().read_to_end(&mut out);
     let _ = writer.join();
     let ok = child.wait().is_ok_and(|s| s.success()) && split_access_units(&mut out, true).len() == 5;
-    if !ok && let Some(why) = errors.join().ok().flatten() {
-        eprintln!("video encoder {} didn't work: {}", codec.ffmpeg_name(), why.lines().last().unwrap_or_default());
+    if !ok {
+        let why = errors.join().unwrap_or_default();
+        eprintln!("video encoder {} didn't work: {}", codec.ffmpeg_name(), why_encoder_failed(&why));
     }
     ok
+}
+
+/// What in ffmpeg's errors says why an encoder didn't work: its own lines,
+/// without the ones ffmpeg adds whatever the reason ("Nothing was written
+/// into output file", "Task finished with error code"…).
+fn why_encoder_failed(stderr: &str) -> String {
+    const GENERIC: &[&str] = &[
+        "Error while opening encoder",
+        "Error sending frames to consumers",
+        "Task finished with error code",
+        "Terminating thread with return code",
+        "Could not open encoder before EOF",
+        "Nothing was written into output file",
+        "Error parsing global options",
+    ];
+    let lines: Vec<&str> =
+        stderr.lines().map(str::trim).filter(|l| !l.is_empty() && !GENERIC.iter().any(|g| l.contains(g))).collect();
+    match lines.as_slice() {
+        [] => stderr.lines().last().unwrap_or("no output").trim().to_string(),
+        _ => lines.join(" | "),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -504,5 +535,30 @@ mod tests {
         f.extend([1, 2, 3]);
         assert_eq!(adts_frame(&f), Some((7, 10)));
         assert_eq!(adts_frame(&f[..9]), None);
+    }
+
+    #[test]
+    fn encoder_errors_keep_the_reason() {
+        // ffmpeg 9's output with no NVIDIA driver loaded.
+        let nvenc = "[h264_nvenc @ 0x555d] Cannot load libcuda.so.1
+[vost#0:0/h264_nvenc @ 0x555d] [enc:h264_nvenc @ 0x555d] Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height.
+[vf#0:0 @ 0x555d] Error sending frames to consumers: Operation not permitted
+[vf#0:0 @ 0x555d] Task finished with error code: -1 (Operation not permitted)
+[vf#0:0 @ 0x555d] Terminating thread with return code -1 (Operation not permitted)
+[vost#0:0/h264_nvenc @ 0x555d] [enc:h264_nvenc @ 0x555d] Could not open encoder before EOF
+[vost#0:0/h264_nvenc @ 0x555d] Task finished with error code: -22 (Invalid argument)
+[vost#0:0/h264_nvenc @ 0x555d] Terminating thread with return code -22 (Invalid argument)
+[out#0/h264 @ 0x555d] Nothing was written into output file, because at least one of its streams received no packets.
+";
+        assert_eq!(why_encoder_failed(nvenc), "[h264_nvenc @ 0x555d] Cannot load libcuda.so.1");
+        // And with no VA-API driver that starts.
+        let vaapi = "[VAAPI @ 0x5645] libva: /usr/lib/dri/nouveau_drv_video.so init failed
+[VAAPI @ 0x5645] Failed to initialise VAAPI connection: 2 (resource allocation failed).
+Device creation failed: -5.
+Failed to set value 'vaapi=va:/dev/dri/renderD128' for option 'init_hw_device': Input/output error
+Error parsing global options: Input/output error
+";
+        assert!(why_encoder_failed(vaapi).starts_with("[VAAPI @ 0x5645] libva: /usr/lib/dri/nouveau_drv_video.so init failed | "));
+        assert_eq!(why_encoder_failed("Unknown thing\n"), "Unknown thing");
     }
 }
