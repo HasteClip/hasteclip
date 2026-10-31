@@ -1276,8 +1276,8 @@ fn spawn_aac(track: usize, mut enc: AacEncoder, rx: mpsc::Receiver<Vec<f32>>, ou
 /// dark background ghosts far too faint (a fifth of its value is about 3% of
 /// its light, not 20%), and a dark thing over a bright one ghosts too strong.
 ///
-/// Looks are taken `BLEND_LATE` after their time, so that pictures noticed
-/// late still count.
+/// Looks are taken a while after their time (at least `BLEND_LATE`, longer
+/// while pictures come in later), so that pictures noticed late still count.
 struct FrameBlend {
     quad: quad::Quad,
     gpu: d3d::Gpu,
@@ -1420,8 +1420,21 @@ impl FrameBlend {
 /// How long after a frame's time it's made: the game capture knows a picture
 /// is new a few milliseconds after it came up (it compares it with the last),
 /// and it must still get into its frame; Desktop Duplication asks for new
-/// pictures every half of it while the screen is still. A guess.
+/// pictures every half of it while the screen is still. A guess. The least it
+/// waits: pictures that keep coming later make it wait longer (see
+/// `BlendPacer::wait`).
 const BLEND_LATE: f64 = 0.012;
+/// The longest it waits for late pictures. A game that keeps the graphics card
+/// busy (Geometry Dash at 1000 fps) gets the hook's comparisons answered 10-20
+/// ms late: waiting 12 ms, a third of its pictures came too late for the looks
+/// that should have seen them, which saw the one before instead, and motion
+/// came out uneven. Waiting longer only delays when frames are made, not their
+/// times in the file.
+const BLEND_LATE_MAX: f64 = 0.1;
+/// How fast the wait comes back down once pictures come in sooner: a 1000th
+/// of the way per picture (about a second at 1000 pictures a second), so one
+/// quiet stretch doesn't drop it just before the next late picture.
+const LATE_EASE: f64 = 0.001;
 /// How much of the way the looks move toward halfway between the game's
 /// pictures, on each picture. A guess: slow enough that the noise in
 /// pictures' times averages out (a few hundred milliseconds), quick enough to
@@ -1461,6 +1474,9 @@ struct BlendPacer {
     last_taken: Option<u64>,
     /// Different pictures in the frame's own time so far.
     different: u32,
+    /// How late pictures come in (seconds after their time): at once up to the
+    /// latest, slowly back down (`LATE_EASE`).
+    lateness: f64,
     blend: FrameBlend,
     converter: d3d::Converter,
     encoder: h264::Encoder,
@@ -1573,6 +1589,12 @@ impl EncodeDiag {
 }
 
 impl BlendPacer {
+    /// How long after their time looks are taken: long enough for the
+    /// pictures that come in latest, with a little to spare.
+    fn wait(&self) -> f64 {
+        (self.lateness * 1.2 + 0.002).clamp(BLEND_LATE, BLEND_LATE_MAX)
+    }
+
     fn look_time(&self, m: i64) -> f64 {
         self.t0 + self.phase + (m as f64 + 0.5) * self.step
     }
@@ -1690,6 +1712,13 @@ impl BlendPacer {
     /// Then the looks move toward halfway between pictures.
     fn arrive(&mut self, at: f64, picture: Option<d3d::Queued>, latest: &d3d::Latest) {
         crate::count_picture();
+        let late = host_now() - at;
+        if late > self.lateness {
+            self.lateness = late;
+        } else {
+            self.lateness += (late - self.lateness) * LATE_EASE;
+        }
+        self.stats.wait = self.stats.wait.max(self.wait());
         if at < self.look_time(self.next - 1) {
             self.stats.late += 1;
             crate::count_missed(1);
@@ -1731,11 +1760,13 @@ struct BlendStats {
     late: u32,
     caught_up: u32,
     behind: f64,
+    /// The longest the looks waited for late pictures (see `BlendPacer::wait`).
+    wait: f64,
 }
 
 impl BlendStats {
     fn new() -> Self {
-        Self { since: Instant::now(), pictures: 0, frames: 0, full: 0, fewest: u32::MAX, most: 0, late: 0, caught_up: 0, behind: 0.0 }
+        Self { since: Instant::now(), pictures: 0, frames: 0, full: 0, fewest: u32::MAX, most: 0, late: 0, caught_up: 0, behind: 0.0, wait: 0.0 }
     }
 
     fn caught_up(&mut self, frames: u32, behind: f64) {
@@ -1750,13 +1781,14 @@ impl BlendStats {
         self.most = self.most.max(different);
         if self.since.elapsed() >= Duration::from_secs(5) {
             eprintln!(
-                "{}: the game showed {:.0} pictures/s; {looks} looks per frame, {}-{} different pictures in each, {:.0}% of frames with {looks}; {} pictures too late, over {} frames{}",
+                "{}: the game showed {:.0} pictures/s; {looks} looks per frame, {}-{} different pictures in each, {:.0}% of frames with {looks}; {} pictures too late (waited up to {:.0} ms), over {} frames{}",
                 if looks == 1 { "frame timing" } else { "frame blending" },
                 self.pictures as f64 / self.since.elapsed().as_secs_f64(),
                 self.fewest,
                 self.most,
                 self.full as f64 * 100.0 / self.frames as f64,
                 self.late,
+                self.wait * 1000.0,
                 self.frames,
                 match self.caught_up {
                     0 => String::new(),
@@ -1801,6 +1833,7 @@ fn spawn_blend_pacer(
             pictures: 0,
             last_taken: None,
             different: 0,
+            lateness: 0.0,
             blend,
             converter,
             encoder,
@@ -1816,9 +1849,9 @@ fn spawn_blend_pacer(
         }
         let mut others = latest.others();
         while !stop2.load(Ordering::Relaxed) {
-            p.catch_up(host_now() - BLEND_LATE);
+            p.catch_up(host_now() - p.wait());
             let (seen, _) = latest.arrivals();
-            let wait = p.frame_end() + BLEND_LATE - host_now();
+            let wait = p.frame_end() + p.wait() - host_now();
             if wait > 0.0 && latest.queue_len() == 0 {
                 latest.wait_for_frame(seen, Duration::from_secs_f64(wait.min(0.05)));
             }
@@ -1832,7 +1865,7 @@ fn spawn_blend_pacer(
                 p.arrive(host_now(), None, &latest);
             }
             // Looks whose time is past (and late pictures' too) see what's up.
-            p.look_until(host_now() - BLEND_LATE);
+            p.look_until(host_now() - p.wait());
         }
         p.encoder.finish();
     });
