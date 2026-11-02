@@ -43,9 +43,15 @@ const RING: usize = 12;
 /// Dash at 1000 fps got answers about 13 ms late: 12 slots held the looks to
 /// about 850 a second, fewer than its pictures, in bursts (looks skipped till
 /// answers came), and blended frames got anywhere from 1 to 8 different
-/// pictures. 40 hold 20 ms at 2000 looks a second; at 1080p, 330 MB, only for
-/// a game that needs them.
+/// pictures. 40 hold 20 ms at 2000 looks a second, only for a game that needs
+/// them; fewer for a bigger picture (`RING_BYTES`).
 const RING_MAX: usize = 40;
+/// The most graphics memory the ring grows to: at 1080p, 40 slots; at 1440p,
+/// 22; at 4K it doesn't grow past `RING`. Windows doesn't refuse a texture
+/// when the card's memory is full, it moves some of the game's to the
+/// computer's memory instead (the game slows down), so this is the limit, not
+/// an allocation that fails.
+const RING_BYTES: u64 = 320 << 20;
 /// With no change seen for this long, the next look copies the picture
 /// anyway (a change the signature missed goes up then). A guess.
 const FORCE_AFTER: f64 = 0.1;
@@ -54,7 +60,7 @@ const FORCE_AFTER: f64 = 0.1;
 /// answer must not hold the ring for good.
 const GIVE_UP: f64 = 0.25;
 /// The signature reads every this many rows.
-const SIGNATURE_ROWS: u32 = 4;
+const SIGNATURE_ROWS: u32 = 2;
 /// The comparison's size, in blocks.
 const BLOCKS: (u32, u32) = (160, 90);
 
@@ -113,8 +119,9 @@ struct Pending {
 
 pub(crate) struct Changes {
     ring: Vec<Slot>,
-    /// The most slots the ring may grow to (`RING_MAX`, or fewer once the
-    /// graphics card had no room for another).
+    /// The most slots the ring may grow to (`RING_MAX`, fewer for a big
+    /// picture, `RING_BYTES`, or once the graphics card had no room for
+    /// another).
     max_slots: usize,
     next: usize,
     /// The slot of the last look, its valid size and when it was made.
@@ -145,7 +152,7 @@ impl Changes {
         let blocks_texture = gpu.texture(BLOCKS.0, BLOCKS.1, DXGI_FORMAT_B8G8R8A8_UNORM, D3D11_BIND_RENDER_TARGET.0 as u32, D3D11_USAGE_DEFAULT, 0)?;
         Ok(Self {
             ring,
-            max_slots: RING_MAX,
+            max_slots: ((RING_BYTES / (width as u64 * height as u64 * 4).max(1)) as usize).clamp(RING, RING_MAX),
             next: 0,
             before: None,
             blocks: quad::target_view(gpu, &blocks_texture)?,
@@ -163,7 +170,7 @@ impl Changes {
 
     /// Where the next look's picture goes: the slot's number, and what to
     /// draw into. While every slot is waiting on its comparison (the graphics
-    /// card is behind), the ring grows by one, up to `RING_MAX`; past that it's
+    /// card is behind), the ring grows by one, up to `max_slots`; past that it's
     /// `None`: the look is skipped and taken again next time instead, so the
     /// pictures already on their way are kept.
     ///

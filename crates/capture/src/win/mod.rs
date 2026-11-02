@@ -1431,10 +1431,46 @@ const BLEND_LATE: f64 = 0.012;
 /// came out uneven. Waiting longer only delays when frames are made, not their
 /// times in the file.
 const BLEND_LATE_MAX: f64 = 0.1;
-/// How fast the wait comes back down once pictures come in sooner: a 1000th
-/// of the way per picture (about a second at 1000 pictures a second), so one
-/// quiet stretch doesn't drop it just before the next late picture.
-const LATE_EASE: f64 = 0.001;
+/// How the wait comes back down once pictures come in sooner: it's long enough
+/// for the latest picture of the last one to two of these (seconds). Timed, not
+/// counted in pictures: one hitch holds it up a second or two, in a 60 fps game
+/// as in one at 1000 fps, and a short quiet stretch doesn't drop it just before
+/// the next late picture.
+const LATE_WINDOW: f64 = 1.0;
+
+/// How late pictures come in (seconds after their time): the latest in this
+/// `LATE_WINDOW` and in the one before.
+#[derive(Default)]
+struct Lateness {
+    since: f64,
+    now: f64,
+    before: f64,
+}
+
+impl Lateness {
+    /// A picture came in `late`, at `now`.
+    fn note(&mut self, now: f64, late: f64) {
+        let gone = now - self.since;
+        if gone >= LATE_WINDOW {
+            self.before = if gone < 2.0 * LATE_WINDOW { self.now } else { 0.0 };
+            self.now = 0.0;
+            self.since = now;
+        }
+        self.now = self.now.max(late);
+    }
+
+    /// The latest picture of the last one or two windows, as of `now`.
+    fn worst(&self, now: f64) -> f64 {
+        let gone = now - self.since;
+        if gone >= 2.0 * LATE_WINDOW {
+            0.0
+        } else if gone >= LATE_WINDOW {
+            self.now
+        } else {
+            self.now.max(self.before)
+        }
+    }
+}
 /// How much of the way the looks move toward halfway between the game's
 /// pictures, on each picture. A guess: slow enough that the noise in
 /// pictures' times averages out (a few hundred milliseconds), quick enough to
@@ -1474,9 +1510,8 @@ struct BlendPacer {
     last_taken: Option<u64>,
     /// Different pictures in the frame's own time so far.
     different: u32,
-    /// How late pictures come in (seconds after their time): at once up to the
-    /// latest, slowly back down (`LATE_EASE`).
-    lateness: f64,
+    /// How late pictures come in, lately.
+    lateness: Lateness,
     blend: FrameBlend,
     converter: d3d::Converter,
     encoder: h264::Encoder,
@@ -1592,7 +1627,7 @@ impl BlendPacer {
     /// How long after their time looks are taken: long enough for the
     /// pictures that come in latest, with a little to spare.
     fn wait(&self) -> f64 {
-        (self.lateness * 1.2 + 0.002).clamp(BLEND_LATE, BLEND_LATE_MAX)
+        (self.lateness.worst(host_now()) * 1.2 + 0.002).clamp(BLEND_LATE, BLEND_LATE_MAX)
     }
 
     fn look_time(&self, m: i64) -> f64 {
@@ -1712,12 +1747,8 @@ impl BlendPacer {
     /// Then the looks move toward halfway between pictures.
     fn arrive(&mut self, at: f64, picture: Option<d3d::Queued>, latest: &d3d::Latest) {
         crate::count_picture();
-        let late = host_now() - at;
-        if late > self.lateness {
-            self.lateness = late;
-        } else {
-            self.lateness += (late - self.lateness) * LATE_EASE;
-        }
+        let now = host_now();
+        self.lateness.note(now, now - at);
         self.stats.wait = self.stats.wait.max(self.wait());
         if at < self.look_time(self.next - 1) {
             self.stats.late += 1;
@@ -1833,7 +1864,7 @@ fn spawn_blend_pacer(
             pictures: 0,
             last_taken: None,
             different: 0,
-            lateness: 0.0,
+            lateness: Lateness::default(),
             blend,
             converter,
             encoder,
