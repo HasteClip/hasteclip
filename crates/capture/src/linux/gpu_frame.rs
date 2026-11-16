@@ -638,6 +638,25 @@ struct Slot {
     pending: f32,
 }
 
+/// The most frames blended at once, the screen's ([`Slot`]) or a Display or
+/// Window source's ([`LayerSlot`]): as many as the shutter has open, and more
+/// while another source's looks are behind (each source's looks are kept
+/// halfway between its own pictures, so one can start a frame before
+/// another has finished the one before: `super::blend`). Made as they're
+/// wanted.
+const SLOTS_MOST: usize = 4;
+
+/// An empty [`Slot`] for frames `width`×`height`.
+fn blend_slot(device: &wgpu::Device, width: u32, height: u32) -> Slot {
+    Slot {
+        sum: device.create_buffer(&wgpu::BufferDescriptor { label: Some("blend sum"), size: width as u64 * height as u64 * 16, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
+        uniforms: device.create_buffer(&wgpu::BufferDescriptor { label: Some("look"), size: 64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
+        frame: None,
+        added: 0.0,
+        pending: 0.0,
+    }
+}
+
 /// The layers under the picture and over it, each set drawn into a canvas
 /// of its own (a pixel a `u32`: its colour and how much it covers,
 /// premultiplied) when one of them, or where it goes, changes.
@@ -919,16 +938,7 @@ impl GpuPicture {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some(entry), layout: None, module: &module, entry_point: Some(entry), compilation_options: Default::default(), cache: None })
         };
         let uniform = |label| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: 64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        let bytes = self.width as u64 * self.height as u64 * 16;
-        let slots: Vec<Slot> = (0..open.max(1))
-            .map(|_| Slot {
-                sum: device.create_buffer(&wgpu::BufferDescriptor { label: Some("blend sum"), size: bytes, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
-                uniforms: uniform("look"),
-                frame: None,
-                added: 0.0,
-                pending: 0.0,
-            })
-            .collect();
+        let slots: Vec<Slot> = (0..open.max(1)).map(|_| blend_slot(device, self.width, self.height)).collect();
         if let Some(b) = &mut self.blend {
             b.slots = slots;
             b.held = None;
@@ -1146,7 +1156,7 @@ impl GpuPicture {
 
     /// The looks from now on see this picture (number `seq`).
     pub(crate) fn hold(&mut self, src: &Frame, seq: u64) {
-        self.flush();
+        self.flush(None);
         let texture = match &src.texture {
             Some(t) => Some(t.clone()),
             None => self.upload(src, seq),
@@ -1162,34 +1172,53 @@ impl GpuPicture {
         if b.held.is_none() {
             return;
         }
-        let at = k.rem_euclid(b.slots.len() as i64) as usize;
-        if b.slots[at].frame != Some(k) {
-            // A frame left open whose slot is wanted again: it's dropped.
-            if b.slots[at].added > 0.0 {
-                self.clear_slot(at);
-            }
-            let Some(b) = &mut self.blend else { return };
-            let slot = &mut b.slots[at];
-            slot.frame = Some(k);
-            slot.added = 0.0;
-            slot.pending = 0.0;
-        }
+        let Some(at) = self.slot_for(k) else { return };
         if let Some(b) = &mut self.blend {
             b.slots[at].pending += weight;
         }
     }
 
+    /// Frame `k`'s slot: its own, else a free one, another made while
+    /// there's room (the screen ahead of a Display or Window source starts a
+    /// frame before the one before is made). With none, an older frame left
+    /// open is dropped for it.
+    fn slot_for(&mut self, k: i64) -> Option<usize> {
+        let b = self.blend.as_ref()?;
+        if let Some(at) = b.slots.iter().position(|s| s.frame == Some(k)) {
+            return Some(at);
+        }
+        let free = b.slots.iter().position(|s| s.frame.is_none());
+        let room = b.slots.len() < SLOTS_MOST;
+        let oldest = b.slots.iter().enumerate().filter(|(_, s)| s.frame.is_some_and(|f| f < k)).min_by_key(|(_, s)| s.frame).map(|(at, _)| at);
+        let at = match (free, room, oldest) {
+            (Some(at), ..) => at,
+            (None, true, _) => {
+                let slot = blend_slot(&self.gpu.device, self.width, self.height);
+                let b = self.blend.as_mut()?;
+                b.slots.push(slot);
+                b.slots.len() - 1
+            }
+            (None, false, Some(at)) => {
+                self.clear_slot(at);
+                at
+            }
+            (None, false, None) => return None,
+        };
+        let slot = &mut self.blend.as_mut()?.slots[at];
+        (slot.frame, slot.added, slot.pending) = (Some(k), 0.0, 0.0);
+        Some(at)
+    }
+
     /// Frame `k`'s looks are all in: make it (into the frame, for `nv12`).
     /// False if it saw no picture.
     pub(crate) fn finish(&mut self, k: i64) -> bool {
-        self.flush();
+        let Some(at) = self.blend.as_ref().and_then(|b| b.slots.iter().position(|s| s.frame == Some(k))) else { return false };
+        self.flush(Some(at));
         let (width, height) = (self.width, self.height);
         let (under, over) = self.layer_flags();
         let Some(b) = &mut self.blend else { return false };
-        let n = b.slots.len() as i64;
-        let at = k.rem_euclid(n) as usize;
         let slot = &mut b.slots[at];
-        if slot.frame != Some(k) || slot.added <= 0.0 {
+        if slot.added <= 0.0 {
             slot.frame = None;
             slot.added = 0.0;
             return false;
@@ -1228,15 +1257,18 @@ impl GpuPicture {
         true
     }
 
-    /// Add each open frame's waiting weight of the held picture to its sum.
-    fn flush(&mut self) {
+    /// Add each open frame's waiting weight of the held picture to its sum
+    /// (`only` that slot's: a frame made adds only its own looks, the next
+    /// frame's wait for the next picture).
+    fn flush(&mut self, only: Option<usize>) {
         let (width, height, screen) = (self.width, self.height, self.screen);
         let Some(b) = &mut self.blend else { return };
+        let wanted = |at: usize, s: &Slot| only.is_none_or(|o| o == at) && s.pending > 0.0;
         let Some(held) = &b.held else {
-            b.slots.iter_mut().for_each(|s| s.pending = 0.0);
+            b.slots.iter_mut().enumerate().filter(|(at, _)| only.is_none_or(|o| o == *at)).for_each(|(_, s)| s.pending = 0.0);
             return;
         };
-        if b.slots.iter().all(|s| s.pending <= 0.0) {
+        if !b.slots.iter().enumerate().any(|(at, s)| wanted(at, s)) {
             return;
         }
         let ([sx, sy, sw, sh], [dx, dy, dw, dh]) = screen.place((held.width(), held.height()), (width, height));
@@ -1244,7 +1276,10 @@ impl GpuPicture {
         let device = &self.gpu.device;
         let source_view = held.create_view(&Default::default());
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("looks") });
-        for slot in b.slots.iter_mut().filter(|s| s.pending > 0.0) {
+        for (at, slot) in b.slots.iter_mut().enumerate() {
+            if !wanted(at, &*slot) {
+                continue;
+            }
             let bytes: Vec<u8> = [sx, sy, sw, sh, dx, dy, dw, dh]
                 .iter()
                 .flat_map(|v| (*v as f32).to_le_bytes())
@@ -1459,9 +1494,6 @@ struct LayerSlot {
     first: Option<(super::layers::Pixels, u64)>,
 }
 
-/// The most frames a [`LayerBlend`] makes at once.
-const LAYER_SLOTS_MOST: usize = 4;
-
 impl LayerBlend {
     /// The size its pictures are.
     pub(crate) fn size(&self) -> (u32, u32) {
@@ -1492,7 +1524,7 @@ impl GpuPicture {
     /// `lb`'s picture that's up is `pixels` (number `seq`): on the card as
     /// it came, or uploaded from our memory. Not if it can't be (none yet).
     pub(crate) fn layer_hold(&self, lb: &mut LayerBlend, pixels: &super::layers::Pixels, seq: u64) {
-        self.layer_flush(lb);
+        self.layer_flush(lb, None);
         let texture = match pixels.texture() {
             Some(t) => Some(t.clone()),
             None => self.layer_upload(lb, pixels, seq),
@@ -1551,7 +1583,7 @@ impl GpuPicture {
             None => {
                 let free = match lb.slots.iter().position(|s| s.frame.is_none()) {
                     Some(free) => free,
-                    None if lb.slots.len() < LAYER_SLOTS_MOST => {
+                    None if lb.slots.len() < SLOTS_MOST => {
                         let device = &self.gpu.device;
                         let bytes = lb.size.0 as u64 * lb.size.1 as u64 * 16;
                         let sum = device.create_buffer(&wgpu::BufferDescriptor { label: Some("layer blend sum"), size: bytes.max(16), usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
@@ -1579,14 +1611,18 @@ impl GpuPicture {
     }
 
     /// Add each of `lb`'s frames' waiting weight of the picture that's up
-    /// to its sum.
-    fn layer_flush(&self, lb: &mut LayerBlend) {
+    /// to its sum (`only` that one of its slots). A frame made adds only its
+    /// own looks: the next frame's (this source ahead of another starts it
+    /// before this one is made) wait for the next picture, so a next frame
+    /// all of whose looks see this one is still this picture as it is.
+    fn layer_flush(&self, lb: &mut LayerBlend, only: Option<usize>) {
         let Some(b) = &self.blend else { return };
+        let wanted = |at: usize, s: &LayerSlot| only.is_none_or(|o| o == at) && s.frame.is_some() && s.pending > 0.0;
         let Some((held, ..)) = &lb.held else {
-            lb.slots.iter_mut().for_each(|s| s.pending = 0.0);
+            lb.slots.iter_mut().enumerate().filter(|(at, _)| only.is_none_or(|o| o == *at)).for_each(|(_, s)| s.pending = 0.0);
             return;
         };
-        if lb.slots.iter().all(|s| s.frame.is_none() || s.pending <= 0.0) {
+        if !lb.slots.iter().enumerate().any(|(at, s)| wanted(at, s)) {
             return;
         }
         // All of the picture into all of the sum (its own pixels), as the
@@ -1595,7 +1631,10 @@ impl GpuPicture {
         let device = &self.gpu.device;
         let source_view = held.create_view(&Default::default());
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("layer looks") });
-        for slot in lb.slots.iter_mut().filter(|s| s.frame.is_some() && s.pending > 0.0) {
+        for (at, slot) in lb.slots.iter_mut().enumerate() {
+            if !wanted(at, &*slot) {
+                continue;
+            }
             let bytes: Vec<u8> = [0.0f32, 0.0, w as f32, h as f32, 0.0, 0.0, w as f32, h as f32]
                 .iter()
                 .flat_map(|v| v.to_le_bytes())
@@ -1639,7 +1678,7 @@ impl GpuPicture {
             lb.slots[at].frame = None;
             return first;
         }
-        self.layer_flush(lb);
+        self.layer_flush(lb, Some(at));
         let b = self.blend.as_ref()?;
         let slot = &mut lb.slots[at];
         slot.frame = None;
@@ -1914,6 +1953,29 @@ mod tests {
         // A quarter of white's light is sRGB 137: luma ((220 * 137 + 128) >> 8) + 16 = 134.
         eprintln!("frame 2 luma {}", out[0]);
         assert!((out[0] as i32 - 134).abs() <= 1, "luma {}", out[0]);
+    }
+
+    /// Blended evenly (one frame open at a time), the screen can still start
+    /// the next frame before this one is made, while a Display or Window
+    /// source's looks are behind its: each keeps its own looks.
+    #[test]
+    #[ignore = "uses the graphics card: cargo test -p capture next_frame_before_this_one -- --ignored"]
+    fn next_frame_before_this_one() {
+        let gpu = super::super::gpu::gpu().expect("a graphics card");
+        let solid = |v: u8| Frame { width: 16, height: 16, stride: 64, order: Order::Bgr, data: [v, v, v, 255].repeat(256), texture: None };
+        let mut pic = GpuPicture::new(gpu, 16, 16, crate::ScreenPlacement::whole(crate::Framing::Fit));
+        pic.start_blending(1);
+        pic.hold(&solid(255), 1);
+        pic.add(0, 1.0);
+        pic.hold(&solid(0), 2);
+        pic.add(1, 1.0);
+        let mut out = Vec::new();
+        assert!(pic.finish(0), "frame 0 kept its look");
+        pic.nv12(&mut out);
+        assert!((out[0] as i32 - 235).abs() <= 1, "frame 0 is white: luma {}", out[0]);
+        assert!(pic.finish(1));
+        pic.nv12(&mut out);
+        assert!((out[0] as i32 - 16).abs() <= 1, "frame 1 is black: luma {}", out[0]);
     }
 
     /// How long a preview frame takes (drawing it, NV12, and the preview).

@@ -1652,6 +1652,9 @@ struct Slot {
     /// The picture its first look saw: all of them did, while nothing's
     /// been mixed into it (`weight` is 0).
     first: Option<Seen>,
+    /// With one look a frame, a copy of the picture its look saw, made once
+    /// another comes up before the frame is made (see `flush_slot`).
+    kept: Option<(windows::Win32::Graphics::Direct3D11::ID3D11Texture2D, windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView)>,
 }
 
 /// The most frames made at once: two blended softly, and one more for
@@ -1725,7 +1728,7 @@ impl FrameBlend {
                 } else {
                     None
                 };
-                self.slots.push(Slot { frame: None, light, weight: 0.0, pending: 0.0, area: (0, 0), size: (0, 0), first: None });
+                self.slots.push(Slot { frame: None, light, weight: 0.0, pending: 0.0, area: (0, 0), size: (0, 0), first: None, kept: None });
                 self.slots.len() - 1
             }
             None => return None,
@@ -1782,18 +1785,49 @@ impl FrameBlend {
         }
     }
 
-    /// Mix the looks at the picture that's up into the averages, at once.
+    /// Mix the looks at the picture that's up into the averages, at once
+    /// (another picture is coming up).
     fn flush(&mut self, quad: &quad::Quad) {
+        for i in 0..self.slots.len() {
+            self.flush_slot(quad, i);
+        }
+    }
+
+    /// The same for one frame's average (`slots[i]`). A frame made mixes in
+    /// only its own looks: the next frame's (a source ahead of another starts
+    /// it before this one is made) wait for the next picture, so a next frame
+    /// all of whose looks see this one is still this picture as it is.
+    fn flush_slot(&mut self, quad: &quad::Quad, i: usize) {
         let (size, held) = (self.size, &self.held);
-        for s in self.slots.iter_mut().filter(|s| s.frame.is_some() && s.pending > 0.0) {
-            let weight = std::mem::take(&mut s.pending);
-            let first = s.weight == 0.0;
-            s.weight += weight;
-            let (w, h) = held.size;
-            s.area = if first { (w, h) } else { (s.area.0.max(w), s.area.1.max(h)) };
+        let s = &mut self.slots[i];
+        if s.frame.is_none() || s.pending <= 0.0 {
+            return;
+        }
+        let weight = std::mem::take(&mut s.pending);
+        let first = s.weight == 0.0;
+        s.weight += weight;
+        let (w, h) = held.size;
+        s.area = if first { (w, h) } else { (s.area.0.max(w), s.area.1.max(h)) };
+        if let Some((target, _)) = &s.light {
             // Mixing in by its share of the total so far keeps it the average.
-            if let Some((target, _)) = &s.light {
-                quad.average_light(&self.gpu, target, size, &held.view, weight / s.weight, s.area);
+            quad.average_light(&self.gpu, target, size, &held.view, weight / s.weight, s.area);
+        } else if !self.blending && s.first.as_ref().is_some_and(|f| f.id == held.id) {
+            // One look a frame: the picture it saw, copied. The capture's
+            // texture soon holds a later picture (its queue's are used in
+            // turn, `own` has two), and this frame may be made most of a
+            // frame later, once another source's look for it is in.
+            if s.kept.is_none() {
+                use windows::Win32::Graphics::Direct3D11::{D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_DEFAULT};
+                let bind = (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32;
+                match self.gpu.texture(size.0, size.1, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM, bind, D3D11_USAGE_DEFAULT, 0).and_then(|t| Ok((quad::shader_view(&self.gpu, &t)?, t))) {
+                    Ok((view, texture)) => s.kept = Some((texture, view)),
+                    Err(e) => eprintln_later!("frame timing: {e:#}"),
+                }
+            }
+            if let Some((texture, view)) = &s.kept {
+                let region = windows::Win32::Graphics::Direct3D11::D3D11_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 };
+                unsafe { self.gpu.context.CopySubresourceRegion(texture, 0, 0, 0, 0, &held.texture, 0, Some(&region)) };
+                s.first = Some(Seen { id: held.id, texture: texture.clone(), view: view.clone(), size: held.size });
             }
         }
     }
@@ -1818,7 +1852,7 @@ impl FrameBlend {
                 seen.size
             }
             None => {
-                self.flush(quad);
+                self.flush_slot(quad, i);
                 let s = &self.slots[i];
                 if let Some((_, view)) = &s.light {
                     quad.from_light(&self.gpu, &self.target, self.size, view, s.area);
@@ -2936,8 +2970,34 @@ mod tests {
             }
             blend.finish(&quad, 1);
             assert_eq!(read(&gpu, &blend.average), 0, "{looks} looks: frame 1 is its own black looks");
+            // Making frame 0 left frame 1's looks as they were.
+            assert_eq!(blend.copied, Some(blend.held.id), "{looks} looks: frame 1 saw only the black picture: copied, not blended");
             assert!(blend.is_empty(0) && blend.is_empty(1));
         }
+    }
+
+    /// With one look a frame, a frame made after two more pictures came up
+    /// (another source's look for it later) is still the picture its look
+    /// saw, although the texture it came in holds another by then.
+    #[test]
+    fn one_look_keeps_its_picture() {
+        let Ok(gpu) = d3d::Gpu::new() else {
+            eprintln!("no graphics card: skipped");
+            return;
+        };
+        let latest = d3d::Latest::new(&gpu, 8, 8).unwrap();
+        let quad = quad::Quad::new(&gpu).unwrap();
+        let mut blend = FrameBlend::new(&gpu, &latest, 1).unwrap();
+        fill(&gpu, &latest, 1.0);
+        blend.hold(&quad, &latest);
+        blend.add(0, 1.0);
+        // Two more pictures: the second is copied over the white one.
+        fill(&gpu, &latest, 0.0);
+        blend.hold(&quad, &latest);
+        fill(&gpu, &latest, 0.5);
+        blend.hold(&quad, &latest);
+        blend.finish(&quad, 0);
+        assert_eq!(read(&gpu, &blend.average), 255, "frame 0 is the white picture its look saw");
     }
 
     /// A frame whose looks all saw one picture is that picture as it is,

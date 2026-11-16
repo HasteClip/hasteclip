@@ -244,7 +244,7 @@ impl Blender {
 
     /// `picture` is the one that's up now.
     pub(crate) fn hold(&mut self, picture: Arc<Buffer>) {
-        self.flush();
+        self.flush(None);
         self.pictures += 1;
         self.held = Some((picture, self.pictures));
     }
@@ -286,13 +286,17 @@ impl Blender {
         }
     }
 
-    /// Mix the looks at the picture that's up into the averages, at once:
-    /// the picture is kept until the GPU is done with it.
-    fn flush(&mut self) {
+    /// Mix the looks at the picture that's up into the averages (`only`
+    /// that one of `slots`), at once: the picture is kept until the GPU is
+    /// done with it. A frame made mixes in only its own looks: the next
+    /// frame's (a source ahead of another starts it before this one is made)
+    /// wait for the next picture, so a next frame all of whose looks see this
+    /// one is still this picture as it is.
+    fn flush(&mut self, only: Option<usize>) {
         let Some((held, _)) = self.held.clone() else { return };
         // Mixing in by its share of the total so far keeps it the average.
         let mut mixes = Vec::new();
-        for (i, s) in self.slots.iter_mut().enumerate().filter(|(_, s)| s.frame.is_some() && s.pending > 0.0) {
+        for (i, s) in self.slots.iter_mut().enumerate().filter(|(i, s)| only.is_none_or(|o| o == *i) && s.frame.is_some() && s.pending > 0.0) {
             let weight = std::mem::take(&mut s.pending);
             s.weight += weight;
             mixes.push((i, weight / s.weight));
@@ -335,7 +339,7 @@ impl Blender {
             (self.made_work, self.made) = (None, n);
             return Some(picture);
         }
-        self.flush();
+        self.flush(Some(i));
         let s = &mut self.slots[i];
         s.frame = None;
         if s.weight == 0.0 {

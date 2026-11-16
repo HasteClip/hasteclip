@@ -8,15 +8,16 @@
 /// Wakes whoever waits on several captures at once (a frame pacer, blending
 /// the recording's own capture and each Display and Window source, each on
 /// its own) when any of them has a new picture: each capture it's given to
-/// rings it.
+/// rings it. Windows and macOS; Linux's pacer wakes on the recording's own
+/// capture and takes the other sources' pictures, timed, as it goes.
 #[derive(Default)]
-#[cfg_attr(not(any(target_os = "windows", target_os = "macos", target_os = "linux")), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
 pub(crate) struct Bell {
     rung: std::sync::Mutex<u64>,
     wake: std::sync::Condvar,
 }
 
-#[cfg_attr(not(any(target_os = "windows", target_os = "macos", target_os = "linux")), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
 impl Bell {
     /// How many times it's been rung.
     pub(crate) fn rung(&self) -> u64 {
