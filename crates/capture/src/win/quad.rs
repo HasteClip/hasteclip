@@ -243,9 +243,11 @@ impl Quad {
     /// Draw all of `source` (sRGB) over `target` (a float texture, in light),
     /// as light, `weight` of it and the rest what's there: with weights 1,
     /// 1/2, 1/3 … the target is the average of the pictures' light, which is
-    /// what a screen showing them in turn gives off.
-    pub(crate) fn average_light(&self, gpu: &Gpu, target: &ID3D11RenderTargetView, size: (u32, u32), source: &ID3D11ShaderResourceView, weight: f32) {
-        self.run(gpu, target, size, source, &whole(size), Shader::ToLight, Some(weight));
+    /// what a screen showing them in turn gives off. Both are `size`, and
+    /// only `area` of it from the top left corner is drawn (a window's
+    /// picture, in a texture with room for a display's).
+    pub(crate) fn average_light(&self, gpu: &Gpu, target: &ID3D11RenderTargetView, size: (u32, u32), source: &ID3D11ShaderResourceView, weight: f32, area: (u32, u32)) {
+        self.run(gpu, target, size, source, &whole(size, area), Shader::ToLight, Some(weight));
     }
 
     /// Draw `source`, an HDR desktop's light (scRGB), where `at` says, as
@@ -255,9 +257,10 @@ impl Quad {
         self.run(gpu, target, size, source, at, Shader::FromHdr(scale), None);
     }
 
-    /// Draw all of `source` (light) into `target`, back as sRGB.
-    pub(crate) fn from_light(&self, gpu: &Gpu, target: &ID3D11RenderTargetView, size: (u32, u32), source: &ID3D11ShaderResourceView) {
-        self.run(gpu, target, size, source, &whole(size), Shader::FromLight, None);
+    /// Draw all of `source` (light) into `target`, back as sRGB: both
+    /// `size`, only `area` of it drawn (as `average_light`).
+    pub(crate) fn from_light(&self, gpu: &Gpu, target: &ID3D11RenderTargetView, size: (u32, u32), source: &ID3D11ShaderResourceView, area: (u32, u32)) {
+        self.run(gpu, target, size, source, &whole(size, area), Shader::FromLight, None);
     }
 
     /// Whether `now` and `before` (both `size` valid, as big as their
@@ -359,12 +362,13 @@ pub(crate) fn fit_within(w: u32, h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
     (((w as f64 * scale) as u32).max(2) & !1, ((h as f64 * scale) as u32).max(2) & !1)
 }
 
-/// All of a target `size` pixels big.
-fn whole(size: (u32, u32)) -> Placement {
+/// All of a source onto all of a target the same `size` (pixel for pixel),
+/// only `area` of it from the top left corner drawn.
+fn whole(size: (u32, u32), area: (u32, u32)) -> Placement {
     Placement {
         dest: [0.0, 0.0, size.0 as f32, size.1 as f32],
         uv: [0.0, 0.0, 1.0, 1.0],
-        clip: RECT { left: 0, top: 0, right: size.0 as i32, bottom: size.1 as i32 },
+        clip: RECT { left: 0, top: 0, right: area.0.min(size.0) as i32, bottom: area.1.min(size.1) as i32 },
         turns: 0,
     }
 }

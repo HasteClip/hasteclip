@@ -314,12 +314,12 @@ impl StreamBlend {
     /// The pacer's frame, added (each the same in the average).
     fn add(&mut self, gpu: &d3d::Gpu) {
         self.count += 1;
-        self.quad.average_light(gpu, &self.light.0, self.size, &self.from, 1.0 / self.count as f32);
+        self.quad.average_light(gpu, &self.light.0, self.size, &self.from, 1.0 / self.count as f32, self.size);
     }
 
     /// The stream frame's done: its average, for the converter.
     fn finish(&mut self, gpu: &d3d::Gpu, content: (u32, u32)) {
-        self.quad.from_light(gpu, &self.out_target, self.size, &self.light.1);
+        self.quad.from_light(gpu, &self.out_target, self.size, &self.light.1, self.size);
         self.out.mark_frame(content);
         self.count = 0;
     }
@@ -344,10 +344,10 @@ impl Capture for Session {
             let (width, height) = crate::output_size(self.size.0, self.size.1, r.short_side);
             let setup = h264::Setup { fps: r.fps, kbps: r.kbps, hardware: from.hardware, export: false, stream: Some(i) };
             let encoder = h264::Encoder::start_with(&from.gpu, width, height, setup, self.writer_tx.clone())?;
-            let direct = d3d::Converter::new(&from.gpu, &from.average, camera(), &encoder.pool.textures, true, width, height, r.fps, from.screen.clone())?;
+            let direct = d3d::Converter::new(&from.gpu, &from.average, camera(), true, &encoder.pool.textures, true, width, height, r.fps, from.screen.clone())?;
             let blended = if every > 1 {
                 let b = StreamBlend::new(&from.gpu, &from.average)?;
-                let c = d3d::Converter::new(&from.gpu, &b.out, camera(), &encoder.pool.textures, true, width, height, r.fps, from.screen.clone())?;
+                let c = d3d::Converter::new(&from.gpu, &b.out, camera(), true, &encoder.pool.textures, true, width, height, r.fps, from.screen.clone())?;
                 Some((b, c))
             } else {
                 None
@@ -454,9 +454,11 @@ impl Session {
             // game's pictures drifted past each other.
             let looks = s.blend_samples.max(1);
             let shutter = crate::shutter::Shutter::new(looks, s.blend_shape);
-            let blend = FrameBlend::new(&gpu, &latest, looks, shutter.frames_open())?;
+            let blend = FrameBlend::new(&gpu, &latest, looks)?;
             latest.set_wants_queue(true);
-            let converter = d3d::Converter::new(&gpu, &blend.average, overlay.clone(), &encoder.pool.textures, true, width, height, s.fps, s.screen.clone())?;
+            // Each Display and Window source drawn from its own blend, as
+            // the recording's own capture is (see `Source`).
+            let converter = d3d::Converter::new(&gpu, &blend.average, overlay.clone(), true, &encoder.pool.textures, true, width, height, s.fps, s.screen.clone())?;
             let preview = d3d::Previewer::new(&gpu, &latest, overlay, width, height, s.fps, s.screen.clone(), crate::preview::new_producer())?;
             session.stream_from = Some(StreamFrom {
                 gpu: gpu.clone(),
@@ -466,7 +468,7 @@ impl Session {
                 hardware: s.use_hardware,
             });
             let ctl = PacerCtl { blend: session.blend_ctl.clone(), stream: session.stream_ctl.clone() };
-            session.pacer = Some(spawn_blend_pacer(s.fps, looks, shutter, latest, blend, converter, encoder, preview, Some(feeds), clock, ctl));
+            session.pacer = Some(spawn_blend_pacer(s.fps, looks, shutter, latest, blend, converter, encoder, preview, Some(feeds), s.screen.clone(), clock, ctl)?);
             Ok(())
         })();
         if let Err(e) = started {
@@ -486,6 +488,10 @@ impl Session {
         let looks = looks.max(1);
         *self.blend_ctl.lock().unwrap() = Some((looks, shape));
         let rate = self.fps * looks;
+        // Displays and windows shown too, as fast as the looks.
+        if let Some(from) = &self.stream_from {
+            from.feeds.set_fps(rate);
+        }
         if self.switch.as_ref().is_some_and(|sw| sw.fps != rate) {
             if let Some(sw) = &mut self.switch {
                 sw.fps = rate;
@@ -1572,163 +1578,259 @@ fn spawn_aac(track: usize, mut enc: AacEncoder, rx: mpsc::Receiver<Vec<f32>>, ou
 ///
 /// Looks are taken a while after their time (at least `BLEND_LATE`, longer
 /// while pictures come in later), so that pictures noticed late still count.
+///
+/// One for each source the frames are made of (see [`Source`]): the
+/// recording's own capture, and each Display and Window source. The work
+/// follows the pictures each shows: a frame all of whose looks saw one
+/// picture is that picture, copied as it is (or not even copied, when the
+/// frame before was it too), so a still source costs nothing; and only a
+/// picture's own size is drawn (a window's, in a texture with room for the
+/// biggest display). Its draws are the pacer's [`quad::Quad`]'s, given to
+/// each call: one set of shaders for every source.
+///
+/// Each frame being made has an average of its own ([`Slot`]), taken as the
+/// frame's first look comes: one at a time blended evenly, two softly, and
+/// one more while another source's looks are behind this one's (each
+/// source's looks are kept halfway between its own pictures, a fraction of a
+/// look from another's, so one can start a frame before another has
+/// finished the one before).
 struct FrameBlend {
-    quad: quad::Quad,
     gpu: d3d::Gpu,
-    /// The picture that's up: a copy of the capture's newest (for one it puts
-    /// up without queueing, a still), or one it handed over whole
-    /// (`Queued`); and its valid size.
-    own: Arc<d3d::Latest>,
-    own_view: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
-    held_view: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
-    /// Keeps a handed-over picture's texture from going away.
-    held_keep: Option<windows::Win32::Graphics::Direct3D11::ID3D11Texture2D>,
-    held_size: (u32, u32),
-    /// The averages being made, as light (16-bit float, so faint ghosts and
-    /// dark colours keep their precision): one per frame open at once, by
-    /// its number (even and odd, blended softly). None with one look a
-    /// frame: the picture is copied as it is.
-    light: Vec<(windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView, windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView)>,
+    /// Copies of the capture's newest picture, for one it puts up without
+    /// queueing (a still): two, taken in turn, so a frame being made keeps
+    /// the one its looks saw while the next comes up.
+    own: [(windows::Win32::Graphics::Direct3D11::ID3D11Texture2D, windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView); 2],
+    next_own: usize,
+    /// The picture that's up: a copy (`own`) or one the capture handed over
+    /// whole (`Queued`).
+    held: Seen,
+    /// The size every texture here is (the capture's).
+    size: (u32, u32),
+    /// Whether frames are blended (more than one look a frame), so each
+    /// average is made as light.
+    blending: bool,
+    /// The averages of the frames being made, and those let go of (kept
+    /// to make the next ones in).
+    slots: Vec<Slot>,
+    /// The one `average` is, as it is, if it's one picture (see `finish`).
+    copied: Option<u64>,
     /// The finished frame, back in sRGB: the converter reads it.
     average: Arc<d3d::Latest>,
     target: windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView,
-    /// Per average: the looks' weight in it so far.
-    weight: [f32; 2],
-    /// Per average: the weight of looks at the picture that's up not added
-    /// yet: added in one draw when another comes up or the frame is done (a
-    /// game slower than the blend rate is seen several times in a row; one
-    /// draw each was a full-size pass per look).
-    pending: [f32; 2],
 }
+
+/// A picture a look can see: a number for each that's come up, its texture
+/// (kept from going away: a queued picture's) and a view to draw it from,
+/// and its valid size from the top left corner.
+#[derive(Clone)]
+struct Seen {
+    id: u64,
+    texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+    view: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
+    size: (u32, u32),
+}
+
+/// One frame's average being made ([`FrameBlend`]).
+struct Slot {
+    /// The frame (none: free for the next).
+    frame: Option<i64>,
+    /// The average as light (16-bit float, so faint ghosts and dark colours
+    /// keep their precision); none with one look a frame.
+    light: Option<(windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView, windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView)>,
+    /// The looks' weight in it so far, and the weight of looks at the
+    /// picture that's up not added yet: added in one draw when another
+    /// comes up or the frame is done (a game slower than the blend rate is
+    /// seen several times in a row; one draw each was a full-size pass per
+    /// look).
+    weight: f32,
+    pending: f32,
+    /// How much of it its pictures cover, from the top left corner (all
+    /// that's drawn of it), and the size of the picture its last look saw
+    /// (the frame's).
+    area: (u32, u32),
+    size: (u32, u32),
+    /// The picture its first look saw: all of them did, while nothing's
+    /// been mixed into it (`weight` is 0).
+    first: Option<Seen>,
+}
+
+/// The most frames made at once: two blended softly, and one more for
+/// another source's looks behind (see [`FrameBlend`]).
+const SLOTS_MOST: usize = 4;
 
 impl FrameBlend {
     /// `looks` a frame (one is timing alone: each frame the picture that was
-    /// up at its time), `open` frames made at once.
-    fn new(gpu: &d3d::Gpu, latest: &Arc<d3d::Latest>, looks: u32, open: usize) -> Result<Self> {
-        let average = d3d::Latest::new(gpu, latest.width, latest.height)?;
-        let own = d3d::Latest::new(gpu, latest.width, latest.height)?;
-        let own_view = quad::shader_view(gpu, &own.texture)?;
+    /// up at its time).
+    fn new(gpu: &d3d::Gpu, latest: &Arc<d3d::Latest>, looks: u32) -> Result<Self> {
         use windows::Win32::Graphics::Direct3D11::{D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_DEFAULT};
+        let size = (latest.width, latest.height);
+        let average = d3d::Latest::new(gpu, size.0, size.1)?;
         let bind = (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32;
-        let light = (0..if looks > 1 { open.clamp(1, 2) } else { 0 })
-            .map(|_| {
-                let t = gpu.texture(latest.width, latest.height, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT, bind, D3D11_USAGE_DEFAULT, 0)?;
-                Ok((quad::target_view(gpu, &t)?, quad::shader_view(gpu, &t)?))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let own = || -> Result<_> {
+            let t = gpu.texture(size.0, size.1, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM, bind, D3D11_USAGE_DEFAULT, 0)?;
+            let view = quad::shader_view(gpu, &t)?;
+            Ok((t, view))
+        };
+        let own = [own()?, own()?];
         Ok(Self {
-            light,
-            quad: quad::Quad::new(gpu)?,
             gpu: gpu.clone(),
-            held_view: own_view.clone(),
-            own_view,
+            held: Seen { id: 0, texture: own[0].0.clone(), view: own[0].1.clone(), size },
             own,
-            held_keep: None,
-            held_size: (latest.width, latest.height),
+            next_own: 0,
+            size,
+            blending: looks > 1,
+            slots: Vec::new(),
+            copied: None,
             target: quad::target_view(gpu, &average.texture)?,
             average,
-            weight: [0.0; 2],
-            pending: [0.0; 2],
         })
     }
 
-    /// Blend `looks` a frame from now on, `open` frames made at once: the
-    /// averages it needs made (or let go of), every frame being made
-    /// started again.
-    fn set_looks(&mut self, looks: u32, open: usize) -> Result<()> {
-        let want = if looks > 1 { open.clamp(1, 2) } else { 0 };
-        if self.light.len() != want {
-            use windows::Win32::Graphics::Direct3D11::{D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_DEFAULT};
-            let bind = (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32;
-            let (w, h) = (self.own.width, self.own.height);
-            self.light = (0..want)
-                .map(|_| {
-                    let t = self.gpu.texture(w, h, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT, bind, D3D11_USAGE_DEFAULT, 0)?;
-                    Ok((quad::target_view(&self.gpu, &t)?, quad::shader_view(&self.gpu, &t)?))
-                })
-                .collect::<Result<Vec<_>>>()?;
+    /// Blend `looks` a frame from now on: every frame being made started
+    /// again (its averages made anew if they're made another way).
+    fn set_looks(&mut self, looks: u32) {
+        if self.blending != (looks > 1) {
+            self.blending = looks > 1;
+            self.slots.clear();
         }
         self.drop_all();
-        Ok(())
     }
 
-    /// Which average frame `k` is made in.
-    fn slot(&self, k: i64) -> usize {
-        k.rem_euclid(self.light.len().max(1) as i64) as usize
+    /// Frame `k`'s average, if it's being made.
+    fn slot(&mut self, k: i64) -> Option<&mut Slot> {
+        self.slots.iter_mut().find(|s| s.frame == Some(k))
+    }
+
+    /// Frame `k`'s average, made (or taken from those let go of) if it
+    /// isn't being made. None if it can't be (no room on the graphics card,
+    /// or too many frames at once: its looks are let go of).
+    fn slot_for(&mut self, k: i64) -> Option<&mut Slot> {
+        if let Some(i) = self.slots.iter().position(|s| s.frame == Some(k)) {
+            return self.slots.get_mut(i);
+        }
+        let i = match self.slots.iter().position(|s| s.frame.is_none()) {
+            Some(i) => i,
+            None if self.slots.len() < SLOTS_MOST => {
+                let light = if self.blending {
+                    use windows::Win32::Graphics::Direct3D11::{D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_DEFAULT};
+                    let bind = (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32;
+                    let made = self.gpu.texture(self.size.0, self.size.1, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT, bind, D3D11_USAGE_DEFAULT, 0).and_then(|t| Ok((quad::target_view(&self.gpu, &t)?, quad::shader_view(&self.gpu, &t)?)));
+                    match made {
+                        Ok(l) => Some(l),
+                        Err(e) => {
+                            eprintln_later!("frame blending: {e:#}");
+                            return None;
+                        }
+                    }
+                } else {
+                    None
+                };
+                self.slots.push(Slot { frame: None, light, weight: 0.0, pending: 0.0, area: (0, 0), size: (0, 0), first: None });
+                self.slots.len() - 1
+            }
+            None => return None,
+        };
+        let s = &mut self.slots[i];
+        (s.frame, s.weight, s.pending, s.first) = (Some(k), 0.0, 0.0, None);
+        Some(s)
     }
 
     /// The capture's newest picture is the one that's up now (copied).
-    fn hold(&mut self, latest: &d3d::Latest) {
-        self.flush();
-        unsafe { self.gpu.context.CopyResource(&self.own.texture, &latest.texture) };
-        self.held_view = self.own_view.clone();
-        self.held_keep = None;
-        self.held_size = latest.content();
+    fn hold(&mut self, quad: &quad::Quad, latest: &d3d::Latest) {
+        self.flush(quad);
+        let (texture, view) = self.own[self.next_own].clone();
+        self.next_own = (self.next_own + 1) % self.own.len();
+        unsafe { self.gpu.context.CopyResource(&texture, &latest.texture) };
+        self.held = Seen { id: self.held.id + 1, texture, view, size: latest.content() };
     }
 
     /// The same, for a picture the capture handed over whole.
-    fn hold_queued(&mut self, q: d3d::Queued) {
-        self.flush();
-        self.held_view = q.view;
-        self.held_keep = Some(q.texture);
-        self.held_size = q.size;
+    fn hold_queued(&mut self, quad: &quad::Quad, q: d3d::Queued) {
+        self.flush(quad);
+        self.held = Seen { id: self.held.id + 1, texture: q.texture, view: q.view, size: q.size };
     }
 
     /// Add a look at the picture that's up to frame `k`'s average, by `weight`.
     fn add(&mut self, k: i64, weight: f32) {
-        let i = self.slot(k);
-        self.pending[i] += weight;
+        let held = self.held.clone();
+        if let Some(s) = self.slot_for(k) {
+            s.size = held.size;
+            if s.weight + s.pending == 0.0 {
+                s.first = Some(held);
+            }
+            s.pending += weight;
+        }
     }
 
     /// No looks in frame `k` so far (no picture has come up yet).
     fn is_empty(&self, k: i64) -> bool {
-        let i = self.slot(k);
-        self.weight[i] + self.pending[i] == 0.0
+        self.slots.iter().find(|s| s.frame == Some(k)).is_none_or(|s| s.weight + s.pending == 0.0)
     }
 
-    /// Frame `k` is skipped: its looks are let go of unmixed, and its
-    /// average starts empty for the frame after next (the picture that's up
-    /// stays up).
+    /// Frame `k` is skipped: its looks are let go of unmixed (the picture
+    /// that's up stays up).
     fn drop_frame(&mut self, k: i64) {
-        let i = self.slot(k);
-        self.weight[i] = 0.0;
-        self.pending[i] = 0.0;
+        if let Some(s) = self.slot(k) {
+            s.frame = None;
+        }
     }
 
     /// Every frame being made is skipped.
     fn drop_all(&mut self) {
-        self.weight = [0.0; 2];
-        self.pending = [0.0; 2];
+        for s in &mut self.slots {
+            s.frame = None;
+        }
     }
 
     /// Mix the looks at the picture that's up into the averages, at once.
-    fn flush(&mut self) {
-        for i in 0..2 {
-            let weight = std::mem::take(&mut self.pending[i]);
-            if weight == 0.0 {
-                continue;
-            }
-            self.weight[i] += weight;
+    fn flush(&mut self, quad: &quad::Quad) {
+        let (size, held) = (self.size, &self.held);
+        for s in self.slots.iter_mut().filter(|s| s.frame.is_some() && s.pending > 0.0) {
+            let weight = std::mem::take(&mut s.pending);
+            let first = s.weight == 0.0;
+            s.weight += weight;
+            let (w, h) = held.size;
+            s.area = if first { (w, h) } else { (s.area.0.max(w), s.area.1.max(h)) };
             // Mixing in by its share of the total so far keeps it the average.
-            if let Some((target, _)) = self.light.get(i) {
-                self.quad.average_light(&self.gpu, target, (self.own.width, self.own.height), &self.held_view, weight / self.weight[i]);
+            if let Some((target, _)) = &s.light {
+                quad.average_light(&self.gpu, target, size, &held.view, weight / s.weight, s.area);
             }
         }
     }
 
-    /// Frame `k` is done: its average is ready for the converter, and starts
-    /// empty for the frame after next. Not for an empty one (see `is_empty`).
-    fn finish(&mut self, k: i64) {
-        self.flush();
-        let i = self.slot(k);
-        match self.light.get(i) {
-            Some((_, view)) => self.quad.from_light(&self.gpu, &self.target, (self.own.width, self.own.height), view),
-            // One look: the picture itself.
-            None => unsafe { self.gpu.context.CopyResource(&self.average.texture, self.held_keep.as_ref().unwrap_or(&self.own.texture)) },
-        }
-        self.average.mark_frame(self.held_size);
-        self.weight[i] = 0.0;
+    /// Frame `k` is done: its average is ready for the converter, and it's
+    /// let go of. Not for an empty one (see `is_empty`).
+    fn finish(&mut self, quad: &quad::Quad, k: i64) {
+        let Some(i) = self.slots.iter().position(|s| s.frame == Some(k)) else { return };
+        let s = &self.slots[i];
+        // One look a frame: the picture it saw, as it is. Or every look saw
+        // the picture that's up, none's mixed in yet: that, as it is, no
+        // blending to do. Copied, unless the frame before was it too.
+        let one = if !self.blending { s.first.clone() } else { s.first.clone().filter(|_| s.weight == 0.0 && s.pending > 0.0) };
+        let shown = match one {
+            Some(seen) => {
+                if self.copied != Some(seen.id) {
+                    let (w, h) = seen.size;
+                    let region = windows::Win32::Graphics::Direct3D11::D3D11_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 };
+                    unsafe { self.gpu.context.CopySubresourceRegion(&self.average.texture, 0, 0, 0, 0, &seen.texture, 0, Some(&region)) };
+                    self.copied = Some(seen.id);
+                }
+                seen.size
+            }
+            None => {
+                self.flush(quad);
+                let s = &self.slots[i];
+                if let Some((_, view)) = &s.light {
+                    quad.from_light(&self.gpu, &self.target, self.size, view, s.area);
+                }
+                self.copied = None;
+                s.size
+            }
+        };
+        self.average.mark_frame(shown);
+        self.slots[i].frame = None;
     }
+
 }
 
 /// How long after a frame's time it's made: the game capture knows a picture
@@ -1797,25 +1899,31 @@ impl Lateness {
 /// (16).
 const MAX_BEHIND: f64 = 0.25;
 
-struct BlendPacer {
-    t0: f64,
-    /// Frames a second.
-    fps: u32,
-    /// Seconds between looks (one over the blend rate), and looks per frame.
-    step: f64,
-    looks: i64,
-    /// Look `m` is at `t0 + phase + (m + 0.5) * step`; frame `k`'s own time
-    /// is looks `k * looks` to `(k + 1) * looks - 1`.
+/// One picture the frames are made of, blended and timed on its own (its
+/// [`FrameBlend`]): the recording's own capture, or a Display or Window
+/// source's (`crate::LayerSource::frame_blended`). Its looks take the
+/// picture it had up at their time, and are kept halfway between its own
+/// pictures (its `phase`): two sources' pictures needn't come at the same
+/// times (a 240 Hz display beside a 540 Hz one, a window that draws when it
+/// likes), so each is locked to its own. Every source's frame `k` is made of
+/// its looks `k * looks` on, each source's a fraction of a look apart.
+struct Source {
+    /// Its layer (`crate::Layer::id`; 0 is the recording's own capture).
+    id: u64,
+    /// What it is, for the log.
+    name: String,
+    latest: Arc<d3d::Latest>,
+    blend: FrameBlend,
+    /// Whether the frames show it, so its looks are added: a source taken
+    /// out of the scene is let go of, but the recording's own capture goes
+    /// on, its looks unadded, while the scene doesn't show it.
+    shown: bool,
+    /// Its look `m` is at `t0 + phase + (m + 0.5) * step` (see
+    /// `crate::shutter::follow_picture`), and its next look to take.
     phase: f64,
-    /// A picture the capture timed has come up (it set `phase`).
-    timed: bool,
-    /// Which frames each look counts toward.
-    shutter: crate::shutter::Shutter,
-    /// The next look to take.
     next: i64,
-    /// The last frame done (made, skipped or empty): later looks don't count
-    /// toward it.
-    closed: i64,
+    /// A picture its capture timed has come up (it set `phase`).
+    timed: bool,
     /// The picture that's up (a number for each, to count different ones),
     /// and the one the last look took.
     held: Option<u64>,
@@ -1823,9 +1931,128 @@ struct BlendPacer {
     last_taken: Option<u64>,
     /// Different pictures in the frame's own time so far.
     different: u32,
+    /// Changes put up some other way than queued (a still), as last seen.
+    others: u64,
+    /// Its pictures a second, lately (which source's are told, see
+    /// `BlendPacer::told`).
+    rate: Rate,
+    stats: SourceStats,
+}
+
+impl Source {
+    /// Its looks from look `next` on, starting at `phase`.
+    fn new(id: u64, name: String, latest: Arc<d3d::Latest>, blend: FrameBlend, phase: f64, next: i64) -> Self {
+        Self {
+            id,
+            name,
+            others: latest.others(),
+            latest,
+            blend,
+            shown: true,
+            phase,
+            next,
+            timed: false,
+            held: None,
+            pictures: 0,
+            last_taken: None,
+            different: 0,
+            rate: Rate::default(),
+            stats: SourceStats::new(),
+        }
+    }
+
+    /// Frame `k` is done: its blend made. One no look saw a picture of (it's
+    /// just been shown, or put in the scene) is its newest picture, as it
+    /// is; one whose capture has nothing to show (a window that closed)
+    /// leaves it out (a Display or Window source's: the recording's own
+    /// always has a picture).
+    fn finish(&mut self, quad: &quad::Quad, k: i64) {
+        if self.id != 0 && !self.latest.has_frame() {
+            self.blend.drop_frame(k);
+            self.blend.average.forget();
+            return;
+        }
+        if self.blend.is_empty(k) {
+            if self.held.is_none() {
+                self.hold_newest(quad);
+            }
+            if self.held.is_none() {
+                return;
+            }
+            self.blend.add(k, 1.0);
+        }
+        self.blend.finish(quad, k);
+    }
+
+    /// Its capture's newest picture is the one that's up (it's just come
+    /// into the frames, with no picture of its own yet), if it has one.
+    fn hold_newest(&mut self, quad: &quad::Quad) {
+        if self.latest.has_frame() {
+            self.blend.hold(quad, &self.latest);
+            self.pictures += 1;
+            self.held = Some(self.pictures);
+        }
+    }
+}
+
+/// A source's pictures a second, as of the last whole second.
+#[derive(Default)]
+struct Rate {
+    since: f64,
+    count: u32,
+    last: u32,
+}
+
+impl Rate {
+    /// A picture came at `now`.
+    fn note(&mut self, now: f64) {
+        if now - self.since >= 1.0 {
+            self.last = if now - self.since < 2.0 { self.count } else { 0 };
+            (self.since, self.count) = (now, 0);
+        }
+        self.count += 1;
+    }
+
+    /// Pictures in the last whole second, as of `now` (or so far, before one's gone by).
+    fn per_second(&self, now: f64) -> u32 {
+        match now - self.since {
+            gone if gone >= 2.0 => 0,
+            gone if gone >= 1.0 => self.count,
+            _ => self.last.max(self.count),
+        }
+    }
+}
+
+struct BlendPacer {
+    t0: f64,
+    /// Frames a second.
+    fps: u32,
+    /// Seconds between looks (one over the blend rate), and looks per frame.
+    step: f64,
+    looks: i64,
+    /// Which frames each look counts toward.
+    shutter: crate::shutter::Shutter,
+    /// The last frame done (made, skipped or empty): later looks don't count
+    /// toward it. A frame's done once every source has taken its looks.
+    closed: i64,
+    /// What the frames are made of: the recording's own capture first, then
+    /// each Display and Window source that shows (see [`Source`]).
+    sources: Vec<Source>,
+    /// The source whose pictures how the capture keeps up tells
+    /// (`crate::blend_sources`): the recording's own capture while the
+    /// scene shows it, else the one showing the most pictures.
+    told: u64,
+    /// Draws every source's blends.
+    quad: quad::Quad,
+    /// Rung by every shown source's capture when a picture comes.
+    bell: Arc<d3d::Bell>,
+    /// Where the recording's own capture goes in the frame (hidden: the
+    /// scene doesn't show it).
+    screen: crate::SharedScreen,
+    /// A frame was made since the sources last followed the layers.
+    follow_due: bool,
     /// How late pictures come in, lately.
     lateness: Lateness,
-    blend: FrameBlend,
     converter: d3d::Converter,
     encoder: h264::Encoder,
     preview: d3d::Previewer,
@@ -1994,13 +2221,27 @@ impl BlendPacer {
         (self.lateness.worst(host_now()) * 1.2 + 0.002).clamp(BLEND_LATE, BLEND_LATE_MAX)
     }
 
-    fn look_time(&self, m: i64) -> f64 {
-        self.t0 + self.phase + (m as f64 + 0.5) * self.step
+    /// When source `i`'s look `m` is.
+    fn look_time(&self, i: usize, m: i64) -> f64 {
+        self.t0 + self.sources[i].phase + (m as f64 + 0.5) * self.step
     }
 
-    /// When the next frame to make is done: its last look.
+    /// When frame `k` is done: every source's last look for it.
+    fn frame_done_at(&self, k: i64) -> f64 {
+        let last = self.shutter.last_look(k);
+        (0..self.sources.len()).map(|i| self.look_time(i, last)).fold(f64::MIN, f64::max)
+    }
+
+    /// When the next frame to make is done.
     fn frame_end(&self) -> f64 {
-        self.look_time(self.shutter.last_look(self.closed + 1))
+        self.frame_done_at(self.closed + 1)
+    }
+
+    /// Whether frames are made: once the recording's own capture has its
+    /// first picture (taken in, or there while the scene doesn't show it).
+    fn started(&self) -> bool {
+        let main = &self.sources[0];
+        main.held.is_some() || main.latest.has_frame()
     }
 
     /// Fallen more than `MAX_BEHIND` behind `t` (what looks are taken up
@@ -2011,16 +2252,20 @@ impl BlendPacer {
         if behind < MAX_BEHIND {
             return;
         }
-        // The first look not due yet, and its frame.
-        let due = ((t - self.t0 - self.phase) / self.step - 0.5).ceil() as i64;
+        // The first look not due yet (by the recording's own capture's),
+        // and its frame.
+        let due = ((t - self.t0 - self.sources[0].phase) / self.step - 0.5).ceil() as i64;
         let (frame, _) = self.shutter.split(due);
         let missed = frame - (self.closed + 1);
-        self.next = self.shutter.first_look(frame);
         self.closed = frame - 1;
-        self.different = 0;
-        self.blend.drop_all();
+        let first = self.shutter.first_look(frame);
+        for s in &mut self.sources {
+            s.next = first;
+            s.different = 0;
+            s.blend.drop_all();
+        }
         // Before the first picture, no frames would have been made.
-        if self.held.is_some() {
+        if self.started() {
             skipped(&mut self.dropped, missed as u64);
             self.stats.caught_up(missed as u32, behind);
             self.diag.caught_up += missed as u32;
@@ -2029,29 +2274,31 @@ impl BlendPacer {
 
     /// Blend `looks` a frame from the next frame on, weighed by `shape`:
     /// the frame under way is made from the looks it gets from now (at the
-    /// new rate), and the looks lock onto the pictures again.
+    /// new rate), and each source's looks lock onto its pictures again. Its
+    /// averages are made as frames come (see [`FrameBlend`]).
     fn change_blend(&mut self, looks: u32, shape: BlendShape) {
         let looks = looks.max(1);
         let shutter = crate::shutter::Shutter::new(looks, shape);
         if looks as i64 == self.looks && shutter == self.shutter {
             return;
         }
-        if let Err(e) = self.blend.set_looks(looks, shutter.frames_open()) {
-            eprintln_later!("frame blending couldn't change: {e:#}");
-            return;
+        for s in &mut self.sources {
+            s.blend.set_looks(looks);
         }
         let k = self.closed + 1;
         self.looks = looks as i64;
         self.step = 1.0 / (self.fps.max(1) * looks) as f64;
         self.shutter = shutter;
         // Frame `k`'s own time is where it was: looks `k * looks` on, at
-        // the new step. The first picture the capture times puts them
-        // halfway between pictures again.
-        self.phase = 0.0;
-        self.timed = false;
-        self.next = self.shutter.first_look(k);
-        self.different = 0;
+        // the new step. The first picture each capture times puts its
+        // looks halfway between its pictures again.
+        let first = self.shutter.first_look(k);
+        for s in &mut self.sources {
+            (s.phase, s.timed, s.next, s.different) = (0.0, false, first, 0);
+        }
+        self.follow_due = true;
         crate::blending(self.fps, looks);
+        self.say_sources();
         eprintln_later!("{}", if looks > 1 { format!("frame blending: {looks} looks a frame from now on") } else { "frame blending: off from now on".to_owned() });
     }
 
@@ -2074,37 +2321,146 @@ impl BlendPacer {
         });
     }
 
-    /// Take every look before `t`: each sees the picture that's up.
+    /// The Display and Window sources that show now, each blended on its
+    /// own: one that's come into the frames (shown, put in the scene, or
+    /// another display or window now) gets its blend, starting from its
+    /// newest picture; one that's gone is let go of. Then whether the scene
+    /// shows the recording's own capture, and whose pictures are told.
+    /// Once a frame, between pictures, never while one's being taken in
+    /// (the sources keep their places in the list meanwhile).
+    fn follow_layers(&mut self) {
+        let Some(feeds) = self.feeds.clone() else { return };
+        let want = feeds.frame_blended();
+        let mut i = 1;
+        while i < self.sources.len() {
+            let s = &self.sources[i];
+            if want.iter().any(|(id, latest, _)| *id == s.id && Arc::ptr_eq(latest, &s.latest)) {
+                i += 1;
+                continue;
+            }
+            let s = self.sources.remove(i);
+            eprintln_later!("frame blending: {} isn't shown, no longer blended", s.name);
+            self.let_go(s);
+        }
+        for (id, latest, name) in want {
+            if self.sources.iter().any(|s| s.id == id) {
+                continue;
+            }
+            match FrameBlend::new(&self.sources[0].blend.gpu, &latest, self.looks as u32) {
+                Ok(blend) => {
+                    latest.set_source(id);
+                    latest.set_bell(Some(self.bell.clone()));
+                    latest.set_wants_queue(true);
+                    feeds.set_blend(id, Some(blend.average.clone()));
+                    // Its looks from the frame under way, where the
+                    // recording's own capture's are, till its first picture
+                    // puts them halfway between its own.
+                    let main = &self.sources[0];
+                    let mut s = Source::new(id, name, latest, blend, main.phase, main.next);
+                    s.hold_newest(&self.quad);
+                    eprintln_later!("frame blending: {} shown, blended on its own", s.name);
+                    self.sources.push(s);
+                }
+                Err(e) => eprintln_later!("frame blending of {name}: {e:#}"),
+            }
+        }
+        // The recording's own capture, while the scene shows it: else its
+        // looks would be blended for nothing, and its pictures copied for
+        // the blend for nothing (all of a 540 Hz display's, while anything
+        // on it moves), each waking the pacer (which, measured, made
+        // another display's pictures come in less evenly). It goes on
+        // meanwhile, so it shows again at once, from its newest picture.
+        let main_shown = feeds.layers().iter().any(|l| matches!(l.source, crate::LayerSource::Main)) && !self.screen.lock().unwrap().hidden;
+        let main = &mut self.sources[0];
+        if main.shown != main_shown {
+            main.shown = main_shown;
+            main.different = 0;
+            main.latest.set_wants_queue(main_shown);
+            main.latest.set_bell(main_shown.then(|| self.bell.clone()));
+            if main_shown {
+                main.hold_newest(&self.quad);
+            } else {
+                drop(main.latest.drain_queue());
+            }
+        }
+        // Whose pictures are told: the recording's own capture's while it
+        // shows, else those of the source showing the most (the first of
+        // those showing as many).
+        let now = host_now();
+        let busiest = self.sources[1..].iter().fold(None::<&Source>, |b, s| if b.is_some_and(|b| b.rate.per_second(now) >= s.rate.per_second(now)) { b } else { Some(s) });
+        self.told = if main_shown { 0 } else { busiest.map_or(0, |s| s.id) };
+        self.say_sources();
+    }
+
+    /// A Display or Window source the frames don't show anymore: its
+    /// capture's pictures aren't queued for it, and frames draw it from its
+    /// newest picture.
+    fn let_go(&self, s: Source) {
+        s.latest.set_wants_queue(false);
+        s.latest.set_bell(None);
+        drop(s.latest.drain_queue());
+        if let Some(f) = &self.feeds {
+            f.set_blend(s.id, None);
+        }
+    }
+
+    /// Which sources the looks are at, and whose pictures are told, for how
+    /// the capture keeps up (`crate::health`).
+    fn say_sources(&self) {
+        crate::blend_sources(self.sources.iter().filter(|s| s.shown).count(), self.told);
+    }
+
+    /// Take every look before `t`, each source's: each sees the picture it
+    /// has up. Then the frames every source has taken its looks for are made.
     fn look_until(&mut self, t: f64) {
+        for i in 0..self.sources.len() {
+            self.take_looks(i, t);
+        }
+        self.close_done();
+        self.stats.log(&mut self.sources, self.looks as u32, self.told);
+    }
+
+    /// Take source `i`'s looks before `t`.
+    fn take_looks(&mut self, i: usize, t: f64) {
         let mut burst = 0;
-        while self.look_time(self.next) < t && burst < 10_000 {
-            self.look();
+        while self.look_time(i, self.sources[i].next) < t && burst < 10_000 {
+            self.look(i);
             burst += 1;
         }
     }
 
-    fn look(&mut self) {
-        let (first, weights) = self.shutter.split(self.next);
-        if let Some(id) = self.held {
+    /// Source `i`'s next look: the picture it has up, added to the frames
+    /// the look counts toward, if the frames show it.
+    fn look(&mut self, i: usize) {
+        let (looks, closed) = (self.looks, self.closed);
+        let s = &mut self.sources[i];
+        let (first, weights) = self.shutter.split(s.next);
+        if s.shown
+            && let Some(id) = s.held
+        {
             for (k, weight) in [(first, weights[0]), (first + 1, weights[1])] {
-                if k > self.closed && weight > 0.0 {
-                    self.blend.add(k, weight);
+                if k > closed && weight > 0.0 {
+                    s.blend.add(k, weight);
                 }
             }
-            if self.last_taken != Some(id) {
-                self.different += 1;
-                self.last_taken = Some(id);
+            if s.last_taken != Some(id) {
+                s.different += 1;
+                s.last_taken = Some(id);
             }
         }
-        self.next += 1;
-        if self.next % self.looks == 0 {
-            let different = std::mem::take(&mut self.different);
-            if self.held.is_some() {
-                self.stats.frame(different, self.looks as u32);
+        s.next += 1;
+        if s.next % looks == 0 {
+            let different = std::mem::take(&mut s.different);
+            if s.shown && s.held.is_some() {
+                s.stats.frame(different, looks as u32);
             }
         }
-        // The frames no later look counts toward are done.
-        let (first, _) = self.shutter.split(self.next);
+    }
+
+    /// The frames no source's later looks count toward are done: made.
+    fn close_done(&mut self) {
+        let Some(next) = self.sources.iter().map(|s| s.next).min() else { return };
+        let (first, _) = self.shutter.split(next);
         while self.closed < first - 1 {
             self.close(self.closed + 1);
         }
@@ -2113,9 +2469,10 @@ impl BlendPacer {
     /// Frame `k` is done: encode it.
     fn close(&mut self, k: i64) {
         self.closed = k;
+        self.follow_due = true;
         let started = Instant::now();
-        let late = host_now() - self.look_time(self.shutter.last_look(k));
-        if self.blend.is_empty(k) {
+        let late = host_now() - self.frame_done_at(k);
+        if !self.started() {
             return;
         }
         let mut steps = CloseSteps::default();
@@ -2137,7 +2494,7 @@ impl BlendPacer {
         let streams_want = self.stream.iter().any(|s| s.wants(k, blending));
         match self.encoder.pool.take() {
             Some(slot) => {
-                self.blend.finish(k);
+                self.finish_sources(k);
                 steps.blend = took();
                 let converted = self.converter.convert(slot);
                 steps.convert = took();
@@ -2162,18 +2519,21 @@ impl BlendPacer {
             // takes it.
             None => {
                 if streams_want {
-                    self.blend.finish(k);
+                    self.finish_sources(k);
                 } else {
-                    self.blend.drop_frame(k);
+                    for s in &mut self.sources {
+                        s.blend.drop_frame(k);
+                    }
                 }
                 skipped(&mut self.dropped, 1);
                 self.diag.pool_empty += 1;
             }
         }
         if streams_want {
-            let content = self.blend.average.content();
+            let main = &self.sources[0].blend;
+            let content = main.average.content();
             for s in &mut self.stream {
-                s.frame(&self.blend.gpu, k, blending, content);
+                s.frame(&main.gpu, k, blending, content);
             }
         }
         let _ = took();
@@ -2181,58 +2541,156 @@ impl BlendPacer {
             eprintln_later!("preview: {e:#}");
         }
         steps.preview = took();
-        self.diag.frame(&self.blend.gpu, late, started.elapsed(), steps);
+        self.diag.frame(&self.sources[0].blend.gpu, late, started.elapsed(), steps);
     }
 
-    /// A new picture came up at `at`: the looks before it saw the one before.
-    /// Then the looks move toward halfway between pictures.
-    fn arrive(&mut self, at: f64, picture: Option<d3d::Queued>, latest: &d3d::Latest) {
-        crate::count_picture();
+    /// Frame `k` made of each source the frames show; the looks of one they
+    /// don't (the recording's own capture, out of the scene) let go of.
+    fn finish_sources(&mut self, k: i64) {
+        for s in &mut self.sources {
+            if s.shown {
+                s.finish(&self.quad, k);
+            } else {
+                s.blend.drop_frame(k);
+            }
+        }
+    }
+
+    /// Every source's pictures that came up since, in the order they did,
+    /// each taken in as it came (see `arrive`). A source's own pictures go
+    /// in the order its capture had them, whatever their times say.
+    fn take_pictures(&mut self) {
         let now = host_now();
-        self.lateness.note(now, now - at);
-        self.stats.wait = self.stats.wait.max(self.wait());
-        if at < self.look_time(self.next - 1) {
-            self.stats.late += 1;
-            crate::count_missed(1);
+        let mut came: Vec<(f64, usize, Option<d3d::Queued>)> = Vec::new();
+        for (i, s) in self.sources.iter_mut().enumerate() {
+            let mut last = f64::MIN;
+            for q in s.latest.drain_queue() {
+                last = last.max(q.at);
+                came.push((last, i, Some(q)));
+            }
+            // Put up some other way (a still): taken from the capture.
+            let others = s.latest.others();
+            if others != s.others {
+                s.others = others;
+                came.push((now.max(last), i, None));
+            }
         }
-        self.look_until(at);
-        // Pictures belong on whole steps of the looks (halfway between two);
-        // the first the capture timed puts them there.
-        let first = picture.is_some() && !self.timed;
-        self.timed |= picture.is_some();
-        self.phase = crate::shutter::follow_picture(self.phase, self.step, at - self.t0, first);
+        came.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (at, i, picture) in came {
+            self.arrive(i, at, picture);
+        }
+    }
+
+    /// A new picture of source `i` came up at `at`: its looks before it saw
+    /// the one before. Then its looks move toward halfway between its
+    /// pictures.
+    fn arrive(&mut self, i: usize, at: f64, picture: Option<d3d::Queued>) {
+        let (id, shown) = (self.sources[i].id, self.sources[i].shown);
+        let now = host_now();
+        // Only a source that shows is waited for and counted.
+        if shown {
+            crate::count_picture_of(id);
+            self.lateness.note(now, now - at);
+            self.stats.wait = self.stats.wait.max(self.wait());
+            if at < self.look_time(i, self.sources[i].next - 1) {
+                self.sources[i].stats.late += 1;
+                crate::count_missed_of(id, 1);
+            }
+        }
+        self.take_looks(i, at);
+        self.close_done();
+        // Pictures belong on whole steps of its looks (halfway between
+        // two); the first its capture timed puts them there.
+        let step = self.step;
+        let since = at - self.t0;
+        let s = &mut self.sources[i];
+        let first = picture.is_some() && !s.timed;
+        s.timed |= picture.is_some();
+        s.phase = crate::shutter::follow_picture(s.phase, step, since, first);
+        if picture.is_some() {
+            let steps = (since - s.phase) / step;
+            s.stats.timing.note(at, steps, step);
+        }
         match picture {
-            Some(q) => self.blend.hold_queued(q),
-            None => self.blend.hold(latest),
+            Some(q) => s.blend.hold_queued(&self.quad, q),
+            None => s.blend.hold(&self.quad, &s.latest),
         }
-        self.pictures += 1;
-        self.held = Some(self.pictures);
-        self.stats.pictures += 1;
+        s.pictures += 1;
+        s.held = Some(s.pictures);
+        s.stats.pictures += 1;
+        s.rate.note(now);
     }
 }
 
-/// What the blending saw, printed every few seconds (to the log): how many
-/// pictures the game showed, how many different ones each frame got (all its
-/// looks, when the game runs at least at the blend rate), how many came
-/// too late for their frame, and the frames skipped to catch up (and how
-/// far behind it was at most).
+/// What the blending saw, printed every few seconds (to the log), a line
+/// for each source the frames showed (see [`SourceStats`]); and the frames
+/// skipped to catch up (and how far behind it was at most).
 struct BlendStats {
     since: Instant,
-    pictures: u32,
-    frames: u32,
-    full: u32,
-    fewest: u32,
-    most: u32,
-    late: u32,
     caught_up: u32,
     behind: f64,
     /// The longest the looks waited for late pictures (see `BlendPacer::wait`).
     wait: f64,
 }
 
+/// One source's part of [`BlendStats`]: how many pictures it showed, how
+/// many different ones each frame got (all its looks, when it changes at
+/// least at the blend rate), and how many came too late for their frame.
+struct SourceStats {
+    pictures: u32,
+    frames: u32,
+    full: u32,
+    fewest: u32,
+    most: u32,
+    late: u32,
+    /// When its pictures came, with `HASTECLIP_BLEND_LOG=1`.
+    timing: Timing,
+}
+
+/// When a source's pictures came against the looks (`HASTECLIP_BLEND_LOG=1`
+/// logs it): how far apart, in looks (a quarter of one each), where between
+/// two looks each fell (a picture halfway between is right for the looks
+/// either side of it), and how many came before the one before them.
+#[derive(Default)]
+struct Timing {
+    last: Option<f64>,
+    apart: [u32; 9],
+    within: [u32; 4],
+    backwards: u32,
+}
+
+impl Timing {
+    /// A picture came at `at`, `steps` looks into the looks' time.
+    fn note(&mut self, at: f64, steps: f64, step: f64) {
+        if let Some(last) = self.last {
+            if at < last {
+                self.backwards += 1;
+            }
+            let apart = ((at - last).max(0.0) / step * 4.0) as usize;
+            self.apart[apart.min(8)] += 1;
+        }
+        self.last = Some(at);
+        self.within[((steps.rem_euclid(1.0) * 4.0) as usize).min(3)] += 1;
+    }
+}
+
+impl SourceStats {
+    fn new() -> Self {
+        Self { pictures: 0, frames: 0, full: 0, fewest: u32::MAX, most: 0, late: 0, timing: Timing::default() }
+    }
+
+    /// A frame's own looks are in: `different` pictures among them.
+    fn frame(&mut self, different: u32, looks: u32) {
+        self.frames += 1;
+        self.full += (different == looks) as u32;
+        self.fewest = self.fewest.min(different);
+        self.most = self.most.max(different);
+    }
+}
+
 impl BlendStats {
     fn new() -> Self {
-        Self { since: Instant::now(), pictures: 0, frames: 0, full: 0, fewest: u32::MAX, most: 0, late: 0, caught_up: 0, behind: 0.0, wait: 0.0 }
+        Self { since: Instant::now(), caught_up: 0, behind: 0.0, wait: 0.0 }
     }
 
     fn caught_up(&mut self, frames: u32, behind: f64) {
@@ -2240,34 +2698,56 @@ impl BlendStats {
         self.behind = self.behind.max(behind);
     }
 
-    fn frame(&mut self, different: u32, looks: u32) {
-        self.frames += 1;
-        self.full += (different == looks) as u32;
-        self.fewest = self.fewest.min(different);
-        self.most = self.most.max(different);
-        if self.since.elapsed() >= Duration::from_secs(5) {
+    /// Every few seconds: a line for each source the frames showed (and,
+    /// with `HASTECLIP_BLEND_LOG=1`, when its pictures came), then it
+    /// counts afresh. `told`: the source whose pictures the capture's
+    /// health tells.
+    fn log(&mut self, sources: &mut [Source], looks: u32, told: u64) {
+        let gone = self.since.elapsed();
+        if gone < Duration::from_secs(5) {
+            return;
+        }
+        let kind = if looks == 1 { "frame timing" } else { "frame blending" };
+        for s in sources.iter_mut() {
+            let st = std::mem::replace(&mut s.stats, SourceStats::new());
+            if st.frames == 0 {
+                continue;
+            }
+            let who = if s.id == 0 { format!("{kind}: the game") } else { format!("{kind} of {}: it", s.name) };
+            static TIMING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *TIMING.get_or_init(|| std::env::var_os("HASTECLIP_BLEND_LOG").is_some()) {
+                let t = &st.timing;
+                eprintln_later!(
+                    "{who}: its pictures by how far apart they came, in quarters of a look's time (0 to 8 and more), {:?}; by where between two looks each fell, in quarters from halfway between them (the middle two are near a look), {:?}; {} came before the one before{}",
+                    t.apart,
+                    t.within,
+                    t.backwards,
+                    if s.id == told { "; its pictures are told" } else { "" }
+                );
+            }
             // On the pacer: written by another thread.
             eprintln_later!(
-                "{}: the game showed {:.0} pictures/s; {looks} looks per frame, {}-{} different pictures in each, {:.0}% of frames with {looks}; {} pictures too late (waited up to {:.0} ms), over {} frames{}",
-                if looks == 1 { "frame timing" } else { "frame blending" },
-                self.pictures as f64 / self.since.elapsed().as_secs_f64(),
-                self.fewest,
-                self.most,
-                self.full as f64 * 100.0 / self.frames as f64,
-                self.late,
+                "{who} showed {:.0} pictures/s; {looks} looks per frame, {}-{} different pictures in each, {:.0}% of frames with {looks}; {} pictures too late (waited up to {:.0} ms), over {} frames{}",
+                st.pictures as f64 / gone.as_secs_f64(),
+                st.fewest,
+                st.most,
+                st.full as f64 * 100.0 / st.frames as f64,
+                st.late,
                 self.wait * 1000.0,
-                self.frames,
+                st.frames,
                 match self.caught_up {
-                    0 => String::new(),
-                    n => format!("; fell up to {:.2} s behind, skipped {n} frames to catch up", self.behind),
+                    n if n > 0 && s.id == 0 => format!("; fell up to {:.2} s behind, skipped {n} frames to catch up", self.behind),
+                    _ => String::new(),
                 }
             );
-            *self = Self::new();
         }
+        *self = Self::new();
     }
 }
 
-/// Like [`spawn_pacer`], for frame blending (see [`FrameBlend`]).
+/// Like [`spawn_pacer`], for frame blending (see [`FrameBlend`]): the
+/// recording's own capture's pictures from `latest`, blended by `blend`,
+/// and each Display and Window source's in `feeds` blended on its own.
 #[allow(clippy::too_many_arguments)]
 fn spawn_blend_pacer(
     fps: u32,
@@ -2279,9 +2759,11 @@ fn spawn_blend_pacer(
     encoder: h264::Encoder,
     preview: d3d::Previewer,
     feeds: Option<Arc<layers::Feeds>>,
+    screen: crate::SharedScreen,
     clock: Arc<Clock>,
     ctl: PacerCtl,
-) -> (Arc<AtomicBool>, JoinHandle<()>) {
+) -> Result<(Arc<AtomicBool>, JoinHandle<()>)> {
+    let quad = quad::Quad::new(&blend.gpu)?;
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
     let handle = thread::spawn(move || {
@@ -2289,22 +2771,22 @@ fn spawn_blend_pacer(
         crate::blending(fps, looks);
         let t0 = host_now();
         clock.set(t0);
+        let bell = Arc::new(d3d::Bell::default());
+        latest.set_bell(Some(bell.clone()));
         let mut p = BlendPacer {
             t0,
             fps,
             step: 1.0 / (fps.max(1) * looks.max(1)) as f64,
             looks: looks.max(1) as i64,
-            phase: 0.0,
-            timed: false,
             shutter,
-            next: 0,
             closed: -1,
-            held: None,
-            pictures: 0,
-            last_taken: None,
-            different: 0,
+            sources: vec![Source::new(0, "the recording's own capture".to_owned(), latest, blend, 0.0, 0)],
+            told: 0,
+            quad,
+            bell,
+            screen,
+            follow_due: true,
             lateness: Lateness::default(),
-            blend,
             converter,
             encoder,
             preview,
@@ -2314,41 +2796,40 @@ fn spawn_blend_pacer(
             stats: BlendStats::new(),
             diag: EncodeDiag::new(),
         };
-        if latest.has_frame() {
-            p.blend.hold(&latest);
-            p.held = Some(0);
-        }
-        let mut others = latest.others();
+        p.sources[0].hold_newest(&p.quad);
         while !stop2.load(Ordering::Relaxed) {
             // Frame blending changed, the stream started or stopped.
             if let Some((looks, shape)) = ctl.blend.lock().unwrap().take() {
                 p.change_blend(looks, shape);
             }
             p.take_stream(&ctl);
+            if std::mem::take(&mut p.follow_due) {
+                p.follow_layers();
+            }
             p.catch_up(host_now() - p.wait());
-            let (seen, _) = latest.arrivals();
+            // Rung by any source's capture once something new is there.
+            let rung = p.bell.rung();
             let wait = p.frame_end() + p.wait() - host_now();
-            if wait > 0.0 && latest.queue_len() == 0 {
-                latest.wait_for_frame(seen, Duration::from_secs_f64(wait.min(0.05)));
+            if wait > 0.0 && p.sources.iter().all(|s| s.latest.queue_len() == 0) {
+                p.bell.wait(rung, Duration::from_secs_f64(wait.min(0.05)));
             }
-            for q in latest.drain_queue() {
-                p.arrive(q.at, Some(q), &latest);
-            }
-            // Put up some other way (a still): take it from the capture.
-            let now_others = latest.others();
-            if now_others != others {
-                others = now_others;
-                p.arrive(host_now(), None, &latest);
-            }
+            p.take_pictures();
             // Looks whose time is past (and late pictures' too) see what's up.
             p.look_until(host_now() - p.wait());
         }
+        // The layers' captures queue no more pictures (they run on until
+        // the session's done with them).
+        let layers: Vec<Source> = p.sources.drain(1..).collect();
+        for s in layers {
+            p.let_go(s);
+        }
+        p.sources[0].latest.set_bell(None);
         for s in std::mem::take(&mut p.stream) {
             s.encoder.finish();
         }
         p.encoder.finish();
     });
-    (stop, handle)
+    Ok((stop, handle))
 }
 
 /// A frame went to the encoder: counted for the UI (the share skipped).
@@ -2404,23 +2885,105 @@ mod tests {
             return;
         };
         let latest = d3d::Latest::new(&gpu, 8, 8).unwrap();
-        let mut blend = FrameBlend::new(&gpu, &latest, 4, 2).unwrap();
+        let quad = quad::Quad::new(&gpu).unwrap();
+        let mut blend = FrameBlend::new(&gpu, &latest, 4).unwrap();
         fill(&gpu, &latest, 1.0);
-        blend.hold(&latest);
+        blend.hold(&quad, &latest);
         blend.add(0, 0.25);
         blend.add(1, 0.75);
         fill(&gpu, &latest, 0.0);
-        blend.hold(&latest);
+        blend.hold(&quad, &latest);
         blend.add(0, 0.75);
         blend.add(1, 0.25);
-        blend.finish(0);
+        blend.finish(&quad, 0);
         let first = read(&gpu, &blend.average);
-        blend.finish(1);
+        blend.finish(&quad, 1);
         let second = read(&gpu, &blend.average);
         // sRGB of 0.25 light is 0.537 (137), of 0.75 is 0.881 (225).
         assert!(first.abs_diff(137) <= 1, "{first}");
         assert!(second.abs_diff(225) <= 1, "{second}");
         assert!(blend.is_empty(2) && blend.is_empty(3), "both start empty again");
+    }
+
+    /// A source whose looks are ahead of another's starts the next frame
+    /// before the one before is made: each frame keeps its own looks,
+    /// blended evenly too (one average a frame, a measured clip had five
+    /// looks in some frames), and with one look a frame, each frame is the
+    /// picture its look saw.
+    #[test]
+    fn the_next_frame_starts_before_this_one_is_made() {
+        let Ok(gpu) = d3d::Gpu::new() else {
+            eprintln!("no graphics card: skipped");
+            return;
+        };
+        let latest = d3d::Latest::new(&gpu, 8, 8).unwrap();
+        let quad = quad::Quad::new(&gpu).unwrap();
+        for looks in [4, 1] {
+            let mut blend = FrameBlend::new(&gpu, &latest, looks).unwrap();
+            fill(&gpu, &latest, 1.0);
+            blend.hold(&quad, &latest);
+            for _ in 0..looks {
+                blend.add(0, 1.0);
+            }
+            // Frame 1's first looks, at a black picture, before frame 0 is made.
+            fill(&gpu, &latest, 0.0);
+            blend.hold(&quad, &latest);
+            blend.add(1, 1.0);
+            blend.finish(&quad, 0);
+            assert_eq!(read(&gpu, &blend.average), 255, "{looks} looks: frame 0 is its own white looks");
+            for _ in 1..looks {
+                blend.add(1, 1.0);
+            }
+            blend.finish(&quad, 1);
+            assert_eq!(read(&gpu, &blend.average), 0, "{looks} looks: frame 1 is its own black looks");
+            assert!(blend.is_empty(0) && blend.is_empty(1));
+        }
+    }
+
+    /// A frame whose looks all saw one picture is that picture as it is,
+    /// copied once: the next such frame of the same picture leaves the
+    /// blend as it is (a still source costs nothing). A frame of two
+    /// pictures is blended again.
+    #[test]
+    fn one_picture_is_copied_once() {
+        let Ok(gpu) = d3d::Gpu::new() else {
+            eprintln!("no graphics card: skipped");
+            return;
+        };
+        let latest = d3d::Latest::new(&gpu, 8, 8).unwrap();
+        let quad = quad::Quad::new(&gpu).unwrap();
+        let mut blend = FrameBlend::new(&gpu, &latest, 4).unwrap();
+        fill(&gpu, &latest, 0.5);
+        blend.hold(&quad, &latest);
+        for k in 0..2 {
+            for _ in 0..4 {
+                blend.add(k, 1.0);
+            }
+            blend.finish(&quad, k);
+            assert_eq!(blend.copied, Some(blend.held.id), "frame {k}: the picture as it is");
+            let grey = read(&gpu, &blend.average);
+            assert!(grey.abs_diff(128) <= 1, "frame {k}: {grey}");
+        }
+        // Drawn over behind its back: a copy again would undo that, so
+        // it's seen whether frame 2 copies.
+        fill(&gpu, &blend.average, 0.0);
+        for _ in 0..4 {
+            blend.add(2, 1.0);
+        }
+        blend.finish(&quad, 2);
+        assert_eq!(read(&gpu, &blend.average), 0, "not copied again: it's the frame before's");
+        // Half the frame white: blended, as light.
+        blend.add(3, 1.0);
+        blend.add(3, 1.0);
+        fill(&gpu, &latest, 1.0);
+        blend.hold(&quad, &latest);
+        blend.add(3, 1.0);
+        blend.add(3, 1.0);
+        blend.finish(&quad, 3);
+        assert_eq!(blend.copied, None);
+        // Half of sRGB 0.5's light (0.216) and half of 1: 0.608, sRGB 0.80 (205).
+        let mixed = read(&gpu, &blend.average);
+        assert!(mixed.abs_diff(205) <= 1, "{mixed}");
     }
 
     /// A fullscreen game that's seen is looked at again 5 s on, then twice as
