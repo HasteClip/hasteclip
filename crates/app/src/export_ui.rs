@@ -5,11 +5,11 @@
 //! they come back when the clip is opened again.
 //!
 //! Its inputs follow ui_kit's rules, as Settings' do: Resolution, Frame
-//! rate and Quality are picked from a menu (Original, Auto, the common
-//! ones, the levels), and Custom… puts a box beside it for a number of your
-//! own; Fit under is always a number, typed straight in. The resolution and
-//! frame rate menus are shared with Free up space's "Make them smaller"
-//! (`free_up.rs`).
+//! rate and Quality are picked from a menu (Original, the common ones, the
+//! levels, and Auto for the resolution while a size decides it), and
+//! Custom… puts a box beside it for a number of your own; Fit under is
+//! always a number, typed straight in. The resolution and frame rate menus
+//! are shared with Free up space's "Make them smaller" (`free_up.rs`).
 
 use media::{BlendShape, ClipInfo, Crop, Edit, Output};
 
@@ -201,8 +201,9 @@ pub(crate) fn rows(ui: &mut egui::Ui, info: &ClipInfo, edit: &mut Edit, form: Fo
         o.video_kbps.and_then(|k| LEVELS.iter().position(|l| level_kbps(w, h, fps, l.1) == k))
     };
     let level = level_of(o);
-    // While a size decides, Auto picks the resolution and rate (each with
-    // the other as it's set), and Original keeps the clip's own.
+    // While a size decides, Auto picks the resolution (for the frame rate as
+    // it's set), and Original keeps the clip's own. A size never picks the
+    // frame rate: it's the clip's own unless a lower one is chosen.
     let sized = o.max_mb.is_some();
     let ph = o.picture(info).1;
     let src = info.fps.round() as u32;
@@ -216,9 +217,8 @@ pub(crate) fn rows(ui: &mut egui::Ui, info: &ClipInfo, edit: &mut Edit, form: Fo
         }
     });
     row(ui, "Frame rate", &mut |ui| {
-        let auto_f = Output { fps: None, ..*o }.frame_rate(info).round() as u32;
-        let firsts = (sized.then(|| auto(format!("{auto_f} fps"), auto_f < src)), original(format!("{src} fps")));
-        if let Some(f) = fps_choice(ui, &id("fps"), o.fps, src, o.frame_rate(info).round() as u32, firsts, "any frame rate") {
+        let own = Choice::new("Original").shown(format!("Original ({src} fps)")).note(format!("{src} fps"));
+        if let Some(f) = fps_choice(ui, &id("fps"), o.fps, src, o.frame_rate(info).round() as u32, own, "any frame rate") {
             o.fps = f;
         }
     });
@@ -261,8 +261,8 @@ pub(crate) fn rows(ui: &mut egui::Ui, info: &ClipInfo, edit: &mut Edit, form: Fo
     }
 
     // Either the quality decides how big it comes out, or a size does (and
-    // then the quality, and the resolution and rate left on Auto, follow).
-    // Capped, it's always a size.
+    // then the quality, and the resolution left on Auto, follow). Capped,
+    // it's always a size.
     if form.cap_mb.is_none() {
         row(ui, "Aim for", &mut |ui| {
             let opts = [
@@ -354,15 +354,17 @@ pub(crate) fn height_choice(ui: &mut egui::Ui, id: &str, now: Option<u32>, pictu
     Some(picked(chosen, &heights, picture_h, has_auto, |h| h / 2 * 2))
 }
 
-/// A frame rate, as [`height_choice`] a resolution: the clip's own is `src`.
-pub(crate) fn fps_choice(ui: &mut egui::Ui, id: &str, now: Option<u32>, src: u32, at: u32, (auto, original): (Option<Choice>, Choice), custom: &str) -> Option<Option<u32>> {
+/// A frame rate, as [`height_choice`] a resolution but with no Auto (a
+/// size to fit under never picks it): Original (the clip's own, `src`), a
+/// common rate below it, or any rate of your own. The new rate when it
+/// changes (`None`: Original).
+pub(crate) fn fps_choice(ui: &mut egui::Ui, id: &str, now: Option<u32>, src: u32, at: u32, original: Choice, custom: &str) -> Option<Option<u32>> {
     let rates: Vec<u32> = RATES.into_iter().filter(|&f| f < src).collect();
-    let has_auto = auto.is_some();
-    let mut choices: Vec<Choice> = auto.into_iter().chain([original]).collect();
+    let mut choices = vec![original];
     choices.extend(rates.iter().map(|f| Choice::new(format!("{f} fps"))));
     let field = ChoiceField { id, choices, custom: Some(Custom { unit: "fps", range: 1..=src.max(1), note: custom }), width: FIELD_W };
-    let chosen = field.show(ui, choice_of(now, &rates, src, has_auto), now.filter(|&f| f < src).unwrap_or(at))?;
-    Some(picked(chosen, &rates, src, has_auto, |f| f))
+    let chosen = field.show(ui, choice_of(now, &rates, src, false), now.filter(|&f| f < src).unwrap_or(at))?;
+    Some(picked(chosen, &rates, src, false, |f| f))
 }
 
 /// The quality: Original (the recording's, `own` kbps), one of `levels`
