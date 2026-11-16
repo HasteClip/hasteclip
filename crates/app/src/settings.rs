@@ -1889,6 +1889,24 @@ impl RecordSettings {
         capture::ScreenPlacement { rect, framing, in_front: self.screen_in_front(), hidden, crop, turns: s.turns % 4, flip_h: s.flip_h, flip_v: s.flip_v }
     }
 
+    /// The Display source drawn from the recording's own capture, instead
+    /// of a capture of its own, while the screen doesn't show in the scene
+    /// shown (taken out of it, or turned off): the one furthest back that
+    /// shows `display`, the display that capture records. It then has all
+    /// the screen has (frame blending, frame timing, the game capture
+    /// hook), which a capture of its own doesn't (issue #64). None while
+    /// the screen shows: it's drawn there.
+    pub fn recorded_visual(&self, display: &str) -> Option<u64> {
+        let order = self.layer_order();
+        if self.screen.enabled && order.contains(&LayerKey::Screen) {
+            return None;
+        }
+        order.iter().rev().find_map(|l| match l {
+            LayerKey::Visual(key) => self.visual(*key).filter(|d| d.enabled && matches!(&d.visual, Visual::Display { id, .. } if id == display)).map(|d| d.key),
+            _ => None,
+        })
+    }
+
     pub fn blend_samples(&self) -> u32 {
         if self.blend_fps == 0 { 1 } else { (self.blend_fps as f64 / self.fps.max(1) as f64).round().max(1.0) as u32 }
     }
@@ -4100,6 +4118,29 @@ mod scene_tests {
         assert!(!back.layer_order().contains(&LayerKey::Screen));
         assert!(s.add_to_scene(LayerKey::Screen));
         assert!(!s.screen_placement().hidden);
+    }
+
+    /// A Display source of the display the screen records, in a scene
+    /// without the screen (or with it off), is drawn from the screen's own
+    /// capture, frame blending and all (issue #64): the one furthest back.
+    /// Not while the screen shows, nor one of another display, nor one
+    /// that's off.
+    #[test]
+    fn a_display_in_the_screens_stead_is_drawn_from_its_capture() {
+        let mut s = setup();
+        let display = |key, id: &str| VisualCfg::new(key, Visual::Display { id: id.into(), name: id.into() });
+        s.visuals.extend([display(3, "D1"), display(4, "D2"), display(5, "D1")]);
+        s.layer_order = vec![LayerKey::Visual(5), LayerKey::Visual(4), LayerKey::Visual(3), LayerKey::Screen];
+        assert_eq!(s.recorded_visual("D1"), None, "the screen shows: it's drawn there");
+        s.screen.enabled = false;
+        assert_eq!(s.recorded_visual("D1"), Some(3), "the screen off: the one furthest back");
+        s.screen.enabled = true;
+        assert!(!s.remove_from_scene(LayerKey::Screen));
+        assert_eq!(s.recorded_visual("D1"), Some(3), "a scene without the screen");
+        assert_eq!(s.recorded_visual("D2"), Some(4));
+        assert_eq!(s.recorded_visual("D3"), None, "none shows the display it records");
+        s.visual_mut(3).unwrap().enabled = false;
+        assert_eq!(s.recorded_visual("D1"), Some(5), "one that's off isn't drawn");
     }
 
     /// Copied and pasted into another scene, sources are the same ones
