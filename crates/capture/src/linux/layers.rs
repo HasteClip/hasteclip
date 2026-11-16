@@ -140,6 +140,8 @@ pub(crate) type StackKey = (Vec<(u64, u64, Place, bool)>, bool, Vec<(u64, u64, P
 /// The layers' pictures, for one capture (the recording's, or the preview's).
 pub(crate) struct Feeds {
     layers: SharedLayers,
+    /// The layers as `stack` last had them.
+    last: Vec<Layer>,
     /// The capture's frame rate (a web page is drawn up to it).
     fps: u32,
     /// Each layer's own picture source, by layer id (none for the main
@@ -212,7 +214,28 @@ impl Feed {
 
 impl Feeds {
     pub(crate) fn new(layers: SharedLayers, fps: u32) -> Self {
-        Self { layers, fps, feeds: Vec::new() }
+        Self { layers, last: Vec::new(), fps, feeds: Vec::new() }
+    }
+
+    /// The layers frame blended with the recording's own picture, each on
+    /// its own (see `super::blend`), as `stack` last had them: each Display
+    /// and Window source that shows (`LayerSource::frame_blended`) and has
+    /// its capture, the capture's pictures and the number its pictures'
+    /// numbers start from, and what it is, for the log.
+    pub(crate) fn frame_blended(&self) -> Vec<(u64, Arc<super::screen::Latest>, u64, String)> {
+        self.last
+            .iter()
+            .filter(|l| l.shown() && l.source.frame_blended())
+            .filter_map(|l| {
+                let (capture, what) = match self.feeds.iter().find(|(id, _)| *id == l.id).map(|(_, f)| f)? {
+                    Feed::Display { id, capture } => (capture, format!("display {id}")),
+                    Feed::Window { app, capture } => (capture, format!("window {app}")),
+                    _ => return None,
+                };
+                let (latest, base) = capture.latest()?;
+                Some((l.id, latest, base, what))
+            })
+            .collect()
     }
 
     /// Follow the layer list (a picture for each layer added or changed,
@@ -220,6 +243,7 @@ impl Feeds {
     pub(crate) fn stack(&mut self) -> Stack {
         let layers = self.layers.lock().map(|l| l.clone()).unwrap_or_default();
         self.follow(&layers);
+        self.last = layers.clone();
         let mut stack = Stack::default();
         for l in &layers {
             if matches!(l.source, LayerSource::Main) {
@@ -354,6 +378,14 @@ impl CaptureFeed {
         let shared2 = shared.clone();
         let _ = thread::Builder::new().name("layer capture".into()).spawn(move || capture_loop(&target, &shared2));
         Self { shared, app, seen: AtomicU64::new(0) }
+    }
+
+    /// Its capture's pictures, while it has one, and the number its
+    /// pictures' numbers start from (see `picture`).
+    fn latest(&self) -> Option<(Arc<super::screen::Latest>, u64)> {
+        let screen = self.shared.screen.lock().ok()?;
+        let (s, base) = screen.as_ref()?;
+        Some((s.latest.clone(), *base))
     }
 
     /// Its newest picture, and its number.

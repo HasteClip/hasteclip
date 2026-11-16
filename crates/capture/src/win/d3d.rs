@@ -286,34 +286,7 @@ pub(crate) struct Latest {
     gpu: Gpu,
 }
 
-/// Wakes whoever waits on several captures (the frame pacer, blending the
-/// recording's own capture and each Display and Window source) when any of
-/// them has a new picture: each capture it's given to rings it.
-#[derive(Default)]
-pub(crate) struct Bell {
-    rung: Mutex<u64>,
-    wake: std::sync::Condvar,
-}
-
-impl Bell {
-    /// How many times it's been rung.
-    pub(crate) fn rung(&self) -> u64 {
-        *self.rung.lock().unwrap()
-    }
-
-    fn ring(&self) {
-        *self.rung.lock().unwrap() += 1;
-        self.wake.notify_all();
-    }
-
-    /// Wait until it's rung more than `seen` times, or `timeout`.
-    pub(crate) fn wait(&self, seen: u64, timeout: std::time::Duration) {
-        let rung = self.rung.lock().unwrap();
-        if *rung == seen {
-            let _ = self.wake.wait_timeout(rung, timeout);
-        }
-    }
-}
+pub(crate) use crate::shutter::Bell;
 
 /// A picture that came up, kept for the frame blending: its own texture.
 pub(crate) struct Queued {

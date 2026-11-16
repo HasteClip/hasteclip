@@ -175,6 +175,12 @@ impl Latest {
         self.arrivals.lock().unwrap().get_or_insert_with(Default::default);
     }
 
+    /// Keep them no more (a Display or Window source no longer blended),
+    /// and let go of those kept.
+    pub(crate) fn stop_queueing(&self) {
+        self.arrivals.lock().unwrap().take();
+    }
+
     /// The pictures arrived since the last drain, oldest first.
     pub(crate) fn drain(&self) -> Vec<Arrival> {
         self.arrivals.lock().unwrap().as_mut().map(|q| q.drain(..).collect()).unwrap_or_default()

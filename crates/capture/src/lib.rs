@@ -1153,7 +1153,7 @@ pub struct Devices {
 /// pictures that came up meanwhile were too late for their frames (one
 /// repeated, the next skipped). A terminal holds a writer for as long as text
 /// in it is selected.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub(crate) fn log_later(line: String) {
     static WRITER: std::sync::OnceLock<Option<std::sync::mpsc::Sender<String>>> = std::sync::OnceLock::new();
     let writer = WRITER.get_or_init(|| {
@@ -1300,7 +1300,7 @@ pub(crate) fn count_skipped(n: u64) {
 
 /// Frame blending got one of the screen's pictures (the recording's own
 /// capture's).
-#[cfg_attr(target_os = "windows", allow(dead_code))]
+#[cfg_attr(any(target_os = "windows", target_os = "macos"), allow(dead_code))]
 pub(crate) fn count_picture() {
     count_picture_of(0);
 }
@@ -1331,7 +1331,7 @@ pub(crate) fn count_missed_of(id: u64, n: u64) {
 /// its own), and source `told`'s pictures are told (its layer's id: see
 /// [`BlendHealth::told`]): said again after [`blending`], which starts from
 /// one, the recording's own capture.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub(crate) fn blend_sources(count: usize, told: u64) {
     HISTORY.lock().unwrap().set_sources(count, told);
 }
@@ -1395,9 +1395,10 @@ pub struct BlendSecond {
 
 /// Whether a Display or Window source is blended (and timed) with the
 /// recording's own capture, each on its own ([`LayerSource::frame_blended`]):
-/// on Windows. Elsewhere only the recording's own capture is, and the other
-/// sources show their newest picture each frame.
-pub const BLEND_EVERY_SOURCE: bool = cfg!(target_os = "windows");
+/// on Windows and macOS, and on Linux wherever frame blending is
+/// ([`frame_blending`]). Elsewhere only the recording's own capture is, and
+/// the other sources show their newest picture each frame.
+pub const BLEND_EVERY_SOURCE: bool = cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux"));
 
 /// How the running capture keeps up: its last whole second, counted each
 /// second from its start, as a frame rate counter would. None before a

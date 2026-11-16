@@ -498,6 +498,12 @@ impl Feed {
         self.0.source.read().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Whether `latest` is its pictures (a display's capture is shared by
+    /// whoever shows it: a Display source of the display it records).
+    fn is(&self, latest: &Arc<screen::Latest>) -> bool {
+        matches!(&*self.source(), Source::Screen(s) if Arc::ptr_eq(&s.latest, latest))
+    }
+
     /// A picture number of the source's as one of ours.
     fn ours(&self, seq: u64) -> u64 {
         let n = seq + self.0.base.load(Ordering::Relaxed);
@@ -831,6 +837,11 @@ struct Picture {
     /// The other layers' pictures, and what of them shows now.
     feeds: layers::Feeds,
     stack: layers::Stack,
+    /// Each Display and Window source frame blended on its own: its layer's
+    /// id, and its blend for the frame being made (with a number that's
+    /// another whenever it's another picture), drawn in its stead (see
+    /// `blend`).
+    blends: Vec<(u64, layers::Pixels, u64)>,
     /// What the canvas shows: the screen picture's number, where it went,
     /// and the other layers' (`Stack::key`).
     shows: Option<(u64, crate::ScreenPlacement, layers::StackKey)>,
@@ -846,15 +857,21 @@ impl Picture {
         let gpu = screen::gpu_frames().map(|g| gpu_frame::GpuPicture::new(g, width, height, placed));
         let mut canvas = if gpu.is_some() { Canvas::new(0, 0) } else { Canvas::new(width, height) };
         canvas.clear();
-        Self { feed, width, height, canvas, gpu, screen, feeds: layers::Feeds::new(layers, fps), stack: layers::Stack::main_only(), shows: None, nv12: Vec::new(), version: 0 }
+        Self { feed, width, height, canvas, gpu, screen, feeds: layers::Feeds::new(layers, fps), stack: layers::Stack::main_only(), blends: Vec::new(), shows: None, nv12: Vec::new(), version: 0 }
     }
 
     /// Where the screen goes now (hidden when the list hasn't it: a scene
     /// without the screen), and what of the other layers shows: on the
     /// card, for the frames made there next (a set of layers that changed
-    /// is drawn again).
+    /// is drawn again). A layer with a blend (`blends`) shows that.
     fn layers(&mut self) -> crate::ScreenPlacement {
         self.stack = self.feeds.stack();
+        for l in self.stack.under.iter_mut().chain(self.stack.over.iter_mut()) {
+            if let Some((_, pixels, seq)) = self.blends.iter().find(|(id, ..)| *id == l.id) {
+                l.pixels = pixels.clone();
+                l.seq = *seq;
+            }
+        }
         let mut placed = *self.screen.lock().unwrap();
         placed.hidden |= !self.stack.main;
         if let Some(g) = &mut self.gpu {
@@ -1240,6 +1257,7 @@ impl Timing {
             }
             Timing::Plain { .. } => None,
             Timing::Blend(b) if looks == 1 => {
+                b.let_go_of_layers(pace);
                 if let Some(g) = &mut pace.picture.gpu {
                     g.stop_blending();
                 }

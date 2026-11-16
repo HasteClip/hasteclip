@@ -58,12 +58,14 @@ pub(crate) struct Latest {
     /// Nothing's being recorded: the away screen (or black) shows.
     waiting: AtomicBool,
     /// For frame blending, which needs every picture and when it came up,
-    /// not just the newest.
+    /// not just the newest (the pacer waits for them on `bell`).
     arrivals: Mutex<Arrivals>,
-    arrived: Condvar,
     /// Where the newest pictures have what they show, by picture: they're
     /// made into frames a little after they come up.
     drawn: Mutex<VecDeque<(Weak<Buffer>, Drawn)>>,
+    /// Rung with each change of the picture, for a pacer that waits on it
+    /// and on other sources' captures too (`crate::shutter::Bell`).
+    bell: Mutex<Option<Arc<crate::shutter::Bell>>>,
 }
 
 /// Pictures as they come up, numbered: `seq` counts every change of the
@@ -107,7 +109,7 @@ impl Latest {
             q.push_back(Arrival { at, seq, buffer: b });
         }
         drop(a);
-        self.arrived.notify_all();
+        self.ring();
     }
 
     /// The picture was put up some other way (the away screen): all of it
@@ -117,7 +119,24 @@ impl Latest {
         self.note(&b, Drawn { at: [0, 0, w as u32, h as u32], shows: None });
         *self.frame.lock().unwrap() = Some(b);
         self.arrivals.lock().unwrap().seq += 1;
-        self.arrived.notify_all();
+        self.ring();
+    }
+
+    fn ring(&self) {
+        if let Some(bell) = self.bell.lock().unwrap().as_ref() {
+            bell.ring();
+        }
+    }
+
+    /// Ring `bell` with each change of the picture from now on (none: stop).
+    pub(crate) fn set_bell(&self, bell: Option<Arc<crate::shutter::Bell>>) {
+        *self.bell.lock().unwrap() = bell;
+    }
+
+    /// Keep no pictures for blending from now on (the scene doesn't show it),
+    /// and let go of those kept.
+    pub(crate) fn stop_queueing(&self) {
+        self.arrivals.lock().unwrap().queue = None;
     }
 
     /// Where `b` has what it shows, kept for the newest few pictures (as
@@ -158,12 +177,6 @@ impl Latest {
     /// The number of the newest change of the picture.
     pub(crate) fn seq(&self) -> u64 {
         self.arrivals.lock().unwrap().seq
-    }
-
-    /// Wait up to `timeout` for a change after `seen`.
-    pub(crate) fn wait(&self, seen: u64, timeout: Duration) {
-        let a = self.arrivals.lock().unwrap();
-        let _ = self.arrived.wait_timeout_while(a, timeout, |a| a.seq <= seen);
     }
 
     /// The pictures that came up since the last call, oldest first.
@@ -1097,10 +1110,30 @@ impl Frames {
         Some(self.make(screen))
     }
 
+    /// The other layers' pictures (the pacer blends each Display and Window
+    /// source's on its own: see `super::blend`).
+    pub(crate) fn feeds(&mut self) -> &mut Feeds {
+        &mut self.feeds
+    }
+
+    /// Whether the frames show the recording's own picture: it's in the
+    /// layers (as they were last made) and not hidden.
+    pub(crate) fn main_shown(&self) -> bool {
+        self.feeds.shows_main() && !self.screen.lock().unwrap().hidden
+    }
+
     /// The frame to encode from `screen` (the newest picture, or a blend of
     /// several): as is when it fills the frame and nothing else shows, else
     /// made by the compositor, every layer where it's placed, in order.
     pub(crate) fn make(&mut self, screen: Arc<Buffer>) -> Arc<Buffer> {
+        self.make_with(screen, &[])
+    }
+
+    /// As [`Self::make`], each layer in `blends` drawn from the picture
+    /// given for it (a Display or Window source's blend for this frame: its
+    /// layer's id, the picture, and a number that's another whenever the
+    /// picture is), not its newest, while its capture has one.
+    pub(crate) fn make_with(&mut self, screen: Arc<Buffer>, blends: &[(u64, Arc<Buffer>, u64)]) -> Arc<Buffer> {
         let placed = *self.screen.lock().unwrap();
         // Filling the frame (or covering it), ScreenCaptureKit puts the
         // picture in as the placement says; in a box, all of it, cut to the
@@ -1113,7 +1146,13 @@ impl Frames {
             fit_window = display.is_none() && framing == crate::Framing::Fit;
         }
         let streamed = if self.ctl.is_some() { as_streamed(&placed, display) } else { placed.is_whole() && !placed.transformed() };
-        let layers = self.feeds.update();
+        let mut layers = self.feeds.update();
+        for (l, shown) in layers.iter_mut() {
+            if let (Some(s), Some((_, picture, version))) = (shown.as_mut(), blends.iter().find(|(id, ..)| *id == l.id)) {
+                s.picture = picture.clone();
+                s.version = *version;
+            }
+        }
         let (w, h) = size_of(&screen.0);
         let set = self.ctl.as_ref().map_or([0, 0, w as u32, h as u32], |c| c.picture_rect());
         let (picture, goes) = screen_place(self.latest.drawn(&screen), fit_window, set, (w as u32, h as u32));

@@ -2302,7 +2302,12 @@ impl App {
         // With several, one source's pictures are told: the screen's while
         // the scene shows it, else the busiest's.
         let shown = if several { self.capture_layer_title(b.told) } else { "The screen".to_owned() };
-        let tip = format!("Each {fps} fps frame blends {} looks at {looks_at}, whether or not anything changed: in the last second, {blended}. {shown} showed {pictures} in it: {each}", b.looks);
+        let mut tip = format!("Each {fps} fps frame blends {} looks at {looks_at}, whether or not anything changed: in the last second, {blended}. {shown} showed {pictures} in it: {each}", b.looks);
+        // Where only the screen is blended, a display or window shown is
+        // said not to be.
+        if !capture::BLEND_EVERY_SOURCE && self.layers_for_capture().iter().any(|l| l.source.frame_blended() && l.shown()) {
+            tip.push_str("\n\nDisplay and Window sources aren't blended on this system yet: each frame shows their newest picture.");
+        }
         ui.add_space(6.0);
         ui.add(egui::Label::new(theme::text(text, 13.0, theme::W::Medium).color(p.text3)).sense(egui::Sense::hover())).on_hover_text(tip);
     }

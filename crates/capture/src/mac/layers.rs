@@ -53,13 +53,16 @@ pub(crate) struct Shown {
 
 /// The layers' pictures, for one capture's frames.
 pub(crate) struct Feeds {
-    /// What the app wants drawn, bottom first.
+    /// What the app wants drawn, bottom first, and as `update` last had it.
     layers: SharedLayers,
+    last: Vec<Layer>,
     /// Each layer's own picture source, by layer id (none for the main
     /// picture).
     feeds: Vec<(u64, Feed)>,
-    /// The rate a display or window is captured at.
-    fps: u32,
+    /// The rate a display or window is captured at (the looks a second,
+    /// with frame blending), shared with the captures, which take up a
+    /// change.
+    fps: Arc<std::sync::atomic::AtomicU32>,
 }
 
 /// One layer's picture.
@@ -142,7 +145,35 @@ fn still_buffer(image: &crate::StillImage) -> Result<Arc<Buffer>> {
 
 impl Feeds {
     pub(crate) fn new(layers: SharedLayers, fps: u32) -> Self {
-        Self { layers, feeds: Vec::new(), fps }
+        Self { layers, last: Vec::new(), feeds: Vec::new(), fps: Arc::new(std::sync::atomic::AtomicU32::new(fps)) }
+    }
+
+    /// Displays and windows are captured at `fps` from now on (the looks a
+    /// second: frame blending changed).
+    pub(crate) fn set_fps(&self, fps: u32) {
+        self.fps.store(fps, Ordering::Relaxed);
+    }
+
+    /// The layers frame blended with the recording's own capture, each on
+    /// its own (see `super::blend`), as `update` last had them: each Display
+    /// and Window source that shows (`LayerSource::frame_blended`), its
+    /// capture's pictures, and what it is, for the log.
+    pub(crate) fn frame_blended(&self) -> Vec<(u64, Arc<Pictures>, String)> {
+        self.last
+            .iter()
+            .filter(|l| l.shown() && l.source.frame_blended())
+            .filter_map(|l| match self.feeds.iter().find(|(id, _)| *id == l.id).map(|(_, f)| f)? {
+                Feed::Display { id, capture } => Some((l.id, capture.pictures.clone(), format!("display {id}"))),
+                Feed::Window { app, capture } => Some((l.id, capture.pictures.clone(), format!("window {app}"))),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether the recording's own picture is in the frames, as `update`
+    /// last had the layers.
+    pub(crate) fn shows_main(&self) -> bool {
+        self.last.is_empty() || self.last.iter().any(|l| matches!(l.source, LayerSource::Main))
     }
 
     /// Follow the layer list: a picture for each layer added (or changed to
@@ -183,6 +214,7 @@ impl Feeds {
                 _ => {}
             }
         }
+        self.last = layers.clone();
         layers
             .into_iter()
             .map(|l| {
@@ -198,11 +230,11 @@ impl Feeds {
             LayerSource::Main => return Ok(None),
             LayerSource::Camera { device, .. } if device.is_empty() => return Ok(None),
             LayerSource::Camera { device, format, placement } => Feed::Camera { device: device.clone(), format: *format, layer: CameraLayer::new(device, *format, placement.is_hidden()) },
-            LayerSource::Display { id, .. } => Feed::Display { id: id.clone(), capture: Capture::start(Target::Display(id.clone()), self.fps) },
-            LayerSource::Window { app, .. } => Feed::Window { app: app.clone(), capture: Capture::start(Target::Window(app.clone()), self.fps) },
+            LayerSource::Display { id, .. } => Feed::Display { id: id.clone(), capture: Capture::start(Target::Display(id.clone()), self.fps.clone()) },
+            LayerSource::Window { app, .. } => Feed::Window { app: app.clone(), capture: Capture::start(Target::Window(app.clone()), self.fps.clone()) },
             LayerSource::Browser { url, width, height, css, .. } => {
                 let page = super::browser::Page::open(url.clone(), *width, *height, css.clone())?;
-                Feed::Browser { url: url.clone(), size: (*width, *height), css: css.clone(), capture: Capture::start(Target::Page(page), self.fps) }
+                Feed::Browser { url: url.clone(), size: (*width, *height), css: css.clone(), capture: Capture::start(Target::Page(page), self.fps.clone()) }
             }
             LayerSource::Picture { picture, .. } => Feed::Still { of: Still::Picture(picture.clone()), picture: still_buffer(&picture.0)? },
             LayerSource::Colour { rgba, .. } => {
@@ -245,17 +277,43 @@ fn frame_at(frames: &[(crate::StillImage, Duration)], t: Duration) -> usize {
 // Displays, windows and pages: ScreenCaptureKit streams of their own
 // ---------------------------------------------------------------------------
 
-/// The newest picture a stream (or a video) handed over, numbered.
+/// The newest picture a stream (or a video) handed over, numbered; and, for
+/// a Display or Window source the pacer blends (`super::blend`), every one
+/// as it comes, with when the screen showed it.
 #[derive(Default)]
 pub(crate) struct Pictures {
     latest: Mutex<Option<(Arc<Buffer>, u64)>>,
     seq: AtomicU64,
+    /// `None` until blending asks for them.
+    queue: Mutex<Option<std::collections::VecDeque<super::video::Arrival>>>,
+    /// Rung with each picture, for the pacer (while it blends it).
+    bell: Mutex<Option<Arc<crate::shutter::Bell>>>,
+    /// Which source it is to frame blending (its layer's id): pictures let
+    /// go of waiting count against it.
+    source: AtomicU64,
 }
 
+/// Pictures kept for blending before the oldest go (each holds one of the
+/// stream's buffers, of which it has a few): as the recording's own.
+const MAX_QUEUED: usize = 4;
+
 impl Pictures {
-    fn set(&self, picture: CFRetained<CVPixelBuffer>) {
+    /// A new picture, up at `at` (host seconds).
+    fn set(&self, picture: CFRetained<CVPixelBuffer>, at: f64) {
         let n = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
-        *self.latest.lock().unwrap() = Some((Arc::new(Buffer(picture)), n));
+        let picture = Arc::new(Buffer(picture));
+        *self.latest.lock().unwrap() = Some((picture.clone(), n));
+        if let Some(q) = self.queue.lock().unwrap().as_mut() {
+            if q.len() >= MAX_QUEUED {
+                // Frame blending fell behind: that picture missed its frame.
+                q.pop_front();
+                crate::count_missed_of(self.source.load(Ordering::Relaxed), 1);
+            }
+            q.push_back(super::video::Arrival { at, seq: n, buffer: picture });
+        }
+        if let Some(bell) = self.bell.lock().unwrap().as_ref() {
+            bell.ring();
+        }
     }
 
     /// Left out until the next: the window closed, the display went.
@@ -263,8 +321,30 @@ impl Pictures {
         self.latest.lock().unwrap().take();
     }
 
-    fn get(&self) -> Option<(Arc<Buffer>, u64)> {
+    pub(crate) fn get(&self) -> Option<(Arc<Buffer>, u64)> {
         self.latest.lock().unwrap().clone()
+    }
+
+    /// Kept for frame blending (source `id`, its layer's), each picture
+    /// ringing `bell`; or (none) no longer, and those kept let go of.
+    pub(crate) fn blend_as(&self, blend: Option<(u64, Arc<crate::shutter::Bell>)>) {
+        let mut queue = self.queue.lock().unwrap();
+        match blend {
+            Some((id, bell)) => {
+                self.source.store(id, Ordering::Relaxed);
+                queue.get_or_insert_with(Default::default);
+                *self.bell.lock().unwrap() = Some(bell);
+            }
+            None => {
+                *queue = None;
+                *self.bell.lock().unwrap() = None;
+            }
+        }
+    }
+
+    /// The pictures that came since the last call, oldest first.
+    pub(crate) fn drain(&self) -> Vec<super::video::Arrival> {
+        self.queue.lock().unwrap().as_mut().map_or_else(Vec::new, |q| q.drain(..).collect())
     }
 }
 
@@ -283,7 +363,10 @@ define_class!(
             if kind == SCStreamOutputType::Screen
                 && let Some(image) = unsafe { sample.image_buffer() }
             {
-                self.ivars().set(image);
+                // On the host clock, when the screen showed it (as the
+                // recording's own capture's).
+                let at = unsafe { sample.presentation_time_stamp().seconds() };
+                self.ivars().set(image, at);
             }
         }
     }
@@ -334,12 +417,18 @@ struct Running {
     window: Option<(u32, (f64, f64))>,
     /// A display's size (pixels) when it was set up.
     display: Option<(u32, (usize, usize))>,
+    /// Its stream's settings: its pictures' size, their rate, and whether
+    /// they're BGRA (a page's) and show the cursor.
+    size: (usize, usize),
     fps: u32,
     bgra: bool,
+    cursor: bool,
 }
 
 impl Capture {
-    fn start(target: Target, fps: u32) -> Self {
+    /// Captured at `rate` (pictures a second at most), which can change
+    /// while it runs.
+    fn start(target: Target, rate: Arc<std::sync::atomic::AtomicU32>) -> Self {
         let pictures = Arc::new(Pictures::default());
         let stop = Arc::new(AtomicBool::new(false));
         let (pictures2, stop2) = (pictures.clone(), stop.clone());
@@ -347,10 +436,10 @@ impl Capture {
             let name = target.name();
             let mut said = None::<String>;
             while !stop2.load(Ordering::Relaxed) {
-                match open(&target, fps, &pictures2) {
+                match open(&target, rate.load(Ordering::Relaxed), &pictures2) {
                     Ok(mut running) => {
                         said = None;
-                        while !stop2.load(Ordering::Relaxed) && keep(&mut running) {
+                        while !stop2.load(Ordering::Relaxed) && keep(&mut running, rate.load(Ordering::Relaxed)) {
                             thread::sleep(Duration::from_millis(100));
                         }
                         crate::sck::stop_capture(&running.stream);
@@ -433,15 +522,20 @@ fn open(target: &Target, fps: u32, pictures: &Arc<Pictures>) -> Result<Running> 
     unsafe { stream.addStreamOutput_type_sampleHandlerQueue_error(ProtocolObject::from_ref(&*output), SCStreamOutputType::Screen, Some(&queue)) }
         .map_err(|e| anyhow::anyhow!("can't capture it: {}", e.localizedDescription()))?;
     crate::sck::start_capture(&stream)?;
-    Ok(Running { stream, _output: output, _watch: watch, stopped, window, display, fps, bgra })
+    Ok(Running { stream, _output: output, _watch: watch, stopped, window, display, size: (w, h), fps, bgra, cursor })
 }
 
 /// Whether a running stream goes on: not stopped by the system, its window
 /// still there (set up again at its size, when that changed), its display
-/// the same size.
-fn keep(r: &mut Running) -> bool {
+/// the same size. Set up again at `fps` when that's another rate (frame
+/// blending changed).
+fn keep(r: &mut Running, fps: u32) -> bool {
     if r.stopped.take().is_some() {
         return false;
+    }
+    if fps != r.fps {
+        r.fps = fps;
+        reconfigure(r);
     }
     if let Some((id, size)) = r.window {
         let Some(now) = windows::windows(false).into_iter().find(|w| w.id == id).map(|w| (w.width, w.height)).or_else(|| (r.bgra).then_some(size)) else {
@@ -452,14 +546,8 @@ fn keep(r: &mut Running) -> bool {
             let Ok(content) = shareable_content() else { return true };
             let Some(sc) = unsafe { content.windows() }.iter().find(|w| unsafe { w.windowID() } == id) else { return false };
             let filter = unsafe { SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), &sc) };
-            let (w, h) = window_pixels(&filter, &content, unsafe { sc.frame() });
-            let config = layer_config(w, h, r.fps, r.bgra, true);
-            let (tx, rx) = std::sync::mpsc::channel();
-            let handler = block2::RcBlock::new(move |_: *mut NSError| {
-                let _ = tx.send(());
-            });
-            unsafe { r.stream.updateConfiguration_completionHandler(&config, Some(&handler)) };
-            let _ = rx.recv_timeout(Duration::from_secs(2));
+            r.size = window_pixels(&filter, &content, unsafe { sc.frame() });
+            reconfigure(r);
         }
     }
     if let Some((id, px)) = r.display {
@@ -469,6 +557,17 @@ fn keep(r: &mut Running) -> bool {
         }
     }
     true
+}
+
+/// `r`'s stream set up again as `r` says it is now, waited for (a moment).
+fn reconfigure(r: &Running) {
+    let config = layer_config(r.size.0, r.size.1, r.fps, r.bgra, r.cursor);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handler = block2::RcBlock::new(move |_: *mut NSError| {
+        let _ = tx.send(());
+    });
+    unsafe { r.stream.updateConfiguration_completionHandler(&config, Some(&handler)) };
+    let _ = rx.recv_timeout(Duration::from_secs(2));
 }
 
 /// A window's size in pixels (`frame` in points), even: as ScreenCaptureKit
@@ -586,7 +685,7 @@ fn play_video(path: &Path, sound: Option<String>, pictures: &Pictures, bt601: &A
     });
     let put = |picture: CFRetained<CVPixelBuffer>| {
         bt601.store(is_bt601(&picture), Ordering::Relaxed);
-        pictures.set(picture);
+        pictures.set(picture, crate::sck::host_now());
     };
     // When its start was (or would have been) up: moved on by the time it's
     // been hidden, so it goes on where it was.

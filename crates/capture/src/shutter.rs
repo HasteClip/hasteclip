@@ -5,6 +5,38 @@
 //! Look `m` is at `m + 0.5` steps (a step is one over the blend rate), and
 //! frame `k`'s own time is steps `k * looks` to `(k + 1) * looks`.
 
+/// Wakes whoever waits on several captures at once (a frame pacer, blending
+/// the recording's own capture and each Display and Window source, each on
+/// its own) when any of them has a new picture: each capture it's given to
+/// rings it.
+#[derive(Default)]
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos", target_os = "linux")), allow(dead_code))]
+pub(crate) struct Bell {
+    rung: std::sync::Mutex<u64>,
+    wake: std::sync::Condvar,
+}
+
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos", target_os = "linux")), allow(dead_code))]
+impl Bell {
+    /// How many times it's been rung.
+    pub(crate) fn rung(&self) -> u64 {
+        *self.rung.lock().unwrap()
+    }
+
+    pub(crate) fn ring(&self) {
+        *self.rung.lock().unwrap() += 1;
+        self.wake.notify_all();
+    }
+
+    /// Wait until it's rung more than `seen` times, or `timeout`.
+    pub(crate) fn wait(&self, seen: u64, timeout: std::time::Duration) {
+        let rung = self.rung.lock().unwrap();
+        if *rung == seen {
+            let _ = self.wake.wait_timeout(rung, timeout);
+        }
+    }
+}
+
 /// How a blended frame weighs the looks in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BlendShape {
