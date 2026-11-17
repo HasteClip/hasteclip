@@ -1,0 +1,50 @@
+# Download stats: once a day, counts HasteClip's downloads from the releases'
+# download counts and redraws the README's graph and badge. Only the files
+# people install from are counted, not update checks or updates
+# (scripts/download-stats.py says which and why).
+#
+# The numbers and drawings live on the stats branch, where the README reads
+# them, so a day's numbers stay out of main's history and start no builds.
+# The first run makes the branch, filled in from the first release on. Run it
+# by hand (Actions → Download stats → Run workflow) to update it now.
+
+name: Download stats
+
+on:
+  schedule:
+    - cron: '41 23 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency: download-stats
+
+jobs:
+  count:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - run: python3 scripts/download-stats-test.py
+
+      - name: Check out the stats branch, or start it
+        run: |
+          if git fetch --depth=1 origin stats; then
+            git worktree add --detach stats FETCH_HEAD
+          else
+            git worktree add --orphan -b stats stats
+          fi
+
+      - run: python3 scripts/download-stats.py stats
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Save the day
+        working-directory: stats
+        run: |
+          git add -A
+          if git diff --cached --quiet; then exit 0; fi
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -q -m "Downloads on $(date -u +%F)"
+          git push origin HEAD:stats
