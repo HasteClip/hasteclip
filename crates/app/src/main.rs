@@ -1271,14 +1271,20 @@ impl App {
     /// sources the scene shown doesn't have: they keep going, so switching
     /// to a scene with them shows them at once (taken out, a window's
     /// capture would start again, a page load again, a camera reopen).
+    /// The recording's own picture once: where the screen is, or where the
+    /// Display source drawn from it in the screen's stead is
+    /// (`recorded_visual`).
     fn layers_for_capture(&self) -> Vec<capture::Layer> {
         use capture::{Layer, LayerSource};
         use settings::LayerKey;
         let mut layers = Vec::new();
+        let recorded = self.recorded_visual();
         let outside = self.settings.outside_scene().into_iter().map(|l| (l, true));
         for (l, out) in outside.chain(self.settings.layer_order().into_iter().rev().map(|l| (l, false))) {
             match l {
-                LayerKey::Screen => layers.push(Layer { id: 0, source: LayerSource::Main }),
+                LayerKey::Screen if recorded.is_none() => layers.push(Layer { id: 0, source: LayerSource::Main }),
+                LayerKey::Screen => {}
+                LayerKey::Visual(key) if recorded == Some(key) => layers.push(Layer { id: 0, source: LayerSource::Main }),
                 LayerKey::Webcam(key) if capture::webcam::AVAILABLE => {
                     if let Some(w) = self.settings.webcam(key) {
                         let placement = if w.enabled && !out { w.placement.into() } else { capture::webcam::Placement::hidden() };
@@ -1425,6 +1431,26 @@ impl App {
     /// Recording the display `id`.
     pub(crate) fn display_source(&self, id: &str) -> capture::VideoSource {
         capture::VideoSource::Screen { id: id.to_owned(), hook: self.game_hook(), method: self.settings.screen_capture.into() }
+    }
+
+    /// The Display source drawn from the recording's own capture in the
+    /// screen's stead (see `RecordSettings::recorded_visual`), while that
+    /// capture records a display: one that shows that display. Only where
+    /// sources besides the screen are drawn at all.
+    pub(crate) fn recorded_visual(&self) -> Option<u64> {
+        match self.video_source() {
+            capture::VideoSource::Screen { id, .. } if capture::layers::MANY => self.settings.recorded_visual(&id),
+            _ => None,
+        }
+    }
+
+    /// Where the recording's own picture goes: the screen's place, or the
+    /// Display source's drawn from it (`recorded_visual`).
+    fn capture_screen_placement(&self) -> capture::ScreenPlacement {
+        match self.recorded_visual().and_then(|key| self.settings.visual(key)) {
+            Some(d) => self.settings.visual_placement(d),
+            None => self.settings.screen_placement(),
+        }
     }
 
     /// When to use the game capture hook: the setting, and the games with
@@ -2008,7 +2034,7 @@ impl App {
             Some(w) if w.enabled => w.placement.into(),
             _ => capture::webcam::Placement::hidden(),
         };
-        *self.screen_placement.lock().unwrap() = self.settings.screen_placement();
+        *self.screen_placement.lock().unwrap() = self.capture_screen_placement();
         self.refresh_visual_pictures();
         let layers = self.layers_for_capture();
         {
