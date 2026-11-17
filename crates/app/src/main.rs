@@ -2257,11 +2257,14 @@ impl App {
         // (`capture::BLEND_EVERY_SOURCE`): the one that fell behind, and
         // the one whose pictures are told, are said by name.
         let several = b.sources > 1;
-        let looks_at = if several { format!("each of its {} captured sources (the screen, and each display and window shown)", b.sources) } else { "the screen".to_owned() };
+        // One source, but not the screen (a scene with a Display or Window
+        // source in its stead): that source is said, not the screen.
+        let only = if several || b.told == 0 { "the screen".to_owned() } else { self.capture_layer_title(b.told) };
+        let looks_at = if several { format!("each of its {} captured sources (the screen, and each display and window shown)", b.sources) } else { only.clone() };
         if missed > 0 {
             let who = self.capture_layer_title(s.missed_by);
             let text = if several { format!("Blending {who} missed {missed} of {} fps", b.rate) } else { format!("Blending missed {missed} of {} fps", b.rate) };
-            let whose = if several { format!("{who}'s") } else { "the screen's".to_owned() };
+            let whose = if several { format!("{who}'s") } else { format!("{only}'s") };
             let tip = format!(
                 "{text}: in the last second, {missed} of {whose} pictures came too late for their frame, or were dropped while the computer was busy. \
                  Those frames reused the picture before: their motion blur is made of fewer pictures.\n\n\
@@ -2301,7 +2304,7 @@ impl App {
         };
         // With several, one source's pictures are told: the screen's while
         // the scene shows it, else the busiest's.
-        let shown = if several { self.capture_layer_title(b.told) } else { "The screen".to_owned() };
+        let shown = if several || b.told != 0 { self.capture_layer_title(b.told) } else { "The screen".to_owned() };
         let mut tip = format!("Each {fps} fps frame blends {} looks at {looks_at}, whether or not anything changed: in the last second, {blended}. {shown} showed {pictures} in it: {each}", b.looks);
         // Where only the screen is blended, a display or window shown is
         // said not to be.
