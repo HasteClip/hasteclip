@@ -2298,12 +2298,18 @@ impl App {
         // (`capture::BLEND_EVERY_SOURCE`): the one that fell behind, and
         // the one whose pictures are told, are said by name.
         let several = b.sources > 1;
+        // What a source is called. The recording's own capture is the
+        // screen, or the Display source drawn from it in the screen's stead
+        // (#64): that one's name, then.
+        let recorded = self.recorded_visual();
+        let title = |id| self.settings.layer_title(capture_layer(id, recorded));
+        let told_screen = capture_layer(b.told, recorded) == settings::LayerKey::Screen;
         // One source, but not the screen (a scene with a Display or Window
         // source in its stead): that source is said, not the screen.
-        let only = if several || b.told == 0 { "the screen".to_owned() } else { self.capture_layer_title(b.told) };
+        let only = if several || told_screen { "the screen".to_owned() } else { title(b.told) };
         let looks_at = if several { format!("each of its {} captured sources (the screen, and each display and window shown)", b.sources) } else { only.clone() };
         if missed > 0 {
-            let who = self.capture_layer_title(s.missed_by);
+            let who = title(s.missed_by);
             let text = if several { format!("Blending {who} missed {missed} of {} fps", b.rate) } else { format!("Blending missed {missed} of {} fps", b.rate) };
             let whose = if several { format!("{who}'s") } else { format!("{only}'s") };
             let tip = format!(
@@ -2345,7 +2351,7 @@ impl App {
         };
         // With several, one source's pictures are told: the screen's while
         // the scene shows it, else the busiest's.
-        let shown = if several || b.told != 0 { self.capture_layer_title(b.told) } else { "The screen".to_owned() };
+        let shown = if several || !told_screen { title(b.told) } else { "The screen".to_owned() };
         let mut tip = format!("Each {fps} fps frame blends {} looks at {looks_at}, whether or not anything changed: in the last second, {blended}. {shown} showed {pictures} in it: {each}", b.looks);
         // Where only the screen is blended, a display or window shown is
         // said not to be.
@@ -2354,20 +2360,6 @@ impl App {
         }
         ui.add_space(6.0);
         ui.add(egui::Label::new(theme::text(text, 13.0, theme::W::Medium).color(p.text3)).sense(egui::Sense::hover())).on_hover_text(tip);
-    }
-
-    /// What the capture's layer `id` is (as `layers_for_capture` numbers
-    /// them: 0 the screen, webcams `1 << 32 | key`, the rest `2 << 32 | key`)
-    /// is called.
-    fn capture_layer_title(&self, id: u64) -> String {
-        use settings::LayerKey;
-        let key = id & 0xffff_ffff;
-        let layer = match id >> 32 & 0xffff {
-            0 => LayerKey::Screen,
-            1 => LayerKey::Webcam(key),
-            _ => LayerKey::Visual(key),
-        };
-        self.settings.layer_title(layer)
     }
 
     /// Follow the game being clipped, for Discord: the last one in focus, for
@@ -2892,6 +2884,21 @@ fn keep_date(path: &std::path::Path, made: Option<std::time::SystemTime>) {
     }
 }
 
+/// Which source the capture's layer `id` is, as `App::layers_for_capture`
+/// numbers them: 0 the recording's own capture, which is the screen, or the
+/// Display source drawn from it in the screen's stead (`recorded`:
+/// `App::recorded_visual`); webcams `1 << 32 | key`; the rest
+/// `2 << 32 | key`.
+fn capture_layer(id: u64, recorded: Option<u64>) -> settings::LayerKey {
+    use settings::LayerKey;
+    let key = id & 0xffff_ffff;
+    match id >> 32 & 0xffff {
+        0 => recorded.map_or(LayerKey::Screen, LayerKey::Visual),
+        1 => LayerKey::Webcam(key),
+        _ => LayerKey::Visual(key),
+    }
+}
+
 /// Names in a list as said: "Twitch", "Twitch and YouTube", "Twitch,
 /// YouTube and Kick".
 pub(crate) fn words_and(names: &[String]) -> String {
@@ -3368,5 +3375,32 @@ mod state_tests {
         assert!(r.has(capture::Mode::Stream) && !r.has(capture::Mode::Record));
         assert_eq!(r.with(capture::Mode::Stream, false), s(true, false, false));
         assert_eq!(words_and(&["Twitch".into(), "YouTube".into(), "Kick".into()]), "Twitch, YouTube and Kick");
+    }
+
+    /// The blending status names the source whose pictures it tells, or
+    /// that fell behind, by the capture's layer id: the recording's own
+    /// capture (0) is the screen, but a Display source drawn from it in the
+    /// screen's stead (#64) is called what that source is.
+    #[test]
+    fn a_display_in_the_screens_stead_is_named_as_itself() {
+        use settings::{LayerKey, Visual, VisualCfg};
+        let mut s = settings::RecordSettings::default();
+        let mut display = VisualCfg::new(3, Visual::Display { id: "D1".into(), name: "D1".into() });
+        display.title = Some("Left monitor".into());
+        s.visuals.push(display);
+        s.visuals.push(VisualCfg::new(4, Visual::Window { app: "game.exe".into(), name: "Game".into() }));
+        // A scene without the screen: the Display source of the display
+        // recorded is drawn from its capture.
+        s.layer_order = vec![LayerKey::Visual(4), LayerKey::Visual(3)];
+        let recorded = s.recorded_visual("D1");
+        assert_eq!(capture_layer(0, recorded), LayerKey::Visual(3));
+        assert_eq!(s.layer_title(capture_layer(0, recorded)), "Left monitor");
+        assert_eq!(s.layer_title(capture_layer(2 << 32 | 4, recorded)), "Window");
+        assert_eq!(capture_layer(1 << 32 | 7, recorded), LayerKey::Webcam(7));
+        // With the screen in the scene, it's the screen.
+        s.layer_order.push(LayerKey::Screen);
+        let recorded = s.recorded_visual("D1");
+        assert_eq!(capture_layer(0, recorded), LayerKey::Screen);
+        assert_eq!(s.layer_title(capture_layer(0, recorded)), "Screen");
     }
 }
