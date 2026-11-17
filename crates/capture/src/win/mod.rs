@@ -994,6 +994,72 @@ impl Sight {
     }
 }
 
+/// How long after the game capture hook failed on a window to try it there
+/// again: at first, then twice as long each time it fails again, up to the
+/// second. A guess.
+const RETRY_HOOK: (Duration, Duration) = (Duration::from_secs(10), Duration::from_secs(300));
+
+/// Windows the game capture hook failed on (it didn't load in time, sent no
+/// picture, or stopped), recorded with Windows' capture or the display's
+/// meanwhile. Not for good: a game still loading when it comes up can keep
+/// the hook from loading in the time it gets, and one Windows' capture can't
+/// see then stayed recorded as the last picture before it, the desktop, till
+/// clipping started again (issue #46). The hook's tried again a while later
+/// (see [`RETRY_HOOK`]), and as soon as the window's back in focus after
+/// being left (alt-tab and back, which got it going before).
+#[derive(Default)]
+struct HookFailures(std::collections::HashMap<usize, HookFailed>);
+
+struct HookFailed {
+    /// When to try again, and how long after that if it fails again.
+    again: Instant,
+    wait: Duration,
+    /// The window's been out of focus since.
+    left: bool,
+    /// Taken up again (see [`HookFailures::due`]); till it fails again.
+    trying: bool,
+}
+
+impl HookFailures {
+    /// The hook failed on `window`.
+    fn failed(&mut self, window: usize, now: Instant) {
+        let wait = self.0.get(&window).map_or(RETRY_HOOK.0, |f| (f.wait * 2).min(RETRY_HOOK.1));
+        self.0.insert(window, HookFailed { again: now + wait, wait, left: false, trying: false });
+    }
+
+    /// Whether `window`'s still to be left to Windows' capture.
+    fn holds_off(&self, window: usize, now: Instant) -> bool {
+        self.0.get(&window).is_some_and(|f| !f.trying && now < f.again)
+    }
+
+    /// Whether to try the hook on `window` again now, where nothing else
+    /// would (its Windows' capture is kept while it's in focus): once, till
+    /// it fails again.
+    fn due(&mut self, window: usize, now: Instant) -> bool {
+        match self.0.get_mut(&window) {
+            Some(f) if !f.trying && now >= f.again => {
+                f.trying = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Which window's in focus now (none: not one of these): one back in
+    /// focus after being left is tried again at once. Closed windows are
+    /// forgotten.
+    fn focus(&mut self, focused: Option<usize>, now: Instant, alive: impl Fn(usize) -> bool) {
+        self.0.retain(|w, _| alive(*w));
+        for (w, f) in &mut self.0 {
+            if Some(*w) != focused {
+                f.left = true;
+            } else if std::mem::take(&mut f.left) && !f.trying {
+                f.again = f.again.min(now);
+            }
+        }
+    }
+}
+
 /// A display's capture: Windows' own, or Desktop Duplication (see `dupl`).
 enum DisplayCapture {
     Wgc(d3d::Capture),
@@ -1109,8 +1175,8 @@ impl Video {
             let mut active: Option<String> = None;
             let mut current: Option<(windows::Win32::Foundation::HWND, String, WindowCapture)> = None;
             // Windows the hook failed on (it couldn't load, or stopped): Windows'
-            // capture for them instead.
-            let mut hook_failed: std::collections::HashSet<usize> = Default::default();
+            // capture for them till it's tried again.
+            let mut hook_failures = HookFailures::default();
             // Apps Windows' capture froze on: hooked from then on.
             let mut frozen: std::collections::HashSet<String> = Default::default();
             let mut sight = Sight::default();
@@ -1148,15 +1214,24 @@ impl Video {
                 if let Some((_, app, _)) = &focused {
                     active = Some(app.clone());
                 }
+                hook_failures.focus(focused.as_ref().map(|(h, _, _)| h.0 as usize), Instant::now(), |w| system::window_alive(windows::Win32::Foundation::HWND(w as _)));
                 // The hook stopped on a window that's still open: Windows'
                 // capture for it instead.
                 if let Some((h, app, WindowCapture::Hook(hooked))) = &current
                     && let Some(why) = hooked.ended()
                 {
                     if system::window_alive(*h) {
-                        eprintln!("{app}: the game capture hook stopped ({why}); recording it with Windows' capture");
-                        hook_failed.insert(h.0 as usize);
+                        eprintln!("{app}: the game capture hook stopped ({why}); recording it with Windows' capture till it's tried again");
+                        hook_failures.failed(h.0 as usize, Instant::now());
                     }
+                    current = None;
+                }
+                // Time to try the hook again on a window it failed on: its
+                // Windows' capture makes way.
+                if let Some((h, app, WindowCapture::Wgc(..))) = &current
+                    && hook_failures.due(h.0 as usize, Instant::now())
+                {
+                    eprintln!("{app}: trying the game capture hook again");
                     current = None;
                 }
                 // Windows' capture of a fullscreen game in focus gets nothing
@@ -1225,7 +1300,7 @@ impl Video {
                                 if plan == hook::Plan::Watch && frozen.contains(&app.to_lowercase()) {
                                     plan = hook::Plan::Hook;
                                 }
-                                if plan == hook::Plan::Hook && hook_failed.contains(&(h.0 as usize)) {
+                                if plan == hook::Plan::Hook && hook_failures.holds_off(h.0 as usize, Instant::now()) {
                                     plan = hook::Plan::Wgc;
                                     why = "the hook failed on this window".into();
                                 }
@@ -1342,7 +1417,7 @@ impl Video {
             let mut hooked: Option<(windows::Win32::Foundation::HWND, String, hook::HookCapture)> = None;
             // How to capture each game window, worked out once.
             let mut plans: std::collections::HashMap<usize, hook::Plan> = Default::default();
-            let mut hook_failed: std::collections::HashSet<usize> = Default::default();
+            let mut hook_failures = HookFailures::default();
             let mut frozen: std::collections::HashSet<String> = Default::default();
             let mut sight = Sight::default();
             let mut gpu_use = gpu_meter();
@@ -1412,6 +1487,7 @@ impl Video {
                 let game = system::foreground_app()
                     .filter(|f| f.main && !system::window_hidden(f.hwnd) && system::fullscreen_on(f.hwnd, monitor))
                     .map(|f| (f.hwnd, f.exe));
+                hook_failures.focus(game.as_ref().map(|(h, _)| h.0 as usize), Instant::now(), |w| system::window_alive(windows::Win32::Foundation::HWND(w as _)));
                 let plan = game.as_ref().map(|(h, exe)| {
                     *plans.entry(h.0 as usize).or_insert_with(|| {
                         let (plan, why) = hook::plan(exe, *h, &settings);
@@ -1425,14 +1501,14 @@ impl Video {
                     && let Some(why) = capture.ended()
                 {
                     if system::window_alive(*h) {
-                        eprintln!("{exe}: the game capture hook stopped ({why}); recording the display");
-                        hook_failed.insert(h.0 as usize);
+                        eprintln!("{exe}: the game capture hook stopped ({why}); recording the display till it's tried again");
+                        hook_failures.failed(h.0 as usize, Instant::now());
                     }
                     hooked = None;
                 }
                 let want = game.clone().filter(|(h, exe)| {
                     let hook = plan == Some(hook::Plan::Hook) || plan == Some(hook::Plan::Watch) && frozen.contains(&exe.to_lowercase());
-                    hook && !hook_failed.contains(&(h.0 as usize))
+                    hook && !hook_failures.holds_off(h.0 as usize, Instant::now())
                 });
                 match &want {
                     Some((h, exe)) if hooked.as_ref().is_none_or(|(hh, ..)| hh != h) => {
@@ -1443,7 +1519,7 @@ impl Video {
                             Ok(capture) => hooked = Some((*h, exe.clone(), capture)),
                             Err(e) => {
                                 eprintln!("{exe}: can't start the game capture hook: {e:#}");
-                                hook_failed.insert(h.0 as usize);
+                                hook_failures.failed(h.0 as usize, Instant::now());
                             }
                         }
                     }
@@ -3058,6 +3134,47 @@ mod tests {
             })
             .collect();
         assert_eq!(waits, [5, 10, 20, 40, 60, 60]);
+    }
+
+    /// A window the hook failed on is left to Windows' capture for 10 s, then
+    /// twice as long each time it fails again, up to 5 minutes (issue #46).
+    #[test]
+    fn hook_tried_again_later_and_later() {
+        let (mut failures, t0) = (HookFailures::default(), Instant::now());
+        let mut waits = Vec::new();
+        let mut now = t0;
+        for _ in 0..7 {
+            failures.failed(1, now);
+            let (wait, again) = (failures.0[&1].wait, failures.0[&1].again);
+            waits.push(wait.as_secs());
+            assert!(failures.holds_off(1, now));
+            assert!(!failures.due(1, now));
+            now = again;
+            assert!(!failures.holds_off(1, now));
+            assert!(failures.due(1, now));
+            assert!(!failures.due(1, now), "taken up once, till it fails again");
+            assert!(!failures.holds_off(1, now), "not held off while it's tried");
+        }
+        assert_eq!(waits, [10, 20, 40, 80, 160, 300, 300]);
+        assert!(!failures.holds_off(2, t0), "another window: never failed");
+    }
+
+    /// Back in focus after being left (alt-tab and back), a window the hook
+    /// failed on is tried again at once; staying in focus, or not having
+    /// left, doesn't; a closed one is forgotten.
+    #[test]
+    fn hook_tried_again_back_in_focus() {
+        let (mut failures, now) = (HookFailures::default(), Instant::now());
+        failures.failed(1, now);
+        failures.focus(Some(1), now, |_| true);
+        assert!(failures.holds_off(1, now), "still in focus: hasn't left");
+        failures.focus(None, now, |_| true);
+        assert!(failures.holds_off(1, now), "left, not back yet");
+        failures.focus(Some(1), now, |_| true);
+        assert!(!failures.holds_off(1, now), "back in focus");
+        assert!(failures.due(1, now));
+        failures.focus(Some(1), now, |w| w != 1);
+        assert!(failures.0.is_empty(), "closed");
     }
 
     /// With nothing running, a screenshot of the main screen is taken by a
