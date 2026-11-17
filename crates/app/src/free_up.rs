@@ -312,7 +312,7 @@ impl App {
                     }
                 });
                 row(ui, "Frame rate, at most", &mut |ui| {
-                    if let Some(f) = export_ui::fps_choice(ui, "free_up_fps", s.fps, top_fps, s.fps.unwrap_or(top_fps), (None, original(format!("{top_fps} fps"))), "any frame rate") {
+                    if let Some(f) = export_ui::fps_choice(ui, "free_up_fps", s.fps, top_fps, s.fps.unwrap_or(top_fps), original(format!("{top_fps} fps")), "any frame rate") {
                         s.fps = f;
                     }
                 });

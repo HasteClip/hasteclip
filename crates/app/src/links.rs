@@ -7,10 +7,11 @@
 //! the file's metadata (repackaged, not re-encoded, so it's quick), and a
 //! picture for the link's preview. A shared clip is at most [`LINK_MAX_MB`]
 //! (what the server takes, and what plays right in a chat): a bigger one
-//! goes up as a copy that fits. Before uploading, its resolution, frame
-//! rate and the size it fits under can be changed in the dialog (the
-//! editor's export settings), and a new version of it later goes up the
-//! same way.
+//! goes up as a copy that fits, at its own frame rate (a lower bitrate,
+//! and a smaller picture where that bitrate would starve it). Before
+//! uploading, its resolution, frame rate and the size it fits under can be
+//! changed in the dialog (the editor's export settings), and a new version
+//! of it later goes up the same way.
 //!
 //! The server knows this app only by a random token it hands out the first
 //! time (kept in `<config_dir>/hasteclip/share.json`): there's no account.
@@ -372,8 +373,9 @@ pub fn rename(link: &Link, named: &Named) -> Result<(), String> {
 pub(crate) const LINK_MAX_MB: u32 = 100;
 
 /// How a clip goes up unless something else is chosen: as it is, or, past
-/// [`LINK_MAX_MB`], as a copy that fits (the biggest picture that does, at
-/// up to 60 fps), made as Save smaller makes one. Only its mix goes up
+/// [`LINK_MAX_MB`], as a copy that fits, made as Save smaller makes one: at
+/// the clip's own frame rate, never fewer frames, with the bitrate that
+/// fits and the biggest picture that bitrate carries. Only its mix goes up
 /// either way.
 pub fn default_output() -> media::Output {
     media::Output { max_mb: Some(LINK_MAX_MB), mix_only: true, ..Default::default() }
@@ -384,17 +386,19 @@ fn capped(output: &media::Output) -> media::Output {
     media::Output { max_mb: Some(output.max_mb.map_or(LINK_MAX_MB, |mb| mb.min(LINK_MAX_MB))), ..*output }
 }
 
-/// Whether a copy of a clip `duration` seconds long can fit in `mb` MB at
-/// all: even the smallest picture takes about [`LEAST_VIDEO_KBPS`], and the
-/// mix its own.
-fn fits_in(mb: u32, duration: f64) -> bool {
+/// Whether a copy of a clip `duration` seconds long at `fps` can fit in
+/// `mb` MB at all: even the smallest picture takes about
+/// [`LEAST_VIDEO_KBPS`] (more at a faster rate, [`media::rate_cost`]), and
+/// the mix its own.
+fn fits_in(mb: u32, duration: f64, fps: f64) -> bool {
     let kbps = f64::from(mb) * 1024.0 * 1024.0 * 8.0 / 1000.0 / duration.max(0.1) * 0.9;
-    kbps - f64::from(media::RENDER_AUDIO_KBPS) >= LEAST_VIDEO_KBPS
+    kbps - f64::from(media::RENDER_AUDIO_KBPS) >= LEAST_VIDEO_KBPS * media::rate_cost(fps)
 }
 
-/// About the least a picture worth watching takes, in kbps: 360p at 30 fps,
-/// soft. Under 100 MB, that's a clip of about 25 minutes.
-const LEAST_VIDEO_KBPS: f64 = 250.0;
+/// About the least a picture worth watching takes at 60 fps, in kbps: 360p,
+/// soft (250 at 30 fps). Under 100 MB, that's a clip of about 24 minutes at
+/// 60 fps, 16 at 240.
+const LEAST_VIDEO_KBPS: f64 = 330.0;
 
 /// Upload `clip` as a new shared clip, or as the new version of shared clip
 /// `replacing`, made as `output` asks ([`made_to_upload`]).
@@ -556,8 +560,10 @@ fn made_to_upload(clip: &Path, work: &Path, output: &media::Output, progress: &P
     if !reshapes(&info, &output) && fits(size) {
         return Ok(clip.to_path_buf());
     }
-    if !fits_in(mb, info.duration) {
-        return Err(too_long(mb));
+    let fps = output.frame_rate(&info);
+    let why = || too_long(mb, fps, slower_fits(mb, info.duration, fps));
+    if !fits_in(mb, info.duration, fps) {
+        return Err(why());
     }
     progress.making.store(true, Ordering::Relaxed);
     let copy = work.join("copy.mp4");
@@ -577,15 +583,31 @@ fn made_to_upload(clip: &Path, work: &Path, output: &media::Output, progress: &P
         // picture, until it fits. Not even the smallest does: it can't be
         // shared (the server takes nothing bigger).
         let (_, h) = edit.output.size(&info);
-        let Some(next) = SMALLER.into_iter().find(|&s| s < h) else { return Err(too_long(mb)) };
+        let Some(next) = SMALLER.into_iter().find(|&s| s < h) else { return Err(why()) };
         edit.output.height = Some(next);
     }
 }
 
-/// Why a clip can't go up: it doesn't fit in `mb` MB.
-fn too_long(mb: u32) -> String {
-    format!("it doesn't fit in {mb} MB, even small. Trim it in the editor and share the part you want")
+/// Why a clip can't go up: it doesn't fit in `mb` MB at `fps`, and whether
+/// it would at a lower frame rate (`slower_fits`), which is the user's to
+/// choose: a size never lowers it.
+fn too_long(mb: u32, fps: f64, slower_fits: bool) -> String {
+    if slower_fits {
+        format!("it doesn't fit in {mb} MB at {fps:.0} fps, even small. Choose a lower frame rate, or trim it in the editor and share the part you want")
+    } else {
+        format!("it doesn't fit in {mb} MB, even small. Trim it in the editor and share the part you want")
+    }
 }
+
+/// Whether a clip `duration` seconds long at `fps` would fit in `mb` MB at
+/// a lower frame rate: at [`SLOWEST_SUGGESTED`].
+fn slower_fits(mb: u32, duration: f64, fps: f64) -> bool {
+    fps > SLOWEST_SUGGESTED + 0.5 && fits_in(mb, duration, SLOWEST_SUGGESTED)
+}
+
+/// The slowest frame rate a clip too long to fit is told it could go up
+/// at: what most video is.
+const SLOWEST_SUGGESTED: f64 = 30.0;
 
 /// Whether `output` changes the picture of a clip that's `info`, a size to
 /// fit under aside (that only matters to a clip bigger than it).
@@ -1012,9 +1034,20 @@ impl UploadForm {
         !reshapes(&self.info, &self.edit.output) && self.bytes <= u64::from(self.most()) << 20
     }
 
-    /// Even a copy can't fit: it's too long for the size.
+    /// Even a copy can't fit: it's too long for the size, at the frame
+    /// rate it goes up at.
     fn too_long(&self) -> bool {
-        !self.as_it_is() && !fits_in(self.most(), self.info.duration)
+        !self.as_it_is() && !fits_in(self.most(), self.info.duration, self.edit.output.frame_rate(&self.info))
+    }
+
+    /// What to do when it's too long: trim it, or, when that would fit,
+    /// choose a lower frame rate (a size never lowers it by itself).
+    fn way_out(&self) -> &'static str {
+        if slower_fits(self.most(), self.info.duration, self.edit.output.frame_rate(&self.info)) {
+            "Choose a lower frame rate under Change, or trim it in the editor."
+        } else {
+            "Trim it in the editor, then share the part you want."
+        }
     }
 
     /// What goes up, in short ("As it is, 42 MB"; "A copy under 100 MB";
@@ -1029,7 +1062,7 @@ impl UploadForm {
             return (format!("As it is, {}", human_bytes(self.bytes)), format!("{}×{} · {:.0} fps{kbps}", info.width, info.height, info.fps));
         }
         if self.too_long() {
-            return (format!("Too long to fit in {mb} MB"), "Trim it in the editor, then share the part you want.".to_owned());
+            return (format!("Too long to fit in {mb} MB"), self.way_out().to_owned());
         }
         let edit = media::Edit { output: capped(&self.edit.output), ..self.edit.clone() };
         let what = if reshapes(info, &edit.output) {
@@ -1445,7 +1478,10 @@ impl App {
                     }
                 } else {
                     let upload = Btn::primary(if error.is_some() { "Try again" } else { "Upload" }).with_icon(icon::CLOUD_ARROW_UP).enabled(!blocked);
-                    let upload = if blocked { upload.tip(format!("It doesn't fit in {LINK_MAX_MB} MB: trim it in the editor first")) } else { upload };
+                    let upload = match form.as_ref().filter(|_| blocked) {
+                        Some(f) => upload.tip(format!("It doesn't fit in {} MB. {}", f.most(), f.way_out())),
+                        None => upload,
+                    };
                     if upload.show(ui).clicked() {
                         pick = Some(Pick::Upload);
                     }
@@ -1866,6 +1902,77 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A 240 fps clip too big for its size goes up as a copy at 240 fps,
+    /// under the size, by this platform's encoder for a fit (x264 on
+    /// Windows and Linux, the Mac's own on macOS).
+    #[test]
+    #[ignore = "encodes 5 s of 1080p240 twice: cargo test -p hasteclip high_fps_copies_keep_their_frames -- --ignored --nocapture"]
+    fn high_fps_copies_keep_their_frames() {
+        let dir = std::env::temp_dir().join(format!("hc-fast-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("Fast.mp4");
+        // A busy picture (moving, with grain) at a bitrate far past 6 MB.
+        let made = media::ffmpeg()
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=1920x1080:r=240:d=5,noise=alls=24:allf=t", "-f", "lavfi", "-i", "sine=f=440:d=5"])
+            .args(["-c:v", "libx264", "-preset", "ultrafast", "-qp", "14", "-c:a", "aac", "-pix_fmt", "yuv420p", "-shortest"])
+            .arg(&clip)
+            .status()
+            .unwrap();
+        assert!(made.success(), "an ffmpeg with x264 makes the test clip");
+        let size = std::fs::metadata(&clip).unwrap().len();
+        assert!(size > 6 << 20, "the test clip is {size} bytes");
+        // 5 s in 6 MB: about 9 Mbit/s, which starves 1080p at 240 fps but
+        // carries 720p.
+        let output = media::Output { max_mb: Some(6), ..default_output() };
+        let copy = made_to_upload(&clip, &dir, &output, &Progress::default()).unwrap();
+        let info = media::probe(&copy).unwrap();
+        let bytes = std::fs::metadata(&copy).unwrap().len();
+        println!("{}x{} at {:.2} fps, {:.2} MB, {} kbps", info.width, info.height, info.fps, bytes as f64 / 1048576.0, info.video_kbps.unwrap_or(0));
+        assert!((info.fps - 240.0).abs() < 0.5, "all its frames: {} fps", info.fps);
+        assert!(bytes <= 6 << 20, "{bytes} bytes");
+        // Planned at 720p; an encoder that can't get that small (the Mac's
+        // own) makes it smaller still, never fewer frames.
+        assert!(info.height <= 720, "{}p", info.height);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What a clip of yours would go up as, made but not uploaded:
+    /// `CLIP=<path> OUT=<folder> cargo test -p hasteclip copy_to_upload --
+    /// --ignored --nocapture` leaves the file that would go up
+    /// (`upload.mp4`) in the folder.
+    #[test]
+    #[ignore = "makes the file a clip goes up as: CLIP=<path> OUT=<folder> cargo test -p hasteclip copy_to_upload -- --ignored --nocapture"]
+    fn copy_to_upload() {
+        let (Some(clip), Some(out)) = (std::env::var_os("CLIP").map(PathBuf::from), std::env::var_os("OUT").map(PathBuf::from)) else {
+            panic!("say which clip (CLIP) and where the copy goes (OUT)");
+        };
+        std::fs::create_dir_all(&out).unwrap();
+        let before = media::probe(&clip).unwrap();
+        let started = Instant::now();
+        let made = made_to_upload(&clip, &out, &default_output(), &Progress::default()).unwrap();
+        let took = started.elapsed();
+        // As `upload` sends it.
+        let upload = out.join("upload.mp4");
+        web_copy(&made, &upload).unwrap();
+        let after = media::probe(&upload).unwrap();
+        let bytes = std::fs::metadata(&upload).unwrap().len();
+        println!(
+            "{}x{} at {:.2} fps, {:.0} s -> {}x{} at {:.2} fps, {} kbps, {:.2} MB ({} bytes), made in {took:.0?}",
+            before.width,
+            before.height,
+            before.fps,
+            before.duration,
+            after.width,
+            after.height,
+            after.fps,
+            after.video_kbps.unwrap_or(0),
+            bytes as f64 / 1048576.0,
+            bytes
+        );
+        assert!((after.fps - before.fps).abs() < 0.5, "its frame rate is kept");
+        assert!(bytes <= u64::from(LINK_MAX_MB) << 20, "{bytes} bytes");
+    }
+
     /// A clip that fits goes up as it is, whatever size it's to fit under;
     /// one asked to be smaller goes as a copy.
     #[test]
@@ -1916,15 +2023,44 @@ mod tests {
         let hour = form(3 << 30, &edit, 3600.0);
         assert!(hour.too_long());
         assert_eq!(hour.what().0, "Too long to fit in 100 MB");
+        assert_eq!(hour.what().1, "Trim it in the editor, then share the part you want.", "not even at 30 fps");
         assert!(!form(300 << 20, &edit, 60.0).too_long());
+
+        // A 240 fps clip goes up at 240 fps, however long: three minutes
+        // as a smaller picture at the bitrate that fits.
+        let form = |bytes: u64, duration: f64| {
+            let info = media::ClipInfo { duration, fps: 240.0, ..info.clone() };
+            let mut edit = media::Edit::new(&info);
+            edit.output = default_output();
+            UploadForm { info, edit, bytes, open: false }
+        };
+        let (what, picture) = form(900 << 20, 180.0).what();
+        assert_eq!(what, "A copy under 100 MB");
+        assert_eq!(picture, "960×540 · 240 fps · 4.2 Mbps");
+        // Twenty minutes is too long at 240 fps, but not at a lower rate,
+        // which is the user's to choose.
+        let long = form(6 << 30, 20.0 * 60.0);
+        assert!(long.too_long());
+        assert_eq!(long.what().1, "Choose a lower frame rate under Change, or trim it in the editor.");
+        let mut thirty = long.edit.clone();
+        thirty.output.fps = Some(30);
+        assert!(!UploadForm { edit: thirty, ..long }.too_long());
     }
 
     #[test]
     fn copies_fit_in_a_link_up_to_a_length() {
-        assert!(fits_in(LINK_MAX_MB, 60.0));
-        assert!(fits_in(LINK_MAX_MB, 20.0 * 60.0), "20 minutes, small");
-        assert!(!fits_in(LINK_MAX_MB, 40.0 * 60.0), "40 minutes is too long");
-        assert!(!fits_in(10, 10.0 * 60.0), "10 minutes in 10 MB");
+        assert!(fits_in(LINK_MAX_MB, 60.0, 60.0));
+        assert!(fits_in(LINK_MAX_MB, 20.0 * 60.0, 60.0), "20 minutes at 60 fps, small");
+        assert!(!fits_in(LINK_MAX_MB, 40.0 * 60.0, 30.0), "40 minutes is too long");
+        assert!(!fits_in(10, 10.0 * 60.0, 30.0), "10 minutes in 10 MB");
+        // More frames take more: 20 minutes is too long at 240 fps, though
+        // it would fit at 30, which is said.
+        assert!(!fits_in(LINK_MAX_MB, 20.0 * 60.0, 240.0));
+        assert!(slower_fits(LINK_MAX_MB, 20.0 * 60.0, 240.0));
+        assert!(!slower_fits(LINK_MAX_MB, 40.0 * 60.0, 240.0), "too long at 30 too");
+        assert!(!slower_fits(LINK_MAX_MB, 20.0 * 60.0, 30.0), "already 30");
+        assert!(too_long(LINK_MAX_MB, 240.0, true).contains("at 240 fps, even small. Choose a lower frame rate"));
+        assert!(!too_long(LINK_MAX_MB, 240.0, false).contains("frame rate"));
         assert_eq!(capped(&media::Output::default()).max_mb, Some(LINK_MAX_MB));
         assert_eq!(capped(&media::Output { max_mb: Some(500), ..Default::default() }).max_mb, Some(LINK_MAX_MB));
         assert_eq!(capped(&media::Output { max_mb: Some(25), ..Default::default() }).max_mb, Some(25));
