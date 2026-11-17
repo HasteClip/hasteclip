@@ -65,6 +65,9 @@ pub(super) struct Blending {
     layers: Vec<LayerSource>,
     /// A frame was made since the layers were last followed.
     follow_due: bool,
+    /// The frames show the recording's own picture (see `follow_layers`).
+    /// Its looks are taken either way: the frames are made from its sums.
+    main_shown: bool,
 }
 
 /// A Display or Window source blended on its own (see the module's doc):
@@ -93,6 +96,39 @@ struct LayerSource {
     seen: u64,
     different: u32,
     stats: LayerStats,
+    /// Its pictures a second, for whose are told while the recording's own
+    /// picture doesn't show (`Blending::say_sources`).
+    rate: Rate,
+}
+
+/// A source's pictures a second, as of the last whole second (as Windows'
+/// and macOS' pacers count them).
+#[derive(Default)]
+struct Rate {
+    since: f64,
+    count: u32,
+    last: u32,
+}
+
+impl Rate {
+    /// A picture came at `now`.
+    fn note(&mut self, now: f64) {
+        if now - self.since >= 1.0 {
+            self.last = if now - self.since < 2.0 { self.count } else { 0 };
+            (self.since, self.count) = (now, 0);
+        }
+        self.count += 1;
+    }
+
+    /// Pictures in the last whole second, as of `now` (or so far, before
+    /// one's gone by).
+    fn per_second(&self, now: f64) -> u32 {
+        match now - self.since {
+            gone if gone >= 2.0 => 0,
+            gone if gone >= 1.0 => self.count,
+            _ => self.last.max(self.count),
+        }
+    }
 }
 
 impl Blending {
@@ -121,6 +157,7 @@ impl Blending {
             stats: BlendStats::new(),
             layers: Vec::new(),
             follow_due: true,
+            main_shown: true,
         };
         b.hold_newest(pace);
         b
@@ -363,10 +400,17 @@ impl Blending {
     /// `timed`: it came from the feed's queue with its time (else it was put
     /// up some other way, and `at` is when it was noticed).
     fn arrive(&mut self, pace: &mut Pace, at: f64, frame: &Frame, id: u64, timed: bool) {
-        crate::count_picture();
+        // How the capture keeps up counts the screen's pictures while the
+        // frames show it (as on Windows and macOS, whose pacers then don't
+        // take them at all).
+        if self.main_shown {
+            crate::count_picture();
+        }
         if at < self.look_time(self.next - 1) {
             self.stats.late += 1;
-            crate::count_missed(1);
+            if self.main_shown {
+                crate::count_missed(1);
+            }
         }
         let mut burst = 0;
         while self.look_time(self.next) < at && burst < 10_000 {
@@ -404,6 +448,7 @@ impl Blending {
         l.timed = true;
         l.phase = crate::shutter::follow_picture(l.phase, step, at - t0, first);
         l.stats.pictures += 1;
+        l.rate.note(at);
         let number = l.base + seq;
         l.hold(pace, &Pixels::Frame(frame.clone()), number);
     }
@@ -415,8 +460,8 @@ impl Blending {
     /// is the recording's own (a Display source of the display it records):
     /// its pictures are taken by the recording's blend.
     fn follow_layers(&mut self, pace: &mut Pace) {
+        self.main_shown = pace.picture.main_shown();
         let want: Vec<_> = pace.picture.feeds.frame_blended().into_iter().filter(|(_, latest, ..)| !pace.picture.feed.is(latest)).collect();
-        let before = self.layers.len();
         self.layers.retain(|l| {
             let keep = want.iter().any(|(id, latest, base, _)| *id == l.id && *base == l.base && Arc::ptr_eq(latest, &l.latest));
             if !keep {
@@ -425,31 +470,48 @@ impl Blending {
             }
             keep
         });
-        let mut changed = self.layers.len() != before;
         for (id, latest, base, name) in want {
             // One blend a capture: a display shown twice shares one.
             if self.layers.iter().any(|l| l.id == id || Arc::ptr_eq(&l.latest, &latest)) {
                 continue;
             }
-            latest.queue_arrivals();
-            let mut l = LayerSource { id, name, latest, base, blend: None, phase: self.phase, next: self.next, timed: false, up: None, last_taken: None, seen: 0, different: 0, stats: LayerStats::new() };
+            latest.queue_arrivals_for(id);
+            let mut l = LayerSource {
+                id,
+                name,
+                latest,
+                base,
+                blend: None,
+                phase: self.phase,
+                next: self.next,
+                timed: false,
+                up: None,
+                last_taken: None,
+                seen: 0,
+                different: 0,
+                stats: LayerStats::new(),
+                rate: Rate::default(),
+            };
             if let Some((frame, seq)) = l.latest.get() {
                 l.seen = seq;
                 l.hold(pace, &Pixels::Frame(frame), base + seq);
             }
             crate::eprintln_later!("frame blending: {} shown, blended on its own", l.name);
             self.layers.push(l);
-            changed = true;
         }
-        if changed {
-            self.say_sources();
-        }
+        self.say_sources();
     }
 
     /// Which sources the looks are at, for how the capture keeps up
-    /// (`crate::health`): the screen's pictures are told.
+    /// (`crate::health`), as on Windows and macOS: the recording's own
+    /// picture while the frames show it, and each Display and Window source
+    /// blended. Its pictures are told while it shows, else those of the
+    /// source showing the most (the first of those showing as many).
     fn say_sources(&self) {
-        crate::blend_sources(1 + self.layers.len(), 0);
+        let now = host_now();
+        let busiest = self.layers.iter().fold(None::<&LayerSource>, |b, l| if b.is_some_and(|b| b.rate.per_second(now) >= l.rate.per_second(now)) { b } else { Some(l) });
+        let told = if self.main_shown { 0 } else { busiest.map_or(0, |l| l.id) };
+        crate::blend_sources(usize::from(self.main_shown) + self.layers.len(), told);
     }
 }
 

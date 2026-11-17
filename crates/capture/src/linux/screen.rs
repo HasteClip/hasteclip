@@ -73,6 +73,10 @@ pub(crate) struct Latest {
     /// (`queue_arrivals`), and the signal that one has.
     arrivals: Mutex<Option<std::collections::VecDeque<Arrival>>>,
     arrived: Condvar,
+    /// Whose pictures they're kept for, as a picture let go of unread is
+    /// counted (`crate::count_missed_of`): a layer's id, 0 (the recording's
+    /// own capture) unless `queue_arrivals_for` says.
+    kept_for: AtomicU64,
 }
 
 /// A picture as it arrived, for frame blending.
@@ -175,6 +179,13 @@ impl Latest {
         self.arrivals.lock().unwrap().get_or_insert_with(Default::default);
     }
 
+    /// As `queue_arrivals`, for layer `id` (a Display or Window source
+    /// blended on its own): a picture let go of unread is its miss.
+    pub(crate) fn queue_arrivals_for(&self, id: u64) {
+        self.kept_for.store(id, Ordering::Relaxed);
+        self.queue_arrivals();
+    }
+
     /// Keep them no more (a Display or Window source no longer blended),
     /// and let go of those kept.
     pub(crate) fn stop_queueing(&self) {
@@ -206,7 +217,7 @@ impl Latest {
                 if q.len() >= ARRIVALS_KEPT {
                     // Frame blending fell behind: that picture missed its frame.
                     q.pop_front();
-                    crate::count_missed(1);
+                    crate::count_missed_of(self.kept_for.load(Ordering::Relaxed), 1);
                 }
                 q.push_back(Arrival { at: super::host_now(), frame, seq });
             }

@@ -860,6 +860,12 @@ impl Picture {
         Self { feed, width, height, canvas, gpu, screen, feeds: layers::Feeds::new(layers, fps), stack: layers::Stack::main_only(), blends: Vec::new(), shows: None, nv12: Vec::new(), version: 0 }
     }
 
+    /// Whether the frames show the recording's own picture, as `layers`
+    /// last had them: the scene has it, turned on.
+    fn main_shown(&self) -> bool {
+        self.stack.main && !self.screen.lock().unwrap().hidden
+    }
+
     /// Where the screen goes now (hidden when the list hasn't it: a scene
     /// without the screen), and what of the other layers shows: on the
     /// card, for the frames made there next (a set of layers that changed
