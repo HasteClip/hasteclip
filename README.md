@@ -11,6 +11,13 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/hasteclip/hasteclip/releases/latest"><img src="https://img.shields.io/github/v/release/hasteclip/hasteclip?label=release" alt="Latest release"></a>
+  <a href="#download-history"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FHasteClip%2Fhasteclip%2Fstats%2Fdownloads.json" alt="Downloads"></a>
+  <a href="#platform-support"><img src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-blue" alt="Platforms: macOS, Windows and Linux"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/hasteclip/hasteclip" alt="License: GPL-3.0"></a>
+</p>
+
+<p align="center">
   <a href="https://github.com/hasteclip/hasteclip/releases/latest"><b>Download</b></a> ·
   <a href="https://hasteclip.com">Website</a> ·
   <a href="#features">Features</a> ·
@@ -29,6 +36,7 @@
 - [Compared with other recorders](#compared-with-other-recorders)
 - [Platform support](#platform-support)
 - [Building from source](#building-from-source)
+- [Download history](#download-history)
 - [Star history](#star-history)
 - [License](#license)
 
@@ -225,6 +233,18 @@ The release scripts build the app and bundle ffmpeg:
 - `scripts/release.ps1` (Windows) also bundles OBS Studio's game capture hook. It packs everything with [Velopack](https://velopack.io) into the installer and the delta update packages.
 - `scripts/release-mac.sh` builds the `.dmg`.
 - `scripts/release-linux.sh` builds the tarball.
+
+## Download history
+
+<a href="https://github.com/hasteclip/hasteclip/tree/stats">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/HasteClip/hasteclip/stats/downloads-dark.svg" />
+   <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/HasteClip/hasteclip/stats/downloads.svg" />
+   <img alt="HasteClip's downloads over time, by system" src="https://raw.githubusercontent.com/HasteClip/hasteclip/stats/downloads.svg" />
+ </picture>
+</a>
+
+Downloads of the installers on GitHub, counted once a day. Updates and update checks aren't counted. The shaded days, before daily counting began, are estimated from release dates. The [stats branch](https://github.com/hasteclip/hasteclip/tree/stats) has the numbers, and how each system's are counted.
 
 ## Star history
 
