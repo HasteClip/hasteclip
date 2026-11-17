@@ -1068,9 +1068,22 @@ pub(crate) struct Frames {
 /// each layer as it was placed and the picture it showed.
 #[derive(PartialEq)]
 struct Made {
-    screen: usize,
+    screen: Held,
     placed: crate::ScreenPlacement,
     layers: Vec<(crate::layers::Layer, Option<(usize, u64)>)>,
+}
+
+/// The screen's picture a frame was made from, the same as another while
+/// it's the same buffer. It's held so that this holds: let go, a pool's
+/// buffer comes back as a new picture (a blend of several, made in a pool
+/// of its own, was often in the buffer the frame before had, and that frame
+/// was repeated instead, issue #64).
+struct Held(Arc<Buffer>);
+
+impl PartialEq for Held {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(&*self.0.0, &*other.0.0)
+    }
 }
 
 impl Frames {
@@ -1134,7 +1147,7 @@ impl Frames {
                 // own each time) and its number (a pool's buffers come back).
                 let buffer = |b: &Buffer| &*b.0 as *const objc2_core_video::CVPixelBuffer as usize;
                 let made = Made {
-                    screen: buffer(&screen),
+                    screen: Held(screen.clone()),
                     placed,
                     layers: layers.iter().map(|(l, s)| (l.clone(), s.as_ref().map(|s| (buffer(&s.picture), s.version)))).collect(),
                 };
