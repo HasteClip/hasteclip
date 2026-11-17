@@ -167,6 +167,22 @@ impl LayerSource {
     pub fn blended(&self) -> bool {
         matches!(self, LayerSource::Picture { .. } | LayerSource::Colour { .. } | LayerSource::Browser { .. } | LayerSource::Animation { .. })
     }
+
+    /// Whether it's frame blended and timed as the recording's own capture
+    /// is, on its own (where it is: [`crate::BLEND_EVERY_SOURCE`]): a
+    /// display or a window, whose pictures come as fast as what's on it
+    /// changes, up to the display's refresh. Always, while frame blending's
+    /// on: there's no switch, as the work follows the pictures it shows (a
+    /// still one costs a copy now and then).
+    ///
+    /// Never a webcam, a video file, a web page or an animated picture:
+    /// their pictures come at their own pace, at or below the frame rate,
+    /// so blending would only mix neighbouring ones (a 30 fps webcam's
+    /// every other frame a mix of two of its pictures). Pictures, words and
+    /// colours never change.
+    pub fn frame_blended(&self) -> bool {
+        matches!(self, LayerSource::Display { .. } | LayerSource::Window { .. })
+    }
 }
 
 /// Whether this platform can capture one app's window as a layer (on

@@ -262,13 +262,13 @@ pub(crate) struct Latest {
     /// sends no new frames. With its valid size.
     saved: Mutex<Option<(ID3D11Texture2D, (u32, u32))>>,
     /// How many new pictures there have been, and when (host seconds, as f64
-    /// bits) the last one came up, to wake a consumer waiting for one.
+    /// bits) the last one came up (a consumer waiting for one waits on a
+    /// [`Bell`]).
     frames: Mutex<u64>,
     arrived: std::sync::atomic::AtomicU64,
     /// How many of those were changes put up some other way than `mark` (a
     /// still, black): a consumer of the queue takes those from `texture`.
     others: std::sync::atomic::AtomicU64,
-    wake: std::sync::Condvar,
     /// Every picture, not just the newest, each copied into a texture of its
     /// own, for a consumer that needs them all (frame blending) while
     /// `wants_queue`: between two of its looks the capture can bring several.
@@ -277,8 +277,16 @@ pub(crate) struct Latest {
     /// The textures the queue's pictures are copied into, taken in turn
     /// (made the first time they're needed), and which is next.
     pool: Mutex<(Vec<(ID3D11Texture2D, ID3D11ShaderResourceView)>, usize)>,
+    /// Rung with each new picture, for a consumer that waits on several
+    /// captures at once (the frame pacer, see [`Bell`]).
+    bell: Mutex<Option<Arc<Bell>>>,
+    /// Which source it is to frame blending (its layer's id, 0 the
+    /// recording's own capture): pictures let go of waiting count against it.
+    source: std::sync::atomic::AtomicU64,
     gpu: Gpu,
 }
+
+pub(crate) use crate::shutter::Bell;
 
 /// A picture that came up, kept for the frame blending: its own texture.
 pub(crate) struct Queued {
@@ -313,12 +321,23 @@ impl Latest {
             frames: Mutex::new(0),
             arrived: std::sync::atomic::AtomicU64::new(0),
             others: std::sync::atomic::AtomicU64::new(0),
-            wake: std::sync::Condvar::new(),
             queue: Mutex::new(std::collections::VecDeque::new()),
             wants_queue: AtomicBool::new(false),
             pool: Mutex::new((Vec::new(), 0)),
+            bell: Mutex::new(None),
+            source: std::sync::atomic::AtomicU64::new(0),
             gpu: gpu.clone(),
         }))
+    }
+
+    /// Ring `bell` with each new picture from now on (none: stop).
+    pub(crate) fn set_bell(&self, bell: Option<Arc<Bell>>) {
+        *self.bell.lock().unwrap() = bell;
+    }
+
+    /// It's source `id` to frame blending (its layer's id): see `source`.
+    pub(crate) fn set_source(&self, id: u64) {
+        self.source.store(id, Ordering::Relaxed);
     }
 
     pub(crate) fn has_frame(&self) -> bool {
@@ -326,7 +345,7 @@ impl Latest {
     }
 
     /// The picture just changed (a still, black): count it and time it, and
-    /// wake anyone waiting.
+    /// ring the bell, if there is one.
     pub(crate) fn note_frame(&self) {
         self.others.fetch_add(1, Ordering::AcqRel);
         self.note_frame_at(super::system::host_now());
@@ -343,7 +362,9 @@ impl Latest {
         *n += 1;
         self.arrived.store(at.to_bits(), Ordering::Release);
         drop(n);
-        self.wake.notify_all();
+        if let Some(bell) = self.bell.lock().unwrap().as_ref() {
+            bell.ring();
+        }
     }
 
     pub(crate) fn set_wants_queue(&self, on: bool) {
@@ -379,7 +400,7 @@ impl Latest {
         while queue.len() > QUEUE_MAX {
             // Frame blending fell behind: that picture missed its frame.
             queue.pop_front();
-            crate::count_missed(1);
+            crate::count_missed_of(self.source.load(Ordering::Relaxed), 1);
         }
         Ok(())
     }
@@ -393,16 +414,9 @@ impl Latest {
     }
 
     /// Pictures so far, and when the last arrived.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn arrivals(&self) -> (u64, f64) {
         (*self.frames.lock().unwrap(), f64::from_bits(self.arrived.load(Ordering::Acquire)))
-    }
-
-    /// Wait until there's a picture newer than count `seen`, or `timeout`.
-    pub(crate) fn wait_for_frame(&self, seen: u64, timeout: std::time::Duration) {
-        let n = self.frames.lock().unwrap();
-        if *n == seen {
-            let _ = self.wake.wait_timeout(n, timeout);
-        }
     }
 
     pub(crate) fn app(&self) -> Option<String> {
@@ -918,6 +932,14 @@ impl Capture {
         Ok(Self { pool, session, item: item.clone(), closed_token, closed, last_frame, ticker, stop })
     }
 
+    /// At most `fps` × 4 pictures a second from now on, as `start` sets it
+    /// (frame blending changed: the looks a second did). Windows 11 24H2
+    /// and later; ignored before.
+    pub(crate) fn set_rate(&self, fps: u32) {
+        let interval = 10_000_000 / (4 * fps.max(1) as i64);
+        let _ = self.session.SetMinUpdateInterval(windows::Foundation::TimeSpan { Duration: interval });
+    }
+
     /// How long since the last frame (since the capture started, before the
     /// first): a window that's showing and sends nothing for long may be one
     /// Windows can't see (exclusive fullscreen).
@@ -1043,6 +1065,11 @@ pub(crate) struct Converter {
     /// each (made as each turns up), as of the feeds' generation.
     feeds: Option<Arc<super::layers::Feeds>>,
     drawn: std::cell::RefCell<(u64, Vec<(u64, Layer)>)>,
+    /// Each Display and Window source drawn from its frame's blend, where
+    /// it has one (the recording's frames, the stream's: see
+    /// `super::layers::Feeds::picture`), not its newest picture (the
+    /// preview's, which shows the recording's own capture's newest too).
+    blended: bool,
     /// What a layer's processor is made for.
     targets: Vec<ID3D11Texture2D>,
     yuv: bool,
@@ -1200,13 +1227,16 @@ impl Layer {
 
 impl Converter {
     /// `feeds`: the other layers' pictures, and their order and places,
-    /// drawn over `source` or under it (none: `source` alone). `screen`:
-    /// where `source` (its crop, if any) goes in the `width`×`height` frame.
+    /// drawn over `source` or under it (none: `source` alone); `blended`:
+    /// each Display and Window source's blend, where it has one (see
+    /// `Converter::blended`). `screen`: where `source` (its crop, if any)
+    /// goes in the `width`×`height` frame.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         gpu: &Gpu,
         source: &Arc<Latest>,
         feeds: Option<Arc<super::layers::Feeds>>,
+        blended: bool,
         targets: &[ID3D11Texture2D],
         yuv: bool,
         width: u32,
@@ -1225,6 +1255,7 @@ impl Converter {
             base,
             feeds,
             drawn: std::cell::RefCell::new((u64::MAX, Vec::new())),
+            blended,
             targets: targets.to_vec(),
             yuv,
             fps,
@@ -1242,7 +1273,7 @@ impl Converter {
         }
         let mut next = Vec::new();
         for l in layers {
-            let Some(picture) = feeds.picture(l.id) else { continue };
+            let Some(picture) = feeds.picture(l.id, self.blended) else { continue };
             if let Some(i) = drawn.1.iter().position(|(id, layer)| *id == l.id && Arc::ptr_eq(&layer.source, &picture)) {
                 next.push(drawn.1.swap_remove(i));
                 continue;
@@ -1470,7 +1501,8 @@ impl Previewer {
             let staging = (0..Self::SLOTS)
                 .map(|_| gpu.texture(width, height, format, 0, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ.0 as u32))
                 .collect::<Result<Vec<_>>>()?;
-            let converter = Converter::new(gpu, latest, feeds.clone(), std::slice::from_ref(&target), false, width, height, fps, screen.clone())?;
+            // Each picture's newest, as the recording's own capture's.
+            let converter = Converter::new(gpu, latest, feeds.clone(), false, std::slice::from_ref(&target), false, width, height, fps, screen.clone())?;
             Ok((target, staging, converter))
         };
         let (rgba, (target, staging, converter)) = match make(DXGI_FORMAT_R8G8B8A8_UNORM) {

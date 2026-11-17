@@ -311,8 +311,9 @@ impl Session {
             let picture = Picture::start(&s.video, &content, &display, (width, height), s.fps * looks, away, placed)?;
             // A layer that can't open (a webcam, a window) doesn't stop the
             // recording: its status says why, and the picture goes on
-            // without it.
-            let frames = Frames::new(picture.latest.clone(), s.layers.clone(), s.screen.clone(), Some(picture.ctl()), width, height, s.fps, crate::preview::new_producer())?;
+            // without it. Displays and windows are looked at as often as
+            // the screen (each blended on its own, see `mac::blend`).
+            let frames = Frames::new(picture.latest.clone(), s.layers.clone(), s.screen.clone(), Some(picture.ctl()), width, height, s.fps * looks, crate::preview::new_producer())?;
             let latest = picture.latest.clone();
             session.video = Some(picture);
             // Not blended too, a frame takes the picture that was up at its

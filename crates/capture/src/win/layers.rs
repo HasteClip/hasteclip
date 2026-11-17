@@ -7,6 +7,11 @@
 //! to another camera or display gets the new one's. Only [`Feeds::update`]
 //! changes what's there, on the pacer's thread, once per frame; converters
 //! take up the change at their next frame (see [`Feeds::generation`]).
+//!
+//! Each Display and Window source that shows is frame blended and timed by
+//! the pacer, as the recording's own capture is (`super::Source`): the
+//! recording's and the stream's frames draw it from its blend
+//! ([`Feeds::set_blend`]), the preview from its newest picture.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,10 +32,16 @@ pub(crate) struct Feeds {
     /// Each layer's own picture source, by layer id (none for the main
     /// picture): changed by `update` only.
     feeds: Mutex<Vec<(u64, Feed)>>,
+    /// Each frame blended Display and Window source's blend for the frame
+    /// being made, by layer id (see `super::FrameBlend`): what the
+    /// recording's frames draw it from. Set by the frame pacer.
+    blends: Mutex<Vec<(u64, Arc<Latest>)>>,
     /// Goes up each time a layer gets another picture, or loses one.
     generation: AtomicU64,
-    /// The rate a display's captured at.
-    fps: u32,
+    /// The rate a display or window is captured at (the looks a second,
+    /// with frame blending), shared with the captures, which take up a
+    /// change.
+    fps: Arc<std::sync::atomic::AtomicU32>,
 }
 
 /// One layer's picture.
@@ -112,7 +123,14 @@ fn still_texture(gpu: &Gpu, image: &crate::StillImage) -> anyhow::Result<Arc<Lat
 
 impl Feeds {
     pub(crate) fn new(gpu: &Gpu, layers: SharedLayers, fps: u32) -> Arc<Self> {
-        let feeds = Arc::new(Self { gpu: gpu.clone(), layers, feeds: Mutex::new(Vec::new()), generation: AtomicU64::new(0), fps });
+        let feeds = Arc::new(Self {
+            gpu: gpu.clone(),
+            layers,
+            feeds: Mutex::new(Vec::new()),
+            blends: Mutex::new(Vec::new()),
+            generation: AtomicU64::new(0),
+            fps: Arc::new(std::sync::atomic::AtomicU32::new(fps)),
+        });
         feeds.update();
         feeds
     }
@@ -126,9 +144,47 @@ impl Feeds {
         self.generation.load(Ordering::Acquire)
     }
 
-    /// Layer `id`'s picture, if it has one.
-    pub(crate) fn picture(&self, id: u64) -> Option<Arc<Latest>> {
+    /// Layer `id`'s picture, if it has one: its newest, or (`blended`) its
+    /// blend for the frame being made, while it has one (see `blends`).
+    pub(crate) fn picture(&self, id: u64, blended: bool) -> Option<Arc<Latest>> {
+        if blended && let Some((_, blend)) = self.blends.lock().unwrap().iter().find(|(i, _)| *i == id) {
+            return Some(blend.clone());
+        }
         self.feeds.lock().unwrap().iter().find(|(i, _)| *i == id).map(|(_, f)| f.latest().clone())
+    }
+
+    /// Layer `id`'s frames are drawn from `blend` from now on (none: from
+    /// its newest picture again).
+    pub(crate) fn set_blend(&self, id: u64, blend: Option<Arc<Latest>>) {
+        let mut blends = self.blends.lock().unwrap();
+        blends.retain(|(i, _)| *i != id);
+        blends.extend(blend.map(|b| (id, b)));
+        drop(blends);
+        self.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// The layers frame blended with the recording's own capture, each on
+    /// its own: each Display and Window source that shows and has its
+    /// capture (`LayerSource::frame_blended`), its capture, and what it is,
+    /// for the log.
+    pub(crate) fn frame_blended(&self) -> Vec<(u64, Arc<Latest>, String)> {
+        let layers = self.layers();
+        let feeds = self.feeds.lock().unwrap();
+        layers
+            .iter()
+            .filter(|l| l.shown() && l.source.frame_blended())
+            .filter_map(|l| match feeds.iter().find(|(id, _)| *id == l.id).map(|(_, f)| f)? {
+                Feed::Display { id, display } => Some((l.id, display.latest.clone(), format!("display {id}"))),
+                Feed::Window { app, window } => Some((l.id, window.latest.clone(), format!("window {app}"))),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Displays and windows are captured at `fps` from now on (the looks
+    /// a second: frame blending changed).
+    pub(crate) fn set_fps(&self, fps: u32) {
+        self.fps.store(fps, Ordering::Relaxed);
     }
 
     /// Follow the layer list: a picture for each layer added (or changed
@@ -157,14 +213,14 @@ impl Feeds {
                     }
                 }
                 LayerSource::Camera { .. } => continue,
-                LayerSource::Display { id, .. } => match CaptureFeed::start(&self.gpu, Target::Display(id.clone()), self.fps) {
+                LayerSource::Display { id, .. } => match CaptureFeed::start(&self.gpu, Target::Display(id.clone()), self.fps.clone()) {
                     Ok(display) => Feed::Display { id: id.clone(), display },
                     Err(e) => {
                         eprintln!("display layer: {e:#}");
                         continue;
                     }
                 },
-                LayerSource::Window { app, .. } => match CaptureFeed::start(&self.gpu, Target::Window(app.clone()), self.fps) {
+                LayerSource::Window { app, .. } => match CaptureFeed::start(&self.gpu, Target::Window(app.clone()), self.fps.clone()) {
                     Ok(window) => Feed::Window { app: app.clone(), window },
                     Err(e) => {
                         eprintln!("window layer: {e:#}");
@@ -173,7 +229,7 @@ impl Feeds {
                 },
                 LayerSource::Browser { url, width, height, css, .. } => {
                     let host = super::browser::BrowserHost::start(url.clone(), *width, *height, css.clone());
-                    match CaptureFeed::start(&self.gpu, Target::Browser(host), self.fps) {
+                    match CaptureFeed::start(&self.gpu, Target::Browser(host), self.fps.clone()) {
                         Ok(page) => Feed::Browser { url: url.clone(), size: (*width, *height), css: css.clone(), page },
                         Err(e) => {
                             eprintln!("browser layer: {e:#}");
@@ -521,7 +577,9 @@ struct CaptureFeed {
 }
 
 impl CaptureFeed {
-    fn start(gpu: &Gpu, target: Target, fps: u32) -> anyhow::Result<Self> {
+    /// Captured at `rate` (frames a second, as `d3d::Capture::start` takes
+    /// them), which can change while it runs.
+    fn start(gpu: &Gpu, target: Target, rate: Arc<std::sync::atomic::AtomicU32>) -> anyhow::Result<Self> {
         // Room for any display (a window fits in the biggest; one bigger
         // is shrunk to fit): it can be another by the time it's found.
         let (w, h) = system::largest_display_box();
@@ -537,6 +595,7 @@ impl CaptureFeed {
                 Target::Browser(_) => "browser layer".to_owned(),
             };
             while !stop2.load(Ordering::Relaxed) {
+                let fps = rate.load(Ordering::Relaxed);
                 let started = match &target {
                     Target::Display(id) => system::connected_monitor(id)
                         .ok_or_else(|| anyhow::anyhow!("the display isn't connected"))
@@ -556,8 +615,15 @@ impl CaptureFeed {
                         // A window closed ends its capture; one hidden away
                         // (not minimized) is looked for again, it may be another.
                         let gone = |w: Option<windows::Win32::Foundation::HWND>| w.is_some_and(|h| !system::window_alive(h));
+                        let mut at = fps;
                         while !stop2.load(Ordering::Relaxed) && !capture.is_closed() && !gone(window) {
                             thread::sleep(Duration::from_millis(50));
+                            // Frame blending changed: as fast as its looks.
+                            let now = rate.load(Ordering::Relaxed);
+                            if now != at {
+                                capture.set_rate(now);
+                                at = now;
+                            }
                         }
                         latest2.forget();
                     }

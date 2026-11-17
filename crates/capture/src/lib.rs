@@ -1153,7 +1153,7 @@ pub struct Devices {
 /// pictures that came up meanwhile were too late for their frames (one
 /// repeated, the next skipped). A terminal holds a writer for as long as text
 /// in it is selected.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub(crate) fn log_later(line: String) {
     static WRITER: std::sync::OnceLock<Option<std::sync::mpsc::Sender<String>>> = std::sync::OnceLock::new();
     let writer = WRITER.get_or_init(|| {
@@ -1185,18 +1185,39 @@ macro_rules! eprintln_later {
 pub(crate) use eprintln_later;
 
 /// One second of the running capture: frames handed to the video encoder
-/// and frames skipped, and (frame blending) the screen's new pictures and
-/// those that missed their frame.
-#[derive(Clone, Copy)]
+/// and frames skipped, and (frame blending) each blended source's new
+/// pictures and those that missed their frame.
+#[derive(Clone, Default)]
 struct Second {
     encoded: u32,
     skipped: u32,
+    /// Each source blended, by its layer's id ([`Layer::id`]; 0 is the
+    /// recording's own capture), once it's been counted.
+    sources: Vec<SourceSecond>,
+}
+
+/// One blended source's second ([`Second::sources`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SourceSecond {
+    id: u64,
     pictures: u32,
     missed: u32,
 }
 
 impl Second {
-    const NONE: Self = Self { encoded: 0, skipped: 0, pictures: 0, missed: 0 };
+    const NONE: Self = Self { encoded: 0, skipped: 0, sources: Vec::new() };
+
+    /// Source `id`'s counts (none yet, it's counted from here).
+    fn source(&mut self, id: u64) -> &mut SourceSecond {
+        let at = match self.sources.iter().position(|s| s.id == id) {
+            Some(at) => at,
+            None => {
+                self.sources.push(SourceSecond { id, pictures: 0, missed: 0 });
+                self.sources.len() - 1
+            }
+        };
+        &mut self.sources[at]
+    }
 }
 
 /// The running capture's second under way and the whole one before it, as
@@ -1208,6 +1229,11 @@ struct History {
     /// blend; none before the pacer begins).
     fps: u32,
     looks: u32,
+    /// How many sources the looks are at (the recording's own capture and
+    /// each Display and Window source that shows), and which one's pictures
+    /// are told (its layer's id): see [`blend_sources`].
+    sources: u32,
+    told: u64,
     /// The second under way (counted from the start) and its counts.
     at: u64,
     now: Second,
@@ -1216,7 +1242,13 @@ struct History {
 }
 
 impl History {
-    const NONE: Self = Self { started: None, fps: 0, looks: 0, at: 0, now: Second::NONE, last: None };
+    const NONE: Self = Self { started: None, fps: 0, looks: 0, sources: 1, told: 0, at: 0, now: Second::NONE, last: None };
+
+    /// See [`blend_sources`].
+    fn set_sources(&mut self, count: usize, told: u64) {
+        self.sources = count.clamp(1, u32::MAX as usize) as u32;
+        self.told = told;
+    }
 
     /// The second under way: once another begins, the one before is whole
     /// (a quiet one when seconds went by with nothing counted). None between
@@ -1224,8 +1256,9 @@ impl History {
     fn now(&mut self) -> Option<&mut Second> {
         let at = self.started?.elapsed().as_secs();
         if at > self.at {
-            self.last = Some(if at == self.at + 1 { self.now } else { Second::NONE });
-            (self.at, self.now) = (at, Second::NONE);
+            let now = std::mem::take(&mut self.now);
+            self.last = Some(if at == self.at + 1 { now } else { Second::NONE });
+            self.at = at;
         }
         Some(&mut self.now)
     }
@@ -1265,15 +1298,42 @@ pub(crate) fn count_skipped(n: u64) {
     count(|s| s.skipped = s.skipped.saturating_add(n.min(u32::MAX as u64) as u32));
 }
 
-/// Frame blending got one of the screen's pictures.
+/// Frame blending got one of the screen's pictures (the recording's own
+/// capture's).
+#[cfg_attr(any(target_os = "windows", target_os = "macos"), allow(dead_code))]
 pub(crate) fn count_picture() {
-    count(|s| s.pictures += 1);
+    count_picture_of(0);
 }
 
-/// `n` of the screen's pictures missed their frame: one came too late for it,
-/// or was let go of waiting while frame blending fell behind.
+/// Frame blending got one of source `id`'s pictures (its layer's id; 0 is
+/// the recording's own capture).
+pub(crate) fn count_picture_of(id: u64) {
+    count(|s| s.source(id).pictures += 1);
+}
+
+/// `n` of the screen's pictures (the recording's own capture's) missed their
+/// frame: one came too late for it, or was let go of waiting while frame
+/// blending fell behind.
 pub(crate) fn count_missed(n: u64) {
-    count(|s| s.missed = s.missed.saturating_add(n.min(u32::MAX as u64) as u32));
+    count_missed_of(0, n);
+}
+
+/// `n` of source `id`'s pictures missed their frame (see [`count_missed`]).
+pub(crate) fn count_missed_of(id: u64, n: u64) {
+    count(|s| {
+        let c = s.source(id);
+        c.missed = c.missed.saturating_add(n.min(u32::MAX as u64) as u32);
+    });
+}
+
+/// The looks are at `count` sources from now on (the recording's own
+/// capture and each Display and Window source that shows, each blended on
+/// its own), and source `told`'s pictures are told (its layer's id: see
+/// [`BlendHealth::told`]): said again after [`blending`], which starts from
+/// one, the recording's own capture.
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos", target_os = "linux")), allow(dead_code))]
+pub(crate) fn blend_sources(count: usize, told: u64) {
+    HISTORY.lock().unwrap().set_sources(count, told);
 }
 
 /// How the running capture keeps up ([`health`]).
@@ -1302,6 +1362,15 @@ pub struct BlendHealth {
     /// Looks at the screen a second, and per frame.
     pub rate: u32,
     pub looks: u32,
+    /// The sources each look is at, each blended on its own: the
+    /// recording's own capture and each Display and Window source that
+    /// shows (where they're blended: [`BLEND_EVERY_SOURCE`]).
+    pub sources: u32,
+    /// The source whose pictures [`BlendSecond::pictures`] counts, by its
+    /// layer's id ([`Layer::id`]): the recording's own capture (0) while the
+    /// scene shows it, else the one that shows the most pictures. (Each
+    /// source's looks are kept halfway between its own pictures.)
+    pub told: u64,
     /// Its last whole second (none until one has gone by).
     pub last_second: Option<BlendSecond>,
 }
@@ -1312,14 +1381,24 @@ pub struct BlendSecond {
     /// Looks blended into the frames that went to the video: every look,
     /// whether or not the screen had changed for it, but a skipped frame's.
     pub blended: u32,
-    /// The screen's new pictures: it only shows one when something on it
-    /// changes (as often as the game draws, or the display refreshes), and
-    /// each look takes the newest one up.
+    /// The new pictures of the source told ([`BlendHealth::told`]): it
+    /// only shows one when something on it changes (as often as the game
+    /// draws, or the display refreshes), and each look takes the newest one
+    /// up.
     pub pictures: u32,
     /// Pictures that missed their frame (came too late for it, or were let go
-    /// of waiting): those frames reused the picture before.
+    /// of waiting): those frames reused the picture before. The most of any
+    /// one source's, and which source that was (`missed_by`, its layer's id).
     pub missed: u32,
+    pub missed_by: u64,
 }
+
+/// Whether a Display or Window source is blended (and timed) with the
+/// recording's own capture, each on its own ([`LayerSource::frame_blended`]):
+/// on Windows and macOS, and on Linux wherever frame blending is
+/// ([`frame_blending`]). Elsewhere only the recording's own capture is, and
+/// the other sources show their newest picture each frame.
+pub const BLEND_EVERY_SOURCE: bool = cfg!(any(target_os = "windows", target_os = "macos", target_os = "linux"));
 
 /// How the running capture keeps up: its last whole second, counted each
 /// second from its start, as a frame rate counter would. None before a
@@ -1332,20 +1411,29 @@ impl History {
     /// [`health`] of this history.
     fn summary(&mut self) -> Option<CaptureHealth> {
         self.now()?;
-        let last_second = self.last.map(|s| LastSecond { encoded: s.encoded, skipped: s.skipped });
-        let (fps, looks) = (self.fps, self.looks);
+        let last_second = self.last.as_ref().map(|s| LastSecond { encoded: s.encoded, skipped: s.skipped });
+        let (fps, looks, told) = (self.fps, self.looks, self.told);
         let blend = (looks > 1).then(|| BlendHealth {
             rate: fps.saturating_mul(looks),
             looks,
-            last_second: self.last.map(|s| BlendSecond {
-                // Every frame made blends all its looks; a skipped one's go
-                // with it. Told by the frames skipped, not those made: the
-                // pacer makes exactly `fps` a second on its own clock, but a
-                // second here can catch one more or one fewer of them as
-                // they're finished. None made or skipped: it was held up.
-                blended: if s.encoded + s.skipped == 0 { 0 } else { fps.saturating_sub(s.skipped).saturating_mul(looks) },
-                pictures: s.pictures,
-                missed: s.missed,
+            sources: self.sources.max(1),
+            told,
+            last_second: self.last.as_ref().map(|s| {
+                // The source that missed the most; of those missing as
+                // many, the first counted.
+                let worst = s.sources.iter().filter(|c| c.missed > 0).fold(None::<&SourceSecond>, |w, c| if w.is_some_and(|w| w.missed >= c.missed) { w } else { Some(c) });
+                BlendSecond {
+                    // Every frame made blends all its looks; a skipped one's
+                    // go with it. Told by the frames skipped, not those
+                    // made: the pacer makes exactly `fps` a second on its
+                    // own clock, but a second here can catch one more or one
+                    // fewer of them as they're finished. None made or
+                    // skipped: it was held up.
+                    blended: if s.encoded + s.skipped == 0 { 0 } else { fps.saturating_sub(s.skipped).saturating_mul(looks) },
+                    pictures: s.sources.iter().find(|c| c.id == told).map_or(0, |c| c.pictures),
+                    missed: worst.map_or(0, |c| c.missed),
+                    missed_by: worst.map_or(0, |c| c.id),
+                }
             }),
         });
         Some(CaptureHealth { last_second, blend })
@@ -1363,6 +1451,12 @@ mod health_tests {
         History { started: Some(Instant::now() - Duration::from_millis(ms)), fps: 60, looks: 9, ..History::NONE }
     }
 
+    /// A second of `encoded` frames made and `skipped`, and each source's
+    /// (its id) new pictures and missed ones.
+    fn second(encoded: u32, skipped: u32, sources: &[(u64, u32, u32)]) -> Second {
+        Second { encoded, skipped, sources: sources.iter().map(|&(id, pictures, missed)| SourceSecond { id, pictures, missed }).collect() }
+    }
+
     /// Counts go to the second they happened in: the last whole second's are
     /// as they were, not the one under way's.
     #[test]
@@ -1371,13 +1465,13 @@ mod health_tests {
         let s = h.summary().unwrap();
         assert_eq!((s.last_second, s.blend.map(|b| (b.rate, b.looks, b.last_second))), (None, Some((540, 9, None))), "no whole second yet");
         // Second 0: 57 frames made and 3 skipped, 500 new pictures, 2 of them too late.
-        *h.now().unwrap() = Second { encoded: 57, skipped: 3, pictures: 500, missed: 2 };
+        *h.now().unwrap() = second(57, 3, &[(0, 500, 2)]);
         // Half a second into second 1: 40 pictures so far.
         h.started = Some(Instant::now() - Duration::from_millis(1500));
-        h.now().unwrap().pictures = 40;
+        h.now().unwrap().source(0).pictures = 40;
         let s = h.summary().unwrap();
         assert_eq!(s.last_second, Some(LastSecond { encoded: 57, skipped: 3 }));
-        assert_eq!(s.blend.unwrap().last_second, Some(BlendSecond { blended: 57 * 9, pictures: 500, missed: 2 }), "a skipped frame's looks aren't blended");
+        assert_eq!(s.blend.unwrap().last_second, Some(BlendSecond { blended: 57 * 9, pictures: 500, missed: 2, missed_by: 0 }), "a skipped frame's looks aren't blended");
     }
 
     /// Every look of a frame made is blended, whether or not the screen
@@ -1387,11 +1481,32 @@ mod health_tests {
     #[test]
     fn every_look_counts() {
         let mut h = began(1500);
-        (h.at, h.last) = (1, Some(Second { encoded: 60, ..Second::NONE }));
-        assert_eq!(h.summary().unwrap().blend.unwrap().last_second, Some(BlendSecond { blended: 540, pictures: 0, missed: 0 }));
+        (h.at, h.last) = (1, Some(second(60, 0, &[])));
+        assert_eq!(h.summary().unwrap().blend.unwrap().last_second, Some(BlendSecond { blended: 540, pictures: 0, missed: 0, missed_by: 0 }));
         // Catching up after falling behind: more than a second's frames skipped at once.
-        h.last = Some(Second { skipped: 75, ..Second::NONE });
+        h.last = Some(second(0, 75, &[]));
         assert_eq!(h.summary().unwrap().blend.unwrap().last_second.map(|b| b.blended), Some(0));
+    }
+
+    /// With other sources blended too, the pictures said are those of the
+    /// source told, and the pictures missed the most any one source missed,
+    /// with which source that was.
+    #[test]
+    fn each_source_counts_on_its_own() {
+        let mut h = began(1500);
+        let display = 2 << 32 | 7;
+        let window = 2 << 32 | 9;
+        (h.at, h.last) = (1, Some(second(60, 0, &[(0, 520, 1), (display, 240, 6), (window, 30, 6)])));
+        h.set_sources(3, 0);
+        let b = h.summary().unwrap().blend.unwrap();
+        assert_eq!(b.sources, 3);
+        assert_eq!(b.last_second, Some(BlendSecond { blended: 540, pictures: 520, missed: 6, missed_by: display }), "the first of those missing as many");
+        // The scene doesn't show the recording's own capture: the
+        // display's pictures are told; nothing missed.
+        h.last = Some(second(60, 0, &[(0, 520, 0), (display, 240, 0)]));
+        h.set_sources(2, display);
+        let b = h.summary().unwrap().blend.unwrap();
+        assert_eq!((b.told, b.last_second.map(|s| (s.pictures, s.missed, s.missed_by))), (display, Some((240, 0, 0))));
     }
 
     /// Seconds with nothing counted still go by: the last whole second is a
@@ -1399,7 +1514,7 @@ mod health_tests {
     #[test]
     fn quiet_seconds_go_by() {
         let mut h = began(0);
-        *h.now().unwrap() = Second { encoded: 60, skipped: 0, pictures: 500, missed: 5 };
+        *h.now().unwrap() = second(60, 0, &[(0, 500, 5)]);
         // Ten seconds later, nothing more counted: the pacer was held up.
         h.started = Some(Instant::now() - Duration::from_secs(10));
         let s = h.summary().unwrap();
