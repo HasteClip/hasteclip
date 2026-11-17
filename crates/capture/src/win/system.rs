@@ -17,14 +17,14 @@ use windows::Win32::Media::Audio::{
 };
 use windows::Win32::System::Com::STGM_READ;
 use windows::Win32::Media::MediaFoundation::{MF_VERSION, MFSTARTUP_FULL, MFStartup};
-use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
+use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, GetLogicalDrives, QueryDosDeviceW, VerQueryValueW};
 use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoIncrementMTAUsage, CoInitializeEx};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW,
 };
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
@@ -775,8 +775,16 @@ pub(crate) fn hidden_command(exe: &std::path::Path) -> std::process::Command {
     cmd
 }
 
-/// Full path of a process's executable.
+/// Full path of a process's executable. Asked of the process when it lets
+/// us open it, else of the system. Some processes keep every other program
+/// out: anti-cheat does that with its game, and such a game was missing from
+/// every list of apps and never recorded (issue #62).
 pub(crate) fn image_path(pid: u32) -> Option<String> {
+    opened_image_path(pid).or_else(|| system_image_path(pid))
+}
+
+/// A process's executable's path, asked of the process itself.
+fn opened_image_path(pid: u32) -> Option<String> {
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut buf = [0u16; 1024];
@@ -785,6 +793,112 @@ pub(crate) fn image_path(pid: u32) -> Option<String> {
         let _ = CloseHandle(handle);
         ok.then(|| String::from_utf16_lossy(&buf[..len as usize]))
     }
+}
+
+/// A process's executable's path, asked of the system, which tells anyone
+/// without the process being opened. It says it as a device path
+/// (`\Device\HarddiskVolume3\…`), given here on its drive (see [`drive_path`]).
+fn system_image_path(pid: u32) -> Option<String> {
+    windows_core::link!("ntdll.dll" "system" fn NtQuerySystemInformation(class: i32, info: *mut core::ffi::c_void, len: u32, returned: *mut u32) -> i32);
+    // UNICODE_STRING: its lengths are in bytes.
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+    // SYSTEM_PROCESS_ID_INFORMATION: a pid in, its executable's path out.
+    #[repr(C)]
+    struct ProcessIdInformation {
+        pid: usize,
+        image_name: UnicodeString,
+    }
+    const SYSTEM_PROCESS_ID_INFORMATION: i32 = 88;
+    const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
+    let mut buf = vec![0u16; 512];
+    // A path longer than the room given: the room it needs comes back, and
+    // it's asked again with that.
+    for _ in 0..2 {
+        let mut info = ProcessIdInformation {
+            pid: pid as usize,
+            image_name: UnicodeString { length: 0, maximum_length: (buf.len() * 2) as u16, buffer: buf.as_mut_ptr() },
+        };
+        // SAFETY: the structure this class takes, its text going into `buf`,
+        // whose size in bytes it says.
+        let status = unsafe {
+            NtQuerySystemInformation(SYSTEM_PROCESS_ID_INFORMATION, (&raw mut info).cast(), std::mem::size_of::<ProcessIdInformation>() as u32, std::ptr::null_mut())
+        };
+        let needed = (info.image_name.maximum_length as usize).div_ceil(2).min(u16::MAX as usize / 2);
+        if status == STATUS_INFO_LENGTH_MISMATCH && needed > buf.len() {
+            buf = vec![0u16; needed];
+            continue;
+        }
+        let len = (info.image_name.length as usize / 2).min(buf.len());
+        if status < 0 || len == 0 {
+            return None;
+        }
+        return Some(drive_path(&String::from_utf16_lossy(&buf[..len]), &drives()));
+    }
+    None
+}
+
+/// Each drive letter with the device it stands for (`C:`,
+/// `\Device\HarddiskVolume3`).
+fn drives() -> Vec<(String, String)> {
+    // SAFETY: no arguments.
+    let letters = unsafe { GetLogicalDrives() };
+    (0..26u8)
+        .filter(|i| letters & (1u32 << i) != 0)
+        .filter_map(|i| {
+            let drive = format!("{}:", (b'A' + i) as char);
+            let name: Vec<u16> = drive.encode_utf16().chain([0]).collect();
+            let mut buf = [0u16; 512];
+            // SAFETY: a NUL-terminated name and room for the answer: the
+            // devices it stands for, each ending in a NUL, the first in use.
+            let len = unsafe { QueryDosDeviceW(PCWSTR(name.as_ptr()), Some(&mut buf)) };
+            (len > 0).then(|| (drive, from_wide(&buf))).filter(|(_, device)| !device.is_empty())
+        })
+        .collect()
+}
+
+/// A device path (`\Device\HarddiskVolume3\Games\x.exe`) as the usual kind:
+/// on its drive's letter (`C:\Games\x.exe`, its device matched whole, so
+/// Volume1 isn't taken for Volume10), or as a network share's
+/// (`\\server\share\…`), else in the form Windows' file functions take a
+/// device path in (`\\?\GLOBALROOT\Device\…`).
+fn drive_path(device_path: &str, drives: &[(String, String)]) -> String {
+    // What follows `device` in the path, when the path is on it.
+    let on = |device: &str| {
+        let rest = device_path.get(device.len()..)?;
+        (!device.is_empty() && device_path[..device.len()].eq_ignore_ascii_case(device) && rest.starts_with('\\')).then_some(rest)
+    };
+    if let Some((drive, rest)) = drives.iter().find_map(|(drive, device)| Some((drive, on(device)?))) {
+        return format!("{drive}{rest}");
+    }
+    if let Some(rest) = on(r"\Device\Mup") {
+        return format!(r"\{rest}");
+    }
+    format!(r"\\?\GLOBALROOT{device_path}")
+}
+
+/// Whether process `pid` lets us open it, as the game capture hook does
+/// first (see `hook::HookCapture::start`). Anti-cheat keeps every other
+/// program out of its game's process.
+pub(crate) fn can_open(pid: u32) -> bool {
+    // SAFETY: a handle closed as soon as it's had.
+    match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, false, pid) } {
+        Ok(handle) => {
+            let _ = unsafe { CloseHandle(handle) };
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Whether running app `exe`'s window's process lets us open it (see
+/// [`can_open`]).
+pub(crate) fn app_can_be_opened(exe: &str) -> bool {
+    find_app_window(exe).is_some_and(|hwnd| can_open(window_pid(hwnd)))
 }
 
 /// The "File description" from an executable's version info — what Task
@@ -957,5 +1071,70 @@ mod tests {
         assert_eq!(version_string(&wide("\u{0}8\u{16}\u{1}FileV")), None);
         assert_eq!(version_string(&wide("  ")), None);
         assert_eq!(version_string(&[]), None);
+    }
+
+    /// A device path comes back on its drive's letter, its device matched
+    /// whole and in any case; on the network as a share; else in the form
+    /// Windows' file functions take.
+    #[test]
+    fn device_paths_on_their_drives() {
+        let drives = [("C:".to_owned(), r"\Device\HarddiskVolume1".to_owned()), ("D:".to_owned(), r"\Device\HarddiskVolume10".to_owned())];
+        assert_eq!(drive_path(r"\Device\HarddiskVolume10\Games\x.exe", &drives), r"D:\Games\x.exe");
+        assert_eq!(drive_path(r"\Device\HarddiskVolume1\Windows\x.exe", &drives), r"C:\Windows\x.exe");
+        assert_eq!(drive_path(r"\device\harddiskvolume1\x.exe", &drives), r"C:\x.exe");
+        assert_eq!(drive_path(r"\Device\Mup\server\share\x.exe", &drives), r"\\server\share\x.exe");
+        assert_eq!(drive_path(r"\Device\CdRom0\x.exe", &drives), r"\\?\GLOBALROOT\Device\CdRom0\x.exe");
+        // A drive whose device came back empty matches nothing.
+        assert_eq!(drive_path(r"\Device\HarddiskVolume1\x.exe", &[("C:".to_owned(), String::new())]), r"\\?\GLOBALROOT\Device\HarddiskVolume1\x.exe");
+    }
+
+    /// The system says where this test's own executable is, on its drive.
+    #[test]
+    fn the_system_says_where_a_process_is() {
+        let exe = std::env::current_exe().unwrap().to_string_lossy().to_lowercase();
+        assert_eq!(system_image_path(std::process::id()).map(|p| p.to_lowercase()), Some(exe));
+    }
+
+    /// A process no other program may open, as anti-cheat makes its game's
+    /// (issue #62): it's still found, by where its executable is, and known
+    /// to be shut.
+    #[test]
+    fn a_shut_process_is_still_found() {
+        use std::os::windows::io::AsRawHandle;
+        let system = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+        let ping = std::path::Path::new(&system).join(r"System32\PING.EXE");
+        let mut child = hidden_command(&ping).args(["-n", "30", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap();
+        let pid = child.id();
+        let open_before = can_open(pid);
+        shut_out(windows::Win32::Foundation::HANDLE(child.as_raw_handle()));
+        let (open_after, opened, found) = (can_open(pid), opened_image_path(pid), image_path(pid));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(open_before);
+        assert!(!open_after, "still opens with its access list emptied: does this run with the right to open any process (SeDebugPrivilege)?");
+        assert_eq!(opened, None);
+        let found = found.expect("found without opening it").to_lowercase();
+        assert!(found.ends_with(r"\ping.exe") && found.as_bytes().get(1) == Some(&b':'), "{found}");
+    }
+
+    /// Empties a process's access list, so no one may open it any more (its
+    /// owner may still change the list): what anti-cheat does with its game.
+    fn shut_out(process: windows::Win32::Foundation::HANDLE) {
+        use windows::Win32::Security::{
+            ACL, ACL_REVISION, DACL_SECURITY_INFORMATION, InitializeAcl, InitializeSecurityDescriptor, PSECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR,
+            SetKernelObjectSecurity, SetSecurityDescriptorDacl,
+        };
+        // SAFETY: an empty list and a descriptor pointing at it, both kept
+        // here until the process has taken them.
+        unsafe {
+            let mut acl = ACL::default();
+            InitializeAcl(&mut acl, std::mem::size_of::<ACL>() as u32, ACL_REVISION).unwrap();
+            let mut sd = SECURITY_DESCRIPTOR::default();
+            let psd = PSECURITY_DESCRIPTOR((&raw mut sd).cast());
+            // SECURITY_DESCRIPTOR_REVISION.
+            InitializeSecurityDescriptor(psd, 1).unwrap();
+            SetSecurityDescriptorDacl(psd, true, Some(&raw const acl), false).unwrap();
+            SetKernelObjectSecurity(process, DACL_SECURITY_INFORMATION, psd).unwrap();
+        }
     }
 }

@@ -12,7 +12,9 @@
 //! cursor over it, and kept in its middle, as a game being played does;
 //! `HIDE_CURSOR=null`: the same, hidden the way GLFW (Minecraft 1.13 on) does,
 //! with no cursor image rather than none shown. `TIMES=1`: how far apart its
-//! pictures came, at the end.
+//! pictures came, at the end. `PROTECT=1`: no other program may open its
+//! process, as anti-cheat keeps every other program out of its game's
+//! (issue #62); nor end it, so it closes only after `SECS`.
 //!
 //!   cargo run -p capture --example hook_target
 //!   APP=hook_target.exe HOOK=1 SECS=5 HEIGHT=0 cargo run -p capture --example record
@@ -40,6 +42,24 @@ fn main() -> windows::core::Result<()> {
     let fullscreen = std::env::var("FULLSCREEN").is_ok_and(|v| v == "1");
     let hide_cursor = std::env::var("HIDE_CURSOR").ok().filter(|v| v == "1" || v == "null");
     NO_CURSOR_IMAGE.store(hide_cursor.as_deref() == Some("null"), std::sync::atomic::Ordering::Relaxed);
+    if std::env::var("PROTECT").is_ok_and(|v| v == "1") {
+        // Its process's access list emptied: no one is let in (its owner may
+        // still change the list, and nothing else).
+        use windows::Win32::Security::{
+            ACL, ACL_REVISION, DACL_SECURITY_INFORMATION, InitializeAcl, InitializeSecurityDescriptor, PSECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR,
+            SetKernelObjectSecurity, SetSecurityDescriptorDacl,
+        };
+        unsafe {
+            let mut acl = ACL::default();
+            InitializeAcl(&mut acl, std::mem::size_of::<ACL>() as u32, ACL_REVISION)?;
+            let mut sd = SECURITY_DESCRIPTOR::default();
+            let psd = PSECURITY_DESCRIPTOR((&raw mut sd).cast());
+            // SECURITY_DESCRIPTOR_REVISION.
+            InitializeSecurityDescriptor(psd, 1)?;
+            SetSecurityDescriptorDacl(psd, true, Some(&raw const acl), false)?;
+            SetKernelObjectSecurity(windows::Win32::System::Threading::GetCurrentProcess(), DACL_SECURITY_INFORMATION, psd)?;
+        }
+    }
     // Fullscreen, the display's real pixels, however it's scaled.
     if fullscreen {
         let _ = unsafe { windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
