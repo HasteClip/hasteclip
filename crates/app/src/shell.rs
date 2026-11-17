@@ -286,6 +286,22 @@ pub fn cloak(window: &impl raw_window_handle::HasWindowHandle, on: bool) {
     }
 }
 
+/// macOS: the app in the Dock (with its menu bar, and in Cmd-Tab) while its
+/// window is out, and not while it's in the menu bar (`shown`: false), as
+/// menu bar apps do: an "accessory" app, in Apple's words. Hidden there, it
+/// stayed in the Dock, where clicking it did nothing. Shown again, the window
+/// takes the focus as before (egui's `Focus` makes the app the active one).
+#[cfg(target_os = "macos")]
+pub fn show_in_dock(shown: bool) {
+    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy as Policy};
+    let Some(mtm) = objc2::MainThreadMarker::new() else { return };
+    let app = NSApplication::sharedApplication(mtm);
+    let policy = if shown { Policy::Regular } else { Policy::Accessory };
+    if app.activationPolicy() != policy {
+        app.setActivationPolicy(policy);
+    }
+}
+
 /// macOS: whether the window is on screen (ordered in), as AppKit has it.
 #[cfg(target_os = "macos")]
 pub fn window_shown(window: &impl raw_window_handle::HasWindowHandle) -> bool {

@@ -244,12 +244,13 @@ fn main() -> eframe::Result<()> {
         // as it starts, on its way to the tray (winit makes it the active
         // one by default, over whatever's in front). `with_active` above
         // doesn't do it here: on macOS it only counts for a window made
-        // visible, and eframe makes it hidden.
+        // visible, and eframe makes it hidden. Nor does it show in the Dock
+        // on its way there (see `shell::show_in_dock`).
         #[cfg(target_os = "macos")]
         event_loop_builder: background.then(|| {
             let hook: eframe::EventLoopBuilderHook = Box::new(|builder| {
-                use winit::platform::macos::EventLoopBuilderExtMacOS;
-                builder.with_activate_ignoring_other_apps(false);
+                use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+                builder.with_activate_ignoring_other_apps(false).with_activation_policy(ActivationPolicy::Accessory);
             });
             hook
         }),
@@ -848,6 +849,11 @@ impl App {
         let to_tray = background && tray.is_some();
         #[cfg(not(any(windows, target_os = "macos")))]
         let _ = background;
+        // macOS: started out of the Dock for the tray (`main`), back in it.
+        #[cfg(target_os = "macos")]
+        if background && !to_tray {
+            shell::show_in_dock(true);
+        }
         let mut app = Self {
             page: Page::Clips,
             rec_state: RecState::default(),
@@ -1479,6 +1485,8 @@ impl eframe::App for App {
             })
         {
             self.in_tray = false;
+            #[cfg(target_os = "macos")]
+            shell::show_in_dock(true);
         }
 
         self.navigate(&ctx);
@@ -2107,6 +2115,9 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        // macOS: out of the Dock too, as menu bar apps are.
+        #[cfg(target_os = "macos")]
+        shell::show_in_dock(false);
     }
 
     fn show_window(&mut self, ctx: &egui::Context) {
@@ -2118,6 +2129,10 @@ impl App {
             ctx.request_repaint();
             return;
         }
+        // macOS: back in the Dock first, so the window comes back as an
+        // ordinary app's and `Focus` can make it the active one.
+        #[cfg(target_os = "macos")]
+        shell::show_in_dock(true);
         // Restored too, where the tray minimizes it (`hide_window`).
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));

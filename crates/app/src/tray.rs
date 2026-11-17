@@ -51,6 +51,10 @@ struct Inner {
     buffer: tray_icon::menu::MenuItem,
     /// What the buffer item says now, so it's only changed when it changes.
     buffering: std::cell::Cell<Option<bool>>,
+    /// macOS: opens the window when the app's opened again while it's
+    /// running (see `mac::Reopen`); kept here, as macOS doesn't keep it.
+    #[cfg(target_os = "macos")]
+    _reopen: Option<objc2::rc::Retained<mac::Reopen>>,
 }
 
 /// The tray / menu bar icon: the logo's glyph alone, as the bar's other icons
@@ -132,6 +136,8 @@ impl Tray {
                     menu_ctx.request_repaint();
                 }
             }));
+            #[cfg(target_os = "macos")]
+            let _reopen = mac::Reopen::listen(tx.clone(), ctx.clone());
             let click_ctx = ctx.clone();
             TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
                 if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e {
@@ -139,7 +145,17 @@ impl Tray {
                     click_ctx.request_repaint();
                 }
             }));
-            Some(Self { rx, inner: Inner { _icon: tray, save, buffer, buffering: Default::default() } })
+            Some(Self {
+                rx,
+                inner: Inner {
+                    _icon: tray,
+                    save,
+                    buffer,
+                    buffering: Default::default(),
+                    #[cfg(target_os = "macos")]
+                    _reopen,
+                },
+            })
         }
         #[cfg(target_os = "linux")]
         {
@@ -176,6 +192,96 @@ impl Tray {
         }
         #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
         let _ = buffering;
+    }
+}
+
+/// macOS: the app opened again while it runs (its Dock icon clicked, or
+/// opened from Finder, Launchpad or Spotlight) opens the window, as it does
+/// in apps that keep running with no window. macOS asks by sending the app a
+/// "reopen" Apple event, which AppKit answers by asking the app's delegate
+/// (`applicationShouldHandleReopen:hasVisibleWindows:`), and by itself only
+/// brings back a minimized window: hidden in the menu bar, the window stayed
+/// hidden. The delegate is winit's, which doesn't answer it, so the event
+/// is handled here instead, as AppKit itself does (`NSAppleEventManager`).
+#[cfg(target_os = "macos")]
+mod mac {
+    use std::sync::mpsc;
+
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyObject, NSObject};
+    use objc2::{AnyThread as _, DefinedClass as _, define_class, msg_send, sel};
+
+    use super::Cmd;
+
+    /// `kCoreEventClass`, `kAEReopenApplication` (the Apple event's class and
+    /// id, four-character codes).
+    const CORE_EVENT_CLASS: u32 = u32::from_be_bytes(*b"aevt");
+    const REOPEN_APPLICATION: u32 = u32::from_be_bytes(*b"rapp");
+
+    pub struct Ivars {
+        tx: mpsc::Sender<Cmd>,
+        ctx: egui::Context,
+    }
+
+    define_class!(
+        // SAFETY: NSObject has no subclassing requirements; the class has
+        // no Drop impl (its ivars do, which is fine).
+        #[unsafe(super(NSObject))]
+        #[name = "HasteClipReopen"]
+        #[ivars = Ivars]
+        pub struct Reopen;
+
+        impl Reopen {
+            #[unsafe(method(handleReopen:withReplyEvent:))]
+            fn handle_reopen(&self, _event: &AnyObject, _reply: &AnyObject) {
+                let _ = self.ivars().tx.send(Cmd::Open);
+                self.ivars().ctx.request_repaint();
+            }
+        }
+    );
+
+    impl Reopen {
+        /// Handles the reopen event from now on, until it's dropped. `None`
+        /// off the main thread.
+        pub fn listen(tx: mpsc::Sender<Cmd>, ctx: egui::Context) -> Option<Retained<Self>> {
+            objc2::MainThreadMarker::new()?;
+            let this = Self::alloc().set_ivars(Ivars { tx, ctx });
+            // SAFETY: NSObject's `init`.
+            let this: Retained<Self> = unsafe { msg_send![super(this), init] };
+            // SAFETY: the class method that gives the shared manager.
+            let manager: Retained<NSObject> = unsafe { msg_send![objc2::class!(NSAppleEventManager), sharedAppleEventManager] };
+            // SAFETY: the selector is the handler's, with the two descriptors
+            // it's called with; the manager doesn't keep the handler, so it's
+            // kept by the tray (`Inner`) and taken off again as it goes.
+            unsafe {
+                let _: () = msg_send![&manager, setEventHandler: &*this, andSelector: sel!(handleReopen:withReplyEvent:), forEventClass: CORE_EVENT_CLASS, andEventID: REOPEN_APPLICATION];
+            }
+            Some(this)
+        }
+    }
+
+    impl Drop for Ivars {
+        fn drop(&mut self) {
+            // Gone with the tray (as the app quits): no handler left behind.
+            // SAFETY: the manager's own methods, with the codes they take.
+            let manager: Retained<NSObject> = unsafe { msg_send![objc2::class!(NSAppleEventManager), sharedAppleEventManager] };
+            unsafe {
+                let _: () = msg_send![&manager, removeEventHandlerForEventClass: CORE_EVENT_CLASS, andEventID: REOPEN_APPLICATION];
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The codes are the four characters, first one highest, as Apple's
+        /// headers have them ('aevt' is 0x61657674).
+        #[test]
+        fn four_character_codes() {
+            assert_eq!(CORE_EVENT_CLASS, 0x6165_7674);
+            assert_eq!(REOPEN_APPLICATION, 0x7261_7070);
+        }
     }
 }
 
