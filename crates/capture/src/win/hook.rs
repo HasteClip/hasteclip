@@ -84,6 +84,11 @@ pub(crate) fn plan(exe: &str, window: HWND, settings: &crate::GameHook) -> (Plan
     if !settings.auto {
         return (Plan::Wgc, "the hook is off".into());
     }
+    // Opening the game's process is the hook's first step: a game that keeps
+    // every other program out of it can't have the hook, allowed or not.
+    if !super::system::can_open(super::system::window_pid(window)) {
+        return (Plan::Wgc, "it keeps other programs out of its process, as anti-cheat does".into());
+    }
     let allowed = settings.allowed.iter().any(|a| a.eq_ignore_ascii_case(exe));
     let anticheat = super::system::window_app_path(window).and_then(|p| super::anticheat::anticheat(&p));
     if let Some(ac) = anticheat.filter(|_| !allowed) {

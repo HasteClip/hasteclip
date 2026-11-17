@@ -626,7 +626,8 @@ pub enum VideoSource {
 /// of Windows' own capture (whether recording games and apps or the screen), which can't see some games (exclusive fullscreen
 /// OpenGL records one frozen frame) and loses the cursor in others. The hook
 /// is OBS Studio's, loaded into the game; it's never used on a game with
-/// anti-cheat unless it's in `allowed`.
+/// anti-cheat unless it's in `allowed`, and never on one that keeps other
+/// programs out of its process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GameHook {
     /// Where it's needed: games known to need it, and games that turn out to
@@ -765,7 +766,8 @@ pub fn game_hook_available() -> bool {
 }
 
 /// The running apps with a window that use anti-cheat (as far as can be
-/// told), and which ("BattlEye").
+/// told), and which ("BattlEye"). Not those that keep every other program
+/// out of their process: the hook can't be used on them, allowed or not.
 pub fn running_anticheat_apps() -> Vec<(Device, String)> {
     #[cfg(target_os = "windows")]
     {
@@ -775,6 +777,7 @@ pub fn running_anticheat_apps() -> Vec<(Device, String)> {
                 let ac = win::anticheat::anticheat(&win::system::running_app_path(&app.id)?)?;
                 Some((app, ac))
             })
+            .filter(|(app, _)| win::system::app_can_be_opened(&app.id))
             .collect()
     }
     #[cfg(not(target_os = "windows"))]
