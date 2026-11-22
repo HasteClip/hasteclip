@@ -1,24 +1,24 @@
 {
- "time": "2026-11-21T04:16:19Z",
+ "time": "2026-11-22T03:28:57Z",
  "releases": {
   "v0.8.0": {
    "published": "2026-11-10T00:41:32Z",
    "files": {
     "assets.win.json": 1,
     "HasteClip-0.7.0-full.nupkg": 2,
-    "HasteClip-0.8.0-delta.nupkg": 362,
+    "HasteClip-0.8.0-delta.nupkg": 369,
     "HasteClip-0.8.0-full.nupkg": 9,
-    "HasteClip-linux-x64.tar.gz": 44,
-    "HasteClip-linux-x64.tar.gz.sha256": 19,
-    "HasteClip-mac-arm64.dmg": 55,
+    "HasteClip-linux-x64.tar.gz": 49,
+    "HasteClip-linux-x64.tar.gz.sha256": 20,
+    "HasteClip-mac-arm64.dmg": 59,
     "HasteClip-mac-arm64.zip": 12,
     "HasteClip-mac-arm64.zip.sha256": 11,
     "HasteClip-web-engine-linux-x64-156.0.26.tar.xz": 3,
     "HasteClip-web-engine-linux-x64-156.0.26.tar.xz.sha256": 2,
     "HasteClip-win-Portable.zip": 5,
-    "HasteClip-win-Setup.exe": 310,
+    "HasteClip-win-Setup.exe": 332,
     "RELEASES": 2,
-    "releases.win.json": 49528
+    "releases.win.json": 54848
    },
    "ids": {
     "assets.win.json": 729548582,
@@ -43,7 +43,7 @@
    "files": {
     "assets.win.json": 1,
     "HasteClip-0.6.0-full.nupkg": 2,
-    "HasteClip-0.7.0-delta.nupkg": 255,
+    "HasteClip-0.7.0-delta.nupkg": 257,
     "HasteClip-0.7.0-full.nupkg": 10,
     "HasteClip-linux-x64.tar.gz": 56,
     "HasteClip-linux-x64.tar.gz.sha256": 6,
@@ -53,7 +53,7 @@
     "HasteClip-win-Portable.zip": 15,
     "HasteClip-win-Setup.exe": 304,
     "RELEASES": 2,
-    "releases.win.json": 71399
+    "releases.win.json": 76718
    },
    "ids": {
     "assets.win.json": 706980360,
@@ -76,7 +76,7 @@
    "files": {
     "assets.win.json": 1,
     "HasteClip-0.5.0-full.nupkg": 1,
-    "HasteClip-0.6.0-delta.nupkg": 258,
+    "HasteClip-0.6.0-delta.nupkg": 260,
     "HasteClip-0.6.0-full.nupkg": 3,
     "HasteClip-linux-x64.tar.gz": 12,
     "HasteClip-linux-x64.tar.gz.sha256": 5,
@@ -86,7 +86,7 @@
     "HasteClip-win-Portable.zip": 3,
     "HasteClip-win-Setup.exe": 86,
     "RELEASES": 1,
-    "releases.win.json": 80258
+    "releases.win.json": 85578
    },
    "ids": {
     "assets.win.json": 692930288,
@@ -109,7 +109,7 @@
    "files": {
     "assets.win.json": 4,
     "HasteClip-0.4.0-full.nupkg": 1,
-    "HasteClip-0.5.0-delta.nupkg": 266,
+    "HasteClip-0.5.0-delta.nupkg": 268,
     "HasteClip-0.5.0-full.nupkg": 9,
     "HasteClip-linux-x64.tar.gz": 5,
     "HasteClip-linux-x64.tar.gz.sha256": 1,
@@ -119,7 +119,7 @@
     "HasteClip-win-Portable.zip": 2,
     "HasteClip-win-Setup.exe": 14,
     "RELEASES": 2,
-    "releases.win.json": 81449
+    "releases.win.json": 86772
    },
    "ids": {
     "assets.win.json": 689746532,
@@ -142,7 +142,7 @@
    "files": {
     "assets.win.json": 1,
     "HasteClip-0.3.0-full.nupkg": 3,
-    "HasteClip-0.4.0-delta.nupkg": 155,
+    "HasteClip-0.4.0-delta.nupkg": 156,
     "HasteClip-0.4.0-full.nupkg": 6,
     "HasteClip-linux-x64.tar.gz": 22,
     "HasteClip-linux-x64.tar.gz.sha256": 3,
@@ -150,7 +150,7 @@
     "HasteClip-win-Portable.zip": 6,
     "HasteClip-win-Setup.exe": 360,
     "RELEASES": 1,
-    "releases.win.json": 103510
+    "releases.win.json": 108831
    },
    "ids": {
     "assets.win.json": 660792356,
@@ -171,7 +171,7 @@
    "files": {
     "assets.win.json": 1,
     "HasteClip-0.2.0-full.nupkg": 1,
-    "HasteClip-0.3.0-delta.nupkg": 112,
+    "HasteClip-0.3.0-delta.nupkg": 113,
     "HasteClip-0.3.0-full.nupkg": 2,
     "HasteClip-linux-x64.tar.gz": 17,
     "HasteClip-linux-x64.tar.gz.sha256": 4,
@@ -179,7 +179,7 @@
     "HasteClip-win-Portable.zip": 4,
     "HasteClip-win-Setup.exe": 90,
     "RELEASES": 1,
-    "releases.win.json": 104878
+    "releases.win.json": 110195
    },
    "ids": {
     "assets.win.json": 657679296,
@@ -208,7 +208,7 @@
     "HasteClip-win-Portable.zip": 3,
     "HasteClip-win-Setup.exe": 200,
     "RELEASES": 1,
-    "releases.win.json": 106696
+    "releases.win.json": 112011
    },
    "ids": {
     "assets.win.json": 651583381,
@@ -235,7 +235,7 @@
     "HasteClip-win-Portable.zip": 1,
     "HasteClip-win-Setup.exe": 11,
     "RELEASES": 1,
-    "releases.win.json": 106747
+    "releases.win.json": 112060
    },
    "ids": {
     "assets.win.json": 648665540,
