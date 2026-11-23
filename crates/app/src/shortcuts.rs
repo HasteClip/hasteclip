@@ -11,7 +11,6 @@
 //! They're registered with `global_hotkey` on macOS, Windows and X11. On
 //! Wayland, where an app can't see keys pressed elsewhere, the desktop portal
 //! does it (`portal_shortcuts`): the keys set here are what we ask it for.
-
 use std::str::FromStr;
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
@@ -94,6 +93,10 @@ impl Registered {
             }
             regular(ev.id);
         }));
+        #[cfg(windows)]
+        if !crate::key_hook::start(Box::new(move |id| press(id))) {
+            eprintln!("couldn't install the keyboard hook: shortcuts may not work while some games are focused");
+        }
         Ok(Self {
             mgr: Some(mgr),
             #[cfg(target_os = "linux")]
@@ -175,6 +178,8 @@ impl Registered {
         }
         #[cfg(target_os = "macos")]
         crate::key_tap::watch(&self.active.iter().map(|(h, _)| *h).collect::<Vec<_>>());
+        #[cfg(windows)]
+        crate::key_hook::watch(&self.active.iter().map(|(h, _)| *h).collect::<Vec<_>>());
         self.from = Some(wanted.clone());
     }
 
