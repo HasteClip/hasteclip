@@ -46,6 +46,8 @@ mod glass;
 mod go_live;
 mod handoff;
 mod hover_play;
+#[cfg(windows)]
+mod key_hook;
 #[cfg(target_os = "macos")]
 mod key_tap;
 #[cfg(target_os = "linux")]
