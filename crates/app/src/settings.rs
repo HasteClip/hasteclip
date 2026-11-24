@@ -1768,25 +1768,52 @@ pub struct CustomSound {
 /// pressed by accident, Start or stop clipping turns clipping off without a
 /// word (the clip you wanted isn't there), recording fills the disk, and
 /// any key taken is one a game or another app may want.
+///
+/// Save clip can have more than one shortcut, each saving its own length
+/// (the last 30 seconds, the last 2 minutes) from the same clipping: the
+/// first is `save_clip`, the rest `more_clips`. A length clipping doesn't
+/// keep saves all it keeps (Settings says so beside it).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Shortcuts {
     pub save_clip: String,
+    /// How far back Save clip's shortcut reaches, in seconds; `None`, all
+    /// that clipping keeps (Clip length), as before there were lengths.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub save_clip_secs: Option<u32>,
     pub toggle_buffer: String,
     pub toggle_record: String,
     pub screenshot: String,
+    /// More Save clip shortcuts, each with a length of its own.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub more_clips: Vec<ClipShortcut>,
 }
 
 impl Default for Shortcuts {
     fn default() -> Self {
-        Self { save_clip: "alt+F10".into(), toggle_buffer: String::new(), toggle_record: String::new(), screenshot: String::new() }
+        Self { save_clip: "alt+F10".into(), save_clip_secs: None, toggle_buffer: String::new(), toggle_record: String::new(), screenshot: String::new(), more_clips: Vec::new() }
     }
 }
+
+/// Another Save clip shortcut: its keys (empty = off) and how far back it
+/// reaches (`None`: all that clipping keeps).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClipShortcut {
+    pub keys: String,
+    pub secs: Option<u32>,
+}
+
+/// The most Save clip shortcuts there can be besides the first.
+pub const MAX_MORE_CLIPS: usize = 8;
 
 /// One of the actions a global shortcut can trigger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShortcutAction {
     SaveClip,
+    /// One of the more Save clip shortcuts (`Shortcuts::more_clips`), by
+    /// its place there.
+    MoreClip(u8),
     ToggleBuffer,
     ToggleRecord,
     Screenshot,
@@ -1797,7 +1824,7 @@ impl ShortcutAction {
 
     pub fn label(self) -> &'static str {
         match self {
-            ShortcutAction::SaveClip => "Save clip",
+            ShortcutAction::SaveClip | ShortcutAction::MoreClip(_) => "Save clip",
             ShortcutAction::ToggleBuffer => "Start or stop clipping",
             ShortcutAction::ToggleRecord => "Start or stop recording",
             ShortcutAction::Screenshot => "Take a screenshot",
@@ -1814,6 +1841,7 @@ impl Shortcuts {
     pub fn get(&self, a: ShortcutAction) -> &str {
         match a {
             ShortcutAction::SaveClip => &self.save_clip,
+            ShortcutAction::MoreClip(i) => self.more_clips.get(usize::from(i)).map_or("", |c| c.keys.as_str()),
             ShortcutAction::ToggleBuffer => &self.toggle_buffer,
             ShortcutAction::ToggleRecord => &self.toggle_record,
             ShortcutAction::Screenshot => &self.screenshot,
@@ -1823,10 +1851,61 @@ impl Shortcuts {
     pub fn set(&mut self, a: ShortcutAction, value: String) {
         match a {
             ShortcutAction::SaveClip => self.save_clip = value,
+            ShortcutAction::MoreClip(i) => {
+                if let Some(c) = self.more_clips.get_mut(usize::from(i)) {
+                    c.keys = value;
+                }
+            }
             ShortcutAction::ToggleBuffer => self.toggle_buffer = value,
             ShortcutAction::ToggleRecord => self.toggle_record = value,
             ShortcutAction::Screenshot => self.screenshot = value,
         }
+    }
+
+    /// How far back a Save clip shortcut reaches, in seconds: `None` for all
+    /// that clipping keeps (and for the shortcuts that don't save a clip).
+    pub fn clip_secs(&self, a: ShortcutAction) -> Option<u32> {
+        match a {
+            ShortcutAction::SaveClip => self.save_clip_secs,
+            ShortcutAction::MoreClip(i) => self.more_clips.get(usize::from(i)).and_then(|c| c.secs),
+            _ => None,
+        }
+        .filter(|s| *s > 0)
+    }
+
+    pub fn set_clip_secs(&mut self, a: ShortcutAction, secs: Option<u32>) {
+        match a {
+            ShortcutAction::SaveClip => self.save_clip_secs = secs,
+            ShortcutAction::MoreClip(i) => {
+                if let Some(c) = self.more_clips.get_mut(usize::from(i)) {
+                    c.secs = secs;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Every shortcut there is, in Settings' order: the Save clip ones
+    /// together, first.
+    pub fn actions(&self) -> Vec<ShortcutAction> {
+        let more = (0..self.more_clips.len().min(MAX_MORE_CLIPS)).map(|i| ShortcutAction::MoreClip(i as u8));
+        let mut all = vec![ShortcutAction::SaveClip];
+        all.extend(more);
+        all.extend(ShortcutAction::ALL.into_iter().filter(|a| *a != ShortcutAction::SaveClip));
+        all
+    }
+
+    /// The Save clip shortcut that saves all that clipping keeps, as the
+    /// Save clip button does, to show beside it: the first one with keys.
+    pub fn whole_clip(&self) -> Option<ShortcutAction> {
+        self.actions().into_iter().find(|a| a.saves_clip() && self.clip_secs(*a).is_none() && !self.get(*a).is_empty())
+    }
+}
+
+impl ShortcutAction {
+    /// Whether it saves a clip (one of the Save clip shortcuts).
+    pub fn saves_clip(self) -> bool {
+        matches!(self, ShortcutAction::SaveClip | ShortcutAction::MoreClip(_))
     }
 }
 
@@ -3349,6 +3428,48 @@ mod shape_tests {
             let back = RecordSettings::from_json(json.to_string().as_bytes()).unwrap();
             assert_eq!((back.resolution, back.shape), (resolution, shape));
         }
+    }
+}
+
+#[cfg(test)]
+mod clip_shortcut_tests {
+    use super::*;
+
+    /// Settings from before lengths load as they were: one Save clip
+    /// shortcut, saving all that clipping keeps; and they're written back
+    /// the same, nothing added.
+    #[test]
+    fn older_shortcuts_load_unchanged() {
+        let s: RecordSettings = serde_json::from_str(r#"{"shortcuts":{"save_clip":"alt+F9","toggle_buffer":"","toggle_record":"","screenshot":""}}"#).unwrap();
+        assert_eq!(s.shortcuts.save_clip, "alt+F9");
+        assert_eq!(s.shortcuts.clip_secs(ShortcutAction::SaveClip), None);
+        assert!(s.shortcuts.more_clips.is_empty());
+        assert_eq!(s.shortcuts.actions(), ShortcutAction::ALL.to_vec());
+        let json: serde_json::Value = serde_json::from_str(&s.to_json()).unwrap();
+        let mut keys: Vec<&String> = json["shortcuts"].as_object().unwrap().keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["save_clip", "screenshot", "toggle_buffer", "toggle_record"]);
+    }
+
+    /// More Save clip shortcuts, each with its length, round-trip; the
+    /// one shown beside the Save clip button is the first that saves all.
+    #[test]
+    fn more_clip_shortcuts_round_trip() {
+        let mut s = RecordSettings::default();
+        s.shortcuts.save_clip_secs = Some(30);
+        s.shortcuts.more_clips.push(ClipShortcut { keys: "alt+F11".into(), secs: Some(1800) });
+        s.shortcuts.more_clips.push(ClipShortcut { keys: "alt+F12".into(), secs: None });
+        let back: RecordSettings = serde_json::from_str(&s.to_json()).unwrap();
+        assert_eq!(back.shortcuts, s.shortcuts);
+        let a = back.shortcuts.actions();
+        assert_eq!(a[..3], [ShortcutAction::SaveClip, ShortcutAction::MoreClip(0), ShortcutAction::MoreClip(1)]);
+        assert_eq!(back.shortcuts.get(ShortcutAction::MoreClip(0)), "alt+F11");
+        assert_eq!(back.shortcuts.clip_secs(ShortcutAction::SaveClip), Some(30));
+        assert_eq!(back.shortcuts.clip_secs(ShortcutAction::MoreClip(0)), Some(1800));
+        assert_eq!(back.shortcuts.whole_clip(), Some(ShortcutAction::MoreClip(1)));
+        // One that's gone (removed while its press was on its way) is off.
+        assert_eq!(back.shortcuts.get(ShortcutAction::MoreClip(5)), "");
+        assert_eq!(back.shortcuts.clip_secs(ShortcutAction::MoreClip(5)), None);
     }
 }
 

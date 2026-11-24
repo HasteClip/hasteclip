@@ -641,6 +641,10 @@ mod tests {
         assert_eq!(start(&ring.snapshot(10.0, 1)), 31.0);
         // 10.2 s back is 30.45: 30 is nearer.
         assert_eq!(start(&ring.snapshot(10.2, 1)), 30.0);
+        // Further back than it keeps (just after clipping started, say):
+        // from the oldest keyframe it has, all of it.
+        let oldest = ring.items.iter().find(|(_, m)| matches!(m, Media::Video { key: true, .. })).unwrap().0;
+        assert_eq!(start(&ring.snapshot(600.0, 1)), oldest);
     }
 
     /// Pictures at 60 fps (a keyframe every second) up to `until`, and two

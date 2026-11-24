@@ -1969,8 +1969,8 @@ impl App {
                 settings::ShortcutAction::ToggleBuffer => self.toggle_buffer(),
                 settings::ShortcutAction::ToggleRecord => self.toggle_record(),
                 // Saved already, the moment the key went down.
-                settings::ShortcutAction::SaveClip if saved => self.clip_saving(),
-                settings::ShortcutAction::SaveClip => self.save_clip(),
+                settings::ShortcutAction::SaveClip | settings::ShortcutAction::MoreClip(_) if saved => self.clip_saving(),
+                a @ (settings::ShortcutAction::SaveClip | settings::ShortcutAction::MoreClip(_)) => self.save_clip_of(self.settings.shortcuts.clip_secs(a)),
                 // Taken already, the moment the key went down.
                 settings::ShortcutAction::Screenshot if saved => {}
                 settings::ShortcutAction::Screenshot => self.take_screenshot(),
@@ -2964,7 +2964,7 @@ impl App {
             }
             demo::Action::Shortcut(settings::ShortcutAction::ToggleBuffer) => self.toggle_buffer(),
             demo::Action::Shortcut(settings::ShortcutAction::ToggleRecord) => self.toggle_record(),
-            demo::Action::Shortcut(settings::ShortcutAction::SaveClip) => self.save_clip(),
+            demo::Action::Shortcut(a @ (settings::ShortcutAction::SaveClip | settings::ShortcutAction::MoreClip(_))) => self.save_clip_of(self.settings.shortcuts.clip_secs(a)),
             demo::Action::Shortcut(settings::ShortcutAction::Screenshot) => self.take_screenshot(),
         }
     }
@@ -3014,14 +3014,21 @@ impl App {
         }
     }
 
+    /// Save a clip of all that clipping keeps.
     fn save_clip(&mut self) {
+        self.save_clip_of(None);
+    }
+
+    /// Save a clip of the last `secs` (all that's kept when that's less, or
+    /// for `None`): a Save clip shortcut with a length of its own.
+    fn save_clip_of(&mut self, secs: Option<u32>) {
         if !self.rec_state.clipping {
             return;
         }
         // Its moment is taken at once; the Saved event lands it in the library.
         // Another can be saved while it's still being written.
         let dir = self.clip_folder();
-        self.service.save_clip(dir, self.games.clip_details());
+        self.service.save_clip(dir, self.games.clip_details(), secs);
         sound::play_saved(&self.settings.save_sound);
         self.voice.saved_by_hand();
         self.clip_saving();

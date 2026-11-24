@@ -22,6 +22,8 @@ use crate::{App, Page, reveal_label, shortcuts};
 
 /// Replay lengths offered as one-click choices (seconds).
 pub(crate) const REPLAY_CHOICES: [u32; 8] = [15, 30, 60, 120, 300, 600, 1200, 1800];
+/// The lengths a Save clip shortcut offers besides all that's kept (seconds).
+const CLIP_LENGTHS: [u32; 7] = [15, 30, 60, 120, 300, 600, 1800];
 /// The settings column's width.
 const COLUMN: f32 = 680.0;
 
@@ -841,9 +843,22 @@ impl App {
         // The desktop keeps the keys (Wayland, but KDE Plasma, where they're
         // set from here): it may ask to confirm them, and has the last word.
         let desktop = self.hotkeys.as_ref().is_ok_and(|h| h.via_desktop() && !h.keys_set_here());
+        let mut add = false;
         ui_kit::list(ui, "shortcuts", |l| {
-            for action in ShortcutAction::ALL.into_iter().filter(|a| a.available()) {
-                if !f.shows(&[action.label(), "shortcut", "hotkey", "keyboard"]) {
+            let actions: Vec<ShortcutAction> = self.settings.shortcuts.actions().into_iter().filter(|a| a.available()).collect();
+            let clips = actions.iter().filter(|a| a.saves_clip()).count();
+            for (n, action) in actions.into_iter().enumerate() {
+                // Save clip's shortcuts, then a way to add another.
+                if n == clips && self.settings.shortcuts.more_clips.len() < settings::MAX_MORE_CLIPS && f.shows(&["save clip", "shortcut", "hotkey", "keyboard", "length", "add"]) {
+                    l.row(Row::new("Add a Save clip shortcut").note("Each saves its own length from the same clipping, up to Clip length"), |ui| {
+                        add = Btn::normal("Add").with_icon(icon::PLUS).small().id("add_clip_shortcut").show(ui).clicked();
+                    });
+                }
+                let label = match action {
+                    ShortcutAction::MoreClip(i) => format!("Save clip {}", u32::from(i) + 2),
+                    a => a.label().to_owned(),
+                };
+                if !f.shows(&[label.as_str(), "shortcut", "hotkey", "keyboard"]) {
                     continue;
                 }
                 let off = self.settings.shortcuts.get(action).is_empty();
@@ -856,8 +871,10 @@ impl App {
                     _ => "",
                 };
                 let problem = self.shortcut_problem(action);
-                let note = problem.clone().unwrap_or_else(|| note.to_owned());
-                l.row(Row::new(action.label()).note(note).warn(problem.is_some()), |ui| self.shortcut_editor(ui, action));
+                // A length clipping doesn't keep: what it saves till it does.
+                let short = self.clip_shortfall(action);
+                let note = problem.clone().or(short).unwrap_or_else(|| note.to_owned());
+                l.row(Row::new(&label).note(note).warn(problem.is_some()), |ui| self.shortcut_editor(ui, action));
             }
             // On Wayland the desktop keeps the keys (the user's, once set):
             // they're changed in its own editor.
@@ -871,6 +888,46 @@ impl App {
                 }
             }
         });
+        if add {
+            // Its length: the first common one no other Save clip shortcut has.
+            let s = &self.settings.shortcuts;
+            let taken: Vec<Option<u32>> = s.actions().into_iter().filter(|a| a.saves_clip()).map(|a| s.clip_secs(a)).collect();
+            let secs = CLIP_LENGTHS.into_iter().find(|l| !taken.contains(&Some(*l))).unwrap_or(30);
+            self.settings.shortcuts.more_clips.push(settings::ClipShortcut { keys: String::new(), secs: Some(secs) });
+            // Its keys next: listening for them.
+            let i = self.settings.shortcuts.more_clips.len() - 1;
+            self.recording_shortcut = Some((ShortcutAction::MoreClip(i as u8), None));
+        }
+    }
+
+    /// What a Save clip shortcut saves while its length is more than
+    /// clipping keeps: all it keeps (it never does nothing).
+    fn clip_shortfall(&self, action: ShortcutAction) -> Option<String> {
+        let secs = self.settings.shortcuts.clip_secs(action)?;
+        let kept = self.settings.replay_seconds;
+        (secs > kept).then(|| format!("Saves {} until Clip length is longer", length_words(kept)))
+    }
+
+    /// How far back a Save clip shortcut reaches: Clip length (all that's
+    /// kept), one of the common lengths, or one of your own (Custom, in
+    /// seconds), as Settings' Resolution offers a height of your own.
+    fn clip_length_field(&mut self, ui: &mut egui::Ui, action: ShortcutAction) {
+        let secs = self.settings.shortcuts.clip_secs(action);
+        let kept = self.settings.replay_seconds;
+        let mut choices = vec![Choice::new("Clip length").note(length_words(kept))];
+        choices.extend(CLIP_LENGTHS.iter().map(|&s| Choice::new(length_words(s)).note(if s > kept { "longer than kept" } else { "" })));
+        let now = match secs {
+            None => Some(0),
+            Some(s) => CLIP_LENGTHS.iter().position(|l| *l == s).map(|i| i + 1),
+        };
+        let id = format!("clip_length_{action:?}");
+        let field = ChoiceField { id: &id, choices, custom: Some(ui_kit::Custom { unit: "s", range: 5..=3600, note: "any length" }), width: 150.0 };
+        match field.show(ui, now, secs.unwrap_or(kept)) {
+            Some(Chosen::Choice(0)) => self.settings.shortcuts.set_clip_secs(action, None),
+            Some(Chosen::Choice(k)) => self.settings.shortcuts.set_clip_secs(action, Some(CLIP_LENGTHS[k - 1])),
+            Some(Chosen::Number(s)) => self.settings.shortcuts.set_clip_secs(action, Some(s)),
+            None => {}
+        }
     }
 
     /// macOS: what HasteClip needs macOS to allow, whether it's allowed,
@@ -1283,7 +1340,9 @@ impl App {
     }
 
     /// One shortcut: its keys as keycaps (click, then press new ones), and
-    /// a menu to turn it off or back to the default.
+    /// a menu to turn it off or back to the default (to take it away, for
+    /// one of the more Save clip ones). A Save clip one has its length
+    /// between the two.
     fn shortcut_editor(&mut self, ui: &mut egui::Ui, action: ShortcutAction) {
         let listening = self.recording_shortcut.map(|(a, _)| a) == Some(action);
         let current = self.settings.shortcuts.get(action).to_owned();
@@ -1294,7 +1353,9 @@ impl App {
             }
         } else {
             // Off by default: turning it off is going back.
-            let more = Btn::icon(Kind::Ghost, icon::DOTS_THREE).small().tip(if default.is_empty() { "Turn off" } else { "Turn off, or back to the default" }).show(ui);
+            let added = matches!(action, ShortcutAction::MoreClip(_));
+            let tip = if added { "Turn off, or remove" } else if default.is_empty() { "Turn off" } else { "Turn off, or back to the default" };
+            let more = Btn::icon(Kind::Ghost, icon::DOTS_THREE).small().tip(tip).show(ui);
             ui_kit::menu_popup(&more, false, 240.0, |ui| {
                 if Item::new("Turn off").icon(icon::PROHIBIT).enabled(!current.is_empty()).show(ui).clicked() {
                     self.settings.shortcuts.set(action, String::new());
@@ -1303,7 +1364,20 @@ impl App {
                 if !default.is_empty() && Item::new("Back to the default").icon(icon::ARROW_COUNTER_CLOCKWISE).enabled(current != default).value(def).show(ui).clicked() {
                     self.settings.shortcuts.set(action, default.clone());
                 }
+                if let ShortcutAction::MoreClip(i) = action
+                    && Item::new("Remove").icon(icon::TRASH).danger().show(ui).clicked()
+                {
+                    let i = usize::from(i);
+                    if i < self.settings.shortcuts.more_clips.len() {
+                        self.settings.shortcuts.more_clips.remove(i);
+                    }
+                    // The ones after it move up a place.
+                    self.recording_shortcut = None;
+                }
             });
+        }
+        if action.saves_clip() {
+            self.clip_length_field(ui, action);
         }
         let keys = shortcuts::keys(&current).unwrap_or_default();
         let tip = if listening { "Press the new shortcut. Esc cancels." } else { "Click, then press the new shortcut" };
@@ -1337,7 +1411,7 @@ impl App {
         match shortcuts::from_press(key, mods) {
             Ok(text) => {
                 // Taking a shortcut another action uses moves it here.
-                for other in ShortcutAction::ALL {
+                for other in self.settings.shortcuts.actions() {
                     if other != action && self.settings.shortcuts.get(other) == text {
                         self.settings.shortcuts.set(other, String::new());
                     }

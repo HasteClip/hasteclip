@@ -780,7 +780,8 @@ impl App {
     fn empty_state(&mut self, ui: &mut egui::Ui) {
         let p = theme::pal(ui);
         self.page_head(ui, "", |_, _| {});
-        let save = self.shortcut_keys(crate::settings::ShortcutAction::SaveClip);
+        // The keys that save all of it, as said below.
+        let save = self.settings.shortcuts.whole_clip().and_then(|a| self.shortcut_keys(a));
         let len = crate::settings_ui::length_words(self.settings.replay_seconds);
         let len = if len == "1 minute" { "minute".to_owned() } else { len };
         let avail = ui.available_rect_before_wrap();

@@ -47,9 +47,10 @@ const BACKLOG: usize = 256;
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "do", rename_all = "snake_case")]
 pub enum Request {
-    /// Save a clip while clipping. While recording, the moment's marked
-    /// too (and only that, without clipping), as the shortcut does.
-    SaveClip,
+    /// Save a clip while clipping: of the last `secs`, or all that's kept
+    /// (left out, 0, or more than it keeps). While recording, the moment's
+    /// marked too (and only that, without clipping), as the shortcut does.
+    SaveClip { secs: Option<u32> },
     Screenshot,
     /// Mark the moment in the recording.
     Mark,
@@ -145,9 +146,10 @@ pub struct Sound {
 /// What a connection does itself, the moment it's asked: the app's
 /// `QuickSave` (a stand-in in the tests).
 pub trait AtOnce: Send + Sync {
-    /// Save a clip, if clipping runs (marking the moment while recording,
-    /// as `QuickSave::save` does). Whether a clip was asked for.
-    fn save(&self) -> bool;
+    /// Save a clip of the last `secs` (all that's kept: `None`), if
+    /// clipping runs (marking the moment while recording, as
+    /// `QuickSave::save` does). Whether a clip was asked for.
+    fn save(&self, secs: Option<u32>) -> bool;
     /// Take a screenshot, where they can be. Whether it was asked for.
     fn screenshot(&self) -> bool;
     /// Mark the moment in the recording. Whether one runs to mark.
@@ -155,8 +157,8 @@ pub trait AtOnce: Send + Sync {
 }
 
 impl AtOnce for crate::service::QuickSave {
-    fn save(&self) -> bool {
-        crate::service::QuickSave::save(self)
+    fn save(&self, secs: Option<u32>) -> bool {
+        self.save_last(secs)
     }
     fn screenshot(&self) -> bool {
         crate::service::QuickSave::screenshot(self)
@@ -309,14 +311,15 @@ impl Hub {
     /// module's doc), the rest in the app's next frame.
     fn ask(&self, request: Request, reply: Reply) {
         match request {
-            Request::SaveClip => {
-                if self.at_once.save() {
+            Request::SaveClip { secs } => {
+                let secs = secs.filter(|s| *s > 0);
+                if self.at_once.save(secs) {
                     reply.ok();
-                    self.forward(Request::SaveClip, true, Reply::none());
+                    self.forward(Request::SaveClip { secs }, true, Reply::none());
                 } else {
                     // Clipping not on (or not yet seen to be): the app
                     // saves one if it is, or says why not.
-                    self.forward(Request::SaveClip, false, reply);
+                    self.forward(Request::SaveClip { secs }, false, reply);
                 }
             }
             Request::Screenshot => {
@@ -542,14 +545,14 @@ impl App {
         let Asked { request, done, reply } = asked;
         match request {
             // Saved already: its card in the library.
-            Request::SaveClip if done => self.clip_saving(),
-            Request::SaveClip if self.rec_state.clipping => {
-                self.save_clip();
+            Request::SaveClip { .. } if done => self.clip_saving(),
+            Request::SaveClip { secs } if self.rec_state.clipping => {
+                self.save_clip_of(secs);
                 reply.ok();
             }
             // The moment was marked (`QuickSave::save`).
-            Request::SaveClip if self.rec_state.recording => reply.ok(),
-            Request::SaveClip => reply.no("Clipping isn't on"),
+            Request::SaveClip { .. } if self.rec_state.recording => reply.ok(),
+            Request::SaveClip { .. } => reply.no("Clipping isn't on"),
             Request::Screenshot if done => {}
             Request::Screenshot if capture::SCREENSHOTS => {
                 self.take_screenshot();
@@ -727,13 +730,16 @@ mod tests {
         clipping: AtomicBool,
         saves: AtomicUsize,
         marks: AtomicUsize,
+        /// The length each clip was asked for.
+        lengths: Mutex<Vec<Option<u32>>>,
     }
 
     impl AtOnce for Counted {
-        fn save(&self) -> bool {
+        fn save(&self, secs: Option<u32>) -> bool {
             let on = self.clipping.load(Ordering::Relaxed);
             if on {
                 self.saves.fetch_add(1, Ordering::Relaxed);
+                self.lengths.lock().unwrap().push(secs);
             }
             on
         }
@@ -875,12 +881,21 @@ mod tests {
         assert_eq!(client.next()["ok"], true, "answered before the app's frame");
         assert_eq!(at_once.saves.load(Ordering::Relaxed), 1);
         let a = asked(&control);
-        assert_eq!((a.request, a.done), (Request::SaveClip, true));
+        assert_eq!((a.request, a.done), (Request::SaveClip { secs: None }, true));
+
+        // With a length: that's what's saved; 0 is all of it, as left out.
+        client.send("{\"id\":6,\"do\":\"save_clip\",\"secs\":30}\n");
+        assert_eq!(client.next()["ok"], true);
+        assert_eq!(asked(&control).request, Request::SaveClip { secs: Some(30) });
+        client.send("{\"id\":7,\"do\":\"save_clip\",\"secs\":0}\n");
+        assert_eq!(client.next()["ok"], true);
+        assert_eq!(asked(&control).request, Request::SaveClip { secs: None });
+        assert_eq!(*at_once.lengths.lock().unwrap(), [None, Some(30), None]);
 
         at_once.clipping.store(false, Ordering::Relaxed);
-        client.send("{\"id\":2,\"do\":\"save_clip\"}\n");
+        client.send("{\"id\":2,\"do\":\"save_clip\",\"secs\":120}\n");
         let a = asked(&control);
-        assert_eq!((a.request.clone(), a.done), (Request::SaveClip, false));
+        assert_eq!((a.request.clone(), a.done), (Request::SaveClip { secs: Some(120) }, false));
         a.reply.no("Clipping isn't on");
         assert_eq!(client.next()["why"], "Clipping isn't on");
 
@@ -928,7 +943,8 @@ mod tests {
     #[test]
     fn requests_as_written() {
         let cases = [
-            (r#"{"do":"save_clip"}"#, Request::SaveClip),
+            (r#"{"do":"save_clip"}"#, Request::SaveClip { secs: None }),
+            (r#"{"id":2,"do":"save_clip","secs":30}"#, Request::SaveClip { secs: Some(30) }),
             (r#"{"do":"clipping","on":false}"#, Request::Clipping { on: Some(false) }),
             (r#"{"do":"recording"}"#, Request::Recording { on: None }),
             (r#"{"do":"stream","on":true}"#, Request::Stream { on: Some(true) }),
@@ -942,6 +958,7 @@ mod tests {
             assert_eq!(parse(text).map(|(_, r)| r), Ok(want), "{text}");
         }
         assert_eq!(parse(r#"{"id":9,"do":"preset"}"#).map(|(_, r)| r), Err(Some(9)), "a preset needs its id");
+        assert_eq!(parse(r#"{"id":8,"do":"save_clip","secs":-5}"#).map(|(_, r)| r), Err(Some(8)), "a length is a whole number of seconds");
         assert_eq!(parse("GET / HTTP/1.1").map(|(_, r)| r), Err(None));
     }
 

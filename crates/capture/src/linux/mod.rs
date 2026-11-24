@@ -320,8 +320,8 @@ impl Recorder for LinuxRecorder {
         self.outputs.start(mode, settings, |s, mov| Session::start(s, &live, mov))
     }
 
-    fn save_clip(&mut self, dir: &Path) -> Result<crate::PendingClip> {
-        self.outputs.save_clip(dir)
+    fn save_clip_of(&mut self, dir: &Path, seconds: Option<u32>) -> Result<crate::PendingClip> {
+        self.outputs.save_clip(dir, seconds)
     }
 
     fn stop(&mut self, mode: Mode, dir: Option<&Path>) -> Result<Option<PathBuf>> {

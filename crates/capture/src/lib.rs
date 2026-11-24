@@ -104,7 +104,7 @@ impl Recorder for Unsupported {
     fn start(&mut self, _: Mode, _: &EncodeSettings) -> anyhow::Result<()> {
         anyhow::bail!("recording isn't available on this platform yet")
     }
-    fn save_clip(&mut self, _: &Path) -> anyhow::Result<PendingClip> {
+    fn save_clip_of(&mut self, _: &Path, _: Option<u32>) -> anyhow::Result<PendingClip> {
         anyhow::bail!("recording isn't available on this platform yet")
     }
     fn stop(&mut self, _: Mode, _: Option<&Path>) -> anyhow::Result<Option<PathBuf>> {
@@ -1645,7 +1645,14 @@ pub trait Recorder {
     /// game's folder in the library, say). Its moment is taken right away; the
     /// returned [`PendingClip`] finishes writing it, which can take a while — so
     /// another can be saved meanwhile.
-    fn save_clip(&mut self, dir: &Path) -> anyhow::Result<PendingClip>;
+    fn save_clip(&mut self, dir: &Path) -> anyhow::Result<PendingClip> {
+        self.save_clip_of(dir, None)
+    }
+
+    /// As [`Self::save_clip`], of the last `seconds` (a Save clip shortcut
+    /// with a length of its own): all that's kept when that's less, or for
+    /// `None`. Cut at the keyframe nearest that far back, as a whole clip is.
+    fn save_clip_of(&mut self, dir: &Path, seconds: Option<u32>) -> anyhow::Result<PendingClip>;
 
     /// Stop `mode`; the capture stops with the last one. Stopping `Record`
     /// returns the finished file, moved into `dir` if given (it's written in

@@ -191,11 +191,12 @@ impl<C: Capture> Outputs<C> {
         }
     }
 
-    /// Save a clip of what clipping has kept, in `dir`.
-    pub(crate) fn save_clip(&mut self, dir: &Path) -> Result<crate::PendingClip> {
+    /// Save a clip of what clipping has kept, in `dir`: the last `seconds`
+    /// of it, or all of it (`None`, or more than it keeps).
+    pub(crate) fn save_clip(&mut self, dir: &Path, seconds: Option<u32>) -> Result<crate::PendingClip> {
         let session = self.session.as_ref().filter(|_| self.running.replay).context("clipping isn't running")?;
         std::fs::create_dir_all(dir)?;
-        writer::request_clip(session.writer(), dir, &self.container_ext, self.replay_seconds as f64)
+        writer::request_clip(session.writer(), dir, &self.container_ext, clip_seconds(self.replay_seconds, seconds))
     }
 
     /// How far back clipping reaches (and Save clip saves), from now on.
@@ -204,6 +205,25 @@ impl<C: Capture> Outputs<C> {
         if let Some(session) = self.session.as_ref().filter(|_| self.running.replay) {
             let _ = session.writer().send(Command::SetWindow(seconds as f64));
         }
+    }
+}
+
+/// How far back a clip asked for `asked` seconds reaches, clipping keeping
+/// `replay`: what's asked, up to all that's kept (`None` or 0: all of it).
+/// Right after clipping starts it keeps less: the writer then starts at the
+/// oldest keyframe it has (`Ring::snapshot_to`), so the clip is all there is.
+fn clip_seconds(replay: u32, asked: Option<u32>) -> f64 {
+    f64::from(asked.filter(|s| *s > 0).map_or(replay, |s| s.min(replay)))
+}
+
+#[cfg(test)]
+mod length_tests {
+    #[test]
+    fn a_clip_is_as_long_as_asked_up_to_what_is_kept() {
+        assert_eq!(super::clip_seconds(120, None), 120.0);
+        assert_eq!(super::clip_seconds(120, Some(30)), 30.0);
+        assert_eq!(super::clip_seconds(120, Some(1800)), 120.0, "more than kept: all of it");
+        assert_eq!(super::clip_seconds(120, Some(0)), 120.0);
     }
 }
 

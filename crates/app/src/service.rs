@@ -17,8 +17,9 @@ use crate::games::Details;
 pub(crate) enum Cmd {
     Start(Mode, Box<EncodeSettings>),
     /// Save the replay buffer as a clip in this folder, its name ending in what
-    /// happened in the game, if known.
-    SaveClip(PathBuf, Details),
+    /// happened in the game, if known: the last so many seconds of it (a
+    /// Save clip shortcut with a length), or all of it (`None`).
+    SaveClip(PathBuf, Details, Option<u32>),
     /// Take a screenshot of what's recorded (with a capture of its own if
     /// nothing runs), into this folder.
     Screenshot(PathBuf, capture::VideoSource, crate::screenshot::Options),
@@ -155,12 +156,18 @@ impl QuickSave {
     /// recording, the moment's marked in the recording too (without
     /// clipping, only that: no clip, false).
     pub fn save(&self) -> bool {
+        self.save_last(None)
+    }
+
+    /// As [`Self::save`], of the last `secs` (all that's kept when that's
+    /// less), or all of it (`None`).
+    pub fn save_last(&self, secs: Option<u32>) -> bool {
         let Some(a) = self.armed.lock().ok().and_then(|a| a.clone()) else {
             self.mark(true);
             return false;
         };
         let dir = crate::games::folder_for(&a.library, a.folder_per_game, &a.game_folders, self.games.clip_game().as_deref());
-        if self.tx.send(Cmd::SaveClip(dir, self.games.clip_details())).is_err() {
+        if self.tx.send(Cmd::SaveClip(dir, self.games.clip_details(), secs)).is_err() {
             return false;
         }
         crate::sound::play_saved(&a.sound);
@@ -243,7 +250,7 @@ impl CaptureService {
                     // Save doesn't change capture state — still buffering afterwards.
                     // The clip's moment is taken now; it's written on its own
                     // thread, so this one is free for the next save at once.
-                    Cmd::SaveClip(dir, details) => match recorder.save_clip(&dir) {
+                    Cmd::SaveClip(dir, details, secs) => match recorder.save_clip_of(&dir, secs) {
                         Ok(pending) => {
                             let evt_tx = evt_tx.clone();
                             thread::spawn(move || match pending.finish() {
@@ -330,8 +337,9 @@ impl CaptureService {
         QuickSave { tx, games, armed: Default::default(), marking: Default::default(), shot: Default::default() }
     }
 
-    pub fn save_clip(&self, dir: PathBuf, details: Details) {
-        self.send(Cmd::SaveClip(dir, details));
+    /// Save the last `secs` as a clip (all that's kept for `None`).
+    pub fn save_clip(&self, dir: PathBuf, details: Details, secs: Option<u32>) {
+        self.send(Cmd::SaveClip(dir, details, secs));
     }
     pub fn screenshot(&self, dir: PathBuf, video: capture::VideoSource, options: crate::screenshot::Options) {
         self.send(Cmd::Screenshot(dir, video, options));
