@@ -10,6 +10,8 @@
 
 use std::sync::mpsc::{self, Receiver};
 
+pub use crate::tray_badge::Status;
+
 /// What the tray asks for. Handled in the app's `logic`, which runs while the
 /// window is hidden too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,9 +41,9 @@ pub struct Tray {
     inner: Inner,
     #[cfg(target_os = "linux")]
     inner: ksni::blocking::Handle<linux::Item>,
-    /// What the menu shows now, so it's only changed when it changes.
+    /// What the menu and icon show now, so they're only changed when they change.
     #[cfg(target_os = "linux")]
-    buffering: std::cell::Cell<bool>,
+    shown: std::cell::Cell<(bool, Status)>,
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -51,6 +53,9 @@ struct Inner {
     buffer: tray_icon::menu::MenuItem,
     /// What the buffer item says now, so it's only changed when it changes.
     buffering: std::cell::Cell<Option<bool>>,
+    /// The glyph the badges go on, and what the icon shows now.
+    base: image::RgbaImage,
+    status: std::cell::Cell<Status>,
     /// macOS: opens the window when the app's opened again while it's
     /// running (see `mac::Reopen`); kept here, as macOS doesn't keep it.
     #[cfg(target_os = "macos")]
@@ -61,7 +66,7 @@ struct Inner {
 /// are (the app icon, with its dark plate, looked small and boxed in there).
 /// Made from its SVG by `scripts/icons.sh`.
 #[cfg(any(windows, target_os = "macos"))]
-fn tray_image() -> Option<tray_icon::Icon> {
+fn tray_base() -> Option<image::RgbaImage> {
     // macOS: 18 points high on a 2x display; macOS sizes it to the bar.
     #[cfg(target_os = "macos")]
     let png: &[u8] = include_bytes!("../assets/tray-mac.png");
@@ -87,7 +92,14 @@ fn tray_image() -> Option<tray_icon::Icon> {
         // which stays smooth), else the biggest.
         SIZES.iter().find(|(s, _)| *s >= want).unwrap_or(&SIZES[SIZES.len() - 1]).1
     };
-    let img = image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()?.to_rgba8();
+    Some(image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()?.to_rgba8())
+}
+
+/// `base` with `status`'s badge, as the tray wants it. macOS: a template
+/// image, so its badges are shapes in one colour (see `tray_badge`).
+#[cfg(any(windows, target_os = "macos"))]
+fn tray_image(base: &image::RgbaImage, status: Status) -> Option<tray_icon::Icon> {
+    let img = crate::tray_badge::badged(base, status, cfg!(target_os = "macos"));
     let (w, h) = img.dimensions();
     tray_icon::Icon::from_rgba(img.into_raw(), w, h).ok()
 }
@@ -111,11 +123,12 @@ impl Tray {
             let quit = MenuItem::new("Quit HasteClip", true, None);
             let menu = Menu::new();
             menu.append_items(&[&open, &PredefinedMenuItem::separator(), &save, &buffer, &PredefinedMenuItem::separator(), &quit]).ok()?;
-            let image = tray_image()?;
+            let base = tray_base()?;
+            let image = tray_image(&base, Status::Idle)?;
             // macOS: a template image, tinted by macOS to suit the menu bar
             // (white on a dark one, black on a light one), as its own icons.
             let built = TrayIconBuilder::new()
-                .with_tooltip("HasteClip")
+                .with_tooltip(Status::Idle.tooltip())
                 .with_icon(image)
                 .with_icon_as_template(cfg!(target_os = "macos"))
                 .with_menu(Box::new(menu))
@@ -152,6 +165,8 @@ impl Tray {
                     save,
                     buffer,
                     buffering: Default::default(),
+                    base,
+                    status: std::cell::Cell::new(Status::Idle),
                     #[cfg(target_os = "macos")]
                     _reopen,
                 },
@@ -160,7 +175,7 @@ impl Tray {
         #[cfg(target_os = "linux")]
         {
             let inner = linux::spawn(ctx, tx, quick)?;
-            Some(Self { rx, inner, buffering: Default::default() })
+            Some(Self { rx, inner, shown: std::cell::Cell::new((false, Status::Idle)) })
         }
         #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
         {
@@ -174,8 +189,8 @@ impl Tray {
         self.rx.try_iter().collect()
     }
 
-    /// Keep the menu in step with capture.
-    pub fn update(&self, buffering: bool) {
+    /// Keep the menu and the icon (and its tooltip) in step with capture.
+    pub fn update(&self, buffering: bool, status: Status) {
         #[cfg(any(windows, target_os = "macos"))]
         {
             let i = &self.inner;
@@ -184,14 +199,24 @@ impl Tray {
                 i.save.set_enabled(buffering);
                 i.buffer.set_text(if buffering { "Stop clipping" } else { "Start clipping" });
             }
+            if i.status.replace(status) != status {
+                if let Some(icon) = tray_image(&i.base, status) {
+                    // `set_icon` keeps a template image a template (macOS).
+                    let _ = i._icon.set_icon(Some(icon));
+                }
+                let _ = i._icon.set_tooltip(Some(status.tooltip()));
+            }
         }
-        // Only when it changed: each update tells the desktop to redraw the menu.
+        // Only when it changed: each update tells the desktop to redraw.
         #[cfg(target_os = "linux")]
-        if self.buffering.replace(buffering) != buffering {
-            self.inner.update(|item| item.buffering = buffering);
+        if self.shown.replace((buffering, status)) != (buffering, status) {
+            self.inner.update(|item| {
+                item.buffering = buffering;
+                item.status = status;
+            });
         }
         #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-        let _ = buffering;
+        let _ = (buffering, status);
     }
 }
 
@@ -310,7 +335,9 @@ mod linux {
 
     /// The tray item: what it shows, and where its clicks go.
     pub struct Item {
-        icon: Vec<ksni::Icon>,
+        /// The glyph at each size trays show, for the badges to go on.
+        base: Vec<image::RgbaImage>,
+        pub status: super::Status,
         tx: mpsc::Sender<Cmd>,
         ctx: egui::Context,
         quick: crate::service::QuickSave,
@@ -348,10 +375,18 @@ mod linux {
             "HasteClip".into()
         }
         fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-            self.icon.clone()
+            // ARGB32 in network byte order, as StatusNotifierItem wants it.
+            self.base
+                .iter()
+                .map(|img| {
+                    let img = crate::tray_badge::badged(img, self.status, false);
+                    let data = img.pixels().flat_map(|p| [p[3], p[0], p[1], p[2]]).collect();
+                    ksni::Icon { width: img.width() as i32, height: img.height() as i32, data }
+                })
+                .collect()
         }
         fn tool_tip(&self) -> ksni::ToolTip {
-            ksni::ToolTip { title: "HasteClip".into(), ..Default::default() }
+            ksni::ToolTip { title: self.status.tooltip().into(), ..Default::default() }
         }
         /// A left click opens the window.
         fn activate(&mut self, _x: i32, _y: i32) {
@@ -397,16 +432,8 @@ mod linux {
             include_bytes!("../assets/tray/glyph-48.png"),
             include_bytes!("../assets/tray/glyph-64.png"),
         ];
-        let sizes: Vec<ksni::Icon> = SIZES
-            .iter()
-            .filter_map(|png| image::load_from_memory_with_format(png, image::ImageFormat::Png).ok())
-            .map(|img| {
-                let img = img.to_rgba8();
-                let data = img.pixels().flat_map(|p| [p[3], p[0], p[1], p[2]]).collect();
-                ksni::Icon { width: img.width() as i32, height: img.height() as i32, data }
-            })
-            .collect();
-        let item = Item { icon: sizes, tx, ctx: ctx.clone(), quick, buffering: false };
+        let base: Vec<image::RgbaImage> = SIZES.iter().filter_map(|png| image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()).map(|img| img.to_rgba8()).collect();
+        let item = Item { base, status: super::Status::Idle, tx, ctx: ctx.clone(), quick, buffering: false };
         match item.spawn() {
             Ok(handle) => Some(handle),
             Err(e) => {

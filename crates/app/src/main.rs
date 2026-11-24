@@ -81,6 +81,7 @@ mod sources_ui;
 mod store;
 mod thumbs;
 mod tray;
+mod tray_badge;
 mod theme;
 mod transfer;
 mod time_field;
@@ -719,6 +720,8 @@ struct App {
     edit_return: Option<PathBuf>,
     /// The tray icon, where there is one: closing the window hides it there.
     tray: Option<tray::Tray>,
+    /// When a clip last finished saving: the tray icon shows a check for a moment.
+    saved_flash: Option<Instant>,
     /// The window's hidden in the tray, until it's shown again.
     in_tray: bool,
     /// Windows and macOS, started with the computer: to go to the tray once
@@ -975,6 +978,7 @@ impl App {
             free_up_batches: Vec::new(),
             last_view: None,
             tray,
+            saved_flash: None,
             in_tray: false,
             #[cfg(any(windows, target_os = "macos"))]
             to_tray,
@@ -2080,7 +2084,16 @@ impl App {
     /// Do what the tray (or another launch) asked.
     fn pump_tray(&mut self, ctx: &egui::Context) {
         let Some(tray) = &self.tray else { return };
-        tray.update(self.rec_state.clipping);
+        // A clip that just saved shows as a check for a moment, then the
+        // icon goes back to what's capturing.
+        let just_saved = self.saved_flash.is_some_and(|at| at.elapsed() < tray_badge::SAVED_FOR);
+        if just_saved {
+            ctx.request_repaint_after(tray_badge::SAVED_FOR);
+        } else {
+            self.saved_flash = None;
+        }
+        let status = tray::Status::of(self.rec_state.clipping, self.rec_state.recording, self.rec_state.streaming, just_saved);
+        tray.update(self.rec_state.clipping, status);
         for cmd in tray.take() {
             match cmd {
                 tray::Cmd::Open => self.show_window(ctx),
@@ -3260,6 +3273,7 @@ impl App {
                     }
                 }
                 Evt::Saved(path) => {
+                    self.saved_flash = Some(Instant::now());
                     self.saving = self.saving.saturating_sub(1);
                     // A new clip is never hidden in a folded Today.
                     self.folded.set(chrono::Local::now().date_naive(), false);
