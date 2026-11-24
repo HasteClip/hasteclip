@@ -81,6 +81,7 @@ mod sources_ui;
 mod store;
 mod thumbs;
 mod tray;
+mod tray_badge;
 mod theme;
 mod transfer;
 mod time_field;
@@ -2080,7 +2081,8 @@ impl App {
     /// Do what the tray (or another launch) asked.
     fn pump_tray(&mut self, ctx: &egui::Context) {
         let Some(tray) = &self.tray else { return };
-        tray.update(self.rec_state.clipping);
+        let status = tray::Status::of(self.rec_state.clipping, self.rec_state.recording, self.rec_state.streaming);
+        tray.update(self.rec_state.clipping, status);
         for cmd in tray.take() {
             match cmd {
                 tray::Cmd::Open => self.show_window(ctx),
