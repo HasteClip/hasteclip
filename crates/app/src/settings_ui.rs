@@ -946,6 +946,7 @@ impl App {
     }
 
     fn app_group(&mut self, ui: &mut egui::Ui, f: &Filter) {
+        let (mut locked_click, mut lock) = (false, None);
         ui_kit::list(ui, "app", |l| {
             if f.shows(&["appearance", "theme", "dark", "light", "system"]) {
                 l.row(Row::new("Appearance"), |ui| {
@@ -965,6 +966,17 @@ impl App {
                 {
                     self.toast_error(format!("Couldn't change that: {e}"));
                 }
+                let place = if cfg!(target_os = "macos") { "menu bar" } else { "tray" };
+                lock = if !crate::tray::available() {
+                    Some(format!("There's no {place} here to start in"))
+                } else if !on {
+                    Some(format!("Turn on \"{}\" first", crate::autostart::label()))
+                } else {
+                    None
+                };
+                let tip = format!("On: it starts in the {place} when you log in, ready to clip. Off: it opens its window.");
+                let (_, c) = l.row(Row::new("Start minimized").tip("Start minimized", &tip).locked(lock.clone()), |ui| ui_kit::switch(ui, &mut self.settings.start_minimized));
+                locked_click = c;
             }
             if self.tray.is_some() && f.shows(&["closing the window", "tray", "menu bar", "quit"]) {
                 let place = if cfg!(target_os = "macos") { "menu bar" } else { "tray" };
@@ -989,6 +1001,7 @@ impl App {
                 l.row(Row::new("Discord activity").tip("Discord activity", tip).note(note), |ui| ui_kit::switch(ui, &mut self.settings.discord_presence));
             }
         });
+        self.say_locked(locked_click, lock);
     }
 
     /// The version and its updates, the license, and going back to the

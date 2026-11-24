@@ -1603,6 +1603,9 @@ pub struct RecordSettings {
     /// Closing the window keeps HasteClip running in the tray (where
     /// there is one) instead of quitting.
     pub close_to_tray: bool,
+    /// Starting with the computer goes straight to the tray (where there
+    /// is one) instead of opening the window.
+    pub start_minimized: bool,
     /// The first close asked which (then it just does it).
     pub close_asked: bool,
     /// macOS: which time the permissions screen was last shown at launch
@@ -1715,6 +1718,7 @@ impl Default for RecordSettings {
             library_sort: LibrarySort::Newest,
             theme: Theme::System,
             close_to_tray: true,
+            start_minimized: true,
             close_asked: false,
             setup_shown: 0,
             game_titles: GameTitles::default(),
@@ -4295,5 +4299,19 @@ mod scene_tests {
         let output = SourceKind::Output { device: "Speakers (Realtek(R) Audio)".into() };
         assert_eq!(serde_json::to_string(&output).unwrap(), r#"{"type":"output","device":"Speakers (Realtek(R) Audio)"}"#);
         assert_eq!(serde_json::from_str::<SourceKind>(&serde_json::to_string(&output).unwrap()).unwrap(), output);
+    }
+}
+
+#[cfg(test)]
+mod start_minimized_tests {
+    use super::*;
+
+    /// Settings saved before the option start in the tray, as autostart always did.
+    #[test]
+    fn older_settings_start_minimized() {
+        let s: RecordSettings = serde_json::from_str(r#"{"fps": 60}"#).unwrap();
+        assert!(s.start_minimized);
+        let s: RecordSettings = serde_json::from_str(r#"{"start_minimized": false}"#).unwrap();
+        assert!(!s.start_minimized);
     }
 }

@@ -204,8 +204,8 @@ fn main() -> eframe::Result<()> {
     if !test_instance {
         proxy::forget_kept();
     }
-    // Started with the computer: straight to the tray.
-    let background = std::env::args().any(|a| a == autostart::BACKGROUND) && tray::available();
+    // Started with the computer: straight to the tray, unless "Start minimized" is off.
+    let background = std::env::args().any(|a| a == autostart::BACKGROUND) && tray::available() && RecordSettings::load().start_minimized;
     // Before anything talks to the desktop portal (screen capture, shortcuts),
     // which wants to know who we are, and needs our `.desktop` file for that.
     #[cfg(target_os = "linux")]
