@@ -53,8 +53,7 @@ struct Inner {
     buffer: tray_icon::menu::MenuItem,
     /// What the buffer item says now, so it's only changed when it changes.
     buffering: std::cell::Cell<Option<bool>>,
-    /// The glyph the badges go on, and what the icon shows now.
-    base: image::RgbaImage,
+    /// What the icon shows now.
     status: std::cell::Cell<Status>,
     /// macOS: opens the window when the app's opened again while it's
     /// running (see `mac::Reopen`); kept here, as macOS doesn't keep it.
@@ -62,44 +61,33 @@ struct Inner {
     _reopen: Option<objc2::rc::Retained<mac::Reopen>>,
 }
 
-/// The tray / menu bar icon: the logo's glyph alone, as the bar's other icons
-/// are (the app icon, with its dark plate, looked small and boxed in there).
-/// Made from its SVG by `scripts/icons.sh`.
+/// The tray / menu bar icon for `status`: the logo's glyph alone, as the
+/// bar's other icons are (the app icon, with its dark plate, looked small and
+/// boxed in there); while capturing, its clapperboard in the state's colour
+/// (`tray_badge`). Made from its SVG by `scripts/icons.sh`.
 #[cfg(any(windows, target_os = "macos"))]
-fn tray_base() -> Option<image::RgbaImage> {
-    // macOS: 18 points high on a 2x display; macOS sizes it to the bar.
+fn tray_image(status: Status) -> Option<tray_icon::Icon> {
+    // macOS: 18 points high on a 2x display; macOS sizes it to the bar. A
+    // template image, which can't be coloured: a badge in one colour instead.
     #[cfg(target_os = "macos")]
-    let png: &[u8] = include_bytes!("../assets/tray-mac.png");
+    let img = {
+        let base = image::load_from_memory_with_format(include_bytes!("../assets/tray-mac.png"), image::ImageFormat::Png).ok()?.to_rgba8();
+        crate::tray_badge::mono_badge(&base, status)
+    };
     // Windows: drawn at exactly the size the tray shows it at, which depends
     // on the display's scale (16 px at 100%, 24 at 150%, ...). Windows scaled
     // a bigger one down coarsely: it looked pixelated.
     #[cfg(windows)]
-    let png: &[u8] = {
+    let img = {
         use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
         // SAFETY: no arguments to get wrong.
         let want = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16);
-        const SIZES: [(i32, &[u8]); 8] = [
-            (16, include_bytes!("../assets/tray/glyph-16.png")),
-            (20, include_bytes!("../assets/tray/glyph-20.png")),
-            (24, include_bytes!("../assets/tray/glyph-24.png")),
-            (28, include_bytes!("../assets/tray/glyph-28.png")),
-            (32, include_bytes!("../assets/tray/glyph-32.png")),
-            (40, include_bytes!("../assets/tray/glyph-40.png")),
-            (48, include_bytes!("../assets/tray/glyph-48.png")),
-            (64, include_bytes!("../assets/tray/glyph-64.png")),
-        ];
+        const SIZES: [i32; 8] = [16, 20, 24, 28, 32, 40, 48, 64];
         // The size asked for, else the next bigger one (scaled down a little,
         // which stays smooth), else the biggest.
-        SIZES.iter().find(|(s, _)| *s >= want).unwrap_or(&SIZES[SIZES.len() - 1]).1
+        let at = SIZES.iter().position(|s| *s >= want).unwrap_or(SIZES.len() - 1);
+        image::load_from_memory_with_format(crate::tray_badge::glyph_pngs(status)[at], image::ImageFormat::Png).ok()?.to_rgba8()
     };
-    Some(image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()?.to_rgba8())
-}
-
-/// `base` with `status`'s badge, as the tray wants it. macOS: a template
-/// image, so its badges are shapes in one colour (see `tray_badge`).
-#[cfg(any(windows, target_os = "macos"))]
-fn tray_image(base: &image::RgbaImage, status: Status) -> Option<tray_icon::Icon> {
-    let img = crate::tray_badge::badged(base, status, cfg!(target_os = "macos"));
     let (w, h) = img.dimensions();
     tray_icon::Icon::from_rgba(img.into_raw(), w, h).ok()
 }
@@ -123,8 +111,7 @@ impl Tray {
             let quit = MenuItem::new("Quit HasteClip", true, None);
             let menu = Menu::new();
             menu.append_items(&[&open, &PredefinedMenuItem::separator(), &save, &buffer, &PredefinedMenuItem::separator(), &quit]).ok()?;
-            let base = tray_base()?;
-            let image = tray_image(&base, Status::Idle)?;
+            let image = tray_image(Status::Idle)?;
             // macOS: a template image, tinted by macOS to suit the menu bar
             // (white on a dark one, black on a light one), as its own icons.
             let built = TrayIconBuilder::new()
@@ -165,7 +152,6 @@ impl Tray {
                     save,
                     buffer,
                     buffering: Default::default(),
-                    base,
                     status: std::cell::Cell::new(Status::Idle),
                     #[cfg(target_os = "macos")]
                     _reopen,
@@ -200,7 +186,7 @@ impl Tray {
                 i.buffer.set_text(if buffering { "Stop clipping" } else { "Start clipping" });
             }
             if i.status.replace(status) != status {
-                if let Some(icon) = tray_image(&i.base, status) {
+                if let Some(icon) = tray_image(status) {
                     // `set_icon` keeps a template image a template (macOS).
                     let _ = i._icon.set_icon(Some(icon));
                 }
@@ -335,8 +321,8 @@ mod linux {
 
     /// The tray item: what it shows, and where its clicks go.
     pub struct Item {
-        /// The glyph at each size trays show, for the badges to go on.
-        base: Vec<image::RgbaImage>,
+        /// The glyph at each size trays show, for each state.
+        icons: [Vec<ksni::Icon>; 4],
         pub status: super::Status,
         tx: mpsc::Sender<Cmd>,
         ctx: egui::Context,
@@ -375,15 +361,7 @@ mod linux {
             "HasteClip".into()
         }
         fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-            // ARGB32 in network byte order, as StatusNotifierItem wants it.
-            self.base
-                .iter()
-                .map(|img| {
-                    let img = crate::tray_badge::badged(img, self.status, false);
-                    let data = img.pixels().flat_map(|p| [p[3], p[0], p[1], p[2]]).collect();
-                    ksni::Icon { width: img.width() as i32, height: img.height() as i32, data }
-                })
-                .collect()
+            self.icons[self.status as usize].clone()
         }
         fn tool_tip(&self) -> ksni::ToolTip {
             ksni::ToolTip { title: self.status.tooltip().into(), ..Default::default() }
@@ -420,20 +398,21 @@ mod linux {
             return None;
         }
         // The glyph alone, as the tray's other icons are (and as on Windows),
-        // drawn at the sizes trays show (16–64 px), for the tray to pick
-        // from; ARGB32 in network byte order as StatusNotifierItem wants it.
-        const SIZES: [&[u8]; 8] = [
-            include_bytes!("../assets/tray/glyph-16.png"),
-            include_bytes!("../assets/tray/glyph-20.png"),
-            include_bytes!("../assets/tray/glyph-24.png"),
-            include_bytes!("../assets/tray/glyph-28.png"),
-            include_bytes!("../assets/tray/glyph-32.png"),
-            include_bytes!("../assets/tray/glyph-40.png"),
-            include_bytes!("../assets/tray/glyph-48.png"),
-            include_bytes!("../assets/tray/glyph-64.png"),
-        ];
-        let base: Vec<image::RgbaImage> = SIZES.iter().filter_map(|png| image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()).map(|img| img.to_rgba8()).collect();
-        let item = Item { base, status: super::Status::Idle, tx, ctx: ctx.clone(), quick, buffering: false };
+        // its clapperboard coloured while capturing, drawn at the sizes trays
+        // show (16-64 px), for the tray to pick from; ARGB32 in network byte
+        // order as StatusNotifierItem wants it.
+        let icons = [super::Status::Idle, super::Status::Clipping, super::Status::Recording, super::Status::Streaming].map(|status| {
+            crate::tray_badge::glyph_pngs(status)
+                .iter()
+                .filter_map(|png| image::load_from_memory_with_format(png, image::ImageFormat::Png).ok())
+                .map(|img| {
+                    let img = img.to_rgba8();
+                    let data = img.pixels().flat_map(|p| [p[3], p[0], p[1], p[2]]).collect();
+                    ksni::Icon { width: img.width() as i32, height: img.height() as i32, data }
+                })
+                .collect()
+        });
+        let item = Item { icons, status: super::Status::Idle, tx, ctx: ctx.clone(), quick, buffering: false };
         match item.spawn() {
             Ok(handle) => Some(handle),
             Err(e) => {
