@@ -103,10 +103,10 @@ impl App {
             self.toast_error("Wait for the export or import that's running to finish");
             return;
         }
-        let lib = self.settings.output_dir.clone();
+        let (lib, per_game) = (self.settings.output_dir.clone(), self.settings.folder_per_game);
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop = cancel.clone();
-        self.start_transfer_with(Kind::FromApps(clips.len()), cancel, move |progress| Ok(Outcome::FromApps(crate::import_apps::import(&clips, &lib, mode, progress, &stop))));
+        self.start_transfer_with(Kind::FromApps(clips.len()), cancel, move |progress| Ok(Outcome::FromApps(crate::import_apps::import(&clips, &lib, mode, per_game, progress, &stop))));
     }
 
     /// Stop the import from other apps that's running (what's in already stays).
@@ -194,7 +194,10 @@ impl App {
         let n = done.added.len();
         let what = if n == 1 { "1 clip".to_owned() } else { format!("{n} clips") };
         let failed = done.failed.len();
-        if failed > 0 {
+        if done.disk_full {
+            let drive = crate::import_apps::drive_name(&self.settings.output_dir).unwrap_or_else(|| "The clips folder's drive".to_owned());
+            self.toast_error(format!("Stopped: {drive} is full. Imported {what}"));
+        } else if failed > 0 {
             let them = if failed == 1 { "1 couldn't be".to_owned() } else { format!("{failed} couldn't be") };
             self.toast_error(format!("Imported {what}; {them} (the log says why)"));
         } else if done.cancelled {
