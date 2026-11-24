@@ -3790,4 +3790,143 @@ mod tests {
         eprintln!("pictures in a second at 30 fps: {still} with the cursor still, {moving} with it moving");
         assert!(moving >= 15, "the cursor moving brought {moving} pictures");
     }
+
+    /// Issue #74: a game that makes its picture anew (a map change or a video
+    /// restart: a new GL context or window, a new Direct3D device or swap
+    /// chain) stays recorded through the game capture hook, its picture
+    /// moving on, not frozen on the last one before. `hook_target` (built by
+    /// `cargo build -p capture --example hook_target`) draws in a small window
+    /// that never takes focus (`ASIDE`: a corner of another display than the
+    /// main one, if there's one), making its picture anew every 6 s as
+    /// `REMAKE` says (`window-leak`, `none` never: see its doc),
+    /// with OpenGL (`GL=1`, the default) or Direct3D 11 (`GL=0`), and the app
+    /// list follows it, hooked (`CAPTURE=wgc`: with Windows' capture
+    /// instead, as a game with anti-cheat is). `OTHER=1`: something else
+    /// keeps the hook going too, as OBS's Game Capture or another HasteClip
+    /// capturing the game does. `REMAKES=n` (3). Nothing of the screen is
+    /// kept.
+    #[test]
+    #[ignore = "shows a window that draws like a game and hooks it: REMAKE=window-leak GL=1 cargo test -p capture follows_a_game_that_remakes_its_picture -- --ignored --nocapture"]
+    fn follows_a_game_that_remakes_its_picture() {
+        use std::io::BufRead;
+        let env = |k: &str| std::env::var(k).ok();
+        let what = env("REMAKE").unwrap_or_else(|| "window-leak".into());
+        let gl = env("GL").is_none_or(|v| v == "1");
+        let wgc = env("CAPTURE").is_some_and(|v| v == "wgc");
+        let remakes: u32 = env("REMAKES").and_then(|n| n.parse().ok()).unwrap_or(3);
+        const EVERY: f64 = 6.0;
+        let built = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("examples").join("hook_target.exe");
+        assert!(built.is_file(), "no {}: cargo build -p capture --example hook_target", built.display());
+        assert!(hook::available(), "the hook's files aren't next to the test (target\\game-hook)");
+        // A copy beside an empty `EasyAntiCheat` folder: a HasteClip that's
+        // installed and running leaves it alone (anti-cheat), so it can't
+        // hook it too.
+        let dir = std::env::temp_dir().join("hasteclip-remakes");
+        std::fs::create_dir_all(dir.join("EasyAntiCheat")).unwrap();
+        let exe = dir.join("hook_target.exe");
+        std::fs::copy(&built, &exe).unwrap();
+        if !wgc {
+            // SAFETY: set before any thread that reads it starts.
+            unsafe { std::env::set_var("HASTECLIP_FORCE_HOOK", "hook_target.exe") };
+        }
+
+        let secs = EVERY * (remakes + 1) as f64;
+        let mut game = std::process::Command::new(&exe);
+        for k in ["REMAKE", "FPS", "FULLSCREEN", "HIDE_CURSOR", "STATIC", "PROTECT", "NOVSYNC", "TIMES"] {
+            game.env_remove(k);
+        }
+        // `none`: never made anew, to compare.
+        if what != "none" {
+            game.env("REMAKE", &what);
+        }
+        let mut game = game
+            .env("GL", if gl { "1" } else { "0" })
+            .env("REMAKE_EVERY", EVERY.to_string())
+            .env("SECS", secs.to_string())
+            .env("SIZE", "320x180")
+            .env("ASIDE", "1")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let t0 = Instant::now();
+        let out = game.stdout.take().unwrap();
+        let said = thread::spawn(move || {
+            for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+                eprintln!("{:5.1} s  hook_target: {line}", t0.elapsed().as_secs_f64());
+            }
+        });
+        // Another capturer's hold on the hook (its keepalive).
+        let _other = env("OTHER").is_some_and(|v| v == "1").then(|| {
+            use windows::Win32::System::Threading::CreateMutexW;
+            let name: Vec<u16> = format!("CaptureHook_KeepAlive{}", game.id()).encode_utf16().chain([0]).collect();
+            let h = unsafe { CreateMutexW(None, false, windows::core::PCWSTR(name.as_ptr())) }.unwrap();
+            struct Held(windows::Win32::Foundation::HANDLE);
+            impl Drop for Held {
+                fn drop(&mut self) {
+                    let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
+                }
+            }
+            Held(h)
+        });
+
+        let gpu = d3d::Gpu::for_capture().unwrap();
+        let latest = d3d::Latest::new(&gpu, 1920, 1080).unwrap();
+        let config = AppsConfig { ids: vec!["hook_target.exe".into()], away_when_unfocused: false, hook: crate::GameHook { auto: !wgc, allowed: Vec::new() } };
+        let video = Video::follow_apps(gpu.clone(), latest.clone(), Arc::new(std::sync::Mutex::new(config)), 60, None);
+        // Where the white bar is across the picture's bottom half (blue), if
+        // it shows: it moves 200 px a second while the game's picture comes.
+        // Counting new pictures doesn't tell: the cursor moving brings some.
+        let staging = gpu.texture(latest.width, 1, DXGI_FORMAT_B8G8R8A8_UNORM, 0, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ.0 as u32).unwrap();
+        let bar = || -> Option<usize> {
+            let (w, h) = latest.content();
+            let region = D3D11_BOX { left: 0, top: h * 3 / 4, front: 0, right: w, bottom: h * 3 / 4 + 1, back: 1 };
+            let _lock = gpu.exclusive();
+            unsafe {
+                gpu.context.CopySubresourceRegion(&staging, 0, 0, 0, 0, &latest.texture, 0, Some(&region));
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                gpu.context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).ok()?;
+                let row = std::slice::from_raw_parts(mapped.pData as *const [u8; 4], w as usize);
+                let x = row.iter().position(|p| p[..3].iter().all(|&c| c > 200));
+                gpu.context.Unmap(&staging, 0);
+                x
+            }
+        };
+        // Each half second: new pictures a second, and how many of its five
+        // looks found the bar moved.
+        let mut seen = Vec::new();
+        let (mut pictures, mut was) = (0, None);
+        while t0.elapsed().as_secs_f64() < secs {
+            let mut moved = 0;
+            for _ in 0..5 {
+                thread::sleep(Duration::from_millis(100));
+                let at = bar();
+                moved += (at.is_some() && at != was) as u32;
+                was = at;
+            }
+            let now = latest.arrivals().0 - latest.others();
+            seen.push((t0.elapsed().as_secs_f64(), (now - pictures) * 2, moved));
+            pictures = now;
+        }
+        video.stop();
+        let _ = game.kill();
+        let _ = game.wait();
+        let _ = said.join();
+        let _ = std::fs::remove_file(&exe);
+        for (t, n, moved) in &seen {
+            eprintln!("{t:5.1} s  {n:4} pictures/s, the bar moved {moved} times in 5");
+        }
+        // Before it's made anew the first time, the picture moves (the hook
+        // can take 4 s to load, more on a busy PC).
+        assert!(seen.iter().any(|(t, _, moved)| *t < EVERY && *moved > 0), "never recorded");
+        // Each time made anew: from 3.5 s after it to the next, it moves on
+        // (frozen, it never moves; on a busy PC it can miss a few looks).
+        for i in 1..=remakes {
+            let (from, to) = (i as f64 * EVERY + 3.5, (i + 1) as f64 * EVERY - 0.2);
+            let looks: Vec<u32> = seen.iter().filter(|(t, ..)| *t > from && *t < to).map(|(.., moved)| *moved).collect();
+            let moved: u32 = looks.iter().sum();
+            let of = 5 * looks.len() as u32;
+            let when = i as f64 * EVERY;
+            assert!(moved * 3 >= of, "after its {what} was made anew at {when:.0} s: frozen (the bar moved {moved} times in {of} looks)");
+        }
+    }
 }
