@@ -11,6 +11,9 @@
 //! They're registered with `global_hotkey` on macOS, Windows and X11. On
 //! Wayland, where an app can't see keys pressed elsewhere, the desktop portal
 //! does it (`portal_shortcuts`): the keys set here are what we ask it for.
+//! Games that keep keys from those get them anyway through `key_tap` (macOS)
+//! and `key_hook` (Windows).
+
 use std::str::FromStr;
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
