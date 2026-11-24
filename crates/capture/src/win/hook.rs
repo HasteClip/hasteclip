@@ -276,9 +276,33 @@ pub(crate) struct HookCapture {
     thread: Option<JoinHandle<()>>,
 }
 
+/// Whose hook a capture takes its pictures from.
+enum Mode {
+    /// Ours: loaded into the game with the hook's files in this folder (or
+    /// asked to start again, if it's in there already), set up, and stopped
+    /// when we're done, unless another capturer still keeps it going.
+    Own(PathBuf),
+    /// Another program's, capturing the game already (OBS's Game Capture,
+    /// for the OBS plugin): nothing loaded, set up, started or stopped, only
+    /// its pictures taken, and its pace kept up (see [`keep_pace`]).
+    Join,
+}
+
 impl HookCapture {
     pub(crate) fn start(gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32) -> Result<Self> {
         let dir = files().context("the game capture hook's files aren't there")?.to_path_buf();
+        Self::spawn(gpu, window, latest, fps, Mode::Own(dir), true)
+    }
+
+    /// Take the pictures of a hook another program loaded into the game and
+    /// captures with (OBS's Game Capture), `fps` looks a second, the cursor
+    /// drawn on them or not. Waits for its first picture as long as it's
+    /// asked to (that program may not be capturing yet).
+    pub(crate) fn join(gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, cursor: bool) -> Result<Self> {
+        Self::spawn(gpu, window, latest, fps, Mode::Join, cursor)
+    }
+
+    fn spawn(gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, mode: Mode, cursor: bool) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let ended = Arc::new(Mutex::new(None));
         let (stop2, ended2, gpu, latest) = (stop.clone(), ended.clone(), gpu.clone(), latest.clone());
@@ -288,7 +312,7 @@ impl HookCapture {
             // picture late, and it can land in the frame after its own.
             super::system::multimedia_thread("Capture");
             let window = window;
-            let result = run(&dir, &gpu, window.0, &latest, fps, &stop2);
+            let result = run(&mode, &gpu, window.0, &latest, fps, cursor, &stop2);
             let reason = match result {
                 Ok(()) => "stopped".to_owned(),
                 Err(e) => {
@@ -321,7 +345,8 @@ impl Drop for HookCapture {
 /// frame. (A guess; OBS retries forever.)
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop: &AtomicBool) -> Result<()> {
+fn run(mode: &Mode, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, draw_cursor: bool, stop: &AtomicBool) -> Result<()> {
+    let joined = matches!(mode, Mode::Join);
     super::system::com_init();
     // The cursor's position and the window's size in physical pixels.
     unsafe {
@@ -341,21 +366,28 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
 
     // While this mutex exists the hook keeps capturing; it checks every few
     // seconds and stops by itself once it's gone (we closed, or crashed).
-    let keepalive = {
-        let name = wide(&format!("CaptureHook_KeepAlive{pid}"));
-        Owned(unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }.context("can't create the hook's keepalive")?)
+    // Joined, the program whose hook it is keeps it going (and its log).
+    let keepalive = match mode {
+        Mode::Own(_) => {
+            let name = wide(&format!("CaptureHook_KeepAlive{pid}"));
+            Some(Owned(unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }.context("can't create the hook's keepalive")?))
+        }
+        Mode::Join => None,
     };
-    let _log = LogPipe::start(pid);
+    let _log = if joined { None } else { LogPipe::start(pid) };
     let began = Instant::now();
 
     // Already in the game (captured before, by us or OBS): ask it to start
     // again. Else load it.
-    let mut helper = match open_event(&format!("CaptureHook_Restart{pid}")) {
-        Some(restart) => {
-            unsafe { SetEvent(restart.0) }.context("can't restart the hook")?;
-            None
-        }
-        None => Some(inject(dir, is64, thread_id)?),
+    let mut helper = match mode {
+        Mode::Join => None,
+        Mode::Own(dir) => match open_event(&format!("CaptureHook_Restart{pid}")) {
+            Some(restart) => {
+                unsafe { SetEvent(restart.0) }.context("can't restart the hook")?;
+                None
+            }
+            None => Some(inject(dir, is64, thread_id)?),
+        },
     };
 
     // The hook's objects appear once it's loaded. The helper keeps nudging the
@@ -389,6 +421,9 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
             if let Some(mut h) = helper {
                 let _ = h.kill();
             }
+            if joined {
+                bail!("the game's hook isn't there (is OBS capturing the game?)");
+            }
             bail!("the hook didn't load in the game (anti-cheat, or the game runs as administrator?)");
         }
         thread::sleep(Duration::from_millis(50));
@@ -401,17 +436,22 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
     // game recorded at 300 came out in steps of 1 and 3 pictures as well
     // as 2.
     let interval = 1_000_000_000 / (4 * fps.max(1) as u64);
-    unsafe {
-        (*hook_info).offsets = offsets(is64);
-        (*hook_info).capture_overlay = false;
-        (*hook_info).force_shmem = false;
-        (*hook_info).unused_use_scale = false;
-        (*hook_info).allow_srgb_alias = true;
-        (*hook_info).frame_interval = interval;
+    if !joined {
+        unsafe {
+            (*hook_info).offsets = offsets(is64);
+            (*hook_info).capture_overlay = false;
+            (*hook_info).force_shmem = false;
+            (*hook_info).unused_use_scale = false;
+            (*hook_info).allow_srgb_alias = true;
+            (*hook_info).frame_interval = interval;
+        }
     }
+    keep_pace(hook_info, interval);
     let event = |name: &str| open_event(&format!("{name}{pid}")).with_context(|| format!("the hook has no {name} event"));
     let (hook_stop, hook_init, hook_exit) = (event("CaptureHook_Stop")?, event("CaptureHook_Initialize")?, event("CaptureHook_Exit")?);
-    unsafe { SetEvent(hook_init.0) }?;
+    if !joined {
+        unsafe { SetEvent(hook_init.0) }?;
+    }
 
     // Which of the hook's pictures was opened last (see `picture_number`),
     // and a newer one seen on the look before: opened a look after it shows
@@ -455,7 +495,7 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
                     eprintln!("game hook: capturing {}×{} ({}) after {:.1?}", s.cx, s.cy, s.kind(), began.elapsed());
                     source = Some(s);
                 }
-                Err(e) if !unsafe { (*hook_info).force_shmem } => {
+                Err(e) if !joined && !unsafe { (*hook_info).force_shmem } => {
                     // Likely on another graphics card than ours: through the
                     // CPU instead. Stopping makes the hook start over.
                     eprintln!("game hook: {e:#}; trying shared memory");
@@ -466,7 +506,7 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
             }
         } else if let Some(n) = number {
             noticed = Some(n);
-        } else if source.is_none() {
+        } else if source.is_none() && !joined {
             if Instant::now() > deadline {
                 break Err(anyhow::anyhow!("the hook loaded but sent no picture (is the game drawing?)"));
             }
@@ -511,7 +551,11 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
             }
         }
         // What's new goes up, with the cursor drawn on it.
-        changes.resolve(gpu, latest, &target, &mut |rtv, size| cursor.draw(gpu, &quad, latest, rtv, window, pid, size));
+        changes.resolve(gpu, latest, &target, &mut |rtv, size| {
+            if draw_cursor {
+                cursor.draw(gpu, &quad, latest, rtv, window, pid, size);
+            }
+        });
         next += every;
         let now = Instant::now();
         if next > now {
@@ -522,10 +566,13 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
     };
     // Stopped, unless something else still keeps it capturing (OBS, or our
     // capture taking over from this one): stopping makes it start over, and
-    // that one's picture would stop meanwhile.
-    drop(keepalive);
-    if open_mutex(&format!("CaptureHook_KeepAlive{pid}")).is_none() {
-        let _ = unsafe { SetEvent(hook_stop.0) };
+    // that one's picture would stop meanwhile. Joined, it's left to the
+    // program whose hook it is.
+    if let Some(keepalive) = keepalive {
+        drop(keepalive);
+        if open_mutex(&format!("CaptureHook_KeepAlive{pid}")).is_none() {
+            let _ = unsafe { SetEvent(hook_stop.0) };
+        }
     }
     result
 }

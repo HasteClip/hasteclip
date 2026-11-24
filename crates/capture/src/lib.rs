@@ -1121,6 +1121,11 @@ pub const SOURCES_WHILE_CAPTURING: bool = cfg!(any(target_os = "windows", target
 /// ([`sources::SourceKind::Output`]): on Windows and Linux. Not yet on macOS.
 pub const OUTPUT_SOURCES: bool = cfg!(any(target_os = "windows", target_os = "linux"));
 
+/// Whether frames can be blended for another program to show
+/// ([`win::feed`]: the OBS plugin): on Windows. Not yet on macOS
+/// (ScreenCaptureKit) or Linux (PipeWire), where the plugin isn't built.
+pub const OBS_FEED: bool = cfg!(target_os = "windows");
+
 /// Whether a desktop source says which programs it records, and can leave
 /// some out ([`sources::SourceKind::Desktop`]'s `leave_out`): on Windows and
 /// Linux. Not yet on macOS.

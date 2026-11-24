@@ -28,6 +28,7 @@ mod cursor;
 mod d3d;
 mod dupl;
 pub(crate) mod export;
+pub mod feed;
 pub mod decode;
 pub(crate) mod direct;
 pub mod gpu;
