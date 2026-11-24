@@ -198,8 +198,10 @@ mod tests {
             }
             let saved = badged(&glyph(size), Status::Saved, false);
             assert_eq!(*saved.get_pixel(0, 0), Rgba([255; 4]));
-            let c = size - (size as f32 * 0.2).max(3.0) as u32 - 1;
-            let p = saved.get_pixel(c, c + 2.min(size - 1 - c));
+            // Lower right of the badge's middle, off the (white) check.
+            let r = (size as f32 * 0.2).max(3.0);
+            let c = (size as f32 - r - 0.5 + r * 0.5) as u32;
+            let p = saved.get_pixel(c, c);
             assert!(p[1] > p[0] + 60 && p[1] > p[2] + 30, "saved at {size}: {p:?}");
         }
     }
