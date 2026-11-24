@@ -4,8 +4,8 @@
 //! use (16 px and up), and nothing to regenerate.
 //!
 //! - Idle: the glyph alone.
-//! - Clipping (the replay buffer is on): an amber dot.
-//! - Recording or streaming: a red dot.
+//! - Clipping (the replay buffer is on): a green dot.
+//! - Recording: a red dot. Streaming: a purple dot (the app's own colours).
 //! - A clip just saved: a green disc with a check, for a couple of seconds.
 //!
 //! macOS shows the menu bar icon as a template image, which macOS tints itself
@@ -36,10 +36,10 @@ impl Status {
     pub fn of(clipping: bool, recording: bool, streaming: bool, just_saved: bool) -> Self {
         if just_saved {
             Self::Saved
-        } else if recording {
-            Self::Recording
         } else if streaming {
             Self::Streaming
+        } else if recording {
+            Self::Recording
         } else if clipping {
             Self::Clipping
         } else {
@@ -58,9 +58,13 @@ impl Status {
         }
     }
 
-    const AMBER: [u8; 3] = [255, 176, 32];
-    const RED: [u8; 3] = [229, 50, 45];
-    const GREEN: [u8; 3] = [47, 191, 113];
+    // The app's own colours for each (theme.rs: live, rec, stream).
+    const CLIPPING: [u8; 3] = [0x3D, 0xD6, 0x8C];
+    const RED: [u8; 3] = [0xFF, 0x50, 0x50];
+    const PURPLE: [u8; 3] = [0xA9, 0x70, 0xFF];
+    /// The saved check's disc: a deeper green than clipping's dot, so the
+    /// check (and its white mark) reads as its own thing.
+    const GREEN: [u8; 3] = [0x12, 0xA4, 0x67];
 }
 
 /// `base` (the glyph, at the size it's shown) with `status`'s badge on it.
@@ -92,8 +96,9 @@ pub fn badged(base: &RgbaImage, status: Status, mono: bool) -> RgbaImage {
         let on_check = || check.iter().map(|&(a, b)| segment_dist((px, py), a, b)).fold(f32::MAX, f32::min) * r - stroke;
         let (colour, a): ([u8; 3], f32) = match (status, mono) {
             (Status::Idle, _) => continue,
-            (Status::Clipping, false) => (Status::AMBER, cover(d - r)),
-            (Status::Recording | Status::Streaming, false) => (Status::RED, cover(d - r)),
+            (Status::Clipping, false) => (Status::CLIPPING, cover(d - r)),
+            (Status::Recording, false) => (Status::RED, cover(d - r)),
+            (Status::Streaming, false) => (Status::PURPLE, cover(d - r)),
             (Status::Saved, false) => {
                 // A green disc, the check white on it.
                 over(p, Status::GREEN, cover(d - r));
@@ -152,6 +157,8 @@ mod tests {
         assert_eq!(Status::of(false, false, false, false), Status::Idle);
         assert_eq!(Status::of(true, false, false, false), Status::Clipping);
         assert_eq!(Status::of(true, true, false, false), Status::Recording);
+        assert_eq!(Status::of(true, true, true, false), Status::Streaming);
+        assert_eq!(Status::of(true, false, true, false), Status::Streaming);
         assert_eq!(Status::of(true, true, true, true), Status::Saved);
     }
 
@@ -165,7 +172,7 @@ mod tests {
     #[test]
     fn badges_are_coloured_bottom_right() {
         for size in [16, 20, 24, 32, 48, 64] {
-            for (status, rgb) in [(Status::Clipping, Status::AMBER), (Status::Recording, Status::RED), (Status::Saved, Status::GREEN)] {
+            for (status, rgb) in [(Status::Clipping, Status::CLIPPING), (Status::Recording, Status::RED), (Status::Streaming, Status::PURPLE), (Status::Saved, Status::GREEN)] {
                 let img = badged(&glyph(size), status, false);
                 // A pixel near the badge's centre (off the check, which is white).
                 let c = size - (size as f32 * 0.2).max(3.0) as u32 - 1;
