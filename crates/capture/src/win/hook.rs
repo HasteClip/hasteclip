@@ -394,19 +394,20 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
         thread::sleep(Duration::from_millis(50));
     };
     let hook_info = info.ptr::<HookInfo>();
+    // Copy at most four times per look (`fps` is looks a second): copying
+    // every frame of a game running at thousands of fps would cost it.
+    // Twice (as OBS does) left a game at twice the rate right on the limit,
+    // where its timing noise decides which pictures get copied: a 600 fps
+    // game recorded at 300 came out in steps of 1 and 3 pictures as well
+    // as 2.
+    let interval = 1_000_000_000 / (4 * fps.max(1) as u64);
     unsafe {
         (*hook_info).offsets = offsets(is64);
         (*hook_info).capture_overlay = false;
         (*hook_info).force_shmem = false;
         (*hook_info).unused_use_scale = false;
         (*hook_info).allow_srgb_alias = true;
-        // Copy at most four times per look (`fps` is looks a second): copying
-        // every frame of a game running at thousands of fps would cost it.
-        // Twice (as OBS does) left a game at twice the rate right on the
-        // limit, where its timing noise decides which pictures get copied:
-        // a 600 fps game recorded at 300 came out in steps of 1 and 3
-        // pictures as well as 2.
-        (*hook_info).frame_interval = 1_000_000_000 / (4 * fps.max(1) as u64);
+        (*hook_info).frame_interval = interval;
     }
     let event = |name: &str| open_event(&format!("{name}{pid}")).with_context(|| format!("the hook has no {name} event"));
     let (hook_stop, hook_init, hook_exit) = (event("CaptureHook_Stop")?, event("CaptureHook_Initialize")?, event("CaptureHook_Exit")?);
@@ -463,6 +464,7 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
         if !super::system::window_alive(window) {
             break Ok(());
         }
+        keep_pace(hook_info, interval);
         // A new picture to copy from: the first, or the hook started over
         // (the game resized or reset its graphics, or a capturer asked).
         let number = picture_number(hook_info).filter(|n| opened != Some(*n));
@@ -561,6 +563,21 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
         let _ = unsafe { SetEvent(hook_stop.0) };
     }
     result
+}
+
+/// Keep the hook copying the game's pictures at least every `interval` ns.
+/// Another capturer of the same game sets its own pace: OBS's Game Capture
+/// sets it back to twice OBS's frame rate every 2 s (its
+/// `reset_frame_interval`, read in OBS's source): with OBS at 60 fps, 120
+/// pictures a second at most, whatever the game draws, far too few to blend
+/// from. Both take their pictures from the same copy, so the quicker pace
+/// serves both: it's set back whenever it's slower.
+fn keep_pace(info: *mut HookInfo, interval: u64) {
+    // Written by the other capturer at any time.
+    let pace = unsafe { &raw mut (*info).frame_interval };
+    if unsafe { pace.read_volatile() } > interval {
+        unsafe { pace.write_volatile(interval) };
+    }
 }
 
 /// The number of the picture the hook copies the game's into, once it has
