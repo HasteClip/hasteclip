@@ -74,6 +74,24 @@ pub fn badged(base: &RgbaImage, status: Status, mono: bool) -> RgbaImage {
     if status == Status::Idle {
         return img;
     }
+    // In colour, what's capturing tints the whole glyph (white times the
+    // colour; the dark keyline stays dark): a dot covered part of it, and it
+    // was hard to tell what the icon was. A template has no colour to tint
+    // with, and a saved clip is a badge on the white glyph: both below.
+    let tint = match status {
+        Status::Clipping => Some(Status::CLIPPING),
+        Status::Recording => Some(Status::RED),
+        Status::Streaming => Some(Status::PURPLE),
+        _ => None,
+    };
+    if let (Some(rgb), false) = (tint, mono) {
+        for p in img.pixels_mut() {
+            for i in 0..3 {
+                p[i] = (u16::from(p[i]) * u16::from(rgb[i]) / 255) as u8;
+            }
+        }
+        return img;
+    }
     let (w, h) = (img.width() as f32, img.height() as f32);
     let size = w.min(h);
     // About a third of the icon across, no smaller than 6 px: legible at 16.
@@ -167,22 +185,22 @@ mod tests {
         assert_eq!(badged(&glyph(16), Status::Idle, false), glyph(16));
     }
 
-    /// The badge sits bottom-right in its colour, at every size trays use, and
-    /// the glyph's far corner is left alone.
+    /// What's capturing tints the whole glyph, at every size trays use; a
+    /// saved clip is a green badge bottom-right on the white glyph; on a
+    /// template, shapes bottom-right.
     #[test]
-    fn badges_are_coloured_bottom_right() {
+    fn tints_and_badges() {
         for size in [16, 20, 24, 32, 48, 64] {
-            for (status, rgb) in [(Status::Clipping, Status::CLIPPING), (Status::Recording, Status::RED), (Status::Streaming, Status::PURPLE), (Status::Saved, Status::GREEN)] {
+            for (status, rgb) in [(Status::Clipping, Status::CLIPPING), (Status::Recording, Status::RED), (Status::Streaming, Status::PURPLE)] {
                 let img = badged(&glyph(size), status, false);
-                // A pixel near the badge's centre (off the check, which is white).
-                let c = size - (size as f32 * 0.2).max(3.0) as u32 - 1;
-                let p = img.get_pixel(c, c + 2.min(size - 1 - c));
-                if status != Status::Saved {
-                    assert_eq!([p[0], p[1], p[2]], rgb, "{status:?} at {size}");
-                }
-                assert_eq!(p[3], 255);
-                assert_eq!(*img.get_pixel(0, 0), Rgba([255; 4]));
+                let p = img.get_pixel(0, 0);
+                assert_eq!([p[0], p[1], p[2], p[3]], [rgb[0], rgb[1], rgb[2], 255], "{status:?} at {size}");
             }
+            let saved = badged(&glyph(size), Status::Saved, false);
+            assert_eq!(*saved.get_pixel(0, 0), Rgba([255; 4]));
+            let c = size - (size as f32 * 0.2).max(3.0) as u32 - 1;
+            let p = saved.get_pixel(c, c + 2.min(size - 1 - c));
+            assert!(p[1] > p[0] + 60 && p[1] > p[2] + 30, "saved at {size}: {p:?}");
         }
     }
 
