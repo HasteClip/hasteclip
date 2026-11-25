@@ -1,5 +1,5 @@
 //! Frame blending for another program to show: the OBS plugin
-//! (`hasteclip-obs`). A game's, window's or display's pictures are taken as
+//! (`HasteClip/obs-frame-blending`). A game's, window's or display's pictures are taken as
 //! a recording takes them (a game through the hook OBS's Game Capture put in
 //! it, [`super::hook::HookCapture::join`]; a window or display through
 //! Windows' capture) and blended as a recording's are ([`super::FrameBlend`],
