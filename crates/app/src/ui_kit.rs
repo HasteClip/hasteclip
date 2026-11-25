@@ -1943,7 +1943,22 @@ fn shift(shape: &mut egui::Shape, offset: Vec2, opacity: f32) {
     }
 }
 
-/// A dialog: a scrim over the window, the box coming into focus.
+/// How near a dialog comes to the window's top and bottom: one taller than
+/// the room between scrolls.
+const DIALOG_EDGE: f32 = 24.0;
+/// The least room a dialog is given, however short the window.
+const DIALOG_MIN_ROOM: f32 = 120.0;
+/// How far a dialog that scrolls reaches into the box's right margin, for
+/// its bar to sit there rather than over what's in it.
+const DIALOG_GUTTER: f32 = 18.0;
+
+/// A dialog: a scrim over the window, the box coming into focus. As tall as
+/// what's in it, up to the window's height less a margin above and below.
+/// What's taller scrolls as a whole, its buttons last, so every choice is
+/// passed on the way to them: a list that scrolled under buttons that
+/// stayed put hid some of its choices (Import clips' OBS Studio, under
+/// NVIDIA and Discord), and the buttons acted on them unseen. While there's
+/// more, its bar shows and its edge fades.
 pub fn dialog<R>(ctx: &egui::Context, id: &str, width: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> egui::ModalResponse<R> {
     let p = theme::ctx_pal(ctx);
     let id = egui::Id::new(id);
@@ -1960,6 +1975,8 @@ pub fn dialog<R>(ctx: &egui::Context, id: &str, width: f32, add: impl FnOnce(&mu
         d.insert_temp(id.with("seen"), pass);
         d.insert_temp(id.with("born"), born);
     });
+    // Opened this frame (still so when the frame's laid out again).
+    let opened = born == now;
     let x = focus_since(ctx, born);
     let frame = egui::Frame::new()
         .fill(p.pop)
@@ -1967,15 +1984,75 @@ pub fn dialog<R>(ctx: &egui::Context, id: &str, width: f32, add: impl FnOnce(&mu
         .stroke(Stroke::new(1.0, if p.dark { Color32::from_white_alpha(18) } else { Color32::from_black_alpha(20) }))
         .shadow(ctx.global_style().visuals.popup_shadow)
         .inner_margin(Margin { left: 18, right: 18, top: 18, bottom: 14 });
+    // The room it has: the window's height, less a margin above and below
+    // and the box's own.
+    let room = (ctx.content_rect().height() - 2.0 * DIALOG_EDGE - frame.inner_margin.sum().y - 2.0 * frame.stroke.width).max(DIALOG_MIN_ROOM);
+    let over_id = id.with("over");
+    let over = ctx.data(|d| d.get_temp::<bool>(over_id)).unwrap_or(false);
+    let fill = theme::fade(frame.fill, theme::ease_out(x));
     // The scrim comes in by itself; the box (drawn on it, in the same layer)
     // comes into focus.
     let modal = egui::Modal::new(id).backdrop_color(theme::fade(p.scrim, theme::ease_out(x))).frame(egui::Frame::NONE).area(egui::Modal::default_area(id).fade_in(false));
-    modal.show(ctx, |ui| {
+    let shown = modal.show(ctx, |ui| {
         focus_in(ui, x, frame, |ui| {
             ui.set_width(width);
-            add(ui)
+            // Taller than the room last frame: it scrolls.
+            let (r, tall) = if over { dialog_scroll(ui, id.with("scroll"), room, opened, fill, add) } else { dialog_fitted(ui, id.with("fitted"), room, add) };
+            // Grown past the room, or back within it: laid out again, unseen.
+            if (tall > room + 0.5) != over {
+                ctx.data_mut(|d| d.insert_temp(over_id, !over));
+                ctx.request_discard("a dialog outgrew the window, or fits it again");
+            }
+            r
         })
-    })
+    });
+    // Placed by the size it had last frame: a new size is laid out again
+    // before it's seen, so a box that grew never reaches off the window.
+    keep_centred(ctx, id, shown.response.rect.size());
+    shown
+}
+
+/// What's in a dialog that fit the room last frame, laid out as egui lays
+/// out a dialog (in the size its box had last frame); and how tall it came
+/// to. It takes up `room` at most: grown taller, it's laid out again to
+/// scroll, and placed by this size.
+fn dialog_fitted<R>(ui: &mut egui::Ui, id: egui::Id, room: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> (R, f32) {
+    let at = ui.available_rect_before_wrap();
+    let mut inside = ui.new_child(egui::UiBuilder::new().id_salt(id).max_rect(at));
+    let r = add(&mut inside);
+    let used = inside.min_rect();
+    ui.advance_cursor_after_rect(Rect::from_min_size(at.min, vec2(used.width(), used.height().min(room))));
+    (r, used.height())
+}
+
+/// What's in a dialog too tall for the room, scrolling in it, its bar in
+/// the box's right margin; and how tall it came to. Laid out in a room of
+/// its own, as tall as `room`: egui lays a dialog out in the size it had
+/// the frame before, so what scrolled in one grew only a little more each
+/// frame. The edge fades into `fill`, the box's colour, while there's more.
+fn dialog_scroll<R>(ui: &mut egui::Ui, id: egui::Id, room: f32, opened: bool, fill: Color32, add: impl FnOnce(&mut egui::Ui) -> R) -> (R, f32) {
+    let width = ui.available_width();
+    let at = ui.available_rect_before_wrap().min;
+    // (The fades are drawn in the fill of the frame they're in: the box
+    // isn't one, focus_in draws it.)
+    let stack = egui::UiStackInfo::new(egui::UiKind::Frame).with_frame(egui::Frame::new().fill(fill));
+    let mut part = ui.new_child(egui::UiBuilder::new().id_salt(id).ui_stack_info(stack).max_rect(Rect::from_min_size(at, vec2(width + DIALOG_GUTTER, room))));
+    // The pages' slim bar, shown while there's more (theirs shows when
+    // they're pointed at).
+    part.spacing_mut().scroll = egui::style::ScrollStyle { bar_outer_margin: 6.0, bar_inner_margin: 0.0, bar_width: 6.0, floating_allocated_width: 0.0, dormant_handle_opacity: 0.5, ..egui::style::ScrollStyle::floating() };
+    let mut scroll = egui::ScrollArea::vertical().id_salt(id).max_height(room).auto_shrink([false, true]);
+    if opened {
+        scroll = scroll.vertical_scroll_offset(0.0);
+    }
+    let out = scroll.show(&mut part, |ui| {
+        ui.set_max_width(width);
+        let top = ui.available_rect_before_wrap().top();
+        let r = add(ui);
+        (r, ui.min_rect().bottom() - top)
+    });
+    // As tall as it came to (the output's own rect is the room it was offered).
+    ui.advance_cursor_after_rect(Rect::from_min_size(at, vec2(width, part.min_rect().height())));
+    out.inner
 }
 
 /// A dialog's title.
@@ -3044,6 +3121,46 @@ mod tests {
         assert!(height(true, 1) > 500.0);
         height(false, 2);
         assert_eq!(height(false, 3), fits, "back to what's in it");
+    }
+
+    /// A dialog taller than the window stays inside it and scrolls as a
+    /// whole, its button last, out of sight until it's scrolled to. It fills
+    /// the room the first frame it's seen (what scrolled in one grew 50
+    /// points a frame), and gives it back.
+    #[test]
+    fn a_dialog_fits_the_window() {
+        let ctx = egui::Context::default();
+        apply(&ctx);
+        let screen = Rect::from_min_size(Pos2::ZERO, vec2(1040.0, 500.0));
+        let show = |frame: u32, list: f32| {
+            let raw = egui::RawInput { screen_rect: Some(screen), max_texture_side: Some(8192), time: Some(f64::from(frame)), ..Default::default() };
+            let mut yes = Rect::NOTHING;
+            let mut out = ctx.run_ui(raw, |ui| {
+                let ctx = ui.ctx().clone();
+                let _ = dialog(&ctx, "fits", 440.0, |ui| {
+                    dialog_title(ui, "A dialog");
+                    ui.add_space(list);
+                    dialog_buttons(ui, |ui| yes = ui.add(button("Yes", true)).rect);
+                });
+            });
+            out.textures_delta.clear();
+            (ctx.memory(|m| m.area_rect(egui::Id::new("fits"))).unwrap_or(Rect::NOTHING), yes)
+        };
+        for frame in 0..3 {
+            show(frame, 100.0);
+        }
+        let (small, yes) = show(3, 100.0);
+        assert!(small.height() < 300.0 && small.contains_rect(yes), "{yes:?} in {small:?}");
+        let (tall, yes) = show(4, 1500.0);
+        assert!(tall.top() >= DIALOG_EDGE - 1.0 && tall.bottom() <= screen.bottom() - DIALOG_EDGE + 1.0, "{tall:?}");
+        assert!(tall.height() > screen.height() - 2.0 * DIALOG_EDGE - 4.0, "{tall:?}");
+        assert!(yes.top() > tall.bottom(), "the button's scrolled to: {yes:?} past {tall:?}");
+        assert_eq!(show(5, 1500.0).0, tall, "and stays put");
+        // Short again: back to its height, its button in it.
+        show(6, 100.0);
+        let (again, yes) = show(7, 100.0);
+        assert_eq!(again.height(), small.height());
+        assert!(again.contains_rect(yes), "{yes:?} in {again:?}");
     }
 
     /// A volume is read however it's typed: either minus sign, a comma for

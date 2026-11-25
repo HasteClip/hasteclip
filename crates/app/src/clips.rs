@@ -12,6 +12,11 @@ const VIDEO_EXTS: &[&str] = &["mp4", "mkv", "mov", "webm", "avi"];
 /// Pictures: screenshots, ours or put in the library some other way.
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp"];
 
+/// Whether the file at `path` is a video the library shows.
+pub fn is_video(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| VIDEO_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+}
+
 /// Whether the file at `path` is a picture (a screenshot), not a video.
 pub fn is_image(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| IMAGE_EXTS.contains(&e.to_ascii_lowercase().as_str()))

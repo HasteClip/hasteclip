@@ -692,6 +692,13 @@ impl App {
                     ui.label(shown).on_hover_text(&path);
                 });
             }
+            if f.shows(&["import", "other apps", "nvidia", "shadowplay", "medal", "discord", "obs", "steam", "outplayed", "amd"]) {
+                l.row(Row::new("Import clips").note(crate::import_apps::FROM), |ui| {
+                    if Btn::normal("Import…").small().id("settings_import").show(ui).clicked() {
+                        self.open_import();
+                    }
+                });
+            }
             if f.shows(&["folder per game"]) {
                 l.row(Row::new("Folder per game").tip("Folder per game", "Clips go in a folder named after the game, like osu!. Clips with no game go in Desktop."), |ui| ui_kit::switch(ui, &mut self.settings.folder_per_game));
             }

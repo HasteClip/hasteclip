@@ -340,6 +340,8 @@ pub enum ToastAction {
     CopyLink(std::path::PathBuf),
     /// Undo the last change to the Sources page's sources (one removed).
     UndoSources,
+    /// Stop the import from other apps that's running.
+    CancelTransfer,
 }
 
 #[derive(Clone)]
@@ -899,6 +901,7 @@ impl App {
                 ToastAction::Undelete(binned) => self.undelete(binned),
                 ToastAction::CopyLink(clip) => self.copy_link(&clip),
                 ToastAction::UndoSources => self.undo_arrangement(),
+                ToastAction::CancelTransfer => self.cancel_transfer(),
             }
         }
     }

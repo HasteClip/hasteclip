@@ -328,7 +328,7 @@ fn valve_cfg_dirs() -> Vec<(PathBuf, Game)> {
 }
 
 /// Steam's library folders: Steam's own, and those in its `libraryfolders.vdf`.
-fn steam_libraries() -> Vec<PathBuf> {
+pub(crate) fn steam_libraries() -> Vec<PathBuf> {
     let Some(steam) = steam_dir() else { return Vec::new() };
     let mut libs = vec![steam.clone()];
     if let Ok(text) = std::fs::read_to_string(steam.join("steamapps").join("libraryfolders.vdf")) {
@@ -357,7 +357,7 @@ fn vdf_paths(text: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-fn steam_dir() -> Option<PathBuf> {
+pub(crate) fn steam_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     {
         use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_SZ, RegGetValueW};

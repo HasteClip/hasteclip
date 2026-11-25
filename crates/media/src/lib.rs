@@ -175,7 +175,7 @@ fn probe_mp4(source: &Path) -> Result<ClipInfo> {
     let movie = mp4::read(source)?;
     let video = movie.tracks.iter().find(|t| t.kind == mp4::Kind::Video).context("no video stream")?;
     let tag = movie.comment.as_deref().map(parse_clip_tag).unwrap_or_default();
-    let audio = movie
+    let mut audio: Vec<AudioStream> = movie
         .tracks
         .iter()
         .filter(|t| t.kind == mp4::Kind::Audio)
@@ -186,6 +186,7 @@ fn probe_mp4(source: &Path) -> Result<ClipInfo> {
             in_mix: tag.mix.as_ref().is_none_or(|m| m.contains(&index)),
         })
         .collect();
+    discord_tracks(&mut audio);
     Ok(ClipInfo {
         duration: movie.seconds,
         fps: if video.samples > 0 && video.seconds > 0.0 { video.samples as f64 / video.seconds } else { 60.0 },
@@ -263,7 +264,7 @@ fn probe_ffprobe(source: &Path) -> Result<ClipInfo> {
         .filter_map(|r| parse_rate(r))
         .next()
         .unwrap_or(60.0);
-    let audio = p
+    let mut audio: Vec<AudioStream> = p
         .streams
         .iter()
         .filter(|s| s.codec_type == "audio")
@@ -280,6 +281,7 @@ fn probe_ffprobe(source: &Path) -> Result<ClipInfo> {
             in_mix: mix_members.as_ref().is_none_or(|m| m.contains(&index)),
         })
         .collect();
+    discord_tracks(&mut audio);
     Ok(ClipInfo {
         duration,
         fps,
@@ -295,6 +297,41 @@ fn probe_ffprobe(source: &Path) -> Result<ClipInfo> {
             Some(_) => false,
         },
     })
+}
+
+/// Discord's clips name each sound track `<user id>:<what>`: `0:all`
+/// (everyone, mixed), `<id>:voice` (one person in the call), and
+/// `<id>:application` (the game, or a stream's sound). Read as our own
+/// clips are laid out, so the player plays the mix and the editor offers
+/// the parts (rebuilding the mix from them, not adding them to it): the
+/// mix first as "Mix", then "Game" and "Voice 1", "Voice 2"… The file is
+/// left as it is. Only when every track is named Discord's way.
+fn discord_tracks(audio: &mut [AudioStream]) {
+    let discord = |t: &str| -> Option<String> {
+        let (id, what) = t.split_once(':')?;
+        (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) && !what.is_empty()).then(|| what.to_owned())
+    };
+    let kinds: Vec<Option<String>> = audio.iter().map(|a| a.title.as_deref().and_then(discord)).collect();
+    if kinds.is_empty() || kinds.iter().any(Option::is_none) {
+        return;
+    }
+    let mut voices = 0;
+    for (i, (a, what)) in audio.iter_mut().zip(kinds).enumerate() {
+        let what = what.unwrap_or_default();
+        a.title = Some(match what.as_str() {
+            "all" if i == 0 => "Mix".to_owned(),
+            "all" => "Everyone".to_owned(),
+            "application" => "Game".to_owned(),
+            "voice" => {
+                voices += 1;
+                format!("Voice {voices}")
+            }
+            other => {
+                let mut c = other.chars();
+                c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+            }
+        });
+    }
 }
 
 /// What our file comment says about a clip.
@@ -1881,6 +1918,29 @@ pub fn from_db(db: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn discord_tracks_read_as_ours() {
+        let track = |index, title: &str| AudioStream { index, title: Some(title.to_owned()), in_mix: true };
+        let mut audio = vec![track(0, "0:all"), track(1, "307946781373759488:voice"), track(2, "656608871573618690:voice"), track(3, "307946781373759488:application")];
+        discord_tracks(&mut audio);
+        let names: Vec<String> = audio.iter().map(AudioStream::label).collect();
+        assert_eq!(names, ["Mix", "Voice 1", "Voice 2", "Game"]);
+        let info = ClipInfo { duration: 1.0, fps: 30.0, width: 2, height: 2, video_kbps: None, audio, id: None, bt601: false };
+        let parts: Vec<String> = info.source_tracks().iter().map(|a| a.label()).collect();
+        assert_eq!(parts, ["Voice 1", "Voice 2", "Game"], "the editor offers the parts, not the mix");
+        // A newer clip: the game alone.
+        let mut one = vec![track(0, "0:application")];
+        discord_tracks(&mut one);
+        assert_eq!(one[0].label(), "Game");
+        // Anything else is left alone.
+        let mut ours = vec![track(0, "Mix"), track(1, "Desktop")];
+        discord_tracks(&mut ours);
+        assert_eq!(ours.iter().map(AudioStream::label).collect::<Vec<_>>(), ["Mix", "Desktop"]);
+        let mut mixed = vec![track(0, "0:all"), track(1, "Microphone")];
+        discord_tracks(&mut mixed);
+        assert_eq!(mixed[0].label(), "0:all", "only when every track is Discord's");
+    }
+
     use super::*;
 
     /// Reading an MP4's or MOV's index here gives what ffprobe gives, for
