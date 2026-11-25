@@ -958,13 +958,16 @@ impl App {
         let modal = ui_kit::dialog(ctx, "keys_dialog", 440.0, |ui| {
             ui_kit::dialog_title(ui, "Keyboard shortcuts");
             let p = theme::pal(ui);
-            egui::Grid::new("keys_grid").num_columns(2).spacing(vec2(18.0, 8.0)).show(ui, |ui| {
-                for (k, what) in rows {
-                    // "Cmd" is the command key: Ctrl off a Mac.
-                    ui.label(theme::text(k.replace("Cmd", crate::shortcuts::cmd_name()), 13.5, W::Semibold).color(p.text));
-                    ui.label(theme::text(*what, 13.5, W::Regular).color(p.text2));
-                    ui.end_row();
-                }
+            // Scrolls in a window too short for all of them.
+            ui_kit::dialog_body(ui, "keys", |ui| {
+                egui::Grid::new("keys_grid").num_columns(2).spacing(vec2(18.0, 8.0)).show(ui, |ui| {
+                    for (k, what) in rows {
+                        // "Cmd" is the command key: Ctrl off a Mac.
+                        ui.label(theme::text(k.replace("Cmd", crate::shortcuts::cmd_name()), 13.5, W::Semibold).color(p.text));
+                        ui.label(theme::text(*what, 13.5, W::Regular).color(p.text2));
+                        ui.end_row();
+                    }
+                });
             });
             ui_kit::dialog_buttons(ui, |ui| {
                 close = ui.add(ui_kit::button("Done", false)).clicked();

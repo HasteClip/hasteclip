@@ -194,71 +194,75 @@ impl App {
             ui_kit::dialog_title(ui, "Import clips");
             ui_kit::dialog_text(ui, "Bring in the clips you made with another app. Each goes into your library's folder for its game.");
             ui.add_space(8.0);
-            ui_kit::list(ui, "import_places", |l| {
-                if looked.is_none() {
-                    l.row(Row::new("Looking for clipping apps…"), |ui| {
-                        ui.spinner();
-                    });
-                } else if none_shown {
-                    let none = format!("None of the apps HasteClip knows ({}) keeps clips on this computer.", import_apps::HERE.iter().map(|k| k.name()).collect::<Vec<_>>().join(", "));
-                    l.row(Row::new("No clipping apps found").note(none), |_| {});
-                }
-                for (i, e) in places.iter().enumerate().filter(|(_, e)| shown(e)) {
-                    let label = if e.src.kind == AppKind::Folder { "Folder" } else { e.src.kind.name() };
-                    let (note, new, all_games) = match e.scan.get() {
-                        None => (format!("Looking…\n{}", folder_lines(&e.src.folders.iter().map(|f| (f.clone(), 0)).collect::<Vec<_>>())), 0, None),
-                        Some(s) => {
-                            let mut lines = vec![summary(s)];
-                            if !s.games.is_empty() {
-                                lines.push(games_line(&s.games));
-                            }
-                            // Where its new clips are; the folders looked in if none.
-                            let folders = if s.folders.is_empty() { e.src.folders.iter().map(|f| (f.clone(), 0)).collect() } else { s.folders.clone() };
-                            lines.push(folder_lines(&folders));
-                            if d.mode == Mode::Move
-                                && let Some(why) = copied_instead(e.src.kind, s)
-                            {
-                                lines.push(why);
-                            }
-                            let all = (s.games.len() > GAMES_SHOWN).then(|| s.games.iter().map(|(g, n)| format!("{g}: {}", clips_word(*n))).collect::<Vec<_>>().join("\n"));
-                            (lines.join("\n"), s.new_clips().count(), all)
-                        }
-                    };
-                    let tip_title = format!("Where {label}'s clips go");
-                    let mut row = Row::new(label).note(note);
-                    if let Some(all) = &all_games {
-                        row = row.tip(&tip_title, all);
-                    }
-                    l.row(row, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 8.0;
-                            // Laid out from the right: the switch on the
-                            // edge, as on every settings row.
-                            let mut on = !d.off.contains(&i) && new > 0;
-                            let was = on;
-                            ui.add_enabled_ui(new > 0, |ui| ui_kit::switch(ui, &mut on));
-                            if on != was {
-                                if on {
-                                    d.off.remove(&i);
-                                } else {
-                                    d.off.insert(i);
-                                }
-                            }
-                            if Btn::ghost("Change folder…").small().id(("import_change", i)).show(ui).clicked() {
-                                pick_folder = Some(Some(i));
-                            }
+            // More places than the window has room for scroll; Copy or move
+            // and the buttons stay in sight.
+            ui_kit::dialog_body(ui, "import_places", |ui| {
+                ui_kit::list(ui, "import_places", |l| {
+                    if looked.is_none() {
+                        l.row(Row::new("Looking for clipping apps…"), |ui| {
+                            ui.spinner();
                         });
+                    } else if none_shown {
+                        let none = format!("None of the apps HasteClip knows ({}) keeps clips on this computer.", import_apps::HERE.iter().map(|k| k.name()).collect::<Vec<_>>().join(", "));
+                        l.row(Row::new("No clipping apps found").note(none), |_| {});
+                    }
+                    for (i, e) in places.iter().enumerate().filter(|(_, e)| shown(e)) {
+                        let label = if e.src.kind == AppKind::Folder { "Folder" } else { e.src.kind.name() };
+                        let (note, new, all_games) = match e.scan.get() {
+                            None => (format!("Looking…\n{}", folder_lines(&e.src.folders.iter().map(|f| (f.clone(), 0)).collect::<Vec<_>>())), 0, None),
+                            Some(s) => {
+                                let mut lines = vec![summary(s)];
+                                if !s.games.is_empty() {
+                                    lines.push(games_line(&s.games));
+                                }
+                                // Where its new clips are; the folders looked in if none.
+                                let folders = if s.folders.is_empty() { e.src.folders.iter().map(|f| (f.clone(), 0)).collect() } else { s.folders.clone() };
+                                lines.push(folder_lines(&folders));
+                                if d.mode == Mode::Move
+                                    && let Some(why) = copied_instead(e.src.kind, s)
+                                {
+                                    lines.push(why);
+                                }
+                                let all = (s.games.len() > GAMES_SHOWN).then(|| s.games.iter().map(|(g, n)| format!("{g}: {}", clips_word(*n))).collect::<Vec<_>>().join("\n"));
+                                (lines.join("\n"), s.new_clips().count(), all)
+                            }
+                        };
+                        let tip_title = format!("Where {label}'s clips go");
+                        let mut row = Row::new(label).note(note);
+                        if let Some(all) = &all_games {
+                            row = row.tip(&tip_title, all);
+                        }
+                        l.row(row, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                // Laid out from the right: the switch on the
+                                // edge, as on every settings row.
+                                let mut on = !d.off.contains(&i) && new > 0;
+                                let was = on;
+                                ui.add_enabled_ui(new > 0, |ui| ui_kit::switch(ui, &mut on));
+                                if on != was {
+                                    if on {
+                                        d.off.remove(&i);
+                                    } else {
+                                        d.off.insert(i);
+                                    }
+                                }
+                                if Btn::ghost("Change folder…").small().id(("import_change", i)).show(ui).clicked() {
+                                    pick_folder = Some(Some(i));
+                                }
+                            });
+                        });
+                    }
+                    l.row(Row::new("Another folder").note("Clips from any other app: its folders are taken as games"), |ui| {
+                        if Btn::normal("Choose…").small().id("import_folder").show(ui).clicked() {
+                            pick_folder = Some(None);
+                        }
                     });
-                }
-                l.row(Row::new("Another folder").note("Clips from any other app: its folders are taken as games"), |ui| {
-                    if Btn::normal("Choose…").small().id("import_folder").show(ui).clicked() {
-                        pick_folder = Some(None);
-                    }
-                });
-                l.row(Row::new("HasteClip file").note("Clips exported from HasteClip on another computer (.hasteclip)"), |ui| {
-                    if Btn::normal("Choose…").small().id("import_file").show(ui).clicked() {
-                        pick_file = true;
-                    }
+                    l.row(Row::new("HasteClip file").note("Clips exported from HasteClip on another computer (.hasteclip)"), |ui| {
+                        if Btn::normal("Choose…").small().id("import_file").show(ui).clicked() {
+                            pick_file = true;
+                        }
+                    });
                 });
             });
             ui.add_space(12.0);
