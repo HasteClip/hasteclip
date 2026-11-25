@@ -22,6 +22,11 @@
 #   each size trays use (16 px at 100% scale, 20 at 125%, 24 at 150%, 32 at
 #   200%, ...), drawn at the pixel size it's shown at, so it's never scaled
 #   by Windows (that made it pixelated).
+# - The tray while capturing (tray/clipping-N.png, recording-N.png,
+#   streaming-N.png): the same, with the clapperboard (the board, its slot and
+#   its sticks) in the state's colour, the horse still white: glyph-keyline.svg
+#   with its group's white fill changed. The colours are the app's own
+#   (theme.rs: live, rec, stream).
 # - macOS's menu bar (tray-mac.png): glyph.svg, 32 px with 2 px clear around
 #   it: macOS shows a menu bar icon 18 points high, and its own glyphs
 #   (Wi-Fi, Focus) are about 16 of those. Shown as a template image: macOS
@@ -55,6 +60,15 @@ for s in 48 64 96 128 192 256; do
 done
 for s in 16 20 24 28 32 40 48 64; do
     rsvg-convert -w $s -h $s glyph-keyline.svg -o tray/glyph-$s.png
+done
+for state in clipping:3DD68C recording:FF5050 streaming:A970FF; do
+    name=${state%%:*}
+    colour=${state##*:}
+    # The first white fill is the group's (board, sticks); the horse keeps white.
+    sed -e "0,/fill=\"#fff\"/s//fill=\"#$colour\"/" -e 's/id="horse"/id="horse" fill="#fff"/' glyph-keyline.svg > "$tmp/$name.svg"
+    for s in 16 20 24 28 32 40 48 64; do
+        rsvg-convert -w $s -h $s "$tmp/$name.svg" -o tray/$name-$s.png
+    done
 done
 rsvg-convert -w 32 -h 32 glyph.svg | magick - -background none -gravity center -extent 36x36 tray-mac.png
 rsvg-convert -w 512 -h 512 glyph.svg | magick - -background none -gravity center -extent 768x768 glyph.png
