@@ -262,6 +262,9 @@ fn run(target: Target, options: Options, shared: &Arc<Shared>, stop: &AtomicBool
         }
     };
     latest.set_wants_queue(true);
+    // The pictures are only ever taken from the queue here: straight into
+    // it, a copy less each.
+    latest.set_straight_to_queue(true);
     let bell = Arc::new(d3d::Bell::default());
     latest.set_bell(Some(bell.clone()));
     let blend = FrameBlend::new(&gpu, &latest, looks)?;
@@ -307,6 +310,7 @@ fn run(target: Target, options: Options, shared: &Arc<Shared>, stop: &AtomicBool
         p.look_until(host_now() - p.wait());
     };
     latest.set_bell(None);
+    latest.set_straight_to_queue(false);
     latest.set_wants_queue(false);
     drop(capture);
     result

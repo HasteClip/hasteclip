@@ -274,9 +274,12 @@ pub(crate) struct Latest {
     /// `wants_queue`: between two of its looks the capture can bring several.
     queue: Mutex<std::collections::VecDeque<Queued>>,
     wants_queue: AtomicBool,
+    /// The queue's consumer reads nothing else (see
+    /// [`Latest::set_straight_to_queue`]).
+    straight: AtomicBool,
     /// The textures the queue's pictures are copied into, taken in turn
     /// (made the first time they're needed), and which is next.
-    pool: Mutex<(Vec<(ID3D11Texture2D, ID3D11ShaderResourceView)>, usize)>,
+    pool: Mutex<(Vec<QueueSlot>, usize)>,
     /// Rung with each new picture, for a consumer that waits on several
     /// captures at once (the frame pacer, see [`Bell`]).
     bell: Mutex<Option<Arc<Bell>>>,
@@ -295,6 +298,20 @@ pub(crate) struct Queued {
     pub size: (u32, u32),
     /// When it came up, host seconds.
     pub at: f64,
+}
+
+/// A frame of Windows' capture as it went up: its size, and the queue's
+/// texture it went straight into, if it did (see
+/// [`Latest::set_straight_to_queue`]).
+type WentUp = ((u32, u32), Option<QueueSlot>);
+
+/// One of the queue's textures, for a picture to go into: copied or drawn
+/// into (through `target`), then handed over by [`Latest::queued`].
+#[derive(Clone)]
+pub(crate) struct QueueSlot {
+    pub texture: ID3D11Texture2D,
+    pub target: ID3D11RenderTargetView,
+    view: ID3D11ShaderResourceView,
 }
 
 /// Pictures waiting beyond this are dropped, oldest first (the consumer is
@@ -323,6 +340,7 @@ impl Latest {
             others: std::sync::atomic::AtomicU64::new(0),
             queue: Mutex::new(std::collections::VecDeque::new()),
             wants_queue: AtomicBool::new(false),
+            straight: AtomicBool::new(false),
             pool: Mutex::new((Vec::new(), 0)),
             bell: Mutex::new(None),
             source: std::sync::atomic::AtomicU64::new(0),
@@ -375,34 +393,58 @@ impl Latest {
         self.wants_queue.load(Ordering::Acquire)
     }
 
-    /// Copy the picture now in `texture` into the queue.
-    fn queue_picture(&self, size: (u32, u32), at: f64) -> Result<()> {
+    /// The queue's consumer reads nothing else of this (the OBS plugin's
+    /// feed): a capture that can puts each new picture straight into one of
+    /// the queue's textures ([`Self::queue_slot`], [`Self::queued`]) instead
+    /// of into `texture` to be copied from there, a copy less per picture.
+    /// `texture` isn't kept up to date then, so nothing else may read it
+    /// (HasteClip's preview, screenshots and away screen do).
+    pub(crate) fn set_straight_to_queue(&self, on: bool) {
+        self.straight.store(on, Ordering::Release);
+    }
+
+    /// Whether new pictures go straight into the queue (see above).
+    pub(crate) fn straight_to_queue(&self) -> bool {
+        self.straight.load(Ordering::Acquire) && self.wants_queue()
+    }
+
+    /// The queue's next texture, for a picture to go into.
+    pub(crate) fn queue_slot(&self) -> Result<QueueSlot> {
         let mut pool = self.pool.lock().unwrap();
         if pool.0.is_empty() {
             let bind = (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32;
             for _ in 0..POOL {
                 let texture = self.gpu.texture(self.width, self.height, DXGI_FORMAT_B8G8R8A8_UNORM, bind, D3D11_USAGE_DEFAULT, 0)?;
                 let view = super::quad::shader_view(&self.gpu, &texture)?;
-                pool.0.push((texture, view));
+                let target = super::quad::target_view(&self.gpu, &texture)?;
+                pool.0.push(QueueSlot { texture, target, view });
             }
         }
         let i = pool.1;
         pool.1 = (i + 1) % POOL;
-        let (texture, view) = pool.0[i].clone();
-        drop(pool);
+        Ok(pool.0[i].clone())
+    }
+
+    /// Copy the picture now in `texture` into the queue.
+    fn queue_picture(&self, size: (u32, u32), at: f64) -> Result<()> {
+        let slot = self.queue_slot()?;
         // Only the picture: the texture has room for a window on the
         // biggest display (2560×1920 beside a portrait screen, for a
         // 2560×1440 one), and nothing reads past the picture's size.
         let region = D3D11_BOX { left: 0, top: 0, front: 0, right: size.0, bottom: size.1, back: 1 };
-        unsafe { self.gpu.context.CopySubresourceRegion(&texture, 0, 0, 0, 0, &self.texture, 0, Some(&region)) };
+        unsafe { self.gpu.context.CopySubresourceRegion(&slot.texture, 0, 0, 0, 0, &self.texture, 0, Some(&region)) };
+        self.push_queued(slot, size, at);
+        Ok(())
+    }
+
+    fn push_queued(&self, slot: QueueSlot, size: (u32, u32), at: f64) {
         let mut queue = self.queue.lock().unwrap();
-        queue.push_back(Queued { texture, view, size, at });
+        queue.push_back(Queued { texture: slot.texture, view: slot.view, size, at });
         while queue.len() > QUEUE_MAX {
             // Frame blending fell behind: that picture missed its frame.
             queue.pop_front();
             crate::count_missed_of(self.source.load(Ordering::Relaxed), 1);
         }
-        Ok(())
     }
 
     pub(crate) fn queue_len(&self) -> usize {
@@ -513,16 +555,32 @@ impl Latest {
     /// A picture that's up now, `queue`d for a consumer that wants every one
     /// (or not: the same game picture with the cursor moved).
     pub(crate) fn mark(&self, size: (u32, u32), at: f64, queue: bool) {
+        let size = self.up(size);
+        if queue
+            && self.wants_queue()
+            && let Err(e) = self.queue_picture(size, at)
+        {
+            eprintln!("frame blending: {e:#}");
+        }
+        self.note_frame_at(at);
+    }
+
+    /// A new picture is in `slot`, `size` of it from its top-left corner, up
+    /// since `at`: queued as [`Self::mark`] queues one, but not through
+    /// `texture` (see [`Self::set_straight_to_queue`]).
+    pub(crate) fn queued(&self, slot: QueueSlot, size: (u32, u32), at: f64) {
+        let size = self.up(size);
+        self.push_queued(slot, size, at);
+        self.note_frame_at(at);
+    }
+
+    /// A picture `size` big is up: its size, within the texture's.
+    fn up(&self, size: (u32, u32)) -> (u32, u32) {
         let size = (size.0.min(self.width), size.1.min(self.height));
         *self.content.lock().unwrap() = size;
         self.waiting.store(false, Ordering::Release);
         self.has_frame.store(true, Ordering::Release);
-        if queue && self.wants_queue() {
-            if let Err(e) = self.queue_picture(size, at) {
-                eprintln!("frame blending: {e:#}");
-            }
-        }
-        self.note_frame_at(at);
+        size
     }
 
     /// Nothing to show (a display that isn't there): it's left out of the
@@ -689,20 +747,28 @@ impl Overlay {
 
     /// `clean` up into `latest`, with the cursor drawn on it.
     fn put_up(&mut self, gpu: &Gpu, latest: &Latest) {
+        let target = self.target.clone();
+        self.put_up_into(gpu, latest, &latest.texture, &target);
+    }
+
+    /// `clean` up into `texture`, one as big as `latest`'s (drawn into
+    /// through `target`), with the cursor drawn on it: a queue's texture,
+    /// for pictures that go straight into the queue.
+    fn put_up_into(&mut self, gpu: &Gpu, latest: &Latest, texture: &ID3D11Texture2D, target: &ID3D11RenderTargetView) {
         let (w, h) = self.size;
         if w == 0 || h == 0 {
             return;
         }
         let _held = gpu.exclusive();
         let region = D3D11_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 };
-        unsafe { gpu.context.CopySubresourceRegion(&latest.texture, 0, 0, 0, 0, &self.clean, 0, Some(&region)) };
+        unsafe { gpu.context.CopySubresourceRegion(texture, 0, 0, 0, 0, &self.clean, 0, Some(&region)) };
         physical(|| {
             self.drawn = super::cursor::showing(self.pid);
             match self.of {
-                Of::Window(window) => self.layer.draw(gpu, &self.quad, latest, &self.target, window, self.pid.unwrap_or(0), self.size),
+                Of::Window(window) => self.layer.draw(gpu, &self.quad, latest, target, window, self.pid.unwrap_or(0), self.size),
                 Of::Display(monitor) => {
                     if let Some((origin, display)) = monitor_rect(monitor) {
-                        self.layer.draw_on_screen(gpu, &self.quad, latest, &self.target, origin, display, self.size);
+                        self.layer.draw_on_screen(gpu, &self.quad, latest, target, origin, display, self.size);
                     }
                 }
                 Of::Page(_) => {}
@@ -810,7 +876,7 @@ impl Capture {
             // exact than when it reaches us; not if it's far off.
             let now = super::system::host_now();
             let shown = frame.SystemRelativeTime().map(|t| t.Duration as f64 / 1e7).ok().filter(|&t| t <= now && t > now - 0.1).unwrap_or(now);
-            let copied = (|| -> Result<Option<(u32, u32)>> {
+            let copied = (|| -> Result<Option<WentUp>> {
                 let access: IDirect3DDxgiInterfaceAccess = frame.Surface()?.cast()?;
                 let tex: ID3D11Texture2D = unsafe { access.GetInterface()? };
                 let mut desc = D3D11_TEXTURE2D_DESC::default();
@@ -852,11 +918,18 @@ impl Capture {
                     }
                     shrink.as_mut().unwrap().draw(gpu2, &tex, region, fitted, (latest2.width, latest2.height))?;
                 }
+                let mut queued = None;
                 if let Some(o) = overlay.as_mut() {
                     o.size = fitted;
-                    o.put_up(gpu2, &latest2);
+                    if latest2.straight_to_queue() {
+                        let slot = latest2.queue_slot()?;
+                        o.put_up_into(gpu2, &latest2, &slot.texture, &slot.target);
+                        queued = Some(slot);
+                    } else {
+                        o.put_up(gpu2, &latest2);
+                    }
                 }
-                Ok(Some(fitted))
+                Ok(Some((fitted, queued)))
             })();
             let _ = frame.Close();
             if let Err(e) = &copied
@@ -864,7 +937,7 @@ impl Capture {
             {
                 eprintln!("windows' capture: couldn't copy a frame: {e:#}");
             }
-            if let Ok(Some(size)) = copied {
+            if let Ok(Some((size, queued))) = copied {
                 // `HASTECLIP_WGC_LOG=1`: how many frames arrive each second.
                 static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                 if *LOG.get_or_init(|| std::env::var_os("HASTECLIP_WGC_LOG").is_some()) {
@@ -876,7 +949,10 @@ impl Capture {
                     }
                 }
                 *last_frame2.lock().unwrap() = std::time::Instant::now();
-                latest2.mark_frame_at(size, shown);
+                match queued {
+                    Some(slot) => latest2.queued(slot, size, shown),
+                    None => latest2.mark_frame_at(size, shown),
+                }
             }
             // The display or window changed size: resize the pool to match.
             let mut size = pool_size.lock().unwrap();
@@ -920,8 +996,20 @@ impl Capture {
                     if o.size.0 == 0 || latest.waiting() || o.hidden() || !o.moved() {
                         continue;
                     }
-                    o.put_up(&gpu, &latest);
                     let counts = since > quiet && counted.is_none_or(|t| t.elapsed() > quiet);
+                    if latest.straight_to_queue() {
+                        // Only the queue is read: a picture that doesn't
+                        // count goes nowhere.
+                        if !counts {
+                            continue;
+                        }
+                        let Ok(slot) = latest.queue_slot() else { continue };
+                        o.put_up_into(&gpu, &latest, &slot.texture, &slot.target);
+                        counted = Some(std::time::Instant::now());
+                        latest.queued(slot, o.size, super::system::host_now());
+                        continue;
+                    }
+                    o.put_up(&gpu, &latest);
                     if counts {
                         counted = Some(std::time::Instant::now());
                     }
@@ -1666,6 +1754,68 @@ mod priority_tests {
         drop(clone);
         assert_eq!(class(), PRIORITY_NORMAL);
         drop(decoder);
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    /// The first pixel's green (0–255) of `texture`, `width`×`height`.
+    fn green(gpu: &Gpu, texture: &ID3D11Texture2D, (width, height): (u32, u32)) -> u8 {
+        let staging = gpu.texture(width, height, DXGI_FORMAT_B8G8R8A8_UNORM, 0, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ.0 as u32).unwrap();
+        unsafe {
+            gpu.context.CopyResource(&staging, texture);
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            gpu.context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).unwrap();
+            let g = *(mapped.pData as *const u8).add(1);
+            gpu.context.Unmap(&staging, 0);
+            g
+        }
+    }
+
+    fn fill(gpu: &Gpu, target: &ID3D11RenderTargetView, green: f32) {
+        unsafe { gpu.context.ClearRenderTargetView(target, &[0.0, green, 0.0, 1.0]) };
+    }
+
+    /// A picture put straight into one of the queue's textures comes out of
+    /// the queue as it went in, sized, timed and counted as one `mark`
+    /// queues, and `texture` is left as it was. `mark` still queues (for a
+    /// capture that can't go straight), and nothing goes straight while the
+    /// queue isn't wanted.
+    #[test]
+    fn straight_to_the_queue() {
+        let Ok(gpu) = Gpu::new() else {
+            eprintln!("no graphics card: skipped");
+            return;
+        };
+        let room = (64, 32);
+        let latest = Latest::new(&gpu, room.0, room.1).unwrap();
+        let target = super::super::quad::target_view(&gpu, &latest.texture).unwrap();
+        fill(&gpu, &target, 0.4);
+        latest.set_straight_to_queue(true);
+        assert!(!latest.straight_to_queue(), "straight without the queue wanted");
+        latest.set_wants_queue(true);
+        assert!(latest.straight_to_queue());
+
+        let slot = latest.queue_slot().unwrap();
+        fill(&gpu, &slot.target, 1.0);
+        latest.queued(slot, (48, 24), 1.5);
+        assert!(latest.has_frame());
+        assert_eq!(latest.content(), (48, 24));
+        assert_eq!(latest.arrivals(), (1, 1.5));
+        let queue = latest.drain_queue();
+        assert_eq!(queue.len(), 1);
+        assert_eq!((queue[0].size, queue[0].at), ((48, 24), 1.5));
+        assert_eq!(green(&gpu, &queue[0].texture, room), 255);
+        assert_eq!(green(&gpu, &latest.texture, room), 102, "the texture was written");
+
+        fill(&gpu, &target, 0.2);
+        latest.mark(room, 2.0, true);
+        let queue = latest.drain_queue();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(green(&gpu, &queue[0].texture, room), 51);
+        assert_eq!(latest.arrivals(), (2, 2.0));
     }
 }
 

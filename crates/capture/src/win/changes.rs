@@ -301,6 +301,9 @@ impl Changes {
     /// it by `draw_cursor` (given where to draw). The same picture with the
     /// cursor moved goes up too, but only counts as a new picture for frame
     /// blending once the game has drawn nothing new for a while (a menu).
+    /// When the queue's consumer reads nothing else, a picture goes straight
+    /// into the queue (see [`Latest::set_straight_to_queue`]), and one that
+    /// doesn't count goes nowhere.
     pub(crate) fn resolve(&mut self, gpu: &Gpu, latest: &Latest, latest_target: &ID3D11RenderTargetView, draw_cursor: &mut dyn FnMut(&ID3D11RenderTargetView, (u32, u32))) {
         while let Some(p) = self.pending.front() {
             // Whether it brought a new picture, and whether its slot holds it.
@@ -358,9 +361,25 @@ impl Changes {
                 self.last_new = at;
             }
             self.counted.2 += differs as u32;
-            unsafe { gpu.context.CopyResource(&latest.texture, &self.ring[slot].picture.texture) };
-            draw_cursor(latest_target, p.size);
-            latest.mark(p.size, at, counts);
+            if latest.straight_to_queue() {
+                if !counts {
+                    continue;
+                }
+                match latest.queue_slot() {
+                    Ok(queued) => {
+                        let (w, h) = p.size;
+                        let region = D3D11_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 };
+                        unsafe { gpu.context.CopySubresourceRegion(&queued.texture, 0, 0, 0, 0, &self.ring[slot].picture.texture, 0, Some(&region)) };
+                        draw_cursor(&queued.target, p.size);
+                        latest.queued(queued, p.size, at);
+                    }
+                    Err(e) => eprintln!("frame blending: {e:#}"),
+                }
+            } else {
+                unsafe { gpu.context.CopyResource(&latest.texture, &self.ring[slot].picture.texture) };
+                draw_cursor(latest_target, p.size);
+                latest.mark(p.size, at, counts);
+            }
             unsafe { gpu.context.Flush() };
         }
     }
