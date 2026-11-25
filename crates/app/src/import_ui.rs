@@ -15,7 +15,7 @@ use std::sync::{Arc, OnceLock};
 
 use crate::App;
 use crate::clips::human_bytes;
-use crate::import_apps::{self, AppKind, Found, Mode, Source};
+use crate::import_apps::{self, AppKind, CopyOnly, Found, Mode, Source};
 use crate::theme;
 use crate::ui_kit::{self, Btn, Dismissed as _, Row, Seg};
 
@@ -163,7 +163,14 @@ impl App {
             match e.scan.get() {
                 None => looking = true,
                 Some(s) if !d.off.contains(&i) => {
-                    let key = |c: &Found| if c.steam { (c.path.to_string_lossy().to_lowercase(), 0) } else { (c.path.file_name().unwrap_or_default().to_string_lossy().to_lowercase(), c.bytes) };
+                    // A copy (`… (2)`, `… - Copy`) of the same size is the same clip.
+                    let key = |c: &Found| {
+                        if c.steam {
+                            return (c.path.to_string_lossy().to_lowercase(), 0);
+                        }
+                        let stem = c.path.file_stem().unwrap_or_default().to_string_lossy();
+                        (format!("{}.{}", import_apps::copy_of(&stem).to_lowercase(), c.ext), c.bytes)
+                    };
                     chosen.extend(s.new_clips().filter(|c| seen.insert(key(c))).cloned());
                 }
                 Some(_) => {}
@@ -208,6 +215,11 @@ impl App {
                             // Where its new clips are; the folders looked in if none.
                             let folders = if s.folders.is_empty() { e.src.folders.iter().map(|f| (f.clone(), 0)).collect() } else { s.folders.clone() };
                             lines.push(folder_lines(&folders));
+                            if d.mode == Mode::Move
+                                && let Some(why) = copied_instead(e.src.kind, s)
+                            {
+                                lines.push(why);
+                            }
                             let all = (s.games.len() > GAMES_SHOWN).then(|| s.games.iter().map(|(g, n)| format!("{g}: {}", clips_word(*n))).collect::<Vec<_>>().join("\n"));
                             (lines.join("\n"), s.new_clips().count(), all)
                         }
@@ -263,13 +275,24 @@ impl App {
                     }
                     Mode::Copy if needed > 0 => format!("Copied into your library, using {}.{free_text} The originals stay where they are.", human_bytes(needed)),
                     Mode::Copy => "Copied into your library. The originals stay where they are.".to_owned(),
-                    Mode::Move if !enough => format!("Moving needs {} for the clips on other drives, but only {} is free {on_drive}.", human_bytes(needed), human_bytes(free.unwrap_or(0))),
-                    Mode::Move if needed == 0 => "Moved into your library on the same drive: no extra space needed. They leave the other apps' folders.".to_owned(),
-                    Mode::Move => format!(
-                        "Moved into your library. {} on other drives is copied there first ({}), and each original deleted once its copy is checked. Steam's are always copied.",
-                        human_bytes(needed),
-                        free.map_or("space unknown".to_owned(), |f| format!("{} free {on_drive}", human_bytes(f)))
-                    ),
+                    Mode::Move if !enough => format!("Moving needs {} for the clips that are copied, but only {} is free {on_drive}.", human_bytes(needed), human_bytes(free.unwrap_or(0))),
+                    Mode::Move => {
+                        let copied = chosen.iter().filter(|c| c.copy_only.is_some()).count();
+                        let elsewhere = chosen.iter().filter(|c| c.copy_only.is_none() && !c.on_library_drive).count();
+                        let mut text = "Moved into your library: they leave the other apps' folders.".to_owned();
+                        if elsewhere > 0 {
+                            text += &format!(" The {} on other drives {} copied, checked byte for byte, then deleted there.", clips_word(elsewhere), if elsewhere == 1 { "is" } else { "are" });
+                        }
+                        if copied > 0 {
+                            text += &format!(" {} {} copied instead, and stay{} where {} too (the rows say why).", clips_word(copied), if copied == 1 { "is" } else { "are" }, if copied == 1 { "s" } else { "" }, if copied == 1 { "it is" } else { "they are" });
+                        }
+                        if needed == 0 {
+                            text += " No extra space needed: they're on the same drive.";
+                        } else {
+                            text += &format!(" Needs {}; {}.", human_bytes(needed), free.map_or("space unknown".to_owned(), |f| format!("{} free {on_drive}", human_bytes(f))));
+                        }
+                        text
+                    }
                 };
                 l.row(Row::new("Copy or move").note(note).warn(!enough), |ui| {
                     if let Some(k) = ui_kit::segmented_opts(ui, "import_mode_seg", &[Seg::from("Copy"), Seg::from("Move")], usize::from(d.mode == Mode::Move), None, true) {
@@ -353,6 +376,33 @@ impl App {
             self.import = None;
         }
     }
+}
+
+/// Why some or all of a place's clips are copied though moving, if any are.
+fn copied_instead(kind: AppKind, s: &Scan) -> Option<String> {
+    let mut steam = 0;
+    let mut records = 0;
+    let mut beside = 0;
+    for c in s.new_clips() {
+        match c.copy_only {
+            Some(CopyOnly::Steam) => steam += 1,
+            Some(CopyOnly::Records) => records += 1,
+            Some(CopyOnly::Sidecar) => beside += 1,
+            None => {}
+        }
+    }
+    if steam > 0 {
+        return Some("Copied, not moved: Steam keeps its own index of them".to_owned());
+    }
+    if records > 0
+        && let Some(why) = kind.kept_back()
+    {
+        return Some(format!("Copied, not moved: {why}"));
+    }
+    (beside > 0).then(|| {
+        let (it, has) = if beside == 1 { ("it", "has") } else { ("them", "have") };
+        format!("{} copied, not moved: {} a file beside {it} (like a LosslessCut project) that would be left behind", clips_word(beside), if beside == 1 { format!("1 {has}") } else { format!("they {has}") })
+    })
 }
 
 /// How many games are named on an app's row; the rest are in its ⓘ.

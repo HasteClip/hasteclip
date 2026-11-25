@@ -6,11 +6,20 @@
 //! else its default folder. A clip goes into the library's folder for its
 //! game (one already there by the same name, give or take case, spaces and
 //! punctuation: "Repo" goes in "R.E.P.O."), named as our own clips are
-//! (`clip_YYYY-MM-DD_HH-MM-SS`, with a title the other app had after
-//! ` - `), and dated when it was captured. Its game comes from, in order:
-//! the app's own list of clips (Medal), the nearest folder it's in that
-//! names a game, its file name (each app's pattern, see [`parse_stem`]).
-//! Its date: Medal's list, its file name, else the file's date.
+//! (`clip_YYYY-MM-DD_HH-MM-SS`, or `recording_…` for a recording, with a
+//! title after ` - `: the other app's, or a name you gave the file), and
+//! dated when it was captured. Its game comes from, in order: the app's own
+//! list of clips (Medal), the nearest folder it's in that names a game (for
+//! apps that keep a folder per game), its file name (each app's pattern,
+//! see [`parse_stem`]).
+//!
+//! Its date, as HasteClip's own: a clip's when it was saved, a recording's
+//! when it started. From the app's list (Medal), the time in its name
+//! (measured against real clips: NVIDIA's and OBS's names are within a
+//! second or two of when the file was made; a Discord id within half a
+//! second), else when the file was made: its creation time, unless that's
+//! later than its last change (then it's a copy, made when copied). Not its
+//! last change: Discord rewrites its clips' files days later.
 //!
 //! | App | OS | Where | Names |
 //! |---|---|---|---|
@@ -32,15 +41,18 @@
 //! A folder many apps share (Videos, home) only gives the clips named in
 //! that app's pattern, so OBS doesn't take every video in Videos; a folder
 //! another app found is left to it; and the library's own folder is never
-//! looked in.
+//! looked in. A folder of the app's own is looked in three folders deep
+//! (recordings put away by year, say).
 //!
 //! Clips are copied, or moved when asked to. A move on one drive is a
 //! rename: nothing is copied or deleted, and it needs no space. A move to
 //! another drive copies, checks the copy against the original byte for
 //! byte, and only then deletes the original (for good, not to the Recycle
-//! Bin: a move is to free that space). Steam's are always copied: they're
-//! pieces Steam keeps its own index of. An import stops when the disk fills
-//! up. What's been imported is noted after each clip
+//! Bin: a move is to free that space). Some are always copied ([`CopyOnly`]):
+//! Steam's (pieces Steam keeps its own index of), those of apps that keep
+//! more about them than is brought over (Medal, Outplayed, Moments), and a
+//! clip with a file beside it that belongs with it (a LosslessCut project,
+//! AMD's microphone track). An import stops when the disk fills up. What's been imported is noted after each clip
 //! (`.hasteclip/imported.json`), so importing again only brings what's new.
 
 use std::collections::{HashMap, HashSet};
@@ -112,6 +124,24 @@ impl AppKind {
         }
     }
 
+    /// Whether the app keeps a folder per game, so a clip's folders name
+    /// its game. In the others' folders, a folder is one you made ("Vrchat
+    /// first video", "2021"), not a game.
+    fn makes_game_folders(self) -> bool {
+        !matches!(self, AppKind::GameBar | AppKind::Discord | AppKind::Obs | AppKind::ReplaySorcery | AppKind::Steam)
+    }
+
+    /// What the app keeps about its clips that isn't brought over yet: its
+    /// clips are copied, not moved, so it keeps them ([`CopyOnly::Records`]).
+    pub fn kept_back(self) -> Option<&'static str> {
+        match self {
+            AppKind::Medal => Some("Medal keeps bookmarks and trims for them that aren't brought over yet"),
+            AppKind::Outplayed => Some("Outplayed keeps their kills and deaths, which aren't brought over yet"),
+            AppKind::SteelSeries => Some("Moments keeps titles and trims for them that aren't brought over yet"),
+            _ => None,
+        }
+    }
+
     /// The names of this app's that a shared folder (Videos, home) gives:
     /// in a folder of its own, any video is the app's.
     fn names(self, pattern: Pattern, game: bool) -> bool {
@@ -153,15 +183,32 @@ pub struct Found {
     pub ext: String,
     /// A Steam clip: pieces to join into one video.
     pub steam: bool,
+    /// Made as a recording (dated when it started, as ours are), not a
+    /// clip (dated when saved).
+    pub recording: bool,
+    /// Why it's copied even when moving, if it is.
+    pub copy_only: Option<CopyOnly>,
     /// On the same drive as the library: moving it there is a rename.
     pub on_library_drive: bool,
+}
+
+/// Why a clip is copied even when the clips are moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyOnly {
+    /// Steam's: pieces Steam keeps its own index of.
+    Steam,
+    /// Its app keeps more about it than is brought over ([`AppKind::kept_back`]).
+    Records,
+    /// A file beside it belongs with it (a LosslessCut project, AMD's
+    /// microphone track) and would be left behind.
+    Sidecar,
 }
 
 impl Found {
     /// The bytes importing it takes on the library's drive: none to move
     /// it within one drive.
     pub fn needs(&self, mode: Mode) -> u64 {
-        if mode == Mode::Move && self.on_library_drive && !self.steam { 0 } else { self.bytes }
+        if mode == Mode::Move && self.on_library_drive && self.copy_only.is_none() { 0 } else { self.bytes }
     }
 }
 
@@ -202,7 +249,9 @@ pub fn scan(src: &Source, others: &[PathBuf], lib: &Path) -> Vec<Found> {
         } else {
             let strict = is_shared(folder);
             let skip: Vec<&Path> = others.iter().filter(|o| !same_path(o, folder)).map(PathBuf::as_path).collect();
-            walk(src.kind, folder, folder, src.kind.depth(), strict, &skip, lib, &mut found);
+            // In a folder of its own, wherever its clips were put.
+            let depth = if strict { src.kind.depth() } else { src.kind.depth().max(OWN_FOLDER_DEPTH) };
+            walk(src.kind, folder, folder, depth, strict, &skip, lib, &mut found);
         }
         let on_drive = same_drive(folder, lib);
         for f in &mut found[start..] {
@@ -212,9 +261,18 @@ pub fn scan(src: &Source, others: &[PathBuf], lib: &Path) -> Vec<Found> {
     if src.kind == AppKind::Medal {
         medal_details(&mut found);
     }
+    if src.kind.kept_back().is_some() {
+        for f in &mut found {
+            f.copy_only = Some(CopyOnly::Records);
+        }
+    }
     found.sort_by_key(|f| std::cmp::Reverse(f.captured));
     found
 }
+
+/// How deep a folder of the app's own (not one shared like Videos) is
+/// looked in: `obs_raw\2021\`, `Clips\<Game>\<date>\`.
+const OWN_FOLDER_DEPTH: usize = 3;
 
 /// Clips in `dir` (`root` or under it), down `depth` more folders, not
 /// going into the folders in `skip` (other apps', reached from a folder
@@ -222,7 +280,10 @@ pub fn scan(src: &Source, others: &[PathBuf], lib: &Path) -> Vec<Found> {
 #[allow(clippy::too_many_arguments)]
 fn walk(kind: AppKind, root: &Path, dir: &Path, depth: usize, strict: bool, skip: &[&Path], lib: &Path, out: &mut Vec<Found>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
+    let entries: Vec<std::fs::DirEntry> = entries.flatten().collect();
+    // Every name here, to see what lies beside a clip.
+    let names: Vec<String> = entries.iter().map(|e| e.file_name().to_string_lossy().to_lowercase()).collect();
+    for entry in &entries {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         // Hidden files, and files still being written by some apps.
@@ -245,19 +306,59 @@ fn walk(kind: AppKind, root: &Path, dir: &Path, depth: usize, strict: bool, skip
         if strict && !kind.names(parsed.pattern, parsed.game.is_some()) {
             continue;
         }
-        let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let game = if kind.makes_game_folders() { folder_game(root, &path).or(parsed.game) } else { parsed.game };
+        // OBS names its recordings by when they start, and its replays
+        // "Replay …"; a file of yours in its folder is one of its recordings.
+        let recording = match parsed.made {
+            Made::Recording => true,
+            Made::Replay => false,
+            Made::Unknown => kind == AppKind::Obs,
+        };
         out.push(Found {
-            game: folder_game(root, &path).or(parsed.game),
-            captured: parsed.at.unwrap_or_else(|| DateTime::<Local>::from(modified).naive_local()),
-            title: None,
+            game,
+            captured: parsed.at.unwrap_or_else(|| DateTime::<Local>::from(file_time(&meta)).naive_local()),
+            title: parsed.title,
             bytes: meta.len(),
             ext: path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_else(|| "mp4".into()),
             steam: false,
+            recording,
+            copy_only: has_sidecar(&stem, &names).then_some(CopyOnly::Sidecar),
             on_library_drive: false,
             folder: root.to_path_buf(),
             path,
         });
     }
+}
+
+/// When a file was made, as the file tells: its creation time, unless
+/// that's after it was last changed (a copy, created when it was copied) or
+/// not known; then its last change. On real clips, Discord's files were
+/// changed up to days after they were made, their creation time within a
+/// second of their ids'.
+fn file_time(meta: &std::fs::Metadata) -> SystemTime {
+    let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    match meta.created() {
+        Ok(created) if created <= modified => created,
+        _ => modified,
+    }
+}
+
+/// Whether a file beside a clip belongs with it: one named like it with
+/// another extension (AMD's microphone `.m4a`, a thumbnail, subtitles) or
+/// its LosslessCut project (`<name>-proj.llc`). Not another video of the
+/// same name (a clip of its own) or a leftover still being written.
+fn has_sidecar(stem: &str, names: &[String]) -> bool {
+    let stem = stem.to_lowercase();
+    let project = format!("{stem}-proj.llc");
+    let dotted = format!("{stem}.");
+    names.iter().any(|n| {
+        if *n == project {
+            return true;
+        }
+        let Some(ext) = n.strip_prefix(&dotted) else { return false };
+        let unfinished = ["tmp", "part", "partial", "crdownload"].iter().any(|t| ext.ends_with(t));
+        !ext.is_empty() && !unfinished && !crate::clips::is_video(Path::new(n))
+    })
 }
 
 /// The game a clip's folders name: the nearest one under `root` that's a
@@ -275,13 +376,32 @@ const SKIP_DIRS: &[&str] = &["temp-capture", "tmp", "temp", "thumbnails", "thumb
 /// Recorder's folder per day), one of the generic names apps use, or an app
 /// NVIDIA didn't know.
 fn is_game_folder(name: &str) -> bool {
-    const GENERIC: &[&str] = &["clips", "replays", "replay", "recordings", "videos", "highlights", "captures", "instant replays", "outplayed", "medal", "nvidia", "nvidiaclips", "nvidia clips"];
-    let lower = name.to_lowercase();
-    if GENERIC.contains(&lower.as_str()) || unknown_app(name) {
-        return false;
+    const GENERIC: &[&str] = &["clips", "replays", "replay", "recordings", "videos", "highlights", "captures", "instant replays", "outplayed", "medal", "nvidia", "nvidiaclips", "nvidia clips", "other", "misc"];
+    // A new folder's name as Windows, macOS and Linux give it, in some languages.
+    const NEW_FOLDER: &[&str] = &["new folder", "untitled folder", "ny mappe", "ny mapp", "uusi kansio", "neuer ordner", "nouveau dossier", "nueva carpeta", "nuova cartella", "nieuwe map", "nova pasta", "nowy folder"];
+    let lower = name.trim().to_lowercase();
+    let base = without_copy_number(&lower);
+    !(GENERIC.contains(&base) || NEW_FOLDER.contains(&base) || unknown_app(name) || is_date_name(name))
+}
+
+/// A folder named for when, not what: a year (`2021`), a month (`2021-08`)
+/// or a day (`2021-08-14`), in the usual orders.
+fn is_date_name(name: &str) -> bool {
+    let n = name.trim();
+    if n.len() == 4 && n.parse::<u32>().is_ok_and(|y| (1990..=2100).contains(&y)) {
+        return true;
     }
-    let date = chrono::NaiveDate::parse_from_str(name, "%Y-%m-%d").is_ok() || chrono::NaiveDate::parse_from_str(name, "%Y.%m.%d").is_ok() || chrono::NaiveDate::parse_from_str(name, "%m-%d-%Y").is_ok();
-    !date
+    let day = ["%Y-%m-%d", "%Y.%m.%d", "%Y_%m_%d", "%m-%d-%Y", "%d.%m.%Y", "%d-%m-%Y"];
+    let month = ["%Y-%m", "%Y.%m", "%Y_%m", "%m-%Y", "%m.%Y"];
+    day.iter().any(|f| chrono::NaiveDate::parse_from_str(n, f).is_ok()) || month.iter().any(|f| chrono::NaiveDate::parse_from_str(&format!("{n} 1"), &format!("{f} %d")).is_ok())
+}
+
+/// "clip (2)" → "clip": a name without the number a copy gets.
+pub fn without_copy_number(name: &str) -> &str {
+    match name.strip_suffix(')').and_then(|n| n.rsplit_once(" (")) {
+        Some((base, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => base,
+        _ => name,
+    }
 }
 
 /// What NVIDIA names an app it has no name for: a hash (40 hex digits), or
@@ -319,36 +439,88 @@ pub struct Parsed {
     pub game: Option<String>,
     pub at: Option<NaiveDateTime>,
     pub pattern: Pattern,
+    /// A title: what follows ` - ` in our own names, or a name you gave the
+    /// file yourself (one in no app's pattern).
+    pub title: Option<String>,
+    pub made: Made,
+}
+
+/// How a clip was made, as its name tells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Made {
+    #[default]
+    Unknown,
+    /// Saved from a replay buffer: named when saved.
+    Replay,
+    /// Recorded: named when it started.
+    Recording,
 }
 
 /// The game and capture time in a clip's file name (without its
-/// extension), in any of the apps' patterns.
+/// extension), in any of the apps' patterns. A copy's name is read as its
+/// original's (`… (2)`, `… - Copy`).
 pub fn parse_stem(stem: &str) -> Parsed {
-    let hit = |pattern, prefix: &str, at| Parsed { game: game_of(prefix), at: Some(at), pattern };
-    // NVIDIA: an index (2 digits) after the seconds, `.DVR` on instant replays.
+    let mut read = parse_name(copy_of(stem));
+    if read.pattern == Pattern::None {
+        read.title = own_title(stem);
+    }
+    read
+}
+
+/// The name a copy was made from: without the number Windows, macOS and
+/// Linux give a copy (`clip (2)`), or Windows' "- Copy" (in some languages).
+pub fn copy_of(stem: &str) -> &str {
+    let base = without_copy_number(stem.trim());
+    let lower = base.to_lowercase();
+    for word in [" - copy", " - kopi", " - kopie", " - copie", " - copia", " copy"] {
+        if lower.ends_with(word) && base.is_char_boundary(base.len() - word.len()) {
+            return base[..base.len() - word.len()].trim_end();
+        }
+    }
+    base
+}
+
+fn parse_name(stem: &str) -> Parsed {
+    let hit = |pattern, prefix: &str, at, made| Parsed { game: game_of(prefix), at: Some(at), pattern, title: None, made };
+    if let Some(own) = own_name(stem) {
+        return own;
+    }
+    // NVIDIA: an index (2 digits) after the seconds, `.DVR` on instant
+    // replays (without it, a recording, named when it started).
+    let dvr = stem.ends_with(".DVR");
     let s = stem.strip_suffix(".DVR").unwrap_or(stem);
     if let Some((a, idx)) = s.rsplit_once('.')
         && (1..=3).contains(&idx.len())
         && idx.bytes().all(|b| b.is_ascii_digit())
         && let Some((pre, at)) = tail(a, "%Y.%m.%d - %H.%M.%S", 21)
     {
-        return hit(Pattern::Nvidia, pre, at);
+        return hit(Pattern::Nvidia, pre, at, if dvr { Made::Replay } else { Made::Recording });
     }
     // AMD: `_replay_` or `_record_`, the seconds sometimes left out.
     if let Some((pre, at)) = tail(stem, "%Y.%m.%d-%H.%M.%S", 19).or_else(|| tail(stem, "%Y.%m.%d-%H.%M", 16))
         && let Some(pre) = pre.strip_suffix('_')
     {
-        let game = pre.strip_suffix("_replay").or_else(|| pre.strip_suffix("_record")).unwrap_or(pre);
-        return hit(Pattern::Amd, game, at);
+        let (game, made) = match (pre.strip_suffix("_replay"), pre.strip_suffix("_record")) {
+            (Some(g), _) => (g, Made::Replay),
+            (_, Some(g)) => (g, Made::Recording),
+            _ => (pre, Made::Unknown),
+        };
+        return hit(Pattern::Amd, game, at, made);
     }
     if let Some((pre, at)) = tail(stem, "%Y-%m-%d %H-%M-%S", 19) {
-        return hit(Pattern::Spaced, pre, at);
+        let made = if pre.trim().eq_ignore_ascii_case("replay") { Made::Replay } else { Made::Unknown };
+        return hit(Pattern::Spaced, pre, at, made);
     }
     if let Some((pre, at)) = tail(stem, "%Y-%m-%d_%H-%M-%S", 19) {
-        if pre == "clip_" {
-            return Parsed { game: None, at: Some(at), pattern: Pattern::Own };
-        }
-        return hit(Pattern::Underscore, pre, at);
+        let word = pre.trim_end_matches('_');
+        let made = if word.eq_ignore_ascii_case("replay") {
+            Made::Replay
+        } else if word.eq_ignore_ascii_case("video") {
+            Made::Recording
+        } else {
+            Made::Unknown
+        };
+        return hit(Pattern::Underscore, pre, at, made);
     }
     // Outplayed: month first, milliseconds after.
     let s = match stem.rsplit_once('-') {
@@ -356,12 +528,12 @@ pub fn parse_stem(stem: &str) -> Parsed {
         _ => stem,
     };
     if let Some((pre, at)) = tail(s, "%m-%d-%Y_%H-%M-%S", 19) {
-        return hit(Pattern::Outplayed, pre, at);
+        return hit(Pattern::Outplayed, pre, at, Made::Unknown);
     }
     if let Some(rest) = stem.strip_prefix("MedalTV")
         && let Some((pre, at)) = tail(rest, "%Y%m%d%H%M%S", 14)
     {
-        return hit(Pattern::Medal, pre, at);
+        return hit(Pattern::Medal, pre, at, Made::Replay);
     }
     // Discord: the game with `_` for spaces, then the clip's id. Clipping a
     // screen, not a game, it's `Screen_1`.
@@ -375,10 +547,35 @@ pub fn parse_stem(stem: &str) -> Parsed {
             let screen = name.strip_prefix("Screen").is_some_and(|n| n.trim().bytes().all(|b| b.is_ascii_digit()));
             let game = if screen { Some(crate::clips::DESKTOP.to_owned()) } else { game_of(&name) };
             let at = if snowflake { id.parse().ok().and_then(snowflake_time) } else { None };
-            return Parsed { game, at, pattern: Pattern::Discord };
+            return Parsed { game, at, pattern: Pattern::Discord, title: None, made: Made::Replay };
         }
     }
-    Parsed { game: None, at: None, pattern: Pattern::None }
+    Parsed { game: None, at: None, pattern: Pattern::None, title: None, made: Made::Unknown }
+}
+
+/// Our own names (from another HasteClip library): `clip_` or
+/// `recording_`, the time, a number when saved in the same second (`-2`),
+/// then a title after ` - `.
+fn own_name(stem: &str) -> Option<Parsed> {
+    let (made, rest) = match (stem.strip_prefix("clip_"), stem.strip_prefix("recording_")) {
+        (Some(r), _) => (Made::Replay, r),
+        (_, Some(r)) => (Made::Recording, r),
+        _ => return None,
+    };
+    let at = NaiveDateTime::parse_from_str(rest.get(..19)?, "%Y-%m-%d_%H-%M-%S").ok()?;
+    let after = &rest[19..];
+    let after = after.strip_prefix('-').map_or(after, |n| n.trim_start_matches(|c: char| c.is_ascii_digit()));
+    let title = after.strip_prefix(" - ").map(str::trim).filter(|t| !t.is_empty()).map(str::to_owned);
+    Some(Parsed { game: None, at: Some(at), pattern: Pattern::Own, title, made })
+}
+
+/// A name you gave a file yourself, kept as its title: unless it's only a
+/// word apps and cameras use ("clip", "video", "clip (2)").
+fn own_title(stem: &str) -> Option<String> {
+    const GENERIC: &[&str] = &["clip", "video", "recording", "replay", "capture", "untitled", "output", "movie", "screen recording", "new video"];
+    let name = stem.trim();
+    let base = without_copy_number(name).to_lowercase();
+    (!base.is_empty() && !GENERIC.contains(&base.as_str())).then(|| name.to_owned())
 }
 
 /// When a Discord id was made: its top bits are milliseconds since 2015.
@@ -707,6 +904,8 @@ fn scan_steam(folder: &Path) -> Vec<Found> {
                 bytes: tree_bytes(&path),
                 ext: "mp4".into(),
                 steam: true,
+                recording: false,
+                copy_only: Some(CopyOnly::Steam),
                 on_library_drive: false,
                 folder: folder.to_path_buf(),
                 path,
@@ -1070,12 +1269,14 @@ fn save_ledger(lib: &Path, keys: &HashSet<String>) -> std::io::Result<()> {
     std::fs::rename(tmp, path)
 }
 
-/// The name a clip gets in the library: ours, with the other app's title.
+/// The name a clip gets in the library: ours (`recording_` for a
+/// recording, as ours are), with its title.
 pub fn library_name(f: &Found) -> String {
     let ts = f.captured.format("%Y-%m-%d_%H-%M-%S");
+    let kind = if f.recording { "recording" } else { "clip" };
     match f.title.as_deref().map(crate::clips::sanitize_name).filter(|t| !t.is_empty()) {
-        Some(t) => format!("clip_{ts} - {}.{}", t.chars().take(80).collect::<String>().trim(), f.ext),
-        None => format!("clip_{ts}.{}", f.ext),
+        Some(t) => format!("{kind}_{ts} - {}.{}", t.chars().take(80).collect::<String>().trim(), f.ext),
+        None => format!("{kind}_{ts}.{}", f.ext),
     }
 }
 
@@ -1178,7 +1379,7 @@ fn import_one(clip: &Found, dir: &Path, mode: Mode, progress: &Progress, cancel:
     // Written to a hidden file first, so a half-copied clip never shows.
     let tmp = dir.join(format!(".import-{}.{}", uuid::Uuid::new_v4().simple(), clip.ext));
     let when = Local.from_local_datetime(&clip.captured).earliest().map(SystemTime::from);
-    let moving = mode == Mode::Move && !clip.steam;
+    let moving = mode == Mode::Move && clip.copy_only.is_none();
     // Moving within a drive: a rename, nothing copied or deleted.
     if moving && std::fs::rename(&clip.path, &dest).is_ok() {
         set_date(&dest, when);
@@ -1337,49 +1538,65 @@ mod tests {
         Some(NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").unwrap())
     }
 
-    fn p(game: Option<&str>, when: &str, pattern: Pattern) -> Parsed {
-        Parsed { game: game.map(str::to_owned), at: at(when), pattern }
+    /// What a name says: its game, time, pattern and how it was made.
+    type Read = (Option<String>, Option<NaiveDateTime>, Pattern, Made);
+
+    fn p(game: Option<&str>, when: &str, pattern: Pattern, made: Made) -> Read {
+        (game.map(str::to_owned), at(when), pattern, made)
+    }
+
+    fn read(stem: &str) -> Read {
+        let r = parse_stem(stem);
+        (r.game, r.at, r.pattern, r.made)
     }
 
     #[test]
     fn nvidia_names() {
-        assert_eq!(parse_stem("VALORANT 2024.01.02 - 12.34.56.78.DVR"), p(Some("VALORANT"), "2024-01-02 12:34:56", Pattern::Nvidia));
-        assert_eq!(parse_stem("Counter-strike 2 2023.11.30 - 23.59.01.02"), p(Some("Counter-strike 2"), "2023-11-30 23:59:01", Pattern::Nvidia));
-        assert_eq!(parse_stem("Desktop 2024.05.06 - 07.08.09.10.DVR"), p(Some("Desktop"), "2024-05-06 07:08:09", Pattern::Nvidia));
+        assert_eq!(read("VALORANT 2024.01.02 - 12.34.56.78.DVR"), p(Some("VALORANT"), "2024-01-02 12:34:56", Pattern::Nvidia, Made::Replay));
+        // Without `.DVR`: a recording, named when it started.
+        assert_eq!(read("Counter-strike 2 2023.11.30 - 23.59.01.02"), p(Some("Counter-strike 2"), "2023-11-30 23:59:01", Pattern::Nvidia, Made::Recording));
+        assert_eq!(read("Desktop 2024.05.06 - 07.08.09.10.DVR"), p(Some("Desktop"), "2024-05-06 07:08:09", Pattern::Nvidia, Made::Replay));
         // Apps NVIDIA had no name for: no game.
-        assert_eq!(parse_stem("56e53accb20696f802d92bd011174126b5e3154e 2025.08.09 - 17.26.25.02.DVR"), p(None, "2025-08-09 17:26:25", Pattern::Nvidia));
-        assert_eq!(parse_stem("Base Profile 2025.08.13 - 22.26.42.02.DVR"), p(None, "2025-08-13 22:26:42", Pattern::Nvidia));
+        assert_eq!(read("56e53accb20696f802d92bd011174126b5e3154e 2025.08.09 - 17.26.25.02.DVR"), p(None, "2025-08-09 17:26:25", Pattern::Nvidia, Made::Replay));
+        assert_eq!(read("Base Profile 2025.08.13 - 22.26.42.02.DVR"), p(None, "2025-08-13 22:26:42", Pattern::Nvidia, Made::Replay));
     }
 
     #[test]
     fn amd_names() {
-        assert_eq!(parse_stem("Apex Legends_replay_2024.03.04-21.05.33"), p(Some("Apex Legends"), "2024-03-04 21:05:33", Pattern::Amd));
-        assert_eq!(parse_stem("Fortnite_record_2024.03.04-21.05"), p(Some("Fortnite"), "2024-03-04 21:05:00", Pattern::Amd));
+        assert_eq!(read("Apex Legends_replay_2024.03.04-21.05.33"), p(Some("Apex Legends"), "2024-03-04 21:05:33", Pattern::Amd, Made::Replay));
+        assert_eq!(read("Fortnite_record_2024.03.04-21.05"), p(Some("Fortnite"), "2024-03-04 21:05:00", Pattern::Amd, Made::Recording));
     }
 
     #[test]
     fn spaced_names() {
         // Game Bar
-        assert_eq!(parse_stem("Minecraft 2024-02-03 10-11-12"), p(Some("Minecraft"), "2024-02-03 10:11:12", Pattern::Spaced));
-        // OBS: no game.
-        assert_eq!(parse_stem("Replay 2024-02-03 10-11-12"), p(None, "2024-02-03 10:11:12", Pattern::Spaced));
-        assert_eq!(parse_stem("2024-02-03 10-11-12"), p(None, "2024-02-03 10:11:12", Pattern::Spaced));
+        assert_eq!(read("Minecraft 2024-02-03 10-11-12"), p(Some("Minecraft"), "2024-02-03 10:11:12", Pattern::Spaced, Made::Unknown));
+        // OBS: no game; its replay buffer's are "Replay …".
+        assert_eq!(read("Replay 2024-02-03 10-11-12"), p(None, "2024-02-03 10:11:12", Pattern::Spaced, Made::Replay));
+        assert_eq!(read("2024-02-03 10-11-12"), p(None, "2024-02-03 10:11:12", Pattern::Spaced, Made::Unknown));
         // GPU Screen Recorder named after the game.
-        assert_eq!(parse_stem("Hollow Knight - 2024-02-03 10-11-12"), p(Some("Hollow Knight"), "2024-02-03 10:11:12", Pattern::Spaced));
+        assert_eq!(read("Hollow Knight - 2024-02-03 10-11-12"), p(Some("Hollow Knight"), "2024-02-03 10:11:12", Pattern::Spaced, Made::Unknown));
     }
 
     #[test]
     fn underscore_names() {
-        assert_eq!(parse_stem("Replay_2024-02-03_10-11-12"), p(None, "2024-02-03 10:11:12", Pattern::Underscore));
-        assert_eq!(parse_stem("Video_2024-02-03_10-11-12"), p(None, "2024-02-03 10:11:12", Pattern::Underscore));
-        assert_eq!(parse_stem("2024-02-03_10-11-12"), p(None, "2024-02-03 10:11:12", Pattern::Underscore));
-        assert_eq!(parse_stem("clip_2024-02-03_10-11-12"), p(None, "2024-02-03 10:11:12", Pattern::Own));
+        assert_eq!(read("Replay_2024-02-03_10-11-12"), p(None, "2024-02-03 10:11:12", Pattern::Underscore, Made::Replay));
+        assert_eq!(read("Video_2024-02-03_10-11-12"), p(None, "2024-02-03 10:11:12", Pattern::Underscore, Made::Recording));
+        assert_eq!(read("2024-02-03_10-11-12"), p(None, "2024-02-03 10:11:12", Pattern::Underscore, Made::Unknown));
+    }
+
+    #[test]
+    fn our_own_names() {
+        assert_eq!(read("clip_2024-02-03_10-11-12"), p(None, "2024-02-03 10:11:12", Pattern::Own, Made::Replay));
+        assert_eq!(read("recording_2024-02-03_10-11-12"), p(None, "2024-02-03 10:11:12", Pattern::Own, Made::Recording));
+        let titled = parse_stem("clip_2024-02-03_10-11-12-2 - 3 kills on Mirage");
+        assert_eq!((titled.at, titled.title.as_deref()), (at("2024-02-03 10:11:12"), Some("3 kills on Mirage")));
     }
 
     #[test]
     fn outplayed_and_medal_names() {
-        assert_eq!(parse_stem("League of Legends 04-05-2024_19-20-21-123"), p(Some("League of Legends"), "2024-04-05 19:20:21", Pattern::Outplayed));
-        assert_eq!(parse_stem("MedalTVVALORANT20241122210533"), p(Some("VALORANT"), "2024-11-22 21:05:33", Pattern::Medal));
+        assert_eq!(read("League of Legends 04-05-2024_19-20-21-123"), p(Some("League of Legends"), "2024-04-05 19:20:21", Pattern::Outplayed, Made::Unknown));
+        assert_eq!(read("MedalTVVALORANT20241122210533"), p(Some("VALORANT"), "2024-11-22 21:05:33", Pattern::Medal, Made::Replay));
     }
 
     #[test]
@@ -1390,9 +1607,8 @@ mod tests {
         let utc = DateTime::<chrono::Utc>::from_timestamp_millis(((1174449235970490368u64 >> 22) + 1_420_070_400_000) as i64).unwrap();
         assert_eq!(old.at, Some(utc.with_timezone(&Local).naive_local()));
         assert_eq!(utc.format("%Y-%m-%d").to_string(), "2023-11-15");
-        // A UUID doesn't: the file's date is used.
-        let new = parse_stem("Counter-Strike_2_01dfc870-a158-4b21-8d4a-aebe6c6299ae");
-        assert_eq!(new, Parsed { game: Some("Counter-Strike 2".into()), at: None, pattern: Pattern::Discord });
+        // A UUID doesn't: when the file was made is used.
+        assert_eq!(read("Counter-Strike_2_01dfc870-a158-4b21-8d4a-aebe6c6299ae"), (Some("Counter-Strike 2".into()), None, Pattern::Discord, Made::Replay));
         assert_eq!(parse_stem("Lethal_Company_1176970350282407936").game.as_deref(), Some("Lethal Company"));
         // A screen, not a game.
         assert_eq!(parse_stem("Screen_1_1174449235970490368").game.as_deref(), Some("Desktop"));
@@ -1401,9 +1617,28 @@ mod tests {
     }
 
     #[test]
-    fn other_names() {
-        assert_eq!(parse_stem("my best clip"), Parsed { game: None, at: None, pattern: Pattern::None });
-        assert_eq!(parse_stem("2024-99-03 10-11-12"), Parsed { game: None, at: None, pattern: Pattern::None });
+    fn copies_read_as_their_originals() {
+        assert_eq!(read("2023-06-28 01-10-13 (2)"), p(None, "2023-06-28 01:10:13", Pattern::Spaced, Made::Unknown));
+        assert_eq!(read("osu! 2025.08.08 - 18.09.11.02.DVR - Copy"), p(Some("osu!"), "2025-08-08 18:09:11", Pattern::Nvidia, Made::Replay));
+        assert_eq!(read("Fortnite_1174449235970490368 - Kopi (3)").2, Pattern::Discord);
+        assert_eq!(parse_stem("2023-06-28 01-10-13 (2)").title, None);
+        assert_eq!(parse_stem("wii shop (2)").title.as_deref(), Some("wii shop (2)"), "yours keeps its whole name");
+        assert_eq!(copy_of("Copy of nothing"), "Copy of nothing");
+    }
+
+    #[test]
+    fn names_of_your_own() {
+        // Kept as the title; no app's pattern, so no time in it.
+        let mine = parse_stem("halal osu");
+        assert_eq!((mine.pattern, mine.at, mine.title.as_deref()), (Pattern::None, None, Some("halal osu")));
+        assert_eq!(parse_stem("Trist begravelse av vår kjære truls").title.as_deref(), Some("Trist begravelse av vår kjære truls"));
+        // Words apps use aren't titles.
+        assert_eq!(parse_stem("clip (2)").title, None);
+        assert_eq!(parse_stem("clip").title, None);
+        assert_eq!(parse_stem("Video").title, None);
+        // A name with a time isn't one of yours.
+        assert_eq!(parse_stem("2024-02-03 10-11-12").title, None);
+        assert_eq!(parse_stem("2024-99-03 10-11-12").at, None);
         assert_eq!(parse_stem("ü 2024-02-03 10-11-12").game.as_deref(), Some("ü"));
     }
 
@@ -1423,14 +1658,42 @@ mod tests {
     #[test]
     fn game_folders() {
         assert!(is_game_folder("VALORANT"));
-        assert!(!is_game_folder("2024-02-03"));
-        assert!(!is_game_folder("Clips"));
-        assert!(!is_game_folder("56e53accb20696f802d92bd011174126b5e3154e"));
-        assert!(!is_game_folder("Base Profile"));
+        assert!(is_game_folder("1999 Racing"));
+        for not_a_game in ["2024-02-03", "Clips", "56e53accb20696f802d92bd011174126b5e3154e", "Base Profile", "2021", "2021-08", "08.2021", "New folder", "New folder (2)", "Ny mappe", "untitled folder"] {
+            assert!(!is_game_folder(not_a_game), "{not_a_game}");
+        }
         let root = Path::new("/v");
         assert_eq!(folder_game(root, Path::new("/v/NvidiaClips/osu!/a.mp4")).as_deref(), Some("osu!"));
         assert_eq!(folder_game(root, Path::new("/v/VALORANT/2024-05-01/a.mp4")).as_deref(), Some("VALORANT"));
+        assert_eq!(folder_game(root, Path::new("/v/2021/a.mp4")), None);
         assert_eq!(folder_game(root, Path::new("/v/a.mp4")), None);
+    }
+
+    #[test]
+    fn files_beside_a_clip() {
+        let names = |n: &[&str]| n.iter().map(|s| s.to_lowercase()).collect::<Vec<_>>();
+        let here = names(&["Desktop 2025.08.10 - 01.20.16.02.DVR.mp4", "Desktop 2025.08.10 - 01.20.16.02.DVR-proj.llc", "Other.mp4"]);
+        assert!(has_sidecar("Desktop 2025.08.10 - 01.20.16.02.DVR", &here), "a LosslessCut project");
+        assert!(!has_sidecar("Other", &here));
+        assert!(has_sidecar("Apex_replay_2024.03.04-21.05.33", &names(&["Apex_replay_2024.03.04-21.05.33.mp4", "Apex_replay_2024.03.04-21.05.33.m4a"])), "AMD's microphone");
+        // A leftover being written, or another clip of the same name, isn't one.
+        assert!(!has_sidecar("Phasmophobia_1169725840716464128", &names(&["Phasmophobia_1169725840716464128.mp4", "Phasmophobia_1169725840716464128.mp4.0.tmp"])));
+        assert!(!has_sidecar("a", &names(&["a.mp4", "a.mkv"])));
+    }
+
+    #[test]
+    fn when_files_were_made() {
+        let dir = test_dir("file-time");
+        let f = dir.join("a.mp4");
+        std::fs::write(&f, b"v").unwrap();
+        let meta = std::fs::metadata(&f).unwrap();
+        assert!(file_time(&meta) <= meta.modified().unwrap(), "made when created, before or as it last changed");
+        // Changed before it was created (a copy keeps its changed time):
+        // the changed time, from when it was really made.
+        let long_ago = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        std::fs::OpenOptions::new().write(true).open(&f).unwrap().set_modified(long_ago).unwrap();
+        assert_eq!(file_time(&std::fs::metadata(&f).unwrap()), long_ago);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1509,6 +1772,8 @@ mod tests {
             bytes: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
             ext: "mp4".into(),
             steam: false,
+            recording: false,
+            copy_only: None,
             on_library_drive: true,
         }
     }
@@ -1519,6 +1784,66 @@ mod tests {
         assert_eq!(library_name(&f), "clip_2024-01-02_12-34-56 - Ace. on Ascent.mp4");
         assert_eq!(crate::clips::title_for_stem("clip_2024-01-02_12-34-56 - Ace. on Ascent"), "Ace. on Ascent · 12:34:56");
         assert_eq!(library_name(&found(Path::new("x.mp4"), None, None)), "clip_2024-01-02_12-34-56.mp4");
+        // A recording is named as ours are, and shown as one.
+        let mut rec = found(Path::new("x.mp4"), None, Some("wii shop"));
+        rec.recording = true;
+        assert_eq!(library_name(&rec), "recording_2024-01-02_12-34-56 - wii shop.mp4");
+        assert_eq!(crate::clips::title_for_stem("recording_2024-01-02_12-34-56 - wii shop"), "wii shop · Recording 12:34:56");
+    }
+
+    #[test]
+    fn scans_obs_folders_of_your_own() {
+        let root = test_dir("obs");
+        let obs = root.join("obs_raw");
+        for dir in ["2021", "Clips", "Videos/Vrchat first video", "New folder"] {
+            std::fs::create_dir_all(obs.join(dir)).unwrap();
+        }
+        std::fs::write(obs.join("2023-10-03 01-16-56.mp4"), b"v").unwrap();
+        std::fs::write(obs.join("Replay 2023-10-03 01-20-00.mp4"), b"v").unwrap();
+        std::fs::write(obs.join("2021").join("2021-08-14_05-03-02.mp4"), b"v").unwrap();
+        std::fs::write(obs.join("Videos/Vrchat first video").join("2021-12-26_21-46-18.mp4"), b"v").unwrap();
+        std::fs::write(obs.join("Clips").join("halal osu.mp4"), b"v").unwrap();
+        let lib = root.join("lib");
+        let found = scan(&Source { kind: AppKind::Obs, folders: vec![obs.clone()] }, &[], &lib);
+        assert_eq!(found.len(), 5, "{found:?}");
+        // OBS keeps no folder per game: yours aren't games.
+        assert!(found.iter().all(|f| f.game.is_none()), "{found:?}");
+        let by_name = |n: &str| found.iter().find(|f| f.path.file_name().unwrap().to_string_lossy() == n).unwrap();
+        assert!(by_name("2023-10-03 01-16-56.mp4").recording, "a recording, dated when it started");
+        assert!(!by_name("Replay 2023-10-03 01-20-00.mp4").recording);
+        assert_eq!(by_name("2021-08-14_05-03-02.mp4").captured, at("2021-08-14 05:03:02").unwrap());
+        let mine = by_name("halal osu.mp4");
+        assert_eq!(mine.title.as_deref(), Some("halal osu"));
+        assert!(library_name(mine).ends_with(" - halal osu.mp4"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn some_are_only_copied() {
+        let root = test_dir("copy-only");
+        let amd = root.join("Radeon ReLive").join("Apex Legends");
+        std::fs::create_dir_all(&amd).unwrap();
+        std::fs::write(amd.join("Apex Legends_replay_2024.03.04-21.05.33.mp4"), vec![1u8; 100]).unwrap();
+        std::fs::write(amd.join("Apex Legends_replay_2024.03.04-21.05.33.m4a"), b"mic").unwrap();
+        std::fs::write(amd.join("Apex Legends_replay_2024.03.04-21.06.00.mp4"), vec![2u8; 100]).unwrap();
+        let lib = root.join("lib");
+        let found = scan(&Source { kind: AppKind::Amd, folders: vec![root.join("Radeon ReLive")] }, &[], &lib);
+        assert_eq!(found.len(), 2);
+        let with_mic = found.iter().find(|f| f.copy_only.is_some()).expect("the clip with its microphone beside it");
+        assert_eq!(with_mic.copy_only, Some(CopyOnly::Sidecar));
+        assert_eq!(found.iter().filter(|f| f.copy_only.is_none()).count(), 1);
+        // Moving: the one with a file beside it is copied, the other moved.
+        let done = import(&found, &lib, Mode::Move, true, &Progress::default(), &AtomicBool::new(false));
+        assert_eq!(done.added.len(), 2, "{:?}", done.failed);
+        assert!(with_mic.path.exists(), "copied, so its microphone track still has it");
+        assert!(!amd.join("Apex Legends_replay_2024.03.04-21.06.00.mp4").exists(), "moved");
+        // Medal's are copied: Medal keeps more about them.
+        let medal = root.join("Medal");
+        std::fs::create_dir_all(medal.join("VALORANT")).unwrap();
+        std::fs::write(medal.join("VALORANT").join("MedalTVVALORANT20241122210533.mp4"), b"v").unwrap();
+        let found = scan(&Source { kind: AppKind::Medal, folders: vec![medal] }, &[], &lib);
+        assert_eq!(found.iter().map(|f| f.copy_only).collect::<Vec<_>>(), vec![Some(CopyOnly::Records)]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1530,8 +1855,10 @@ mod tests {
         f.on_library_drive = false;
         assert_eq!(f.needs(Mode::Move), 100);
         f.on_library_drive = true;
-        f.steam = true;
+        f.copy_only = Some(CopyOnly::Steam);
         assert_eq!(f.needs(Mode::Move), 100, "Steam's are always copied");
+        f.copy_only = Some(CopyOnly::Sidecar);
+        assert_eq!(f.needs(Mode::Move), 100, "so is a clip with a file beside it");
         let here = std::env::temp_dir();
         assert!(free_space(&here).is_some_and(|b| b > 0));
         assert!(free_space(&here.join("no such folder").join("deeper")).is_some(), "the nearest folder that exists");
@@ -1673,6 +2000,31 @@ mod tests {
                 println!("  pattern {pat} : {}", list.len());
                 for c in list.iter().take(3) {
                     println!("    {} -> game {:?}, {} -> {}", c.path.display(), c.game, c.captured, library_name(c));
+                }
+            }
+            let recordings = clips.iter().filter(|c| c.recording).count();
+            let titled: Vec<&Found> = clips.iter().filter(|c| c.title.is_some()).collect();
+            println!("  recordings {recordings}, clips {}", clips.len() - recordings);
+            for reason in [CopyOnly::Steam, CopyOnly::Records, CopyOnly::Sidecar] {
+                let n = clips.iter().filter(|c| c.copy_only == Some(reason)).count();
+                if n > 0 {
+                    println!("  copied even when moving ({reason:?}): {n}");
+                    for c in clips.iter().filter(|c| c.copy_only == Some(reason)).take(3) {
+                        println!("    {}", c.path.display());
+                    }
+                }
+            }
+            println!("  titled {}", titled.len());
+            for c in titled.iter().take(8) {
+                println!("    {} -> {}", c.path.display(), library_name(c));
+            }
+            if src.kind == AppKind::Discord {
+                for c in clips.iter().rev().take(2) {
+                    if let Ok(info) = media::probe(&c.path) {
+                        let all: Vec<String> = info.audio.iter().map(|a| a.label()).collect();
+                        let sources: Vec<String> = info.source_tracks().iter().map(|a| a.label()).collect();
+                        println!("  tracks of {}: {all:?}; the editor's: {sources:?}", c.path.display());
+                    }
                 }
             }
         }
