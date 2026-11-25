@@ -248,103 +248,99 @@ impl App {
                 ui_kit::hint(ui, &format!("{} more selected {} left out: screenshots, and clips still saving.", ask.skipped, if ask.skipped == 1 { "is" } else { "are" }));
             }
 
-            // The choices scroll in a window too short for them all; what it
-            // comes to and the buttons stay in sight.
-            ui_kit::dialog_body(ui, "free_up_choices", |ui| {
-                // --- Their original recordings ---
-                if ask.with_original > 0 {
-                    section(ui, "Original recording", if many { "s" } else { "" });
-                    ui_kit::hint(ui, &if many {
-                        format!("{} of them keep the recording they were cut from ({}), so their edits can be changed later.", ask.with_original, export_ui::human_bytes(ask.kept))
-                    } else {
-                        "Kept so the edit can be changed later, or reverted.".to_owned()
-                    });
-                    ui.add_space(8.0);
-                    let id = egui::Id::new("free_up_originals");
-                    if choice_row(ui, id.with("keep"), ask.originals.is_none(), true, false, "Keep", if many { "Their edits can still be changed." } else { "The edit can still be changed." }, "").clicked() {
-                        ask.originals = None;
-                    }
-                    ui.add_space(6.0);
-                    let (trim_text, trim_amount) = match trim {
-                        Some(0) => (if many { "Each one is already about as short as its edit." } else { "It's already about as short as the edit." }, "Nothing".to_owned()),
-                        t => (
-                            if many { "Keeps only the part each edit uses: they can still be changed within it." } else { "Keeps only the part the edit uses: it can still be changed within it." },
-                            t.map_or("…".to_owned(), |b| format!("about {}", export_ui::human_bytes(b))),
-                        ),
-                    };
-                    if choice_row(ui, id.with("trim"), ask.originals == Some(FreeUp::Trim), trim != Some(0), false, "Trim", trim_text, &trim_amount).clicked() {
-                        ask.originals = Some(FreeUp::Trim);
-                    }
-                    ui.add_space(6.0);
-                    let mut delete_text = if many { "The clips stay as they are, but their edits can't be changed or reverted any more." } else { "The clip stays as it is, but its edit can't be changed or reverted any more." }.to_owned();
-                    if !permanently {
-                        delete_text.push_str(&format!(" {} go to the {}.", if many { "They" } else { "It" }, store::bin_name()));
-                    }
-                    if choice_row(ui, id.with("delete"), ask.originals == Some(FreeUp::Delete), true, true, "Delete", &delete_text, &export_ui::human_bytes(ask.kept)).clicked() {
-                        ask.originals = Some(FreeUp::Delete);
-                    }
-                }
-
-                // --- Make them smaller ---
-                ui.add_space(if ask.with_original > 0 { 14.0 } else { 10.0 });
-                ui.horizontal(|ui| {
-                    ui.label(theme::text(format!("Make {them} smaller"), 13.5, W::Semibold).color(p.text));
-                    // Clips with no original: this is all there is to do.
-                    if ask.with_original > 0 {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui_kit::switch(ui, &mut ask.smaller_on));
-                    }
+            // --- Their original recordings ---
+            if ask.with_original > 0 {
+                section(ui, "Original recording", if many { "s" } else { "" });
+                ui_kit::hint(ui, &if many {
+                    format!("{} of them keep the recording they were cut from ({}), so their edits can be changed later.", ask.with_original, export_ui::human_bytes(ask.kept))
+                } else {
+                    "Kept so the edit can be changed later, or reverted.".to_owned()
                 });
-                ui_kit::hint(ui, &format!("Encodes {them} again at a lower resolution, frame rate or quality. Lost detail can't be brought back."));
-                if ask.smaller_on {
-                    ui.add_space(6.0);
-                    // For one clip, what each quality level comes to for it.
-                    let bitrates = items.filter(|i| !many && i.len() == 1).and_then(|i| i[0].level_bitrates(&ask.smaller));
-                    let s = &mut ask.smaller;
-                    let row = |ui: &mut egui::Ui, label: &str, add: &mut dyn FnMut(&mut egui::Ui)| {
-                        ui.horizontal(|ui| {
-                            ui.set_min_height(36.0);
-                            ui.label(theme::text(label, 13.5, W::Regular).color(p.text));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| add(ui));
-                        });
-                    };
-                    // Original: each clip as it is, for several; for one, what it is.
-                    let original = |what: String| if many { Choice::new("Original").note("each clip's own") } else { Choice::new("Original").shown(format!("Original ({what})")).note(what) };
-                    row(ui, "Resolution, at most", &mut |ui| {
-                        if let Some(h) = export_ui::height_choice(ui, "free_up_height", s.height, top_h, s.height.unwrap_or(top_h), (None, original(format!("{top_h}p"))), "any height") {
-                            s.height = h;
-                        }
-                    });
-                    row(ui, "Frame rate, at most", &mut |ui| {
-                        if let Some(f) = export_ui::fps_choice(ui, "free_up_fps", s.fps, top_fps, s.fps.unwrap_or(top_fps), original(format!("{top_fps} fps")), "any frame rate") {
-                            s.fps = f;
-                        }
-                    });
-                    row(ui, "Quality", &mut |ui| {
-                        if let Some(q) = quality_choice(ui, "free_up_quality", s.quality, bitrates) {
-                            s.quality = q;
-                        }
-                    });
-                    if items.is_some() {
-                        if not_worth > 0 {
-                            ui_kit::hint(ui, &if !many {
-                                "It's already about this small, so it's left as it is.".to_owned()
-                            } else if made_smaller == 0 {
-                                "They're all already about this small, so they're left as they are.".to_owned()
-                            } else {
-                                format!("{not_worth} of them {} already about this small, and {} left as {}.", if not_worth == 1 { "is" } else { "are" }, if not_worth == 1 { "is" } else { "are" }, if not_worth == 1 { "it is" } else { "they are" })
-                            });
-                        }
-                        if replaced > 0 {
-                            let bin = if permanently { String::new() } else { format!(" (to the {})", store::bin_name()) };
-                            ui_kit::hint(ui, &if many {
-                                format!("{replaced} that were never edited are replaced by their smaller version{bin}.")
-                            } else {
-                                format!("It was never edited, so it's replaced by its smaller version{bin}.")
-                            });
-                        }
-                    }
+                ui.add_space(8.0);
+                let id = egui::Id::new("free_up_originals");
+                if choice_row(ui, id.with("keep"), ask.originals.is_none(), true, false, "Keep", if many { "Their edits can still be changed." } else { "The edit can still be changed." }, "").clicked() {
+                    ask.originals = None;
+                }
+                ui.add_space(6.0);
+                let (trim_text, trim_amount) = match trim {
+                    Some(0) => (if many { "Each one is already about as short as its edit." } else { "It's already about as short as the edit." }, "Nothing".to_owned()),
+                    t => (
+                        if many { "Keeps only the part each edit uses: they can still be changed within it." } else { "Keeps only the part the edit uses: it can still be changed within it." },
+                        t.map_or("…".to_owned(), |b| format!("about {}", export_ui::human_bytes(b))),
+                    ),
+                };
+                if choice_row(ui, id.with("trim"), ask.originals == Some(FreeUp::Trim), trim != Some(0), false, "Trim", trim_text, &trim_amount).clicked() {
+                    ask.originals = Some(FreeUp::Trim);
+                }
+                ui.add_space(6.0);
+                let mut delete_text = if many { "The clips stay as they are, but their edits can't be changed or reverted any more." } else { "The clip stays as it is, but its edit can't be changed or reverted any more." }.to_owned();
+                if !permanently {
+                    delete_text.push_str(&format!(" {} go to the {}.", if many { "They" } else { "It" }, store::bin_name()));
+                }
+                if choice_row(ui, id.with("delete"), ask.originals == Some(FreeUp::Delete), true, true, "Delete", &delete_text, &export_ui::human_bytes(ask.kept)).clicked() {
+                    ask.originals = Some(FreeUp::Delete);
+                }
+            }
+
+            // --- Make them smaller ---
+            ui.add_space(if ask.with_original > 0 { 14.0 } else { 10.0 });
+            ui.horizontal(|ui| {
+                ui.label(theme::text(format!("Make {them} smaller"), 13.5, W::Semibold).color(p.text));
+                // Clips with no original: this is all there is to do.
+                if ask.with_original > 0 {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui_kit::switch(ui, &mut ask.smaller_on));
                 }
             });
+            ui_kit::hint(ui, &format!("Encodes {them} again at a lower resolution, frame rate or quality. Lost detail can't be brought back."));
+            if ask.smaller_on {
+                ui.add_space(6.0);
+                // For one clip, what each quality level comes to for it.
+                let bitrates = items.filter(|i| !many && i.len() == 1).and_then(|i| i[0].level_bitrates(&ask.smaller));
+                let s = &mut ask.smaller;
+                let row = |ui: &mut egui::Ui, label: &str, add: &mut dyn FnMut(&mut egui::Ui)| {
+                    ui.horizontal(|ui| {
+                        ui.set_min_height(36.0);
+                        ui.label(theme::text(label, 13.5, W::Regular).color(p.text));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| add(ui));
+                    });
+                };
+                // Original: each clip as it is, for several; for one, what it is.
+                let original = |what: String| if many { Choice::new("Original").note("each clip's own") } else { Choice::new("Original").shown(format!("Original ({what})")).note(what) };
+                row(ui, "Resolution, at most", &mut |ui| {
+                    if let Some(h) = export_ui::height_choice(ui, "free_up_height", s.height, top_h, s.height.unwrap_or(top_h), (None, original(format!("{top_h}p"))), "any height") {
+                        s.height = h;
+                    }
+                });
+                row(ui, "Frame rate, at most", &mut |ui| {
+                    if let Some(f) = export_ui::fps_choice(ui, "free_up_fps", s.fps, top_fps, s.fps.unwrap_or(top_fps), original(format!("{top_fps} fps")), "any frame rate") {
+                        s.fps = f;
+                    }
+                });
+                row(ui, "Quality", &mut |ui| {
+                    if let Some(q) = quality_choice(ui, "free_up_quality", s.quality, bitrates) {
+                        s.quality = q;
+                    }
+                });
+                if items.is_some() {
+                    if not_worth > 0 {
+                        ui_kit::hint(ui, &if !many {
+                            "It's already about this small, so it's left as it is.".to_owned()
+                        } else if made_smaller == 0 {
+                            "They're all already about this small, so they're left as they are.".to_owned()
+                        } else {
+                            format!("{not_worth} of them {} already about this small, and {} left as {}.", if not_worth == 1 { "is" } else { "are" }, if not_worth == 1 { "is" } else { "are" }, if not_worth == 1 { "it is" } else { "they are" })
+                        });
+                    }
+                    if replaced > 0 {
+                        let bin = if permanently { String::new() } else { format!(" (to the {})", store::bin_name()) };
+                        ui_kit::hint(ui, &if many {
+                            format!("{replaced} that were never edited are replaced by their smaller version{bin}.")
+                        } else {
+                            format!("It was never edited, so it's replaced by its smaller version{bin}.")
+                        });
+                    }
+                }
+            }
 
             // --- What it comes to ---
             ui.add_space(12.0);
