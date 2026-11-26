@@ -35,7 +35,7 @@ use windows::Win32::System::Pipes::{ConnectNamedPipe, CreateNamedPipeW, PIPE_REA
 use windows::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor, GetWindowThreadProcessId};
 use windows::core::PCWSTR;
 
-use super::d3d::{Gpu, Latest};
+use super::d3d::{CaptureRate, Gpu, Latest};
 use super::quad::{Placement, Quad, fit_within};
 
 /// The hook's files, next to the app (`game-hook\`), or in `target\game-hook`
@@ -277,7 +277,7 @@ pub(crate) struct HookCapture {
 }
 
 impl HookCapture {
-    pub(crate) fn start(gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32) -> Result<Self> {
+    pub(crate) fn start(gpu: &Gpu, window: HWND, latest: &Arc<Latest>, rate: CaptureRate) -> Result<Self> {
         let dir = files().context("the game capture hook's files aren't there")?.to_path_buf();
         let stop = Arc::new(AtomicBool::new(false));
         let ended = Arc::new(Mutex::new(None));
@@ -288,7 +288,7 @@ impl HookCapture {
             // picture late, and it can land in the frame after its own.
             super::system::multimedia_thread("Capture");
             let window = window;
-            let result = run(&dir, &gpu, window.0, &latest, fps, &stop2);
+            let result = run(&dir, &gpu, window.0, &latest, rate, &stop2);
             let reason = match result {
                 Ok(()) => "stopped".to_owned(),
                 Err(e) => {
@@ -321,7 +321,7 @@ impl Drop for HookCapture {
 /// frame. (A guess; OBS retries forever.)
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop: &AtomicBool) -> Result<()> {
+fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, rate: CaptureRate, stop: &AtomicBool) -> Result<()> {
     super::system::com_init();
     // The cursor's position and the window's size in physical pixels.
     unsafe {
@@ -394,13 +394,11 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
         thread::sleep(Duration::from_millis(50));
     };
     let hook_info = info.ptr::<HookInfo>();
-    // Copy at most four times per look (`fps` is looks a second): copying
-    // every frame of a game running at thousands of fps would cost it.
-    // Twice (as OBS does) left a game at twice the rate right on the limit,
-    // where its timing noise decides which pictures get copied: a 600 fps
-    // game recorded at 300 came out in steps of 1 and 3 pictures as well
-    // as 2.
-    let interval = 1_000_000_000 / (4 * fps.max(1) as u64);
+    // Without blending, copy at up to four times the frame rate as before;
+    // with blending, scale more gently (~1.7x the look rate, capped at 1200/s,
+    // never under one per look) so high blend rates don't force the game's
+    // hook to copy every frame.
+    let interval = (1_000_000_000.0 / rate.hook_copies_per_second()) as u64;
     unsafe {
         (*hook_info).offsets = offsets(is64);
         (*hook_info).capture_overlay = false;
@@ -436,8 +434,8 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
     let quad = Quad::new(gpu)?;
     let target = super::quad::target_view(gpu, &latest.texture)?;
     let mut cursor = super::cursor::CursorLayer::new();
-    let every = Duration::from_secs_f64(1.0 / reads_per_second(fps));
-    let mut changes = super::changes::Changes::new(gpu, latest.width, latest.height, 1.0 / (2.0 * fps.max(1) as f64))?;
+    let every = Duration::from_secs_f64(1.0 / reads_per_second(rate));
+    let mut changes = super::changes::Changes::new(gpu, latest.width, latest.height, 1.0 / (2.0 * rate.looks_per_second().max(1) as f64))?;
     let mut next = Instant::now();
     let result = loop {
         if stop.load(Ordering::Relaxed) {
@@ -612,14 +610,10 @@ fn has_picture(info: &HookInfo, window: HWND) -> bool {
     picture_number(info).is_some() && picture_names(info, window).iter().any(|n| View::open(n, std::mem::size_of::<u32>()).is_some())
 }
 
-/// How often to look at the hook's copy of the game's picture, for `fps`
-/// looks a second: four times per look, so that when each picture came up is
-/// known to a quarter of a look (twice, a game at twice the rate came out in
-/// uneven steps), but at most 2400 a second (a guess at what's cheap; each
-/// look still makes a signature), and never under twice per look.
-fn reads_per_second(fps: u32) -> f64 {
-    let fps = fps.max(1) as f64;
-    (4.0 * fps).min(2400.0).max(2.0 * fps)
+/// How often to look at the hook's copy of the game's picture (see
+/// [`CaptureRate::hook_reads_per_second`]).
+pub(crate) fn reads_per_second(rate: CaptureRate) -> f64 {
+    rate.hook_reads_per_second()
 }
 
 /// Start loading the hook into the game with OBS's helper, the way OBS does

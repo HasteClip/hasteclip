@@ -25,6 +25,61 @@ use windows::Win32::System::WinRT::Direct3D11::{CreateDirect3D11DeviceFromDXGIDe
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::core::{IInspectable, Interface};
 
+/// The recording's frame rate and looks per frame, used to set each capture
+/// backend's rate limits: without blending (`looks == 1`), captures keep 4x
+/// the frame rate; with blending, the multiplier scales more gently so high
+/// blend rates don't force thousands of copies a second inside the game or
+/// compositor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CaptureRate {
+    pub fps: u32,
+    pub looks: u32,
+}
+
+impl CaptureRate {
+    pub(crate) fn new(fps: u32, looks: u32) -> Self {
+        Self { fps: fps.max(1), looks: looks.max(1) }
+    }
+
+    pub(crate) fn looks_per_second(self) -> u32 {
+        self.fps.saturating_mul(self.looks)
+    }
+
+    pub(crate) fn pack(self) -> u64 {
+        (u64::from(self.fps) << 32) | u64::from(self.looks)
+    }
+
+    pub(crate) fn unpack(v: u64) -> Self {
+        Self::new((v >> 32) as u32, v as u32)
+    }
+
+    pub(crate) fn wgc_updates_per_second(self) -> f64 {
+        (4.0 * self.fps as f64).max(2.25 * self.looks_per_second() as f64)
+    }
+
+    pub(crate) fn hook_copies_per_second(self) -> f64 {
+        let base = 4.0 * self.fps as f64;
+        if self.looks <= 1 {
+            base
+        } else {
+            let lps = self.looks_per_second() as f64;
+            base.max(1.7 * lps).min(1200.0).max(lps)
+        }
+    }
+
+    pub(crate) fn hook_reads_per_second(self) -> f64 {
+        let lps = self.looks_per_second() as f64;
+        let cap = if self.looks <= 1 { 2400.0 } else { 1200.0 };
+        (4.0 * self.fps as f64).max(2.5 * lps).min(cap).max(2.0 * lps)
+    }
+
+    pub(crate) fn dupl_asks_per_second(self) -> f64 {
+        let lps = self.looks_per_second() as f64;
+        let cap = if self.looks <= 1 { 2400.0 } else { 1200.0 };
+        (4.0 * self.fps as f64).max(2.5 * lps).min(cap).max(lps)
+    }
+}
+
 /// A COM object moved to another thread. D3D11 objects are free-threaded
 /// (the device is multithread-protected); WinRT capture objects are agile.
 pub(crate) struct Shared<T>(pub T);
@@ -276,7 +331,13 @@ pub(crate) struct Latest {
     wants_queue: AtomicBool,
     /// The textures the queue's pictures are copied into, taken in turn
     /// (made the first time they're needed), and which is next.
-    pool: Mutex<(Vec<(ID3D11Texture2D, ID3D11ShaderResourceView)>, usize)>,
+    pool: Mutex<(Vec<PoolSlot>, usize)>,
+    /// The most recent texture pushed via `push_queued`, so `sync_texture()`
+    /// can update `self.texture` on demand (screenshots, away screen, cursor).
+    newest_queued: Mutex<Option<(ID3D11Texture2D, (u32, u32))>>,
+    /// True when `newest_queued` is newer than `self.texture` because the UI
+    /// preview wasn't requesting frames.
+    texture_stale: AtomicBool,
     /// Rung with each new picture, for a consumer that waits on several
     /// captures at once (the frame pacer, see [`Bell`]).
     bell: Mutex<Option<Arc<Bell>>>,
@@ -288,10 +349,19 @@ pub(crate) struct Latest {
 
 pub(crate) use crate::shutter::Bell;
 
+/// One reusable typeless BGRA texture from `Latest`'s pool, with render target
+/// and hardware-decoded sRGB views.
+#[derive(Clone)]
+pub(crate) struct PoolSlot {
+    pub texture: ID3D11Texture2D,
+    pub target: ID3D11RenderTargetView,
+    pub srgb_view: ID3D11ShaderResourceView,
+}
+
 /// A picture that came up, kept for the frame blending: its own texture.
 pub(crate) struct Queued {
     pub texture: ID3D11Texture2D,
-    pub view: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
+    pub srgb_view: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
     pub size: (u32, u32),
     /// When it came up, host seconds.
     pub at: f64,
@@ -324,6 +394,8 @@ impl Latest {
             queue: Mutex::new(std::collections::VecDeque::new()),
             wants_queue: AtomicBool::new(false),
             pool: Mutex::new((Vec::new(), 0)),
+            newest_queued: Mutex::new(None),
+            texture_stale: AtomicBool::new(false),
             bell: Mutex::new(None),
             source: std::sync::atomic::AtomicU64::new(0),
             gpu: gpu.clone(),
@@ -375,28 +447,84 @@ impl Latest {
         self.wants_queue.load(Ordering::Acquire)
     }
 
-    /// Copy the picture now in `texture` into the queue.
-    fn queue_picture(&self, size: (u32, u32), at: f64) -> Result<()> {
+    /// Take the next reusable BGRA_TYPELESS texture slot from the queue pool
+    /// (lazily allocating `POOL` textures the first time).
+    pub(crate) fn take_pool_slot(&self) -> Result<PoolSlot> {
         let mut pool = self.pool.lock().unwrap();
         if pool.0.is_empty() {
             let bind = (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32;
             for _ in 0..POOL {
-                let texture = self.gpu.texture(self.width, self.height, DXGI_FORMAT_B8G8R8A8_UNORM, bind, D3D11_USAGE_DEFAULT, 0)?;
-                let view = super::quad::shader_view(&self.gpu, &texture)?;
-                pool.0.push((texture, view));
+                let texture = self.gpu.texture(
+                    self.width,
+                    self.height,
+                    windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_TYPELESS,
+                    bind,
+                    D3D11_USAGE_DEFAULT,
+                    0,
+                )?;
+                let target = super::quad::target_view(&self.gpu, &texture)?;
+                let srgb_view = super::quad::shader_view_srgb(&self.gpu, &texture)?;
+                pool.0.push(PoolSlot { texture, target, srgb_view });
             }
         }
         let i = pool.1;
         pool.1 = (i + 1) % POOL;
-        let (texture, view) = pool.0[i].clone();
-        drop(pool);
+        Ok(pool.0[i].clone())
+    }
+
+    /// Hand a picture already written into a [`PoolSlot`] directly to frame
+    /// blending without copying through `self.texture`. Copies to `self.texture`
+    /// only when the UI preview is actively requesting frames; otherwise marks
+    /// `self.texture` stale for [`Self::sync_texture`].
+    pub(crate) fn push_queued(&self, slot: PoolSlot, size: (u32, u32), at: f64) {
+        let size = (size.0.min(self.width), size.1.min(self.height));
+        *self.content.lock().unwrap() = size;
+        self.waiting.store(false, Ordering::Release);
+        self.has_frame.store(true, Ordering::Release);
+        *self.newest_queued.lock().unwrap() = Some((slot.texture.clone(), size));
+        if crate::preview::wants_frame() {
+            let region = D3D11_BOX { left: 0, top: 0, front: 0, right: size.0, bottom: size.1, back: 1 };
+            unsafe { self.gpu.context.CopySubresourceRegion(&self.texture, 0, 0, 0, 0, &slot.texture, 0, Some(&region)) };
+            self.texture_stale.store(false, Ordering::Release);
+        } else {
+            self.texture_stale.store(true, Ordering::Release);
+        }
+        if self.wants_queue() {
+            let mut q = self.queue.lock().unwrap();
+            q.push_back(Queued { texture: slot.texture, srgb_view: slot.srgb_view, size, at });
+            while q.len() > QUEUE_MAX {
+                q.pop_front();
+                crate::count_missed_of(self.source.load(Ordering::Relaxed), 1);
+            }
+        }
+        self.note_frame_at(at);
+    }
+
+    /// Bring `self.texture` up to date with the newest queued picture, if a
+    /// direct-to-pool push skipped copying into it.
+    pub(crate) fn sync_texture(&self) {
+        if !self.texture_stale.load(Ordering::Acquire) || !self.texture_stale.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        if let Some((tex, size)) = self.newest_queued.lock().unwrap().clone()
+            && size.0 > 0
+            && size.1 > 0
+        {
+            let region = D3D11_BOX { left: 0, top: 0, front: 0, right: size.0.min(self.width), bottom: size.1.min(self.height), back: 1 };
+            unsafe { self.gpu.context.CopySubresourceRegion(&self.texture, 0, 0, 0, 0, &tex, 0, Some(&region)) };
+        }
+    }
+
+    /// Copy the picture now in `texture` into the queue.
+    fn queue_picture(&self, size: (u32, u32), at: f64) -> Result<()> {
+        let slot = self.take_pool_slot()?;
         // Only the picture: the texture has room for a window on the
         // biggest display (2560×1920 beside a portrait screen, for a
         // 2560×1440 one), and nothing reads past the picture's size.
         let region = D3D11_BOX { left: 0, top: 0, front: 0, right: size.0, bottom: size.1, back: 1 };
-        unsafe { self.gpu.context.CopySubresourceRegion(&texture, 0, 0, 0, 0, &self.texture, 0, Some(&region)) };
+        unsafe { self.gpu.context.CopySubresourceRegion(&slot.texture, 0, 0, 0, 0, &self.texture, 0, Some(&region)) };
         let mut queue = self.queue.lock().unwrap();
-        queue.push_back(Queued { texture, view, size, at });
+        queue.push_back(Queued { texture: slot.texture, srgb_view: slot.srgb_view, size, at });
         while queue.len() > QUEUE_MAX {
             // Frame blending fell behind: that picture missed its frame.
             queue.pop_front();
@@ -443,6 +571,7 @@ impl Latest {
         }
         // Covering a real picture: keep it, to bring back (`restore`).
         if self.has_frame.load(Ordering::Acquire) && !self.waiting.load(Ordering::Acquire) {
+            self.sync_texture();
             let bind = (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32;
             let mut saved = self.saved.lock().unwrap();
             if saved.is_none() {
@@ -457,6 +586,8 @@ impl Latest {
         unsafe {
             self.gpu.context.UpdateSubresource(&self.texture, 0, Some(&region), image.bgra.as_ptr().cast(), image.width * 4, 0);
         }
+        *self.newest_queued.lock().unwrap() = None;
+        self.texture_stale.store(false, Ordering::Release);
         *self.content.lock().unwrap() = (image.width, image.height);
         self.waiting.store(true, Ordering::Release);
         self.has_frame.store(true, Ordering::Release);
@@ -470,6 +601,8 @@ impl Latest {
         let saved = self.saved.lock().unwrap();
         let Some((copy, size)) = saved.as_ref().filter(|(_, s)| s.0 > 0) else { return false };
         unsafe { self.gpu.context.CopyResource(&self.texture, copy) };
+        *self.newest_queued.lock().unwrap() = None;
+        self.texture_stale.store(false, Ordering::Release);
         *self.content.lock().unwrap() = *size;
         self.waiting.store(false, Ordering::Release);
         self.note_frame();
@@ -494,6 +627,8 @@ impl Latest {
         let (w, h) = (width.min(self.width), height.min(self.height));
         let region = D3D11_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 };
         unsafe { self.gpu.context.UpdateSubresource(&self.texture, 0, Some(&region), data.cast(), pitch, 0) };
+        *self.newest_queued.lock().unwrap() = None;
+        self.texture_stale.store(false, Ordering::Release);
         *self.content.lock().unwrap() = (w, h);
         self.waiting.store(false, Ordering::Release);
         self.has_frame.store(true, Ordering::Release);
@@ -514,6 +649,8 @@ impl Latest {
     /// (or not: the same game picture with the cursor moved).
     pub(crate) fn mark(&self, size: (u32, u32), at: f64, queue: bool) {
         let size = (size.0.min(self.width), size.1.min(self.height));
+        *self.newest_queued.lock().unwrap() = None;
+        self.texture_stale.store(false, Ordering::Release);
         *self.content.lock().unwrap() = size;
         self.waiting.store(false, Ordering::Release);
         self.has_frame.store(true, Ordering::Release);
@@ -539,6 +676,8 @@ impl Latest {
             let view = view.context("no render target view")?;
             self.gpu.context.ClearRenderTargetView(&view, &[0.0, 0.0, 0.0, 1.0]);
         }
+        *self.newest_queued.lock().unwrap() = None;
+        self.texture_stale.store(false, Ordering::Release);
         *self.content.lock().unwrap() = (self.width, self.height);
         self.waiting.store(true, Ordering::Release);
         self.has_frame.store(true, Ordering::Release);
@@ -550,6 +689,7 @@ impl Latest {
     /// size): copied aside on the GPU at once, read back by the returned
     /// [`crate::PendingShot`].
     pub(crate) fn snapshot(&self) -> Result<crate::PendingShot> {
+        self.sync_texture();
         let (w, h) = self.content();
         if w == 0 || h == 0 {
             bail!("nothing has been captured yet");
@@ -642,6 +782,9 @@ struct Overlay {
     target: ID3D11RenderTargetView,
     /// The last frame, without the cursor, `size` of it from its top-left corner.
     clean: ID3D11Texture2D,
+    /// True when the direct-to-pool path skipped copying into `clean` because
+    /// no cursor was showing; refreshed from `latest` before drawing a cursor.
+    clean_stale: bool,
     size: (u32, u32),
     layer: super::cursor::CursorLayer,
     of: Of,
@@ -667,6 +810,7 @@ impl Overlay {
             quad: super::quad::Quad::new(gpu)?,
             target: super::quad::target_view(gpu, &latest.texture)?,
             clean: gpu.texture(latest.width, latest.height, DXGI_FORMAT_B8G8R8A8_UNORM, bind, D3D11_USAGE_DEFAULT, 0)?,
+            clean_stale: false,
             size: (0, 0),
             layer: super::cursor::CursorLayer::new(),
             of,
@@ -687,28 +831,51 @@ impl Overlay {
         matches!(self.of, Of::Window(window) if super::system::window_hidden(window))
     }
 
-    /// `clean` up into `latest`, with the cursor drawn on it.
-    fn put_up(&mut self, gpu: &Gpu, latest: &Latest) {
+    /// `clean` up into `target_tex`/`target_rtv`, with the cursor drawn on it.
+    fn put_up_into(&mut self, gpu: &Gpu, latest: &Latest, target_tex: &ID3D11Texture2D, target_rtv: &ID3D11RenderTargetView, flush: bool) {
         let (w, h) = self.size;
         if w == 0 || h == 0 {
             return;
         }
         let _held = gpu.exclusive();
         let region = D3D11_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 };
-        unsafe { gpu.context.CopySubresourceRegion(&latest.texture, 0, 0, 0, 0, &self.clean, 0, Some(&region)) };
+        unsafe { gpu.context.CopySubresourceRegion(target_tex, 0, 0, 0, 0, &self.clean, 0, Some(&region)) };
         physical(|| {
             self.drawn = super::cursor::showing(self.pid);
             match self.of {
-                Of::Window(window) => self.layer.draw(gpu, &self.quad, latest, &self.target, window, self.pid.unwrap_or(0), self.size),
+                Of::Window(window) => self.layer.draw(gpu, &self.quad, latest, target_rtv, window, self.pid.unwrap_or(0), self.size),
                 Of::Display(monitor) => {
                     if let Some((origin, display)) = monitor_rect(monitor) {
-                        self.layer.draw_on_screen(gpu, &self.quad, latest, &self.target, origin, display, self.size);
+                        self.layer.draw_on_screen(gpu, &self.quad, latest, target_rtv, origin, display, self.size);
                     }
                 }
                 Of::Page(_) => {}
             }
         });
-        unsafe { gpu.context.Flush() };
+        if flush {
+            unsafe { gpu.context.Flush() };
+        }
+    }
+
+    /// Refresh `clean` from `latest` if the direct-to-pool path skipped it.
+    fn sync_clean(&mut self, gpu: &Gpu, latest: &Latest) {
+        if !self.clean_stale {
+            return;
+        }
+        latest.sync_texture();
+        let (w, h) = self.size;
+        if w > 0 && h > 0 {
+            let region = D3D11_BOX { left: 0, top: 0, front: 0, right: w.min(latest.width), bottom: h.min(latest.height), back: 1 };
+            unsafe { gpu.context.CopySubresourceRegion(&self.clean, 0, 0, 0, 0, &latest.texture, 0, Some(&region)) };
+        }
+        self.clean_stale = false;
+    }
+
+    /// `clean` up into `latest`, with the cursor drawn on it.
+    fn put_up(&mut self, gpu: &Gpu, latest: &Latest) {
+        self.sync_clean(gpu, latest);
+        let target = self.target.clone();
+        self.put_up_into(gpu, latest, &latest.texture, &target, true);
     }
 }
 
@@ -755,10 +922,10 @@ pub(crate) fn window_item(window: HWND) -> Result<GraphicsCaptureItem> {
 }
 
 impl Capture {
-    /// Capture `item`, which is `of`, into `latest`, at most `fps` × 4 times
-    /// a second. For a window, only its client area is kept (no title bar or
-    /// borders).
-    pub(crate) fn start(gpu: &Gpu, item: &GraphicsCaptureItem, latest: &Arc<Latest>, of: Of, fps: u32) -> Result<Self> {
+    /// Capture `item`, which is `of`, into `latest`, at the rate `rate` needs
+    /// (see [`CaptureRate::wgc_updates_per_second`]). For a window, only its
+    /// client area is kept (no title bar or borders).
+    pub(crate) fn start(gpu: &Gpu, item: &GraphicsCaptureItem, latest: &Arc<Latest>, of: Of, rate: CaptureRate) -> Result<Self> {
         let window = match of {
             Of::Window(window) | Of::Page(window) => Some(window),
             Of::Display(_) => None,
@@ -782,11 +949,11 @@ impl Capture {
         let _ = session.SetIsBorderRequired(false);
         // Not every display refresh (540 a second on a 540 Hz monitor), just
         // enough for the recording: less work for Windows' compositor, which
-        // games feel. Four times the recording rate: measured, Windows delivers
-        // well under the limit (at half a frame period a 60 fps recording got
-        // only 44 frames a second; at a quarter, 184). Windows 11 24H2 and
-        // later; ignored before.
-        let interval = 10_000_000 / (4 * fps.max(1) as i64);
+        // games feel. Kept well above the target rate because WGC drops frames
+        // when the minimum interval sits near the recording step (measured: an
+        // 8.3 ms interval delivered 44 frames/s for a 60 fps recording vs 184
+        // at 4x). Windows 11 24H2 and later; ignored before.
+        let interval = (10_000_000.0 / rate.wgc_updates_per_second()).max(1.0) as i64;
         let _ = session.SetMinUpdateInterval(windows::Foundation::TimeSpan { Duration: interval });
 
         let pool_size = Mutex::new(size);
@@ -810,7 +977,7 @@ impl Capture {
             // exact than when it reaches us; not if it's far off.
             let now = super::system::host_now();
             let shown = frame.SystemRelativeTime().map(|t| t.Duration as f64 / 1e7).ok().filter(|&t| t <= now && t > now - 0.1).unwrap_or(now);
-            let copied = (|| -> Result<Option<(u32, u32)>> {
+            let copied = (|| -> Result<bool> {
                 let access: IDirect3DDxgiInterfaceAccess = frame.Surface()?.cast()?;
                 let tex: ID3D11Texture2D = unsafe { access.GetInterface()? };
                 let mut desc = D3D11_TEXTURE2D_DESC::default();
@@ -822,7 +989,7 @@ impl Capture {
                 // texture (which crashes the driver), so skip it; the pool is
                 // resized below and the next frame is whole.
                 if cw > desc.Width || ch > desc.Height {
-                    return Ok(None);
+                    return Ok(false);
                 }
                 // The part of the frame to keep: a window's client area, else all of it.
                 let (x, y, w, h) = window2
@@ -832,17 +999,46 @@ impl Capture {
                     .filter(|&(_, _, w, h)| w >= 2 && h >= 2)
                     .unwrap_or((0, 0, cw, ch));
                 if w < 2 || h < 2 {
-                    return Ok(None);
+                    return Ok(false);
                 }
                 let region = D3D11_BOX { left: x, top: y, front: 0, right: x + w, bottom: y + h, back: 1 };
-                // Into `latest`, or kept without the cursor, to go up into
-                // `latest` with the cursor drawn on it.
                 let mut overlay = overlay2.as_ref().map(|o| o.lock().unwrap());
-                let into = overlay.as_ref().map_or(&latest2.texture, |o| &o.clean);
                 // Too big for `latest` (a display whose mode grew after the
                 // capture started, a window bigger than every display):
                 // shrunk to fit, keeping its shape, not cut off.
                 let fitted = super::quad::fit_within(w, h, latest2.width, latest2.height);
+                // When queueing for frame blending or timing, copy straight into
+                // a pooled texture rather than through `clean` and `latest`.
+                // Publish while still holding `overlay` so the cursor ticker
+                // cannot copy an older slot in the gap before `push_queued`.
+                if latest2.wants_queue() && fitted == (w, h) {
+                    let slot = latest2.take_pool_slot()?;
+                    match overlay.as_mut() {
+                        None => {
+                            unsafe { gpu2.context.CopySubresourceRegion(&slot.texture, 0, 0, 0, 0, &tex, 0, Some(&region)) };
+                        }
+                        Some(o) => {
+                            let showing = physical(|| super::cursor::showing(o.pid));
+                            if showing.is_none() && o.drawn.is_none() {
+                                // No cursor to draw: one copy straight into the queue slot.
+                                // `clean` is refreshed lazily if the cursor appears over a still screen.
+                                unsafe { gpu2.context.CopySubresourceRegion(&slot.texture, 0, 0, 0, 0, &tex, 0, Some(&region)) };
+                                o.size = fitted;
+                                o.clean_stale = true;
+                            } else {
+                                unsafe { gpu2.context.CopySubresourceRegion(&o.clean, 0, 0, 0, 0, &tex, 0, Some(&region)) };
+                                o.size = fitted;
+                                o.clean_stale = false;
+                                o.put_up_into(gpu2, &latest2, &slot.texture, &slot.target, false);
+                            }
+                        }
+                    }
+                    latest2.push_queued(slot, fitted, shown);
+                    return Ok(true);
+                }
+                // Into `latest`, or kept without the cursor, to go up into
+                // `latest` with the cursor drawn on it.
+                let into = overlay.as_ref().map_or(&latest2.texture, |o| &o.clean);
                 if fitted == (w, h) {
                     unsafe { gpu2.context.CopySubresourceRegion(into, 0, 0, 0, 0, &tex, 0, Some(&region)) };
                 } else {
@@ -854,9 +1050,11 @@ impl Capture {
                 }
                 if let Some(o) = overlay.as_mut() {
                     o.size = fitted;
+                    o.clean_stale = false;
                     o.put_up(gpu2, &latest2);
                 }
-                Ok(Some(fitted))
+                latest2.mark_frame_at(fitted, shown);
+                Ok(true)
             })();
             let _ = frame.Close();
             if let Err(e) = &copied
@@ -864,7 +1062,7 @@ impl Capture {
             {
                 eprintln!("windows' capture: couldn't copy a frame: {e:#}");
             }
-            if let Ok(Some(size)) = copied {
+            if matches!(copied, Ok(true)) {
                 // `HASTECLIP_WGC_LOG=1`: how many frames arrive each second.
                 static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                 if *LOG.get_or_init(|| std::env::var_os("HASTECLIP_WGC_LOG").is_some()) {
@@ -876,7 +1074,6 @@ impl Capture {
                     }
                 }
                 *last_frame2.lock().unwrap() = std::time::Instant::now();
-                latest2.mark_frame_at(size, shown);
             }
             // The display or window changed size: resize the pool to match.
             let mut size = pool_size.lock().unwrap();
@@ -897,9 +1094,11 @@ impl Capture {
         let stop = Arc::new(AtomicBool::new(false));
         let ticker = overlay.map(|overlay| {
             let (gpu, latest, last_frame, stop) = (gpu.clone(), latest.clone(), last_frame.clone(), stop.clone());
-            // As often as the recording's frames: a cursor that moved within
-            // a frame goes up with the next anyway.
-            let every = std::time::Duration::from_secs_f64(1.0 / fps.max(1) as f64);
+            // Cap still-screen cursor polling at 120 Hz (or the recording's own
+            // frame rate if higher) so high blend rates don't wake this thread
+            // nearly 1000 times a second while keeping unblended high-fps unchanged.
+            let hz = rate.looks_per_second().min(120.max(rate.fps)).max(1);
+            let every = std::time::Duration::from_secs_f64(1.0 / hz as f64);
             // The same picture with the cursor moved counts as a new one for
             // frame blending only once nothing else has come for a while (a
             // still screen), as with Desktop Duplication: else a moving cursor
@@ -932,11 +1131,10 @@ impl Capture {
         Ok(Self { pool, session, item: item.clone(), closed_token, closed, last_frame, ticker, stop })
     }
 
-    /// At most `fps` × 4 pictures a second from now on, as `start` sets it
-    /// (frame blending changed: the looks a second did). Windows 11 24H2
-    /// and later; ignored before.
-    pub(crate) fn set_rate(&self, fps: u32) {
-        let interval = 10_000_000 / (4 * fps.max(1) as i64);
+    /// Update the minimum frame interval when frame blending changes. Windows
+    /// 11 24H2 and later; ignored before.
+    pub(crate) fn set_rate(&self, rate: CaptureRate) {
+        let interval = (10_000_000.0 / rate.wgc_updates_per_second()).max(1.0) as i64;
         let _ = self.session.SetMinUpdateInterval(windows::Foundation::TimeSpan { Duration: interval });
     }
 
@@ -1195,6 +1393,9 @@ impl Layer {
     /// target as it is (only `target` is written).
     #[allow(clippy::too_many_arguments)]
     fn draw(&self, video: &ID3D11VideoContext, slot: usize, source_rect: RECT, dest: RECT, target: RECT, turns: u8, mirror: (bool, bool)) -> windows::core::Result<()> {
+        // Bring `source.texture` up to date when the preview or a layer reads a
+        // capture that skipped copying into it while preview was idle.
+        self.source.sync_texture();
         unsafe {
             // Turned, then mirrored, as the processor does them.
             video.VideoProcessorSetStreamRotation(&self.processor, 0, turns % 4 != 0, D3D11_VIDEO_PROCESSOR_ROTATION((turns % 4) as i32));

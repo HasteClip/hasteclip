@@ -50,14 +50,14 @@ float4 ps_diff(V i) : SV_Target {
     return float4(most, most, most, 1);
 }
 // A picture's signature: in each block of `area.z` texels square (within
-// `area.xy`), sums of every texel of every `area.w`-th row, plain and weighted
-// by where in the block it is, so that anything moving or changing within a
-// block changes them (a plain sum stays put for a thing moving inside it).
+// `area.xy`), sums of every other texel of every `area.w`-th row, plain and
+// weighted by where in the block it is, so that anything moving or changing
+// within a block changes them while reading far fewer texels per look.
 float4 ps_signature(V i) : SV_Target {
     int2 origin = int2(i.pos.xy) * (int)area.z;
     float4 sum = 0;
     [loop] for (int y = 0; y < (int)area.z; y += (int)area.w) {
-        [loop] for (int x = 0; x < (int)area.z; x++) {
+        [loop] for (int x = 0; x < (int)area.z; x += 2) {
             int2 at = origin + int2(x, y);
             if (at.x < (int)area.x && at.y < (int)area.y) {
                 float3 c = image.Load(int3(at, 0)).rgb * 255;
@@ -80,6 +80,22 @@ float4 ps_opaque(V i) : SV_Target { return float4(image.Sample(linear_clamp, i.u
 float3 to_light(float3 c) { return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4); }
 float3 from_light(float3 c) { c = saturate(c); return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1.0 / 2.4) - 0.055; }
 float4 ps_to_light(V i) : SV_Target { return float4(to_light(image.Sample(linear_clamp, i.uv).rgb), 1); }
+// Sampled through an sRGB view, so the graphics card turns sRGB into light
+// itself; scaled by its weight `turn.z` for ONE + INV_SRC_ALPHA mixing.
+float4 ps_linear_mix(V i) : SV_Target {
+    float3 c = image.Sample(linear_clamp, i.uv).rgb;
+    return float4(c * turn.z, turn.z);
+}
+// Reads the sRGB picture once and mixes it into two open frame averages at
+// once, by `turn.z` and `turn.w` (soft blending).
+struct DualOut { float4 t0 : SV_Target0; float4 t1 : SV_Target1; };
+DualOut ps_linear_mix_dual(V i) {
+    float3 c = image.Sample(linear_clamp, i.uv).rgb;
+    DualOut o;
+    o.t0 = float4(c * turn.z, turn.z);
+    o.t1 = float4(c * turn.w, turn.w);
+    return o;
+}
 float4 ps_from_light(V i) : SV_Target { return float4(from_light(image.Sample(linear_clamp, i.uv).rgb), 1); }
 // An HDR desktop's light (scRGB: 1 is 80 nits), `turn.y` of it, back as sRGB:
 // with `turn.y` 80 over the SDR white level, SDR white comes out white.
@@ -95,6 +111,9 @@ enum Shader {
     Opaque,
     /// Turned into light (from sRGB), replacing or mixed by a weight.
     ToLight,
+    /// Sampled through an sRGB view so the graphics card turns it into light
+    /// itself, mixed by a premultiplied weight.
+    LinearMix(f32),
     /// Turned from light back into sRGB, replacing.
     FromLight,
     /// Scaled light (an HDR desktop's) turned into sRGB, replacing.
@@ -110,12 +129,17 @@ pub(crate) struct Quad {
     ps_signature: ID3D11PixelShader,
     ps_changed: ID3D11PixelShader,
     ps_to_light: ID3D11PixelShader,
+    ps_linear_mix: ID3D11PixelShader,
+    ps_linear_mix_dual: ID3D11PixelShader,
     ps_from_light: ID3D11PixelShader,
     ps_from_hdr: ID3D11PixelShader,
     block: ID3D11Buffer,
+    rasterizer: ID3D11RasterizerState,
     blend: ID3D11BlendState,
     /// Mixes by a constant (the blend factor) instead of the picture's alpha.
     mix: ID3D11BlendState,
+    /// Mixes by per-target premultiplied weight (`rgb * w`, `a = w` -> `ONE + INV_SRC_ALPHA`).
+    premul_mix: ID3D11BlendState,
     sampler: ID3D11SamplerState,
     place: ID3D11Buffer,
 }
@@ -160,6 +184,8 @@ impl Quad {
         let ps_signature_code = compile(s!("ps_signature"), s!("ps_4_0"))?;
         let ps_changed_code = compile(s!("ps_changed"), s!("ps_4_0"))?;
         let ps_to_light_code = compile(s!("ps_to_light"), s!("ps_4_0"))?;
+        let ps_linear_mix_code = compile(s!("ps_linear_mix"), s!("ps_4_0"))?;
+        let ps_linear_mix_dual_code = compile(s!("ps_linear_mix_dual"), s!("ps_4_0"))?;
         let ps_from_light_code = compile(s!("ps_from_light"), s!("ps_4_0"))?;
         let ps_from_hdr_code = compile(s!("ps_from_hdr"), s!("ps_4_0"))?;
         unsafe {
@@ -177,6 +203,10 @@ impl Quad {
             dev.CreatePixelShader(bytes(&ps_changed_code), None, Some(&mut ps_changed))?;
             let mut ps_to_light = None;
             dev.CreatePixelShader(bytes(&ps_to_light_code), None, Some(&mut ps_to_light))?;
+            let mut ps_linear_mix = None;
+            dev.CreatePixelShader(bytes(&ps_linear_mix_code), None, Some(&mut ps_linear_mix))?;
+            let mut ps_linear_mix_dual = None;
+            dev.CreatePixelShader(bytes(&ps_linear_mix_dual_code), None, Some(&mut ps_linear_mix_dual))?;
             let mut ps_from_light = None;
             dev.CreatePixelShader(bytes(&ps_from_light_code), None, Some(&mut ps_from_light))?;
             let mut ps_from_hdr = None;
@@ -184,6 +214,15 @@ impl Quad {
             let block_desc = D3D11_BUFFER_DESC { ByteWidth: 16, Usage: D3D11_USAGE_DEFAULT, BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32, ..Default::default() };
             let mut block = None;
             dev.CreateBuffer(&block_desc, None, Some(&mut block))?;
+            let rs_desc = D3D11_RASTERIZER_DESC {
+                FillMode: D3D11_FILL_SOLID,
+                CullMode: D3D11_CULL_NONE,
+                ScissorEnable: true.into(),
+                DepthClipEnable: true.into(),
+                ..Default::default()
+            };
+            let mut rasterizer = None;
+            dev.CreateRasterizerState(&rs_desc, Some(&mut rasterizer))?;
             // Straight alpha over the picture; the picture stays opaque.
             let mut blend_desc = D3D11_BLEND_DESC::default();
             blend_desc.RenderTarget[0] = D3D11_RENDER_TARGET_BLEND_DESC {
@@ -202,6 +241,21 @@ impl Quad {
             blend_desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_BLEND_FACTOR;
             let mut mix = None;
             dev.CreateBlendState(&blend_desc, Some(&mut mix))?;
+            // Per-target premultiplied weight mix: the shader outputs `(c * w, w)`
+            // for each target, and the graphics card computes `c * w + dest * (1 - w)`.
+            let mut premul_desc = D3D11_BLEND_DESC::default();
+            premul_desc.RenderTarget[0] = D3D11_RENDER_TARGET_BLEND_DESC {
+                BlendEnable: true.into(),
+                SrcBlend: D3D11_BLEND_ONE,
+                DestBlend: D3D11_BLEND_INV_SRC_ALPHA,
+                BlendOp: D3D11_BLEND_OP_ADD,
+                SrcBlendAlpha: D3D11_BLEND_ZERO,
+                DestBlendAlpha: D3D11_BLEND_ONE,
+                BlendOpAlpha: D3D11_BLEND_OP_ADD,
+                RenderTargetWriteMask: D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8,
+            };
+            let mut premul_mix = None;
+            dev.CreateBlendState(&premul_desc, Some(&mut premul_mix))?;
             let sampler_desc = D3D11_SAMPLER_DESC {
                 Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
                 AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
@@ -223,11 +277,15 @@ impl Quad {
                 ps_signature: ps_signature.context("no pixel shader")?,
                 ps_changed: ps_changed.context("no pixel shader")?,
                 ps_to_light: ps_to_light.context("no pixel shader")?,
+                ps_linear_mix: ps_linear_mix.context("no pixel shader")?,
+                ps_linear_mix_dual: ps_linear_mix_dual.context("no pixel shader")?,
                 ps_from_light: ps_from_light.context("no pixel shader")?,
                 ps_from_hdr: ps_from_hdr.context("no pixel shader")?,
                 block: block.context("no constant buffer")?,
+                rasterizer: rasterizer.context("no rasterizer state")?,
                 blend: blend.context("no blend state")?,
                 mix: mix.context("no blend state")?,
+                premul_mix: premul_mix.context("no blend state")?,
                 sampler: sampler.context("no sampler")?,
                 place: place.context("no constant buffer")?,
             })
@@ -250,6 +308,69 @@ impl Quad {
         self.run(gpu, target, size, source, &whole(size, area), Shader::ToLight, Some(weight));
     }
 
+    /// Mix `src_area` of an sRGB view `source` (of texture size `src_size`)
+    /// into `dst_area` of `target` (of texture size `dst_size`), letting the
+    /// graphics card turn sRGB into light on sampling and shrinking if needed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn average_light_srgb(
+        &self,
+        gpu: &Gpu,
+        target: &ID3D11RenderTargetView,
+        dst_size: (u32, u32),
+        dst_area: (u32, u32),
+        source: &ID3D11ShaderResourceView,
+        src_size: (u32, u32),
+        src_area: (u32, u32),
+        weight: f32,
+    ) {
+        let at = scaled(dst_area, src_size, src_area);
+        self.run(gpu, target, dst_size, source, &at, Shader::LinearMix(weight), Some(weight));
+    }
+
+    /// Reads `src_area` of an sRGB view `source` once and mixes it into both
+    /// `target0` (weight `w0`) and `target1` (weight `w1`) in a single draw
+    /// (for soft blending's two open frames).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn average_light_srgb_dual(
+        &self,
+        gpu: &Gpu,
+        target0: &ID3D11RenderTargetView,
+        target1: &ID3D11RenderTargetView,
+        dst_size: (u32, u32),
+        dst_area: (u32, u32),
+        source: &ID3D11ShaderResourceView,
+        src_size: (u32, u32),
+        src_area: (u32, u32),
+        w0: f32,
+        w1: f32,
+    ) {
+        let at = scaled(dst_area, src_size, src_area);
+        let (w, h) = (dst_size.0 as f32, dst_size.1 as f32);
+        let [l, t, r, b] = at.dest;
+        let place = [l / w * 2.0 - 1.0, 1.0 - t / h * 2.0, r / w * 2.0 - 1.0, 1.0 - b / h * 2.0, at.uv[0], at.uv[1], at.uv[2], at.uv[3], 0.0, 1.0, w0, w1];
+        let _lock = gpu.exclusive();
+        let ctx = &gpu.context;
+        unsafe {
+            ctx.UpdateSubresource(&self.place, 0, None, place.as_ptr().cast(), 0, 0);
+            ctx.RSSetState(&self.rasterizer);
+            ctx.RSSetScissorRects(Some(&[at.clip]));
+            ctx.RSSetViewports(Some(&[D3D11_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: w, Height: h, MinDepth: 0.0, MaxDepth: 1.0 }]));
+            ctx.OMSetRenderTargets(Some(&[Some(target0.clone()), Some(target1.clone())]), None);
+            ctx.OMSetBlendState(Some(&self.premul_mix), None, 0xffff_ffff);
+            ctx.IASetInputLayout(None);
+            ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            ctx.VSSetShader(&self.vs, None);
+            ctx.VSSetConstantBuffers(0, Some(&[Some(self.place.clone())]));
+            ctx.PSSetShader(&self.ps_linear_mix_dual, None);
+            ctx.PSSetConstantBuffers(0, Some(&[Some(self.place.clone())]));
+            ctx.PSSetShaderResources(0, Some(&[Some(source.clone())]));
+            ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
+            ctx.Draw(4, 0);
+            ctx.OMSetRenderTargets(None, None);
+            ctx.PSSetShaderResources(0, Some(&[None]));
+        }
+    }
+
     /// Draw `source`, an HDR desktop's light (scRGB), where `at` says, as
     /// sRGB: `scale` of its light (80 nits over the SDR white level puts SDR
     /// white at white; brighter than that is clipped).
@@ -261,6 +382,20 @@ impl Quad {
     /// `size`, only `area` of it drawn (as `average_light`).
     pub(crate) fn from_light(&self, gpu: &Gpu, target: &ID3D11RenderTargetView, size: (u32, u32), source: &ID3D11ShaderResourceView, area: (u32, u32)) {
         self.run(gpu, target, size, source, &whole(size, area), Shader::FromLight, None);
+    }
+
+    /// Draw `area` of `source` (light, in a texture of `src_size`) into the
+    /// top-left `area` of `target` (of `dst_size`), back as sRGB.
+    pub(crate) fn to_srgb_into(
+        &self,
+        gpu: &Gpu,
+        target: &ID3D11RenderTargetView,
+        dst_size: (u32, u32),
+        source: &ID3D11ShaderResourceView,
+        src_size: (u32, u32),
+        area: (u32, u32),
+    ) {
+        self.run(gpu, target, dst_size, source, &scaled(area, src_size, area), Shader::FromLight, None);
     }
 
     /// Whether `now` and `before` (both `size` valid, as big as their
@@ -295,6 +430,7 @@ impl Quad {
         unsafe {
             ctx.UpdateSubresource(&self.place, 0, None, place.as_ptr().cast(), 0, 0);
             ctx.UpdateSubresource(&self.block, 0, None, area.as_ptr().cast(), 0, 0);
+            ctx.RSSetState(&self.rasterizer);
             ctx.RSSetScissorRects(Some(&[RECT { left: 0, top: 0, right: out.0 as i32, bottom: out.1 as i32 }]));
             ctx.RSSetViewports(Some(&[D3D11_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: out.0 as f32, Height: out.1 as f32, MinDepth: 0.0, MaxDepth: 1.0 }]));
             ctx.OMSetRenderTargets(Some(&[Some(target.clone())]), None);
@@ -317,17 +453,23 @@ impl Quad {
         let (w, h) = (size.0 as f32, size.1 as f32);
         let [l, t, r, b] = at.dest;
         let scale = if let Shader::FromHdr(s) = shader { s } else { 1.0 };
-        let place = [l / w * 2.0 - 1.0, 1.0 - t / h * 2.0, r / w * 2.0 - 1.0, 1.0 - b / h * 2.0, at.uv[0], at.uv[1], at.uv[2], at.uv[3], (at.turns % 4) as f32, scale, 0.0, 0.0];
+        let w0 = if let Shader::LinearMix(w) = shader { w } else { 1.0 };
+        let place = [l / w * 2.0 - 1.0, 1.0 - t / h * 2.0, r / w * 2.0 - 1.0, 1.0 - b / h * 2.0, at.uv[0], at.uv[1], at.uv[2], at.uv[3], (at.turns % 4) as f32, scale, w0, 0.0];
         let _lock = gpu.exclusive();
         let ctx = &gpu.context;
         unsafe {
             ctx.UpdateSubresource(&self.place, 0, None, place.as_ptr().cast(), 0, 0);
+            ctx.RSSetState(&self.rasterizer);
             ctx.RSSetScissorRects(Some(&[at.clip]));
             ctx.RSSetViewports(Some(&[D3D11_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: w, Height: h, MinDepth: 0.0, MaxDepth: 1.0 }]));
             ctx.OMSetRenderTargets(Some(&[Some(target.clone())]), None);
-            match weight {
-                Some(w) if w < 1.0 => ctx.OMSetBlendState(Some(&self.mix), Some(&[w; 4]), 0xffff_ffff),
-                _ => ctx.OMSetBlendState(if shader == Shader::Plain { Some(&self.blend) } else { None }, None, 0xffff_ffff),
+            match shader {
+                Shader::LinearMix(w) if w < 1.0 => ctx.OMSetBlendState(Some(&self.premul_mix), None, 0xffff_ffff),
+                Shader::LinearMix(_) => ctx.OMSetBlendState(None, None, 0xffff_ffff),
+                _ => match weight {
+                    Some(w) if w < 1.0 => ctx.OMSetBlendState(Some(&self.mix), Some(&[w; 4]), 0xffff_ffff),
+                    _ => ctx.OMSetBlendState(if shader == Shader::Plain { Some(&self.blend) } else { None }, None, 0xffff_ffff),
+                },
             }
             ctx.IASetInputLayout(None);
             ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
@@ -337,6 +479,7 @@ impl Quad {
                 Shader::Plain => &self.ps,
                 Shader::Opaque => &self.ps_opaque,
                 Shader::ToLight => &self.ps_to_light,
+                Shader::LinearMix(_) => &self.ps_linear_mix,
                 Shader::FromLight => &self.ps_from_light,
                 Shader::FromHdr(_) => &self.ps_from_hdr,
             };
@@ -373,6 +516,19 @@ fn whole(size: (u32, u32), area: (u32, u32)) -> Placement {
     }
 }
 
+/// `src_area` of a source texture (`src_size`) mapped onto `dst_area` from the
+/// top-left corner of the target.
+pub(crate) fn scaled(dst_area: (u32, u32), src_size: (u32, u32), src_area: (u32, u32)) -> Placement {
+    let u = src_area.0.min(src_size.0) as f32 / src_size.0.max(1) as f32;
+    let v = src_area.1.min(src_size.1) as f32 / src_size.1.max(1) as f32;
+    Placement {
+        dest: [0.0, 0.0, dst_area.0 as f32, dst_area.1 as f32],
+        uv: [0.0, 0.0, u, v],
+        clip: RECT { left: 0, top: 0, right: dst_area.0 as i32, bottom: dst_area.1 as i32 },
+        turns: 0,
+    }
+}
+
 /// A view to sample a texture through (a typeless one read as plain colour).
 pub(crate) fn shader_view(gpu: &Gpu, texture: &ID3D11Texture2D) -> Result<ID3D11ShaderResourceView> {
     let mut desc = D3D11_TEXTURE2D_DESC::default();
@@ -395,10 +551,46 @@ pub(crate) fn shader_view(gpu: &Gpu, texture: &ID3D11Texture2D) -> Result<ID3D11
     view.context("no shader view")
 }
 
-/// A view to draw into a texture.
-pub(crate) fn target_view(gpu: &Gpu, texture: &ID3D11Texture2D) -> Result<ID3D11RenderTargetView> {
+/// An sRGB view for a typeless BGRA/RGBA texture, so the graphics card turns
+/// sRGB into linear light on sampling instead of in the shader.
+pub(crate) fn shader_view_srgb(gpu: &Gpu, texture: &ID3D11Texture2D) -> Result<ID3D11ShaderResourceView> {
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    unsafe { texture.GetDesc(&mut desc) };
+    let format = match desc.Format {
+        DXGI_FORMAT_B8G8R8A8_TYPELESS | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+        DXGI_FORMAT_R8G8B8A8_TYPELESS | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+        DXGI_FORMAT_B8G8R8X8_TYPELESS | DXGI_FORMAT_B8G8R8X8_UNORM_SRGB => DXGI_FORMAT_B8G8R8X8_UNORM_SRGB,
+        _ => return shader_view(gpu, texture),
+    };
+    let view_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+        Format: format,
+        ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2D,
+        Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D11_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1 } },
+    };
     let mut view = None;
-    unsafe { gpu.device.CreateRenderTargetView(texture, None, Some(&mut view)) }?;
+    unsafe { gpu.device.CreateShaderResourceView(texture, Some(&view_desc), Some(&mut view)) }.context("can't read the picture as sRGB")?;
+    view.context("no sRGB shader view")
+}
+
+/// A view to draw into a texture (handles `*_TYPELESS` BGRA/RGBA textures as `UNORM`).
+pub(crate) fn target_view(gpu: &Gpu, texture: &ID3D11Texture2D) -> Result<ID3D11RenderTargetView> {
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    unsafe { texture.GetDesc(&mut desc) };
+    let rtv_desc = match desc.Format {
+        DXGI_FORMAT_B8G8R8A8_TYPELESS => Some(D3D11_RENDER_TARGET_VIEW_DESC {
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 { Texture2D: D3D11_TEX2D_RTV { MipSlice: 0 } },
+        }),
+        DXGI_FORMAT_R8G8B8A8_TYPELESS => Some(D3D11_RENDER_TARGET_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 { Texture2D: D3D11_TEX2D_RTV { MipSlice: 0 } },
+        }),
+        _ => None,
+    };
+    let mut view = None;
+    unsafe { gpu.device.CreateRenderTargetView(texture, rtv_desc.as_ref().map(|d| d as *const _), Some(&mut view)) }?;
     view.context("no render target view")
 }
 

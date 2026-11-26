@@ -130,7 +130,7 @@ impl Recorder for WinRecorder {
         system::com_init();
         let gpu = d3d::Gpu::for_capture()?;
         let (source, (w, h)) = PictureSource::plan(video)?;
-        let picture = source.open(&gpu, w, h, 60, None)?;
+        let picture = source.open(&gpu, w, h, d3d::CaptureRate::new(60, 1), None)?;
         // A screen has its picture by now; games and apps take a moment to
         // find the one that's showing.
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -222,6 +222,7 @@ struct StreamOut {
     /// in its own time averaged (`StreamBlend`), and converted from that.
     blended: Option<(StreamBlend, d3d::Converter)>,
     encoder: h264::Encoder,
+    size: (u32, u32),
     every: i64,
     /// Frames its encoder couldn't take.
     dropped: u64,
@@ -353,7 +354,7 @@ impl Capture for Session {
                 None
             };
             eprintln!("stream: {} at {width}×{height}, {} fps, {} kb/s", encoder.name, r.fps, r.kbps);
-            outs.push(StreamOut { direct, blended, encoder, every, dropped: 0 });
+            outs.push(StreamOut { direct, blended, encoder, size: (width, height), every, dropped: 0 });
         }
         *self.stream_ctl.lock().unwrap() = Some(outs);
         Ok(())
@@ -433,17 +434,18 @@ impl Session {
             let encoder = h264::Encoder::start(&gpu, width, height, s, session.writer_tx.clone())?;
             session.apps = picture_source.apps();
             // The screen is captured fast enough for every look to find a new
-            // picture: the capture's rate limits are set from the looks per
-            // second, not the frame rate (at 60 fps they'd hold it to 240).
-            let looks_per_second = s.fps * s.blend_samples.max(1);
-            let picture = picture_source.open(&gpu, canvas_w, canvas_h, looks_per_second, s.away_screen.clone())?;
+            // picture: without blending, four times the frame rate; with
+            // blending, scaled from the looks per second.
+            let looks = s.blend_samples.max(1);
+            let rate = d3d::CaptureRate::new(s.fps, looks);
+            let picture = picture_source.open(&gpu, canvas_w, canvas_h, rate, s.away_screen.clone())?;
             let latest = picture.latest.clone();
             session.video = Some(picture.video);
-            session.switch = Some(Switch { gpu: gpu.clone(), latest: latest.clone(), fps: looks_per_second, away: s.away_screen.clone(), source: s.video.clone() });
+            session.switch = Some(Switch { gpu: gpu.clone(), latest: latest.clone(), rate, away: s.away_screen.clone(), source: s.video.clone() });
             // The other layers: a webcam or display that can't open doesn't
             // stop the recording (its status says why), the picture goes on
             // without it.
-            let feeds = layers::Feeds::new(&gpu, s.layers.clone(), looks_per_second);
+            let feeds = layers::Feeds::new(&gpu, s.layers.clone(), rate);
             let overlay = Some(feeds.clone());
             // Each frame comes from the pictures shown during it, timed by
             // when each came up (see `FrameBlend`): with blending their
@@ -452,9 +454,10 @@ impl Session {
             // pictures of a game at the recording's rate (a 300 fps game
             // recorded at 300: up to 22% of frames), as the clock and the
             // game's pictures drifted past each other.
-            let looks = s.blend_samples.max(1);
             let shutter = crate::shutter::Shutter::new(looks, s.blend_shape);
-            let blend = FrameBlend::new(&gpu, &latest, looks)?;
+            let src_size = (latest.width, latest.height);
+            let blend_max = desired_blend_size(&s.screen.lock().unwrap(), latest.content(), src_size, (width, height));
+            let blend = FrameBlend::new_sized(&gpu, &latest, looks, blend_max)?;
             latest.set_wants_queue(true);
             // Each Display and Window source drawn from its own blend, as
             // the recording's own capture is (see `Source`).
@@ -468,7 +471,7 @@ impl Session {
                 hardware: s.use_hardware,
             });
             let ctl = PacerCtl { blend: session.blend_ctl.clone(), stream: session.stream_ctl.clone() };
-            session.pacer = Some(spawn_blend_pacer(s.fps, looks, shutter, latest, blend, converter, encoder, preview, Some(feeds), s.screen.clone(), clock, ctl)?);
+            session.pacer = Some(spawn_blend_pacer(s.fps, (width, height), looks, shutter, latest, blend, converter, encoder, preview, Some(feeds), s.screen.clone(), clock, ctl)?);
             Ok(())
         })();
         if let Err(e) = started {
@@ -487,14 +490,14 @@ impl Session {
         }
         let looks = looks.max(1);
         *self.blend_ctl.lock().unwrap() = Some((looks, shape));
-        let rate = self.fps * looks;
+        let rate = d3d::CaptureRate::new(self.fps, looks);
         // Displays and windows shown too, as fast as the looks.
         if let Some(from) = &self.stream_from {
-            from.feeds.set_fps(rate);
+            from.feeds.set_rate(rate);
         }
-        if self.switch.as_ref().is_some_and(|sw| sw.fps != rate) {
+        if self.switch.as_ref().is_some_and(|sw| sw.rate != rate) {
             if let Some(sw) = &mut self.switch {
-                sw.fps = rate;
+                sw.rate = rate;
             }
             self.restart_video();
         }
@@ -516,7 +519,7 @@ impl Session {
             old.stop();
         }
         let apps = source.apps();
-        match source.start(&sw.gpu, &sw.latest, sw.fps, sw.away.clone()) {
+        match source.start(&sw.gpu, &sw.latest, sw.rate, sw.away.clone()) {
             Ok(v) => {
                 // The games and apps followed, as they were.
                 if let (Some(new), Some(old)) = (&apps, &self.apps) {
@@ -557,7 +560,7 @@ impl Session {
             old.stop();
         }
         let apps = source.apps();
-        match source.start(&sw.gpu, &sw.latest, sw.fps, sw.away.clone()) {
+        match source.start(&sw.gpu, &sw.latest, sw.rate, sw.away.clone()) {
             Ok(v) => {
                 self.video = Some(v);
                 self.apps = apps;
@@ -569,7 +572,7 @@ impl Session {
                 // Back to what it was recording.
                 if let Ok((old, _)) = PictureSource::plan(&sw.source) {
                     self.apps = old.apps();
-                    self.video = old.start(&sw.gpu, &sw.latest, sw.fps, sw.away.clone()).ok();
+                    self.video = old.start(&sw.gpu, &sw.latest, sw.rate, sw.away.clone()).ok();
                 }
                 false
             }
@@ -675,7 +678,7 @@ type AppList = Arc<std::sync::Mutex<AppsConfig>>;
 struct Switch {
     gpu: d3d::Gpu,
     latest: Arc<d3d::Latest>,
-    fps: u32,
+    rate: d3d::CaptureRate,
     away: Option<Arc<crate::StillImage>>,
     /// What it's recording now.
     source: VideoSource,
@@ -706,7 +709,7 @@ impl PictureSource {
         })
     }
 
-    fn open(self, gpu: &d3d::Gpu, width: u32, height: u32, fps: u32, away: Option<Arc<crate::StillImage>>) -> Result<Picture> {
+    fn open(self, gpu: &d3d::Gpu, width: u32, height: u32, rate: d3d::CaptureRate, away: Option<Arc<crate::StillImage>>) -> Result<Picture> {
         // What's captured is copied 1:1 before it's scaled into the frame, so the
         // copy must hold all of it. A display is its own size; an app's window
         // can be on any display — on a portrait one, taller than the frame — so
@@ -719,12 +722,12 @@ impl PictureSource {
             (w.max(width), h.max(height))
         };
         let latest = d3d::Latest::new(gpu, copy_w, copy_h)?;
-        let video = self.start(gpu, &latest, fps, away)?;
+        let video = self.start(gpu, &latest, rate, away)?;
         Ok(Picture { video, latest })
     }
 
     /// Start recording into `latest`.
-    fn start(self, gpu: &d3d::Gpu, latest: &Arc<d3d::Latest>, fps: u32, away: Option<Arc<crate::StillImage>>) -> Result<Video> {
+    fn start(self, gpu: &d3d::Gpu, latest: &Arc<d3d::Latest>, rate: d3d::CaptureRate, away: Option<Arc<crate::StillImage>>) -> Result<Video> {
         Ok(match self {
             PictureSource::Apps(list) => {
                 // The away screen (black with it off) until one of the
@@ -734,11 +737,11 @@ impl PictureSource {
                     Some(image) => latest.show_still(image)?,
                     None => latest.clear()?,
                 }
-                Video::follow_apps(gpu.clone(), latest.clone(), list, fps, away)
+                Video::follow_apps(gpu.clone(), latest.clone(), list, rate, away)
             }
             PictureSource::Screen(id, item, monitor, hook, method) => {
                 let by = NEXT_FOLLOWER.fetch_add(1, Ordering::Relaxed);
-                let capture = DisplayCapture::start(gpu, &item, monitor, latest, fps, method, by)?;
+                let capture = DisplayCapture::start(gpu, &item, monitor, latest, rate, method, by)?;
                 // Wait for the first frame so a capture that can't see the screen
                 // fails here, visibly, instead of producing an empty file.
                 let deadline = Instant::now() + Duration::from_secs(3);
@@ -748,7 +751,7 @@ impl PictureSource {
                     }
                     thread::sleep(Duration::from_millis(10));
                 }
-                Video::follow_screen(gpu.clone(), latest.clone(), id, item, monitor, capture, fps, hook, method, by)
+                Video::follow_screen(gpu.clone(), latest.clone(), id, item, monitor, capture, rate, hook, method, by)
             }
         })
     }
@@ -795,9 +798,10 @@ impl PreviewCapture {
                 if let (PictureSource::Apps(list), Some(shared)) = (&mut source, apps2) {
                     *list = shared; // so `update` reaches the running follower
                 }
-                let picture = source.open(&gpu, w, h, fps, away)?;
+                let rate = d3d::CaptureRate::new(fps, 1);
+                let picture = source.open(&gpu, w, h, rate, away)?;
                 let (width, height) = size.of(w, h);
-                let feeds = layers::Feeds::new(&gpu, layers, fps);
+                let feeds = layers::Feeds::new(&gpu, layers, rate);
                 let preview = d3d::Previewer::new(&gpu, &picture.latest, Some(feeds.clone()), width, height, fps, screen, generation)?;
                 Ok((picture, preview, feeds))
             })();
@@ -1091,36 +1095,36 @@ impl DisplayCapture {
         item: &windows::Graphics::Capture::GraphicsCaptureItem,
         monitor: windows::Win32::Graphics::Gdi::HMONITOR,
         latest: &Arc<d3d::Latest>,
-        fps: u32,
+        rate: d3d::CaptureRate,
         choice: crate::ScreenCapture,
         by: u64,
     ) -> Result<Self> {
         let (method, why) = dupl::choose(choice, gpu, monitor);
         if method == dupl::Method::Wgc {
             eprintln!("recording the display with Windows' capture ({why})");
-            return Self::wgc(gpu, item, monitor, latest, fps, by, false);
+            return Self::wgc(gpu, item, monitor, latest, rate, by, false);
         }
-        match Self::duplicate(gpu, monitor, latest, fps, by) {
+        match Self::duplicate(gpu, monitor, latest, rate, by) {
             Ok(c) => {
                 eprintln!("recording the display with Desktop Duplication ({why})");
                 Ok(c)
             }
             Err(e) => {
                 eprintln!("can't record the display with Desktop Duplication ({e:#}); using Windows' capture until it can");
-                Self::wgc(gpu, item, monitor, latest, fps, by, true)
+                Self::wgc(gpu, item, monitor, latest, rate, by, true)
             }
         }
     }
 
-    fn duplicate(gpu: &d3d::Gpu, monitor: windows::Win32::Graphics::Gdi::HMONITOR, latest: &Arc<d3d::Latest>, fps: u32, by: u64) -> Result<Self> {
-        let c = dupl::DuplCapture::start(gpu, monitor, latest, fps)?;
+    fn duplicate(gpu: &d3d::Gpu, monitor: windows::Win32::Graphics::Gdi::HMONITOR, latest: &Arc<d3d::Latest>, rate: d3d::CaptureRate, by: u64) -> Result<Self> {
+        let c = dupl::DuplCapture::start(gpu, monitor, latest, rate)?;
         set_in_use(by, crate::ScreenCaptureInUse { duplication: true, fell_back: false });
         Ok(DisplayCapture::Dupl(c))
     }
 
     /// Windows' capture, standing in for Desktop Duplication or not.
-    fn wgc(gpu: &d3d::Gpu, item: &windows::Graphics::Capture::GraphicsCaptureItem, monitor: windows::Win32::Graphics::Gdi::HMONITOR, latest: &Arc<d3d::Latest>, fps: u32, by: u64, stand_in: bool) -> Result<Self> {
-        let c = d3d::Capture::start(gpu, item, latest, d3d::Of::Display(monitor), fps)?;
+    fn wgc(gpu: &d3d::Gpu, item: &windows::Graphics::Capture::GraphicsCaptureItem, monitor: windows::Win32::Graphics::Gdi::HMONITOR, latest: &Arc<d3d::Latest>, rate: d3d::CaptureRate, by: u64, stand_in: bool) -> Result<Self> {
+        let c = d3d::Capture::start(gpu, item, latest, d3d::Of::Display(monitor), rate)?;
         set_in_use(by, crate::ScreenCaptureInUse { duplication: false, fell_back: stand_in });
         Ok(if stand_in { DisplayCapture::StandIn(c) } else { DisplayCapture::Wgc(c) })
     }
@@ -1165,7 +1169,7 @@ impl Video {
     /// How often to look at which app is in focus.
     const RESCAN: Duration = Duration::from_millis(100);
 
-    fn follow_apps(gpu: d3d::Gpu, latest: Arc<d3d::Latest>, list: AppList, fps: u32, away: Option<Arc<crate::StillImage>>) -> Self {
+    fn follow_apps(gpu: d3d::Gpu, latest: Arc<d3d::Latest>, list: AppList, rate: d3d::CaptureRate, away: Option<Arc<crate::StillImage>>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let thread = thread::spawn(move || {
@@ -1306,9 +1310,9 @@ impl Video {
                                 }
                                 eprintln!("recording {app} with {} ({why})", if plan == hook::Plan::Hook { "the game capture hook" } else { "Windows' capture" });
                                 let started = match plan {
-                                    hook::Plan::Hook => hook::HookCapture::start(&gpu, h, &latest, fps).map(WindowCapture::Hook),
+                                    hook::Plan::Hook => hook::HookCapture::start(&gpu, h, &latest, rate).map(WindowCapture::Hook),
                                     p => d3d::window_item(h)
-                                        .and_then(|item| d3d::Capture::start(&gpu, &item, &latest, d3d::Of::Window(h), fps))
+                                        .and_then(|item| d3d::Capture::start(&gpu, &item, &latest, d3d::Of::Window(h), rate))
                                         .map(|c| WindowCapture::Wgc(c, p == hook::Plan::Watch)),
                                 };
                                 match started {
@@ -1382,7 +1386,7 @@ impl Video {
         item: windows::Graphics::Capture::GraphicsCaptureItem,
         monitor: windows::Win32::Graphics::Gdi::HMONITOR,
         first: DisplayCapture,
-        fps: u32,
+        rate: d3d::CaptureRate,
         settings: crate::GameHook,
         method: crate::ScreenCapture,
         by: u64,
@@ -1515,7 +1519,7 @@ impl Video {
                         hooked = None;
                         display = None;
                         eprintln!("recording {exe} with the game capture hook while it's fullscreen");
-                        match hook::HookCapture::start(&gpu, *h, &latest, fps) {
+                        match hook::HookCapture::start(&gpu, *h, &latest, rate) {
                             Ok(capture) => hooked = Some((*h, exe.clone(), capture)),
                             Err(e) => {
                                 eprintln!("{exe}: can't start the game capture hook: {e:#}");
@@ -1532,11 +1536,11 @@ impl Video {
                     && let Some(why) = c.ended()
                 {
                     eprintln!("desktop duplication stopped ({why}); recording the display with Windows' capture until it can start again");
-                    display = DisplayCapture::wgc(&gpu, &item, monitor, &latest, fps, by, true).map_err(|e| eprintln!("can't record the display: {e:#}")).ok();
+                    display = DisplayCapture::wgc(&gpu, &item, monitor, &latest, rate, by, true).map_err(|e| eprintln!("can't record the display: {e:#}")).ok();
                     retry.0 = Instant::now() + retry.1;
                 }
                 if hooked.is_none() && display.is_none() {
-                    match DisplayCapture::start(&gpu, &item, monitor, &latest, fps, method, by) {
+                    match DisplayCapture::start(&gpu, &item, monitor, &latest, rate, method, by) {
                         Ok(c) => {
                             if matches!(c, DisplayCapture::StandIn(_)) {
                                 retry.0 = Instant::now() + retry.1;
@@ -1551,7 +1555,7 @@ impl Video {
                 if let Some(DisplayCapture::StandIn(_)) = &display
                     && Instant::now() >= retry.0
                 {
-                    match DisplayCapture::duplicate(&gpu, monitor, &latest, fps, by) {
+                    match DisplayCapture::duplicate(&gpu, monitor, &latest, rate, by) {
                         Ok(c) => {
                             eprintln!("recording the display with Desktop Duplication again");
                             display = Some(c);
@@ -1670,18 +1674,45 @@ fn spawn_aac(track: usize, mut enc: AacEncoder, rx: mpsc::Receiver<Vec<f32>>, ou
 /// source's looks are kept halfway between its own pictures, a fraction of a
 /// look from another's, so one can start a frame before another has
 /// finished the one before).
+/// The size frame blending can average the recording's picture at: the output
+/// size when the screen isn't cropped, turned sideways, stretched past the
+/// frame, or fitted with `Fill`/`Stretch` onto a different shape, else the
+/// capture's full size.
+fn desired_blend_size(p: &crate::ScreenPlacement, content_size: (u32, u32), src_size: (u32, u32), out_size: (u32, u32)) -> (u32, u32) {
+    let same_shape = u64::from(content_size.0) * u64::from(out_size.1) == u64::from(content_size.1) * u64::from(out_size.0);
+    let can_shrink = p.crop.is_none()
+        && p.turns.is_multiple_of(2)
+        && p.rect[2] <= 1.0
+        && p.rect[3] <= 1.0
+        && (p.framing == crate::Framing::Fit || same_shape);
+    if can_shrink {
+        // Clamp to at least half each axis so single-tap bilinear sampling
+        // stays a proper 2x2 average (e.g. 4K -> 720p blends at 1080p and
+        // lets the video processor handle the rest).
+        let min_w = src_size.0.div_ceil(2).max(2);
+        let min_h = src_size.1.div_ceil(2).max(2);
+        (src_size.0.min(out_size.0.max(min_w)), src_size.1.min(out_size.1.max(min_h)))
+    } else {
+        src_size
+    }
+}
+
 struct FrameBlend {
     gpu: d3d::Gpu,
     /// Copies of the capture's newest picture, for one it puts up without
     /// queueing (a still): two, taken in turn, so a frame being made keeps
-    /// the one its looks saw while the next comes up.
+    /// the one its looks saw while the next comes up. Stored as typeless BGRA
+    /// with a hardware-sRGB view.
     own: [(windows::Win32::Graphics::Direct3D11::ID3D11Texture2D, windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView); 2],
     next_own: usize,
     /// The picture that's up: a copy (`own`) or one the capture handed over
     /// whole (`Queued`).
     held: Seen,
-    /// The size every texture here is (the capture's).
-    size: (u32, u32),
+    /// Dimensions of the capture's source textures (`own`, `Queued`, and `average`).
+    src_size: (u32, u32),
+    /// Dimensions of the float light averages (`Slot::light`), capped to the
+    /// output size when the screen placement allows it.
+    blend_size: (u32, u32),
     /// Whether frames are blended (more than one look a frame), so each
     /// average is made as light.
     blending: bool,
@@ -1690,19 +1721,21 @@ struct FrameBlend {
     slots: Vec<Slot>,
     /// The one `average` is, as it is, if it's one picture (see `finish`).
     copied: Option<u64>,
-    /// The finished frame, back in sRGB: the converter reads it.
+    /// The finished frame, back in sRGB: the converter reads it. Kept at
+    /// `src_size` so `blend_size` can grow back to full size mid-recording
+    /// without rebuilding the converter.
     average: Arc<d3d::Latest>,
     target: windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView,
 }
 
 /// A picture a look can see: a number for each that's come up, its texture
-/// (kept from going away: a queued picture's) and a view to draw it from,
+/// (kept from going away: a queued picture's), its hardware-sRGB view,
 /// and its valid size from the top left corner.
 #[derive(Clone)]
 struct Seen {
     id: u64,
     texture: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
-    view: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
+    srgb_view: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
     size: (u32, u32),
 }
 
@@ -1739,30 +1772,50 @@ const SLOTS_MOST: usize = 4;
 
 impl FrameBlend {
     /// `looks` a frame (one is timing alone: each frame the picture that was
-    /// up at its time).
+    /// up at its time), blended at `latest`'s full size.
     fn new(gpu: &d3d::Gpu, latest: &Arc<d3d::Latest>, looks: u32) -> Result<Self> {
+        Self::new_sized(gpu, latest, looks, (latest.width, latest.height))
+    }
+
+    /// As [`Self::new`], capping the float light averages to `max_size`.
+    fn new_sized(gpu: &d3d::Gpu, latest: &Arc<d3d::Latest>, looks: u32, max_size: (u32, u32)) -> Result<Self> {
         use windows::Win32::Graphics::Direct3D11::{D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_DEFAULT};
-        let size = (latest.width, latest.height);
-        let average = d3d::Latest::new(gpu, size.0, size.1)?;
+        let src_size = (latest.width, latest.height);
+        let blend_size = (src_size.0.min(max_size.0.max(2)), src_size.1.min(max_size.1.max(2)));
+        let average = d3d::Latest::new(gpu, src_size.0, src_size.1)?;
         let bind = (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32;
         let own = || -> Result<_> {
-            let t = gpu.texture(size.0, size.1, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM, bind, D3D11_USAGE_DEFAULT, 0)?;
-            let view = quad::shader_view(gpu, &t)?;
-            Ok((t, view))
+            let t = gpu.texture(src_size.0, src_size.1, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_TYPELESS, bind, D3D11_USAGE_DEFAULT, 0)?;
+            let srgb_view = quad::shader_view_srgb(gpu, &t)?;
+            Ok((t, srgb_view))
         };
         let own = [own()?, own()?];
         Ok(Self {
             gpu: gpu.clone(),
-            held: Seen { id: 0, texture: own[0].0.clone(), view: own[0].1.clone(), size },
+            held: Seen { id: 0, texture: own[0].0.clone(), srgb_view: own[0].1.clone(), size: src_size },
             own,
             next_own: 0,
-            size,
+            src_size,
+            blend_size,
             blending: looks > 1,
             slots: Vec::new(),
             copied: None,
             target: quad::target_view(gpu, &average.texture)?,
             average,
         })
+    }
+
+    /// Change the size of the float light averages (when screen placement,
+    /// window shape, or stream size changes while recording): drops in-flight
+    /// slots and recreates them lazily (one or two repeated frames on a flip,
+    /// as with [`Self::set_looks`]).
+    fn set_blend_size(&mut self, max_size: (u32, u32)) {
+        let next = (self.src_size.0.min(max_size.0.max(2)), self.src_size.1.min(max_size.1.max(2)));
+        if next != self.blend_size {
+            self.blend_size = next;
+            self.slots.clear();
+            self.copied = None;
+        }
     }
 
     /// Blend `looks` a frame from now on: every frame being made started
@@ -1793,7 +1846,23 @@ impl FrameBlend {
                 let light = if self.blending {
                     use windows::Win32::Graphics::Direct3D11::{D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_DEFAULT};
                     let bind = (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32;
-                    let made = self.gpu.texture(self.size.0, self.size.1, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT, bind, D3D11_USAGE_DEFAULT, 0).and_then(|t| Ok((quad::target_view(&self.gpu, &t)?, quad::shader_view(&self.gpu, &t)?)));
+                    let made = self
+                        .gpu
+                        .texture(
+                            self.blend_size.0,
+                            self.blend_size.1,
+                            windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                            bind,
+                            D3D11_USAGE_DEFAULT,
+                            0,
+                        )
+                        .and_then(|t| {
+                            let rtv = quad::target_view(&self.gpu, &t)?;
+                            let srv = quad::shader_view(&self.gpu, &t)?;
+                            // Clear once so a first draw with weight 1 never multiplies uninitialised values by zero.
+                            unsafe { self.gpu.context.ClearRenderTargetView(&rtv, &[0.0, 0.0, 0.0, 1.0]) };
+                            Ok((rtv, srv))
+                        });
                     match made {
                         Ok(l) => Some(l),
                         Err(e) => {
@@ -1817,23 +1886,25 @@ impl FrameBlend {
     /// The capture's newest picture is the one that's up now (copied).
     fn hold(&mut self, quad: &quad::Quad, latest: &d3d::Latest) {
         self.flush(quad);
-        let (texture, view) = self.own[self.next_own].clone();
+        latest.sync_texture();
+        let (texture, srgb_view) = self.own[self.next_own].clone();
         self.next_own = (self.next_own + 1) % self.own.len();
         unsafe { self.gpu.context.CopyResource(&texture, &latest.texture) };
-        self.held = Seen { id: self.held.id + 1, texture, view, size: latest.content() };
+        self.held = Seen { id: self.held.id + 1, texture, srgb_view, size: latest.content() };
     }
 
     /// The same, for a picture the capture handed over whole.
     fn hold_queued(&mut self, quad: &quad::Quad, q: d3d::Queued) {
         self.flush(quad);
-        self.held = Seen { id: self.held.id + 1, texture: q.texture, view: q.view, size: q.size };
+        self.held = Seen { id: self.held.id + 1, texture: q.texture, srgb_view: q.srgb_view, size: q.size };
     }
 
     /// Add a look at the picture that's up to frame `k`'s average, by `weight`.
     fn add(&mut self, k: i64, weight: f32) {
         let held = self.held.clone();
+        let dst = quad::fit_within(held.size.0, held.size.1, self.blend_size.0, self.blend_size.1);
         if let Some(s) = self.slot_for(k) {
-            s.size = held.size;
+            s.size = dst;
             if s.weight + s.pending == 0.0 {
                 s.first = Some(held);
             }
@@ -1862,8 +1933,43 @@ impl FrameBlend {
     }
 
     /// Mix the looks at the picture that's up into the averages, at once
-    /// (another picture is coming up).
+    /// (another picture is coming up). When two blended frames are open at
+    /// once (soft blending), both are updated in a single draw.
     fn flush(&mut self, quad: &quad::Quad) {
+        if self.blending {
+            let mut ready = [usize::MAX; 2];
+            let mut pending_total = 0usize;
+            let mut with_light = 0usize;
+            for (i, s) in self.slots.iter().enumerate() {
+                if s.frame.is_some() && s.pending > 0.0 {
+                    pending_total += 1;
+                    if s.light.is_some() {
+                        if with_light < 2 {
+                            ready[with_light] = i;
+                        }
+                        with_light += 1;
+                    }
+                }
+            }
+            if pending_total == 2 && with_light == 2 {
+                let (i0, i1) = (ready[0], ready[1]);
+                let dst = quad::fit_within(self.held.size.0, self.held.size.1, self.blend_size.0, self.blend_size.1);
+                let mut prep = |idx: usize| -> f32 {
+                    let s = &mut self.slots[idx];
+                    let w = std::mem::take(&mut s.pending);
+                    let first = s.weight == 0.0;
+                    s.weight += w;
+                    s.area = if first { dst } else { (s.area.0.max(dst.0), s.area.1.max(dst.1)) };
+                    w / s.weight
+                };
+                let w0 = prep(i0);
+                let w1 = prep(i1);
+                if let (Some((t0, _)), Some((t1, _))) = (&self.slots[i0].light, &self.slots[i1].light) {
+                    quad.average_light_srgb_dual(&self.gpu, t0, t1, self.blend_size, dst, &self.held.srgb_view, self.src_size, self.held.size, w0, w1);
+                }
+                return;
+            }
+        }
         for i in 0..self.slots.len() {
             self.flush_slot(quad, i);
         }
@@ -1874,7 +1980,7 @@ impl FrameBlend {
     /// it before this one is made) wait for the next picture, so a next frame
     /// all of whose looks see this one is still this picture as it is.
     fn flush_slot(&mut self, quad: &quad::Quad, i: usize) {
-        let (size, held) = (self.size, &self.held);
+        let (src_size, blend_size, held) = (self.src_size, self.blend_size, &self.held);
         let s = &mut self.slots[i];
         if s.frame.is_none() || s.pending <= 0.0 {
             return;
@@ -1882,11 +1988,12 @@ impl FrameBlend {
         let weight = std::mem::take(&mut s.pending);
         let first = s.weight == 0.0;
         s.weight += weight;
-        let (w, h) = held.size;
-        s.area = if first { (w, h) } else { (s.area.0.max(w), s.area.1.max(h)) };
+        let dst = quad::fit_within(held.size.0, held.size.1, blend_size.0, blend_size.1);
+        s.area = if first { dst } else { (s.area.0.max(dst.0), s.area.1.max(dst.1)) };
         if let Some((target, _)) = &s.light {
-            // Mixing in by its share of the total so far keeps it the average.
-            quad.average_light(&self.gpu, target, size, &held.view, weight / s.weight, s.area);
+            // Mixing in by its share of the total so far keeps it the average,
+            // letting the graphics card turn sRGB into light on sampling.
+            quad.average_light_srgb(&self.gpu, target, blend_size, dst, &held.srgb_view, src_size, held.size, weight / s.weight);
         } else if !self.blending && s.first.as_ref().is_some_and(|f| f.id == held.id) {
             // One look a frame: the picture it saw, copied. The capture's
             // texture soon holds a later picture (its queue's are used in
@@ -1895,15 +2002,20 @@ impl FrameBlend {
             if s.kept.is_none() {
                 use windows::Win32::Graphics::Direct3D11::{D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_DEFAULT};
                 let bind = (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32;
-                match self.gpu.texture(size.0, size.1, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM, bind, D3D11_USAGE_DEFAULT, 0).and_then(|t| Ok((quad::shader_view(&self.gpu, &t)?, t))) {
-                    Ok((view, texture)) => s.kept = Some((texture, view)),
+                match self
+                    .gpu
+                    .texture(src_size.0, src_size.1, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_TYPELESS, bind, D3D11_USAGE_DEFAULT, 0)
+                    .and_then(|t| Ok((quad::shader_view_srgb(&self.gpu, &t)?, t)))
+                {
+                    Ok((srgb_view, texture)) => s.kept = Some((texture, srgb_view)),
                     Err(e) => eprintln_later!("frame timing: {e:#}"),
                 }
             }
-            if let Some((texture, view)) = &s.kept {
+            if let Some((texture, srgb_view)) = &s.kept {
+                let (w, h) = held.size;
                 let region = windows::Win32::Graphics::Direct3D11::D3D11_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 };
                 unsafe { self.gpu.context.CopySubresourceRegion(texture, 0, 0, 0, 0, &held.texture, 0, Some(&region)) };
-                s.first = Some(Seen { id: held.id, texture: texture.clone(), view: view.clone(), size: held.size });
+                s.first = Some(Seen { id: held.id, texture: texture.clone(), srgb_view: srgb_view.clone(), size: held.size });
             }
         }
     }
@@ -1915,7 +2027,8 @@ impl FrameBlend {
         let s = &self.slots[i];
         // One look a frame: the picture it saw, as it is. Or every look saw
         // the picture that's up, none's mixed in yet: that, as it is, no
-        // blending to do. Copied, unless the frame before was it too.
+        // blending to do. Copied 1:1 into `average` (which has room for full
+        // capture size), unless the frame before was it too.
         let one = if !self.blending { s.first.clone() } else { s.first.clone().filter(|_| s.weight == 0.0 && s.pending > 0.0) };
         let shown = match one {
             Some(seen) => {
@@ -1931,7 +2044,7 @@ impl FrameBlend {
                 self.flush_slot(quad, i);
                 let s = &self.slots[i];
                 if let Some((_, view)) = &s.light {
-                    quad.from_light(&self.gpu, &self.target, self.size, view, s.area);
+                    quad.to_srgb_into(&self.gpu, &self.target, self.src_size, view, self.blend_size, s.area);
                 }
                 self.copied = None;
                 s.size
@@ -2135,8 +2248,9 @@ impl Rate {
 
 struct BlendPacer {
     t0: f64,
-    /// Frames a second.
+    /// Frames a second, and the recording's output size.
     fps: u32,
+    out_size: (u32, u32),
     /// Seconds between looks (one over the blend rate), and looks per frame.
     step: f64,
     looks: i64,
@@ -2439,6 +2553,13 @@ impl BlendPacer {
     /// Once a frame, between pictures, never while one's being taken in
     /// (the sources keep their places in the list meanwhile).
     fn follow_layers(&mut self) {
+        let placement = *self.screen.lock().unwrap();
+        let need_size = self.stream.iter().fold(self.out_size, |(w, h), s| (w.max(s.size.0), h.max(s.size.1)));
+        let main = &mut self.sources[0];
+        let by_latest = desired_blend_size(&placement, main.latest.content(), main.blend.src_size, need_size);
+        let by_held = desired_blend_size(&placement, main.blend.held.size, main.blend.src_size, need_size);
+        main.blend.set_blend_size((by_latest.0.max(by_held.0), by_latest.1.max(by_held.1)));
+
         let Some(feeds) = self.feeds.clone() else { return };
         let want = feeds.frame_blended();
         let mut i = 1;
@@ -2480,7 +2601,7 @@ impl BlendPacer {
         // on it moves), each waking the pacer (which, measured, made
         // another display's pictures come in less evenly). It goes on
         // meanwhile, so it shows again at once, from its newest picture.
-        let main_shown = feeds.layers().iter().any(|l| matches!(l.source, crate::LayerSource::Main)) && !self.screen.lock().unwrap().hidden;
+        let main_shown = feeds.layers().iter().any(|l| matches!(l.source, crate::LayerSource::Main)) && !placement.hidden;
         let main = &mut self.sources[0];
         if main.shown != main_shown {
             main.shown = main_shown;
@@ -2861,6 +2982,7 @@ impl BlendStats {
 #[allow(clippy::too_many_arguments)]
 fn spawn_blend_pacer(
     fps: u32,
+    out_size: (u32, u32),
     looks: u32,
     shutter: crate::shutter::Shutter,
     latest: Arc<d3d::Latest>,
@@ -2886,6 +3008,7 @@ fn spawn_blend_pacer(
         let mut p = BlendPacer {
             t0,
             fps,
+            out_size,
             step: 1.0 / (fps.max(1) * looks.max(1)) as f64,
             looks: looks.max(1) as i64,
             shutter,
@@ -3723,9 +3846,9 @@ mod tests {
             let method = if duplication { "Desktop Duplication" } else { "Windows' capture" };
             // Kept until its picture's been looked at.
             let (dupl, wgc) = if duplication {
-                (Some(dupl::DuplCapture::start(&gpu, monitor, &latest, 30).unwrap()), None)
+                (Some(dupl::DuplCapture::start(&gpu, monitor, &latest, d3d::CaptureRate::new(30, 1)).unwrap()), None)
             } else {
-                (None, Some(d3d::Capture::start(&gpu, &d3d::monitor_item(monitor).unwrap(), &latest, d3d::Of::Display(monitor), 30).unwrap()))
+                (None, Some(d3d::Capture::start(&gpu, &d3d::monitor_item(monitor).unwrap(), &latest, d3d::Of::Display(monitor), d3d::CaptureRate::new(30, 1)).unwrap()))
             };
             let deadline = Instant::now() + Duration::from_secs(3);
             while !latest.has_frame() {
@@ -3765,7 +3888,7 @@ mod tests {
         let (cx, cy) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
         let gpu = d3d::Gpu::new().unwrap();
         let latest = d3d::Latest::new(&gpu, w, h).unwrap();
-        let capture = d3d::Capture::start(&gpu, &d3d::monitor_item(monitor).unwrap(), &latest, d3d::Of::Display(monitor), 30).unwrap();
+        let capture = d3d::Capture::start(&gpu, &d3d::monitor_item(monitor).unwrap(), &latest, d3d::Of::Display(monitor), d3d::CaptureRate::new(30, 1)).unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
         while !latest.has_frame() {
             assert!(Instant::now() < deadline, "no picture");
@@ -3872,7 +3995,7 @@ mod tests {
         let gpu = d3d::Gpu::for_capture().unwrap();
         let latest = d3d::Latest::new(&gpu, 1920, 1080).unwrap();
         let config = AppsConfig { ids: vec!["hook_target.exe".into()], away_when_unfocused: false, hook: crate::GameHook { auto: !wgc, allowed: Vec::new() } };
-        let video = Video::follow_apps(gpu.clone(), latest.clone(), Arc::new(std::sync::Mutex::new(config)), 60, None);
+        let video = Video::follow_apps(gpu.clone(), latest.clone(), Arc::new(std::sync::Mutex::new(config)), d3d::CaptureRate::new(60, 1), None);
         // Where the white bar is across the picture's bottom half (blue), if
         // it shows: it moves 200 px a second while the game's picture comes.
         // Counting new pictures doesn't tell: the cursor moving brings some.
@@ -3928,5 +4051,294 @@ mod tests {
             let when = i as f64 * EVERY;
             assert!(moved * 3 >= of, "after its {what} was made anew at {when:.0} s: frozen (the bar moved {moved} times in {of} looks)");
         }
+    }
+
+    /// GPU benchmark for 1 second of 60 fps recording at 1440p -> 1080p
+    /// with 8x (480 fps) frame blending: measures signature polling, copy overhead,
+    /// and Even/Soft blending GPU+CPU time.
+    #[test]
+    #[ignore = "GPU benchmark: cargo test --release -p capture bench_blend_pipeline -- --ignored --nocapture"]
+    fn bench_blend_pipeline() {
+        let gpu = d3d::Gpu::new().unwrap();
+        let (cap_w, cap_h) = (2560u32, 1440u32);
+        let (out_w, out_h) = (1920u32, 1080u32);
+        let latest = d3d::Latest::new(&gpu, cap_w, cap_h).unwrap();
+        let quad = quad::Quad::new(&gpu).unwrap();
+        let bind = (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32;
+        // 8 distinct BGRA_TYPELESS source textures (2560x1440) cycling like a 480 fps game.
+        let mut srcs = Vec::new();
+        for i in 0..8u32 {
+            let t = gpu
+                .texture(cap_w, cap_h, windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_TYPELESS, bind, D3D11_USAGE_DEFAULT, 0)
+                .unwrap();
+            let rtv = quad::target_view(&gpu, &t).unwrap();
+            let srv = quad::shader_view(&gpu, &t).unwrap();
+            let srgb = quad::shader_view_srgb(&gpu, &t).unwrap();
+            let v = (i as f32 + 1.0) / 9.0;
+            unsafe { gpu.context.ClearRenderTargetView(&rtv, &[v, v * 0.5, 1.0 - v, 1.0]) };
+            srcs.push((t, srv, srgb));
+        }
+        gpu.wait_idle().unwrap();
+
+        // 1. Hook signature polling (1 second at 480 fps blend).
+        let polls = hook::reads_per_second(d3d::CaptureRate::new(60, 8)) as usize;
+        let mut changes = changes::Changes::new(&gpu, cap_w, cap_h, 1.0 / 960.0).unwrap();
+        let latest_rtv = quad::target_view(&gpu, &latest.texture).unwrap();
+        let t_sig = Instant::now();
+        for p in 0..polls {
+            if let Some((slot, pic, _)) = changes.slot(&gpu) {
+                let (ref src_t, ref src_srv, _) = srcs[(p / 3) % srcs.len()];
+                changes.read(&gpu, &quad, slot, src_srv, (cap_w, cap_h), (100, 100), &mut || {
+                    unsafe { gpu.context.CopyResource(&pic.texture, src_t) };
+                    Some((cap_w, cap_h))
+                });
+            }
+            changes.resolve(&gpu, &latest, &latest_rtv, &mut |_, _| {});
+        }
+        let sig_submit = t_sig.elapsed();
+        gpu.wait_idle().unwrap();
+        let sig_total = t_sig.elapsed();
+        eprintln!(
+            "BENCH signature+predicated-copy ({polls} polls/s): submit {:.2} ms, GPU+CPU total {:.2} ms ({:.1}% of 1s)",
+            sig_submit.as_secs_f64() * 1000.0,
+            sig_total.as_secs_f64() * 1000.0,
+            sig_total.as_secs_f64() * 100.0
+        );
+
+        // 2. FrameBlend Even (60 frames x 8 unique pictures = 480 blends, 1440p -> 1080p).
+        let mut blend = FrameBlend::new_sized(&gpu, &latest, 8, (out_w, out_h)).unwrap();
+        for k in -2..=0i64 {
+            for j in 0..8usize {
+                let (ref t, _, ref srgb) = srcs[(j) % srcs.len()];
+                blend.hold_queued(&quad, d3d::Queued { texture: t.clone(), srgb_view: srgb.clone(), size: (cap_w, cap_h), at: 0.0 });
+                blend.add(k, 1.0);
+            }
+            blend.finish(&quad, k);
+        }
+        gpu.wait_idle().unwrap();
+
+        let t_even = Instant::now();
+        for k in 1..=60i64 {
+            for j in 0..8usize {
+                let (ref t, _, ref srgb) = srcs[(k as usize + j) % srcs.len()];
+                blend.hold_queued(&quad, d3d::Queued { texture: t.clone(), srgb_view: srgb.clone(), size: (cap_w, cap_h), at: 0.0 });
+                blend.add(k, 1.0);
+            }
+            blend.finish(&quad, k);
+        }
+        let even_submit = t_even.elapsed();
+        gpu.wait_idle().unwrap();
+        let even_total = t_even.elapsed();
+        eprintln!(
+            "BENCH FrameBlend Even (60x8 = 480 pics/s, 1440p->1080p): submit {:.2} ms, GPU+CPU total {:.2} ms ({:.1}% of 1s)",
+            even_submit.as_secs_f64() * 1000.0,
+            even_total.as_secs_f64() * 1000.0,
+            even_total.as_secs_f64() * 100.0
+        );
+
+        // 3. FrameBlend Soft (60 frames x 8 unique pictures, 2 open slots per picture, 1440p -> 1080p).
+        let shutter = crate::shutter::Shutter::new(8, crate::BlendShape::Soft);
+        let mut blend_soft = FrameBlend::new_sized(&gpu, &latest, 8, (out_w, out_h)).unwrap();
+        let t_soft = Instant::now();
+        let mut m = shutter.first_look(0);
+        for k in 0..60i64 {
+            let last = shutter.last_look(k);
+            while m <= last {
+                let (ref t, _, ref srgb) = srcs[(m as usize) % srcs.len()];
+                blend_soft.hold_queued(&quad, d3d::Queued { texture: t.clone(), srgb_view: srgb.clone(), size: (cap_w, cap_h), at: 0.0 });
+                let (first, w) = shutter.split(m);
+                if first >= 0 && w[0] > 0.0 {
+                    blend_soft.add(first, w[0]);
+                }
+                if first + 1 >= 0 && w[1] > 0.0 {
+                    blend_soft.add(first + 1, w[1]);
+                }
+                m += 1;
+            }
+            blend_soft.finish(&quad, k);
+        }
+        let soft_submit = t_soft.elapsed();
+        gpu.wait_idle().unwrap();
+        let soft_total = t_soft.elapsed();
+        eprintln!(
+            "BENCH FrameBlend Soft (60x8 = 480 pics/s, 2 targets in one draw, 1440p->1080p): submit {:.2} ms, GPU+CPU total {:.2} ms ({:.1}% of 1s)",
+            soft_submit.as_secs_f64() * 1000.0,
+            soft_total.as_secs_f64() * 1000.0,
+            soft_total.as_secs_f64() * 100.0
+        );
+    }
+
+    /// Verify RGB accuracy across 8-sample linear-light blending with downscaling.
+    #[test]
+    fn rgb_blend_precision() {
+        let Ok(gpu) = d3d::Gpu::new() else {
+            return;
+        };
+        let latest = d3d::Latest::new(&gpu, 16, 16).unwrap();
+        let quad = quad::Quad::new(&gpu).unwrap();
+        let target = quad::target_view(&gpu, &latest.texture).unwrap();
+        let mut blend = FrameBlend::new_sized(&gpu, &latest, 8, (8, 8)).unwrap();
+        let to_lin = |c: f64| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+        let from_lin = |c: f64| if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+        let samples = [0.0f32, 0.15, 0.3, 0.45, 0.6, 0.75, 0.9, 1.0];
+        let mut sum = [0.0f64; 3];
+        for (idx, &v) in samples.iter().enumerate() {
+            let rgb = [v, 1.0 - v, (idx as f32 * 0.13) % 1.0];
+            unsafe { gpu.context.ClearRenderTargetView(&target, &[rgb[0], rgb[1], rgb[2], 1.0]) };
+            blend.hold(&quad, &latest);
+            blend.add(0, 1.0);
+            for ch in 0..3 {
+                sum[ch] += to_lin(rgb[ch] as f64);
+            }
+        }
+        blend.finish(&quad, 0);
+        assert_eq!(blend.average.content(), (8, 8));
+        let px = pixel(&gpu, &blend.average, 0, 0);
+        let got = [px[2], px[1], px[0]]; // BGRA -> RGB
+        for ch in 0..3 {
+            let exp = (from_lin(sum[ch] / samples.len() as f64) * 255.0).round() as u8;
+            assert!(got[ch].abs_diff(exp) <= 1, "channel {ch}: got {}, expected {exp} (bgra={px:?})", got[ch]);
+        }
+    }
+
+    /// Without blending, capture rates stay at 4x the frame rate; with blending,
+    /// they scale more gently while never dropping below 4x the frame rate.
+    #[test]
+    fn capture_rate_keeps_unblended_at_4x() {
+        let off = d3d::CaptureRate::new(60, 1);
+        assert_eq!(off.wgc_updates_per_second(), 240.0);
+        assert_eq!(off.hook_copies_per_second(), 240.0);
+        assert_eq!(off.hook_reads_per_second(), 240.0);
+        assert_eq!(off.dupl_asks_per_second(), 240.0);
+
+        let off_360 = d3d::CaptureRate::new(360, 1);
+        assert_eq!(off_360.hook_copies_per_second(), 1440.0);
+        assert_eq!(off_360.hook_reads_per_second(), 1440.0);
+        assert_eq!(off_360.dupl_asks_per_second(), 1440.0);
+
+        let off_600 = d3d::CaptureRate::new(600, 1);
+        assert_eq!(off_600.hook_copies_per_second(), 2400.0);
+        assert_eq!(off_600.hook_reads_per_second(), 2400.0);
+        assert_eq!(off_600.dupl_asks_per_second(), 2400.0);
+
+        let blend4 = d3d::CaptureRate::new(60, 4);
+        assert_eq!(blend4.wgc_updates_per_second(), 540.0);
+        assert_eq!(blend4.hook_copies_per_second(), 408.0);
+        assert_eq!(blend4.hook_reads_per_second(), 600.0);
+        assert_eq!(blend4.dupl_asks_per_second(), 600.0);
+
+        // Above 1200 looks/s, desktop duplication still asks at least once per look.
+        let blend_high = d3d::CaptureRate::new(240, 8);
+        assert_eq!(blend_high.dupl_asks_per_second(), 1920.0);
+    }
+
+    /// Output-size blending only applies when the screen placement is uncropped,
+    /// upright, unzoomed, and either `Fit` or `Fill`/`Stretch` matching the
+    /// picture's actual shape.
+    #[test]
+    fn blend_size_follows_placement_changes() {
+        let src = (2560, 1440);
+        let out = (1920, 1080);
+        let fit = crate::ScreenPlacement::whole(crate::Framing::Fit);
+        assert_eq!(desired_blend_size(&fit, src, src, out), out);
+        // Never shrinks below half an axis so bilinear stays a proper 2x2 average.
+        assert_eq!(desired_blend_size(&fit, (3840, 2160), (3840, 2160), (1280, 720)), (1920, 1080));
+        // Fit on a different aspect ratio still shrinks cleanly without upscaling.
+        assert_eq!(desired_blend_size(&fit, src, src, (1080, 1920)), (1280, 1440));
+        // Same aspect ratio Fill and Stretch can still blend at output size.
+        let fill = crate::ScreenPlacement::whole(crate::Framing::Fill);
+        assert_eq!(desired_blend_size(&fill, src, src, out), out);
+        let stretch = crate::ScreenPlacement::whole(crate::Framing::Stretch);
+        assert_eq!(desired_blend_size(&stretch, src, src, out), out);
+        // Different aspect ratio Fill or Stretch must stay full size.
+        assert_eq!(desired_blend_size(&fill, src, src, (1080, 1080)), src);
+        assert_eq!(desired_blend_size(&stretch, src, src, (1080, 1920)), src);
+        // Window content with a different aspect ratio inside a 16:9 texture box stays full size.
+        assert_eq!(desired_blend_size(&fill, (1280, 1024), src, out), src);
+        assert_eq!(desired_blend_size(&stretch, (1280, 1024), src, out), src);
+        // Crop, sideways turn, or zoomed box must stay full size.
+        let cropped = crate::ScreenPlacement { crop: Some(crate::Crop { w: 1920, h: 1080, at: None }), ..fit };
+        assert_eq!(desired_blend_size(&cropped, src, src, out), src);
+        let turned = crate::ScreenPlacement { turns: 1, ..fit };
+        assert_eq!(desired_blend_size(&turned, src, src, out), src);
+        let zoomed = crate::ScreenPlacement { rect: [0.0, 0.0, 1.5, 1.5], ..fit };
+        assert_eq!(desired_blend_size(&zoomed, src, src, out), src);
+    }
+
+    /// Direct-to-pool frames still keep `show_still`/`restore` and `snapshot`
+    /// fresh when the UI preview isn't running.
+    #[test]
+    fn sync_texture_keeps_still_and_snapshot_fresh() {
+        let Ok(gpu) = d3d::Gpu::new() else {
+            return;
+        };
+        let latest = d3d::Latest::new(&gpu, 16, 16).unwrap();
+        latest.set_wants_queue(true);
+        let slot = latest.take_pool_slot().unwrap();
+        unsafe { gpu.context.ClearRenderTargetView(&slot.target, &[0.0, 1.0, 0.0, 1.0]) };
+        latest.push_queued(slot, (16, 16), 1.0);
+        // `snapshot` sees the direct-to-pool green frame immediately, before any still.
+        let queued_shot = latest.snapshot().unwrap().finish().unwrap();
+        assert_eq!(&queued_shot.bgra[..4], &[0, 255, 0, 255], "snapshot sees the direct-to-pool green frame");
+        // Push a fresh queued slot again so `texture_stale` is true before `show_still`.
+        let slot2 = latest.take_pool_slot().unwrap();
+        unsafe { gpu.context.ClearRenderTargetView(&slot2.target, &[0.0, 1.0, 0.0, 1.0]) };
+        latest.push_queued(slot2, (16, 16), 2.0);
+        // `show_still` saves the green frame via `sync_texture`, covers it with red, then `restore` brings green back.
+        let red = crate::StillImage { width: 16, height: 16, bgra: [0, 0, 255, 255].repeat(256) };
+        latest.show_still(&red).unwrap();
+        assert_eq!(pixel(&gpu, &latest, 0, 0), [0, 0, 255, 255]);
+        let shot = latest.snapshot().unwrap().finish().unwrap();
+        assert_eq!(&shot.bgra[..4], &[0, 0, 255, 255], "snapshot sees the newer still, not an older queued slot");
+        assert!(latest.restore());
+        assert_eq!(pixel(&gpu, &latest, 0, 0), [0, 255, 0, 255], "restore brings back the direct-to-pool green frame");
+    }
+
+    /// The sparse signature (every 2nd column, every 4th row) catches a 2 px
+    /// vertical line immediately without waiting for `FORCE_AFTER`.
+    #[test]
+    fn signature_catches_2px_vertical_line() {
+        let Ok(gpu) = d3d::Gpu::new() else {
+            return;
+        };
+        let (w, h) = (320u32, 180u32);
+        let latest = d3d::Latest::new(&gpu, w, h).unwrap();
+        let latest_rtv = quad::target_view(&gpu, &latest.texture).unwrap();
+        let quad = quad::Quad::new(&gpu).unwrap();
+        let bind = (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32;
+        let tex = gpu.texture(w, h, DXGI_FORMAT_B8G8R8A8_UNORM, bind, D3D11_USAGE_DEFAULT, 0).unwrap();
+        let rtv = quad::target_view(&gpu, &tex).unwrap();
+        let srv = quad::shader_view(&gpu, &tex).unwrap();
+        let mut changes = changes::Changes::new(&gpu, w, h, 1.0 / 240.0).unwrap();
+
+        // Frame 1: solid black.
+        unsafe { gpu.context.ClearRenderTargetView(&rtv, &[0.0, 0.0, 0.0, 1.0]) };
+        let (s0, p0, _) = changes.slot(&gpu).unwrap();
+        changes.read(&gpu, &quad, s0, &srv, (w, h), (0, 0), &mut || {
+            unsafe { gpu.context.CopyResource(&p0.texture, &tex) };
+            Some((w, h))
+        });
+        gpu.wait_idle().unwrap();
+        changes.resolve(&gpu, &latest, &latest_rtv, &mut |_, _| {});
+        let after_first = latest.arrivals().0;
+
+        // Frame 2: draw a thin 2 px wide vertical white line.
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 100..102 {
+                let off = ((y * w + x) * 4) as usize;
+                px[off..off + 4].copy_from_slice(&[255, 255, 255, 255]);
+            }
+        }
+        unsafe { gpu.context.UpdateSubresource(&tex, 0, None, px.as_ptr().cast(), w * 4, 0) };
+        let (s1, p1, _) = changes.slot(&gpu).unwrap();
+        changes.read(&gpu, &quad, s1, &srv, (w, h), (0, 0), &mut || {
+            unsafe { gpu.context.CopyResource(&p1.texture, &tex) };
+            Some((w, h))
+        });
+        unsafe { gpu.context.Flush() };
+        gpu.wait_idle().unwrap();
+        changes.resolve(&gpu, &latest, &latest_rtv, &mut |_, _| {});
+        assert!(latest.arrivals().0 > after_first, "signature missed a 2 px vertical line");
     }
 }

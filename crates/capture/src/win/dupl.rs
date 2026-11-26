@@ -36,7 +36,7 @@ use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 use windows::core::Interface;
 
-use super::d3d::{Gpu, Latest, Shared};
+use super::d3d::{CaptureRate, Gpu, Latest, Shared};
 use super::quad::{Placement, Quad, fit_within};
 
 /// How a display is captured (see [`crate::ScreenCapture`]).
@@ -177,7 +177,7 @@ impl DuplCapture {
     /// Start, and wait for the first picture: a duplication that can't start
     /// or sees nothing fails here, for Windows Graphics Capture to be used
     /// instead.
-    pub(crate) fn start(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, fps: u32) -> Result<Self> {
+    pub(crate) fn start(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, rate: CaptureRate) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let ended = Arc::new(Mutex::new(None));
         let last_picture = Arc::new(Mutex::new(Instant::now()));
@@ -188,7 +188,7 @@ impl DuplCapture {
             // On time, like the pacer: a picture taken late is timed late.
             super::system::multimedia_thread("Capture");
             let monitor = monitor;
-            let result = run(&gpu, monitor.0, &latest, fps, &stop2, &last_picture2, &ready_tx);
+            let result = run(&gpu, monitor.0, &latest, rate, &stop2, &last_picture2, &ready_tx);
             if let Err(e) = &result {
                 eprintln!("desktop duplication: {e:#}");
                 let _ = ready_tx.send(Err(format!("{e:#}")));
@@ -332,12 +332,9 @@ impl Drop for DuplCapture {
     }
 }
 
-/// How often to ask for a new picture, for `fps` looks a second: four times
-/// per look (as Windows Graphics Capture's limit, and the game capture hook's
-/// copies), so when each came up is known to a quarter of a look, but at most
-/// 2400 a second. Asking hands over only what's new, with when it came up.
-fn asks_per_second(fps: u32) -> f64 {
-    (4.0 * fps.max(1) as f64).min(2400.0)
+/// How often to ask for a new picture (see [`CaptureRate::dupl_asks_per_second`]).
+fn asks_per_second(rate: CaptureRate) -> f64 {
+    rate.dupl_asks_per_second()
 }
 
 /// After the display's picture or mode changes under it (a game going
@@ -346,7 +343,7 @@ fn asks_per_second(fps: u32) -> f64 {
 /// until Desktop Duplication can start (see `Video::follow_screen`).
 const RESTART_FOR: Duration = Duration::from_secs(10);
 
-fn run(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, fps: u32, stop: &AtomicBool, last_picture: &Mutex<Instant>, ready: &std::sync::mpsc::Sender<Result<(), String>>) -> Result<()> {
+fn run(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, rate: CaptureRate, stop: &AtomicBool, last_picture: &Mutex<Instant>, ready: &std::sync::mpsc::Sender<Result<(), String>>) -> Result<()> {
     super::system::com_init();
     // Needed for the newer duplication call, and for the cursor's position
     // in the display's real pixels.
@@ -364,7 +361,8 @@ fn run(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, fps: u32, stop: &Atom
         if d.turns > 0 { format!(", turned {}°", d.turns * 90) } else { String::new() },
         d.hdr.map_or(String::new(), |s| format!(", HDR (SDR white at {:.0} nits)", 80.0 / s))
     );
-    let every = Duration::from_secs_f64(1.0 / asks_per_second(fps));
+    let lps = rate.looks_per_second().max(1);
+    let every = Duration::from_secs_f64(1.0 / asks_per_second(rate));
     // A still screen is asked only often enough that a new picture is noticed
     // in time for its frame (see `BLEND_LATE`): it's timed by when it came
     // up, however late it's noticed. Asking at the full rate finds nothing
@@ -374,7 +372,7 @@ fn run(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, fps: u32, stop: &Atom
     // as between those asks: a game showing pictures faster than that, two
     // could come between asks and one be lost.
     let still_every = every.max(Duration::from_secs_f64(super::BLEND_LATE / 2.0));
-    let still_after = Duration::from_secs_f64(1.0 / fps.max(1) as f64).max(2 * still_every);
+    let still_after = Duration::from_secs_f64(1.0 / lps as f64).max(2 * still_every);
     let mut changed = Instant::now();
     let mut next = Instant::now();
     let mut first = true;
@@ -386,7 +384,7 @@ fn run(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, fps: u32, stop: &Atom
     // cursor moving counts as one for frame blending (a still screen): a
     // guess, as for the game capture hook, two frames' looks.
     let mut last_new = 0.0;
-    let quiet = 2.0 / fps.max(1) as f64;
+    let quiet = 2.0 / lps as f64;
     // When this duplication started (again), for its first picture's timeout.
     let mut started = Instant::now();
     // When the duplication stopped working (it was lost, or one started again
@@ -496,8 +494,6 @@ fn run(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, fps: u32, stop: &Atom
             last_cursor = Some((pos.x, pos.y));
             changed = Instant::now();
             let at = got.unwrap_or_else(super::system::host_now);
-            let drawn = draw(gpu, &quad, &target, latest, texture, view, &d);
-            cursor.draw_on_screen(gpu, &quad, latest, &target, d.origin, d.size, drawn);
             // The same picture with the cursor moved only counts as a new one
             // for frame blending once nothing else has changed for a while (a
             // still screen), as with the game capture hook: else a moving
@@ -506,8 +502,20 @@ fn run(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, fps: u32, stop: &Atom
             if counts {
                 last_new = at;
             }
-            latest.mark(drawn, at, counts);
-            unsafe { gpu.context.Flush() };
+            if counts
+                && latest.wants_queue()
+                && let Ok(pool_slot) = latest.take_pool_slot()
+            {
+                let drawn = draw_into(gpu, &quad, &pool_slot.texture, &pool_slot.target, (latest.width, latest.height), texture, view, &d);
+                cursor.draw_on_screen(gpu, &quad, latest, &pool_slot.target, d.origin, d.size, drawn);
+                latest.push_queued(pool_slot, drawn, at);
+                unsafe { gpu.context.Flush() };
+            } else {
+                let drawn = draw_into(gpu, &quad, &latest.texture, &target, (latest.width, latest.height), texture, view, &d);
+                cursor.draw_on_screen(gpu, &quad, latest, &target, d.origin, d.size, drawn);
+                latest.mark(drawn, at, counts);
+                unsafe { gpu.context.Flush() };
+            }
             if got.is_some() {
                 counted.2 += 1;
             } else {
@@ -596,16 +604,15 @@ fn copy_frame(
     Ok((texture, view))
 }
 
-/// Draw the held picture into `latest`, upright, in SDR: a 16-bit float one
-/// is light (an HDR desktop's, or a fullscreen game's that scans out in it),
-/// whatever the display said when the duplication started. Shrunk to fit,
-/// keeping its shape, when the display has grown bigger than `latest` (its
-/// mode changed after the capture started). Its size there.
-fn draw(
+/// Draw (or directly copy when unrotated SDR and 1:1) the held picture into
+/// `dest_tex`/`target`, upright, in SDR.
+#[allow(clippy::too_many_arguments)]
+fn draw_into(
     gpu: &Gpu,
     quad: &Quad,
+    dest_tex: &ID3D11Texture2D,
     target: &windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView,
-    latest: &Latest,
+    dest_size: (u32, u32),
     texture: &ID3D11Texture2D,
     view: &windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
     d: &Duplication,
@@ -613,7 +620,13 @@ fn draw(
     let mut desc = windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC::default();
     unsafe { texture.GetDesc(&mut desc) };
     let light = desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
-    let (w, h) = fit_within(d.size.0, d.size.1, latest.width, latest.height);
+    let (w, h) = fit_within(d.size.0, d.size.1, dest_size.0, dest_size.1);
+    // Unrotated SDR at 1:1 size: plain GPU copy skips a full-screen pixel shader.
+    if !light && d.turns == 0 && (w, h) == (desc.Width, desc.Height) && desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM {
+        let region = windows::Win32::Graphics::Direct3D11::D3D11_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 };
+        unsafe { gpu.context.CopySubresourceRegion(dest_tex, 0, 0, 0, 0, texture, 0, Some(&region)) };
+        return (w, h);
+    }
     let at = Placement {
         dest: [0.0, 0.0, w as f32, h as f32],
         uv: [0.0, 0.0, 1.0, 1.0],
@@ -622,9 +635,9 @@ fn draw(
     };
     if light {
         // SDR white at white: an SDR desktop's light is 1 at white already.
-        quad.draw_hdr(gpu, target, (latest.width, latest.height), view, &at, d.hdr.unwrap_or(1.0));
+        quad.draw_hdr(gpu, target, dest_size, view, &at, d.hdr.unwrap_or(1.0));
     } else {
-        quad.draw(gpu, target, (latest.width, latest.height), view, &at, true);
+        quad.draw(gpu, target, dest_size, view, &at, true);
     }
     (w, h)
 }
@@ -686,10 +699,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn asks_four_times_per_look_up_to_a_limit() {
-        assert_eq!(asks_per_second(60), 240.0);
-        assert_eq!(asks_per_second(600), 2400.0);
-        assert_eq!(asks_per_second(0), 4.0);
+    fn asks_per_look_up_to_a_limit() {
+        assert_eq!(asks_per_second(CaptureRate::new(60, 1)), 240.0);
+        assert_eq!(asks_per_second(CaptureRate::new(360, 1)), 1440.0);
+        assert_eq!(asks_per_second(CaptureRate::new(600, 1)), 2400.0);
+        assert_eq!(asks_per_second(CaptureRate::new(60, 4)), 600.0);
+        assert_eq!(asks_per_second(CaptureRate::new(60, 10)), 1200.0);
+        assert_eq!(asks_per_second(CaptureRate::new(0, 1)), 4.0);
     }
 
     /// The lock screen's refusal is told apart from other failures, through
