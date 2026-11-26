@@ -1808,13 +1808,16 @@ impl FrameBlend {
     /// Change the size of the float light averages (when screen placement,
     /// window shape, or stream size changes while recording): drops in-flight
     /// slots and recreates them lazily (one or two repeated frames on a flip,
-    /// as with [`Self::set_looks`]).
+    /// as with [`Self::set_looks`]). With one look a frame nothing is made at
+    /// that size, so nothing in flight is dropped.
     fn set_blend_size(&mut self, max_size: (u32, u32)) {
         let next = (self.src_size.0.min(max_size.0.max(2)), self.src_size.1.min(max_size.1.max(2)));
         if next != self.blend_size {
             self.blend_size = next;
-            self.slots.clear();
-            self.copied = None;
+            if self.blending {
+                self.slots.clear();
+                self.copied = None;
+            }
         }
     }
 
@@ -2028,17 +2031,25 @@ impl FrameBlend {
         // One look a frame: the picture it saw, as it is. Or every look saw
         // the picture that's up, none's mixed in yet: that, as it is, no
         // blending to do. Copied 1:1 into `average` (which has room for full
-        // capture size), unless the frame before was it too.
+        // capture size), unless the frame before was it too. Blending, it's
+        // shrunk to the blended frames' size as they are (filtered as light):
+        // frames of one picture and of several then come out alike, to the
+        // converter and to a stream averaging them together.
         let one = if !self.blending { s.first.clone() } else { s.first.clone().filter(|_| s.weight == 0.0 && s.pending > 0.0) };
         let shown = match one {
             Some(seen) => {
+                let dst = if self.blending { quad::fit_within(seen.size.0, seen.size.1, self.blend_size.0, self.blend_size.1) } else { seen.size };
                 if self.copied != Some(seen.id) {
-                    let (w, h) = seen.size;
-                    let region = windows::Win32::Graphics::Direct3D11::D3D11_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 };
-                    unsafe { self.gpu.context.CopySubresourceRegion(&self.average.texture, 0, 0, 0, 0, &seen.texture, 0, Some(&region)) };
+                    if dst == seen.size {
+                        let (w, h) = seen.size;
+                        let region = windows::Win32::Graphics::Direct3D11::D3D11_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 };
+                        unsafe { self.gpu.context.CopySubresourceRegion(&self.average.texture, 0, 0, 0, 0, &seen.texture, 0, Some(&region)) };
+                    } else {
+                        quad.to_srgb_scaled(&self.gpu, &self.target, self.src_size, dst, &seen.srgb_view, self.src_size, seen.size);
+                    }
                     self.copied = Some(seen.id);
                 }
-                seen.size
+                dst
             }
             None => {
                 self.flush_slot(quad, i);
@@ -2554,12 +2565,6 @@ impl BlendPacer {
     /// (the sources keep their places in the list meanwhile).
     fn follow_layers(&mut self) {
         let placement = *self.screen.lock().unwrap();
-        let need_size = self.stream.iter().fold(self.out_size, |(w, h), s| (w.max(s.size.0), h.max(s.size.1)));
-        let main = &mut self.sources[0];
-        let by_latest = desired_blend_size(&placement, main.latest.content(), main.blend.src_size, need_size);
-        let by_held = desired_blend_size(&placement, main.blend.held.size, main.blend.src_size, need_size);
-        main.blend.set_blend_size((by_latest.0.max(by_held.0), by_latest.1.max(by_held.1)));
-
         let Some(feeds) = self.feeds.clone() else { return };
         let want = feeds.frame_blended();
         let mut i = 1;
@@ -2697,6 +2702,19 @@ impl BlendPacer {
         }
     }
 
+    /// The size the recording's own capture is blended at, for the screen's
+    /// placement the converter is about to use (see `desired_blend_size`).
+    /// Right before a frame is made: a placement that changed since (a crop
+    /// or zoom put on by a scene switch) never meets a frame blended small.
+    fn follow_blend_size(&mut self) {
+        let placement = *self.screen.lock().unwrap();
+        let need_size = self.stream.iter().fold(self.out_size, |(w, h), s| (w.max(s.size.0), h.max(s.size.1)));
+        let main = &mut self.sources[0];
+        let by_latest = desired_blend_size(&placement, main.latest.content(), main.blend.src_size, need_size);
+        let by_held = desired_blend_size(&placement, main.blend.held.size, main.blend.src_size, need_size);
+        main.blend.set_blend_size((by_latest.0.max(by_held.0), by_latest.1.max(by_held.1)));
+    }
+
     /// Frame `k` is done: encode it.
     fn close(&mut self, k: i64) {
         self.closed = k;
@@ -2723,6 +2741,7 @@ impl BlendPacer {
         // frames wants every one, else those at its frames' times.
         let blending = self.looks > 1;
         let streams_want = self.stream.iter().any(|s| s.wants(k, blending));
+        self.follow_blend_size();
         match self.encoder.pool.take() {
             Some(slot) => {
                 self.finish_sources(k);
@@ -4201,8 +4220,10 @@ mod tests {
         }
     }
 
-    /// Without blending, capture rates stay at 4x the frame rate; with blending,
-    /// they scale more gently while never dropping below 4x the frame rate.
+    /// Without blending, capture rates stay at 4x the frame rate; with
+    /// blending, the hook copies a whole number of times per look (two, or
+    /// one past 600 looks a second) and looks at its copy once more per look
+    /// than that; Windows' capture stays at 4x the looks.
     #[test]
     fn capture_rate_keeps_unblended_at_4x() {
         let off = d3d::CaptureRate::new(60, 1);
@@ -4222,10 +4243,23 @@ mod tests {
         assert_eq!(off_600.dupl_asks_per_second(), 2400.0);
 
         let blend4 = d3d::CaptureRate::new(60, 4);
-        assert_eq!(blend4.wgc_updates_per_second(), 540.0);
-        assert_eq!(blend4.hook_copies_per_second(), 408.0);
-        assert_eq!(blend4.hook_reads_per_second(), 600.0);
+        assert_eq!(blend4.wgc_updates_per_second(), 960.0);
+        assert_eq!(blend4.hook_copies_per_second(), 480.0);
+        assert_eq!(blend4.hook_reads_per_second(), 720.0);
         assert_eq!(blend4.dupl_asks_per_second(), 600.0);
+
+        // (looks, copies, reads): copies always a whole multiple of the looks.
+        for (rate, copies, reads) in [
+            (d3d::CaptureRate::new(30, 8), 480.0, 720.0),
+            (d3d::CaptureRate::new(60, 8), 960.0, 1440.0),
+            (d3d::CaptureRate::new(120, 4), 960.0, 1440.0),
+            (d3d::CaptureRate::new(60, 16), 960.0, 1920.0),
+            (d3d::CaptureRate::new(120, 16), 1920.0, 2400.0),
+        ] {
+            assert_eq!(rate.hook_copies_per_second(), copies, "{rate:?}");
+            assert_eq!(rate.hook_reads_per_second(), reads, "{rate:?}");
+            assert_eq!(rate.hook_copies_per_second() % rate.looks_per_second() as f64, 0.0, "{rate:?}");
+        }
 
         // Above 1200 looks/s, desktop duplication still asks at least once per look.
         let blend_high = d3d::CaptureRate::new(240, 8);
@@ -4340,5 +4374,79 @@ mod tests {
         gpu.wait_idle().unwrap();
         changes.resolve(&gpu, &latest, &latest_rtv, &mut |_, _| {});
         assert!(latest.arrivals().0 > after_first, "signature missed a 2 px vertical line");
+    }
+
+    /// The signature's slanted samples catch a line a pixel thin in any
+    /// column or row at once (every remainder of 8 each way), not only
+    /// after `FORCE_AFTER`.
+    #[test]
+    fn signature_catches_thin_lines_anywhere() {
+        let Ok(gpu) = d3d::Gpu::new() else {
+            return;
+        };
+        let (w, h) = (320u32, 180u32);
+        let quad = quad::Quad::new(&gpu).unwrap();
+        let bind = (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32;
+        let tex = gpu.texture(w, h, DXGI_FORMAT_B8G8R8A8_UNORM, bind, D3D11_USAGE_DEFAULT, 0).unwrap();
+        let rtv = quad::target_view(&gpu, &tex).unwrap();
+        let srv = quad::shader_view(&gpu, &tex).unwrap();
+        let columns = (0..8u32).map(|n| (format!("1 px column at x={}", 101 + n), (0..h).map(|y| (101 + n, y)).collect::<Vec<_>>()));
+        let rows = (0..8u32).map(|n| (format!("1 px row at y={}", 61 + n), (0..w).map(|x| (x, 61 + n)).collect::<Vec<_>>()));
+        for (what, pixels) in columns.chain(rows) {
+            let latest = d3d::Latest::new(&gpu, w, h).unwrap();
+            let latest_rtv = quad::target_view(&gpu, &latest.texture).unwrap();
+            let mut changes = changes::Changes::new(&gpu, w, h, 1.0 / 240.0).unwrap();
+            // Black, then the line on it.
+            unsafe { gpu.context.ClearRenderTargetView(&rtv, &[0.0, 0.0, 0.0, 1.0]) };
+            let (s0, p0, _) = changes.slot(&gpu).unwrap();
+            changes.read(&gpu, &quad, s0, &srv, (w, h), (0, 0), &mut || {
+                unsafe { gpu.context.CopyResource(&p0.texture, &tex) };
+                Some((w, h))
+            });
+            gpu.wait_idle().unwrap();
+            changes.resolve(&gpu, &latest, &latest_rtv, &mut |_, _| {});
+            let after_first = latest.arrivals().0;
+            let mut px = [0u8, 0, 0, 255].repeat((w * h) as usize);
+            for (x, y) in pixels {
+                let off = ((y * w + x) * 4) as usize;
+                px[off..off + 4].copy_from_slice(&[255, 255, 255, 255]);
+            }
+            unsafe { gpu.context.UpdateSubresource(&tex, 0, None, px.as_ptr().cast(), w * 4, 0) };
+            let (s1, p1, _) = changes.slot(&gpu).unwrap();
+            changes.read(&gpu, &quad, s1, &srv, (w, h), (0, 0), &mut || {
+                unsafe { gpu.context.CopyResource(&p1.texture, &tex) };
+                Some((w, h))
+            });
+            gpu.wait_idle().unwrap();
+            changes.resolve(&gpu, &latest, &latest_rtv, &mut |_, _| {});
+            assert!(latest.arrivals().0 > after_first, "the signature missed a {what}");
+        }
+    }
+
+    /// Blending at a smaller size than the capture's, a frame every look of
+    /// which saw one picture comes out at that size too, as the blended
+    /// frames beside it do (a stream averaging frames of both kinds, or the
+    /// converter scaling them, would otherwise get two sizes).
+    #[test]
+    fn one_picture_frame_matches_blend_size() {
+        let Ok(gpu) = d3d::Gpu::new() else {
+            return;
+        };
+        let latest = d3d::Latest::new(&gpu, 16, 16).unwrap();
+        let quad = quad::Quad::new(&gpu).unwrap();
+        let target = quad::target_view(&gpu, &latest.texture).unwrap();
+        let mut blend = FrameBlend::new_sized(&gpu, &latest, 4, (8, 8)).unwrap();
+        unsafe { gpu.context.ClearRenderTargetView(&target, &[0.2, 0.6, 0.9, 1.0]) };
+        blend.hold(&quad, &latest);
+        for _ in 0..4 {
+            blend.add(0, 1.0);
+        }
+        blend.finish(&quad, 0);
+        assert_eq!(blend.average.content(), (8, 8));
+        let px = pixel(&gpu, &blend.average, 3, 3);
+        let want = [230u8, 153, 51];
+        for c in 0..3 {
+            assert!(px[c].abs_diff(want[c]) <= 1, "channel {c}: got {px:?}, want {want:?}");
+        }
     }
 }

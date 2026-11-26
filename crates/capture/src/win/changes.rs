@@ -59,9 +59,10 @@ const FORCE_AFTER: f64 = 0.1;
 /// would be too old to belong in a frame anyway, and a driver that loses an
 /// answer must not hold the ring for good.
 const GIVE_UP: f64 = 0.25;
-/// The signature reads every this many rows (and every other column in
-/// `ps_signature`: one texel in eight, four times fewer reads than before).
-const SIGNATURE_ROWS: u32 = 4;
+/// The signature reads one texel in this many, on a slant (see
+/// `ps_signature`): every row and every column has some, so a line a pixel
+/// thin and this long is never missed.
+const SIGNATURE_EVERY: u32 = 8;
 /// The comparison's size, in blocks.
 const BLOCKS: (u32, u32) = (80, 45);
 
@@ -140,10 +141,6 @@ pub(crate) struct Changes {
     last_new: f64,
     /// How long without a new picture before the cursor moving counts as one.
     quiet: f64,
-    /// Batch `Flush()` calls across rapid looks so we don't submit a tiny
-    /// GPU command buffer on every single look.
-    polls_since_flush: u32,
-    last_flush: f64,
     /// `HASTECLIP_HOOK_LOG=1`: looks, new pictures, comparisons dropped unread,
     /// looks skipped for a full ring, and the most that were waiting, since
     /// `counted.0`.
@@ -169,8 +166,6 @@ impl Changes {
             last_new: 0.0,
             // A guess: four looks, two game pictures at the blend rate.
             quiet: look_every * 4.0,
-            polls_since_flush: 0,
-            last_flush: 0.0,
             counted: (std::time::Instant::now(), 0, 0, 0, 0, 0),
         })
     }
@@ -253,7 +248,7 @@ impl Changes {
         let _lock = gpu.exclusive();
         let at = host_now();
         let slot = &self.ring[i];
-        quad.signature(gpu, &slot.signature.0, BLOCKS, source, source_size, SIGNATURE_ROWS);
+        quad.signature(gpu, &slot.signature.0, BLOCKS, source, source_size, SIGNATURE_EVERY);
         let forced = at - self.last_new.max(self.last_forced) > FORCE_AFTER;
         let (check, before, size) = match self.before {
             // (Compared by signature, `before`'s size is the source's.)
@@ -273,12 +268,10 @@ impl Changes {
             }
             None => (Check::First, at, copy()),
         };
-        self.polls_since_flush += 1;
-        if self.polls_since_flush >= 2 || at - self.last_flush >= 0.0015 {
-            unsafe { gpu.context.Flush() };
-            self.polls_since_flush = 0;
-            self.last_flush = at;
-        }
+        // Sent now: the signature reads the game's picture when the graphics
+        // card runs it, and the look is timed `at` (one held back to the next
+        // look's flush was seen up to a look late, timed early).
+        unsafe { gpu.context.Flush() };
         let Some(size) = size else { return };
         self.push(Pending { slot: i, at, before, size, cursor, check }, source_size);
     }
@@ -380,6 +373,7 @@ impl Changes {
                 draw_cursor(&pool_slot.target, p.size);
                 latest.push_queued(pool_slot, p.size, at);
             } else {
+                latest.begin_write();
                 unsafe { gpu.context.CopySubresourceRegion(&latest.texture, 0, 0, 0, 0, &self.ring[slot].picture.texture, 0, Some(&region)) };
                 draw_cursor(latest_target, p.size);
                 latest.mark(p.size, at, counts);

@@ -50,14 +50,16 @@ float4 ps_diff(V i) : SV_Target {
     return float4(most, most, most, 1);
 }
 // A picture's signature: in each block of `area.z` texels square (within
-// `area.xy`), sums of every other texel of every `area.w`-th row, plain and
-// weighted by where in the block it is, so that anything moving or changing
-// within a block changes them while reading far fewer texels per look.
+// `area.xy`), sums of one texel in `area.w`, on a slant across the picture
+// (where x + 3y is a multiple of it: every row and every column has some, so
+// a thin line is never between them), plain and weighted by where in the
+// block it is, so that anything moving or changing within a block changes them.
 float4 ps_signature(V i) : SV_Target {
     int2 origin = int2(i.pos.xy) * (int)area.z;
+    int every = (int)area.w;
     float4 sum = 0;
-    [loop] for (int y = 0; y < (int)area.z; y += (int)area.w) {
-        [loop] for (int x = 0; x < (int)area.z; x += 2) {
+    [loop] for (int y = 0; y < (int)area.z; y++) {
+        [loop] for (int x = (every - (origin.x + 3 * (origin.y + y)) % every) % every; x < (int)area.z; x += every) {
             int2 at = origin + int2(x, y);
             if (at.x < (int)area.x && at.y < (int)area.y) {
                 float3 c = image.Load(int3(at, 0)).rgb * 255;
@@ -398,6 +400,25 @@ impl Quad {
         self.run(gpu, target, dst_size, source, &scaled(area, src_size, area), Shader::FromLight, None);
     }
 
+    /// Draw `src_area` of an sRGB view `source` (of a texture of `src_size`)
+    /// shrunk into the top-left `dst_area` of `target` (of `dst_size`), the
+    /// way a blended frame is: the graphics card turns it into light as it
+    /// samples, it's filtered as light and turned back into sRGB. A frame of
+    /// one picture then matches the blended ones beside it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn to_srgb_scaled(
+        &self,
+        gpu: &Gpu,
+        target: &ID3D11RenderTargetView,
+        dst_size: (u32, u32),
+        dst_area: (u32, u32),
+        source: &ID3D11ShaderResourceView,
+        src_size: (u32, u32),
+        src_area: (u32, u32),
+    ) {
+        self.run(gpu, target, dst_size, source, &scaled(dst_area, src_size, src_area), Shader::FromLight, None);
+    }
+
     /// Whether `now` and `before` (both `size` valid, as big as their
     /// textures) differ: drawn into `target` (`out` pixels), each pixel the
     /// largest colour difference in a block of them, nonzero where they do.
@@ -407,10 +428,10 @@ impl Quad {
     }
 
     /// `source`'s signature (`size` of it valid) into `target` (`out` pixels,
-    /// a float texture): see `ps_signature`. Reads every `rows`-th row.
-    pub(crate) fn signature(&self, gpu: &Gpu, target: &ID3D11RenderTargetView, out: (u32, u32), source: &ID3D11ShaderResourceView, size: (u32, u32), rows: u32) {
+    /// a float texture): see `ps_signature`. Reads one texel in `every`.
+    pub(crate) fn signature(&self, gpu: &Gpu, target: &ID3D11RenderTargetView, out: (u32, u32), source: &ID3D11ShaderResourceView, size: (u32, u32), every: u32) {
         let block = size.0.div_ceil(out.0).max(size.1.div_ceil(out.1)).max(1);
-        self.blocks(gpu, target, out, &self.ps_signature, source, None, [size.0 as f32, size.1 as f32, block as f32, rows.max(1) as f32]);
+        self.blocks(gpu, target, out, &self.ps_signature, source, None, [size.0 as f32, size.1 as f32, block as f32, every.max(1) as f32]);
     }
 
     /// Draws into `target` (`out` pixels, its contents of no use) only where

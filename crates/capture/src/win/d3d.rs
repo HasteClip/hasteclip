@@ -53,24 +53,42 @@ impl CaptureRate {
         Self::new((v >> 32) as u32, v as u32)
     }
 
+    /// Windows' capture: four times the looks a second, blending or not.
+    /// It delivers well under its limit when that's near the look rate
+    /// (measured: at twice a 60 fps recording's rate it gave 44 frames a
+    /// second), and never more than the display's refresh rate anyway.
     pub(crate) fn wgc_updates_per_second(self) -> f64 {
-        (4.0 * self.fps as f64).max(2.25 * self.looks_per_second() as f64)
+        4.0 * self.looks_per_second() as f64
+    }
+
+    /// With blending, the hook copies a whole number of times per look (two,
+    /// or one past 600 looks a second): the copies then fall the same way
+    /// against every look, and each look's picture is as far from the last
+    /// one's as the looks are. A share like 1.7 beats against the looks
+    /// (gaps of one copy and of two), and the motion in a frame comes out
+    /// uneven.
+    fn copies_per_look(self) -> f64 {
+        (1200.0 / self.looks_per_second() as f64).floor().clamp(1.0, 2.0)
     }
 
     pub(crate) fn hook_copies_per_second(self) -> f64 {
-        let base = 4.0 * self.fps as f64;
         if self.looks <= 1 {
-            base
+            4.0 * self.fps as f64
         } else {
-            let lps = self.looks_per_second() as f64;
-            base.max(1.7 * lps).min(1200.0).max(lps)
+            self.copies_per_look() * self.looks_per_second() as f64
         }
     }
 
+    /// Looks at the hook's copy: without blending, four per frame as before;
+    /// with blending, once more per look than the copies (three for two),
+    /// so the looks never fall in step with the copies.
     pub(crate) fn hook_reads_per_second(self) -> f64 {
         let lps = self.looks_per_second() as f64;
-        let cap = if self.looks <= 1 { 2400.0 } else { 1200.0 };
-        (4.0 * self.fps as f64).max(2.5 * lps).min(cap).max(2.0 * lps)
+        if self.looks <= 1 {
+            (4.0 * lps).min(2400.0).max(2.0 * lps)
+        } else {
+            ((self.copies_per_look() + 1.0) * lps).min(2400.0)
+        }
     }
 
     pub(crate) fn dupl_asks_per_second(self) -> f64 {
@@ -452,7 +470,10 @@ impl Latest {
     pub(crate) fn take_pool_slot(&self) -> Result<PoolSlot> {
         let mut pool = self.pool.lock().unwrap();
         if pool.0.is_empty() {
+            // All of them or none: a pool left part-made would be indexed
+            // past its end on the next call.
             let bind = (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32;
+            let mut made = Vec::with_capacity(POOL);
             for _ in 0..POOL {
                 let texture = self.gpu.texture(
                     self.width,
@@ -464,8 +485,9 @@ impl Latest {
                 )?;
                 let target = super::quad::target_view(&self.gpu, &texture)?;
                 let srgb_view = super::quad::shader_view_srgb(&self.gpu, &texture)?;
-                pool.0.push(PoolSlot { texture, target, srgb_view });
+                made.push(PoolSlot { texture, target, srgb_view });
             }
+            pool.0 = made;
         }
         let i = pool.1;
         pool.1 = (i + 1) % POOL;
@@ -481,13 +503,18 @@ impl Latest {
         *self.content.lock().unwrap() = size;
         self.waiting.store(false, Ordering::Release);
         self.has_frame.store(true, Ordering::Release);
-        *self.newest_queued.lock().unwrap() = Some((slot.texture.clone(), size));
-        if crate::preview::wants_frame() {
-            let region = D3D11_BOX { left: 0, top: 0, front: 0, right: size.0, bottom: size.1, back: 1 };
-            unsafe { self.gpu.context.CopySubresourceRegion(&self.texture, 0, 0, 0, 0, &slot.texture, 0, Some(&region)) };
-            self.texture_stale.store(false, Ordering::Release);
-        } else {
-            self.texture_stale.store(true, Ordering::Release);
+        {
+            // Under the lock `sync_texture` and `begin_write` take, so the
+            // slot and whether `texture` lags it always go together.
+            let mut newest = self.newest_queued.lock().unwrap();
+            *newest = Some((slot.texture.clone(), size));
+            if crate::preview::wants_frame() {
+                let region = D3D11_BOX { left: 0, top: 0, front: 0, right: size.0, bottom: size.1, back: 1 };
+                unsafe { self.gpu.context.CopySubresourceRegion(&self.texture, 0, 0, 0, 0, &slot.texture, 0, Some(&region)) };
+                self.texture_stale.store(false, Ordering::Release);
+            } else {
+                self.texture_stale.store(true, Ordering::Release);
+            }
         }
         if self.wants_queue() {
             let mut q = self.queue.lock().unwrap();
@@ -503,16 +530,32 @@ impl Latest {
     /// Bring `self.texture` up to date with the newest queued picture, if a
     /// direct-to-pool push skipped copying into it.
     pub(crate) fn sync_texture(&self) {
-        if !self.texture_stale.load(Ordering::Acquire) || !self.texture_stale.swap(false, Ordering::AcqRel) {
+        if !self.texture_stale.load(Ordering::Acquire) {
             return;
         }
-        if let Some((tex, size)) = self.newest_queued.lock().unwrap().clone()
+        // The lock first, held across the copy: a capture writing `texture`
+        // itself waits in `begin_write` till this copy is on its way, so its
+        // newer picture lands after it, not under it.
+        let newest = self.newest_queued.lock().unwrap();
+        if !self.texture_stale.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        if let Some((tex, size)) = newest.as_ref()
             && size.0 > 0
             && size.1 > 0
         {
             let region = D3D11_BOX { left: 0, top: 0, front: 0, right: size.0.min(self.width), bottom: size.1.min(self.height), back: 1 };
-            unsafe { self.gpu.context.CopySubresourceRegion(&self.texture, 0, 0, 0, 0, &tex, 0, Some(&region)) };
+            unsafe { self.gpu.context.CopySubresourceRegion(&self.texture, 0, 0, 0, 0, tex, 0, Some(&region)) };
         }
+    }
+
+    /// A picture is about to be written into `texture` itself (not through
+    /// the pool): what the pool's newest holds is older from now on, so a
+    /// reader's [`Self::sync_texture`] must not copy it over the new one.
+    pub(crate) fn begin_write(&self) {
+        let mut newest = self.newest_queued.lock().unwrap();
+        *newest = None;
+        self.texture_stale.store(false, Ordering::Release);
     }
 
     /// Copy the picture now in `texture` into the queue.
@@ -583,11 +626,10 @@ impl Latest {
             }
         }
         let region = D3D11_BOX { left: 0, top: 0, front: 0, right: image.width, bottom: image.height, back: 1 };
+        self.begin_write();
         unsafe {
             self.gpu.context.UpdateSubresource(&self.texture, 0, Some(&region), image.bgra.as_ptr().cast(), image.width * 4, 0);
         }
-        *self.newest_queued.lock().unwrap() = None;
-        self.texture_stale.store(false, Ordering::Release);
         *self.content.lock().unwrap() = (image.width, image.height);
         self.waiting.store(true, Ordering::Release);
         self.has_frame.store(true, Ordering::Release);
@@ -600,9 +642,8 @@ impl Latest {
     pub(crate) fn restore(&self) -> bool {
         let saved = self.saved.lock().unwrap();
         let Some((copy, size)) = saved.as_ref().filter(|(_, s)| s.0 > 0) else { return false };
+        self.begin_write();
         unsafe { self.gpu.context.CopyResource(&self.texture, copy) };
-        *self.newest_queued.lock().unwrap() = None;
-        self.texture_stale.store(false, Ordering::Release);
         *self.content.lock().unwrap() = *size;
         self.waiting.store(false, Ordering::Release);
         self.note_frame();
@@ -626,9 +667,8 @@ impl Latest {
     pub(crate) fn upload_bgra(&self, data: *const u8, pitch: u32, width: u32, height: u32) {
         let (w, h) = (width.min(self.width), height.min(self.height));
         let region = D3D11_BOX { left: 0, top: 0, front: 0, right: w, bottom: h, back: 1 };
+        self.begin_write();
         unsafe { self.gpu.context.UpdateSubresource(&self.texture, 0, Some(&region), data.cast(), pitch, 0) };
-        *self.newest_queued.lock().unwrap() = None;
-        self.texture_stale.store(false, Ordering::Release);
         *self.content.lock().unwrap() = (w, h);
         self.waiting.store(false, Ordering::Release);
         self.has_frame.store(true, Ordering::Release);
@@ -670,14 +710,13 @@ impl Latest {
 
     /// Show black, as a full-size frame.
     pub(crate) fn clear(&self) -> Result<()> {
+        self.begin_write();
         unsafe {
             let mut view = None;
             self.gpu.device.CreateRenderTargetView(&self.texture, None, Some(&mut view))?;
             let view = view.context("no render target view")?;
             self.gpu.context.ClearRenderTargetView(&view, &[0.0, 0.0, 0.0, 1.0]);
         }
-        *self.newest_queued.lock().unwrap() = None;
-        self.texture_stale.store(false, Ordering::Release);
         *self.content.lock().unwrap() = (self.width, self.height);
         self.waiting.store(true, Ordering::Release);
         self.has_frame.store(true, Ordering::Release);
@@ -874,6 +913,7 @@ impl Overlay {
     /// `clean` up into `latest`, with the cursor drawn on it.
     fn put_up(&mut self, gpu: &Gpu, latest: &Latest) {
         self.sync_clean(gpu, latest);
+        latest.begin_write();
         let target = self.target.clone();
         self.put_up_into(gpu, latest, &latest.texture, &target, true);
     }
@@ -1011,8 +1051,12 @@ impl Capture {
                 // a pooled texture rather than through `clean` and `latest`.
                 // Publish while still holding `overlay` so the cursor ticker
                 // cannot copy an older slot in the gap before `push_queued`.
-                if latest2.wants_queue() && fitted == (w, h) {
-                    let slot = latest2.take_pool_slot()?;
+                // (No pool texture to be had: the old way, as hook and Desktop
+                // Duplication do, which says why once.)
+                if latest2.wants_queue()
+                    && fitted == (w, h)
+                    && let Ok(slot) = latest2.take_pool_slot()
+                {
                     match overlay.as_mut() {
                         None => {
                             unsafe { gpu2.context.CopySubresourceRegion(&slot.texture, 0, 0, 0, 0, &tex, 0, Some(&region)) };
@@ -1037,7 +1081,10 @@ impl Capture {
                     return Ok(true);
                 }
                 // Into `latest`, or kept without the cursor, to go up into
-                // `latest` with the cursor drawn on it.
+                // `latest` with the cursor drawn on it (`put_up` says so then).
+                if overlay.is_none() {
+                    latest2.begin_write();
+                }
                 let into = overlay.as_ref().map_or(&latest2.texture, |o| &o.clean);
                 if fitted == (w, h) {
                     unsafe { gpu2.context.CopySubresourceRegion(into, 0, 0, 0, 0, &tex, 0, Some(&region)) };
@@ -1094,11 +1141,10 @@ impl Capture {
         let stop = Arc::new(AtomicBool::new(false));
         let ticker = overlay.map(|overlay| {
             let (gpu, latest, last_frame, stop) = (gpu.clone(), latest.clone(), last_frame.clone(), stop.clone());
-            // Cap still-screen cursor polling at 120 Hz (or the recording's own
-            // frame rate if higher) so high blend rates don't wake this thread
-            // nearly 1000 times a second while keeping unblended high-fps unchanged.
-            let hz = rate.looks_per_second().min(120.max(rate.fps)).max(1);
-            let every = std::time::Duration::from_secs_f64(1.0 / hz as f64);
+            // As often as the looks: a cursor moving over a still screen is
+            // blended like a game's picture (a wake-up costs little; a copy
+            // is only made when the cursor moved).
+            let every = std::time::Duration::from_secs_f64(1.0 / rate.looks_per_second().max(1) as f64);
             // The same picture with the cursor moved counts as a new one for
             // frame blending only once nothing else has come for a while (a
             // still screen), as with Desktop Duplication: else a moving cursor

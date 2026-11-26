@@ -511,6 +511,7 @@ fn run(gpu: &Gpu, monitor: HMONITOR, latest: &Arc<Latest>, rate: CaptureRate, st
                 latest.push_queued(pool_slot, drawn, at);
                 unsafe { gpu.context.Flush() };
             } else {
+                latest.begin_write();
                 let drawn = draw_into(gpu, &quad, &latest.texture, &target, (latest.width, latest.height), texture, view, &d);
                 cursor.draw_on_screen(gpu, &quad, latest, &target, d.origin, d.size, drawn);
                 latest.mark(drawn, at, counts);
