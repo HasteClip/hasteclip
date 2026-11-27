@@ -26,12 +26,52 @@ pub fn is_on() -> bool {
 /// Start with the computer, or not.
 pub fn set(on: bool) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    // A build from the source folder isn't the installed app: starting it with the computer
-    // would launch the developer's build, so only turning it off is allowed there.
-    if on && exe.components().any(|c| c.as_os_str() == "target") {
-        return Err("only the installed app can start with the computer".into());
+    // Only turning it off is allowed from a copy that isn't the installed app.
+    if on && let Some(why) = not_installed(&exe) {
+        return Err(why.into());
     }
     imp::set(on, &exe)
+}
+
+/// Why `exe` can't be what starts with the computer, if it can't. A build
+/// from the source folder isn't the installed app: starting it with the
+/// computer would launch the developer's build. A Mac app opened straight
+/// from its disk image, or from where it was downloaded (macOS runs that
+/// from a copy of its own), won't be there when you next log in.
+fn not_installed(exe: &std::path::Path) -> Option<&'static str> {
+    if exe.components().any(|c| c.as_os_str() == "target") {
+        return Some("only the installed app can start with the computer");
+    }
+    if cfg!(target_os = "macos") && (exe.starts_with("/Volumes") || exe.components().any(|c| c.as_os_str() == "AppTranslocation")) {
+        return Some("move HasteClip to Applications first");
+    }
+    None
+}
+
+/// A new install's first launch (see `RecordSettings::autostart_pending`):
+/// HasteClip starts with the computer from now on, in the tray, as a clipper
+/// only saves what happens while it runs. It's the one time the entry changes
+/// without the switch being flipped, besides uninstalling on Windows (the
+/// installer's hook, in `main`, takes it away). Not on a Linux desktop without a
+/// tray: started there, it would open its window every time you log in.
+/// Whether that's settled: not while this copy isn't the installed app (a
+/// build of your own, a Mac app opened from its disk image), so the
+/// installed one does it the first time it's opened.
+pub fn new_install() -> bool {
+    let Ok(exe) = std::env::current_exe() else { return true };
+    if let Some(why) = not_installed(&exe) {
+        crate::logfile::tell(&format!("Not starting with the computer yet: {why}"));
+        return false;
+    }
+    if !crate::tray::available() {
+        crate::logfile::tell("Not starting with the computer: there's no tray here to start in");
+        return true;
+    }
+    match imp::set(true, &exe) {
+        Ok(()) => eprintln!("A new install: \"{}\" is on", label()),
+        Err(e) => crate::logfile::tell(&format!("Couldn't start with the computer: {e}")),
+    }
+    true
 }
 
 #[cfg(windows)]
@@ -118,5 +158,25 @@ mod imp {
         );
         std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
         std::fs::write(path, desktop).map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// Only the installed app starts with the computer: not a build of your
+    /// own, nor a Mac app opened from its disk image or from Downloads.
+    #[test]
+    fn only_the_installed_app_starts_with_the_computer() {
+        assert!(not_installed(Path::new("/home/me/hasteclip/target/release/hasteclip")).is_some());
+        assert!(not_installed(Path::new(r"C:\Users\me\AppData\Local\HasteClip\current\hasteclip.exe")).is_none());
+        assert!(not_installed(Path::new("/Applications/HasteClip.app/Contents/MacOS/hasteclip")).is_none());
+        assert!(not_installed(Path::new("/home/me/Apps/HasteClip/hasteclip")).is_none());
+        let mac = cfg!(target_os = "macos");
+        assert_eq!(not_installed(Path::new("/Volumes/HasteClip/HasteClip.app/Contents/MacOS/hasteclip")).is_some(), mac);
+        let downloaded = "/private/var/folders/x1/abc/T/AppTranslocation/0F1E/d/HasteClip.app/Contents/MacOS/hasteclip";
+        assert_eq!(not_installed(Path::new(downloaded)).is_some(), mac);
     }
 }

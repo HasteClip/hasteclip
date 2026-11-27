@@ -80,8 +80,8 @@ The first time you record or open **Sources**, your desktop asks which screen to
 
 ## Getting started
 
-1. **Open HasteClip.** Clipping starts right away. It keeps the last minute in memory, and nothing is written to your drive until you save.
-2. **Play.** When something happens, press <kbd>Alt</kbd> + <kbd>F10</kbd> (<kbd>Option</kbd> + <kbd>F10</kbd> on macOS). You can also say **“HasteClip that”** if a microphone is set up.
+1. **Open HasteClip.** Clipping starts right away. It keeps the last minute in memory, and nothing is written to your drive until you save. From then on it starts with your computer, in the tray or menu bar, ready before you play (on Linux, if your desktop has a tray). *Settings → App* turns that off.
+2. **Play.** When something happens, press <kbd>Alt</kbd> + <kbd>F10</kbd> (<kbd>Option</kbd> + <kbd>F10</kbd> on macOS). You can also say **“HasteClip that”** once you turn on *Save by voice* in *Settings → Clipping*.
 3. **Find it in your library.** The clip lands under *Today*, in its game's folder. Click it to watch, then **Edit** to trim it or **Share** to send it.
 
 Then make it yours:
@@ -95,7 +95,7 @@ Clips are saved in a `hasteclip` folder in your Videos folder (Movies on macOS),
 
 ### Clip and record
 
-- **Replay buffer.** It keeps the last 5 seconds to 1 hour in memory. Save it with a shortcut, or by voice: “HasteClip that” is recognised on your computer and never sent anywhere.
+- **Replay buffer.** It keeps the last 5 seconds to 1 hour in memory. Save it with a shortcut, or by voice once you turn it on: “HasteClip that” is recognised on your computer and never sent anywhere.
 - **Clips named after the play.** “3 kills on Mirage”, “Pentakill as Jinx”, “412pp FC”: clips of Counter-Strike 2, Dota 2, League of Legends and osu! are named after what happened. Other games' clips are named by the time.
 - **Recording.** Record straight to disk for as long as you like. A crash or power loss still leaves a playable file.
 - **Go live.** Stream to Twitch, YouTube, Kick or a server of your own, to several at once, at a size, frame rate and bitrate of the stream's own, frame blending and all. Clipping and recording go on beside it, all from one capture.
