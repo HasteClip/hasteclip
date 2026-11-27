@@ -35,7 +35,7 @@ use windows::Win32::System::Pipes::{ConnectNamedPipe, CreateNamedPipeW, PIPE_REA
 use windows::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor, GetWindowThreadProcessId};
 use windows::core::PCWSTR;
 
-use super::d3d::{Gpu, Latest};
+use super::d3d::{CaptureRate, Gpu, Latest};
 use super::quad::{Placement, Quad, fit_within};
 
 /// The hook's files, next to the app (`game-hook\`), or in `target\game-hook`
@@ -277,7 +277,7 @@ pub(crate) struct HookCapture {
 }
 
 impl HookCapture {
-    pub(crate) fn start(gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32) -> Result<Self> {
+    pub(crate) fn start(gpu: &Gpu, window: HWND, latest: &Arc<Latest>, rate: CaptureRate) -> Result<Self> {
         let dir = files().context("the game capture hook's files aren't there")?.to_path_buf();
         let stop = Arc::new(AtomicBool::new(false));
         let ended = Arc::new(Mutex::new(None));
@@ -288,7 +288,7 @@ impl HookCapture {
             // picture late, and it can land in the frame after its own.
             super::system::multimedia_thread("Capture");
             let window = window;
-            let result = run(&dir, &gpu, window.0, &latest, fps, &stop2);
+            let result = run(&dir, &gpu, window.0, &latest, rate, &stop2);
             let reason = match result {
                 Ok(()) => "stopped".to_owned(),
                 Err(e) => {
@@ -321,7 +321,7 @@ impl Drop for HookCapture {
 /// frame. (A guess; OBS retries forever.)
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop: &AtomicBool) -> Result<()> {
+fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, rate: CaptureRate, stop: &AtomicBool) -> Result<()> {
     super::system::com_init();
     // The cursor's position and the window's size in physical pixels.
     unsafe {
@@ -394,19 +394,18 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
         thread::sleep(Duration::from_millis(50));
     };
     let hook_info = info.ptr::<HookInfo>();
+    // Without blending, copy at up to four times the frame rate as before;
+    // with blending, scale more gently (~1.7x the look rate, capped at 1200/s,
+    // never under one per look) so high blend rates don't force the game's
+    // hook to copy every frame.
+    let interval = (1_000_000_000.0 / rate.hook_copies_per_second()) as u64;
     unsafe {
         (*hook_info).offsets = offsets(is64);
         (*hook_info).capture_overlay = false;
         (*hook_info).force_shmem = false;
         (*hook_info).unused_use_scale = false;
         (*hook_info).allow_srgb_alias = true;
-        // Copy at most four times per look (`fps` is looks a second): copying
-        // every frame of a game running at thousands of fps would cost it.
-        // Twice (as OBS does) left a game at twice the rate right on the
-        // limit, where its timing noise decides which pictures get copied:
-        // a 600 fps game recorded at 300 came out in steps of 1 and 3
-        // pictures as well as 2.
-        (*hook_info).frame_interval = 1_000_000_000 / (4 * fps.max(1) as u64);
+        (*hook_info).frame_interval = interval;
     }
     let event = |name: &str| open_event(&format!("{name}{pid}")).with_context(|| format!("the hook has no {name} event"));
     let (hook_stop, hook_init, hook_exit) = (event("CaptureHook_Stop")?, event("CaptureHook_Initialize")?, event("CaptureHook_Exit")?);
@@ -419,18 +418,24 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
     let mut noticed = None;
     // Already capturing for someone else (a preview closing as a recording
     // starts, or OBS): its picture, until the hook starts over.
-    let mut source: Option<Source> = opened.and_then(|_| Source::open(gpu, unsafe { &*hook_info }, window).ok());
+    let mut source: Option<Source> = opened.and_then(|_| Source::open(gpu, unsafe { &*hook_info }, window).ok().flatten());
     if let Some(s) = &source {
         eprintln!("game hook: capturing {}×{} ({}), already running", s.cx, s.cy, s.kind());
     }
-    // Nothing yet a few seconds in (a hook that stopped capturing, and
-    // wasn't asked to start again): asking it to stop makes it start over.
+    // Nothing yet a few seconds in, from a hook that has a picture this
+    // couldn't open: asking it to stop makes it start over. (Not one that's
+    // still coming up, slow to hook OpenGL (3-7 s seen here): it'd keep the
+    // stop and let go of its first picture for it.)
     let mut nudged = false;
+    // The picture (its number) the hook was last asked to start over from
+    // because the window it copies from was gone (see `Source::orphaned`):
+    // asked once.
+    let mut restarted: Option<u32> = None;
     let quad = Quad::new(gpu)?;
     let target = super::quad::target_view(gpu, &latest.texture)?;
     let mut cursor = super::cursor::CursorLayer::new();
-    let every = Duration::from_secs_f64(1.0 / reads_per_second(fps));
-    let mut changes = super::changes::Changes::new(gpu, latest.width, latest.height, 1.0 / (2.0 * fps.max(1) as f64))?;
+    let every = Duration::from_secs_f64(1.0 / reads_per_second(rate));
+    let mut changes = super::changes::Changes::new(gpu, latest.width, latest.height, 1.0 / (2.0 * rate.looks_per_second().max(1) as f64))?;
     let mut next = Instant::now();
     let result = loop {
         if stop.load(Ordering::Relaxed) {
@@ -439,24 +444,48 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
         if process.signalled() || hook_exit.signalled() {
             break Ok(());
         }
+        // The game made the window it draws in anew (a video restart, a map
+        // change): the hook is still on the old one, which no picture will
+        // come from again (see `Source::orphaned`). Asked to stop, it lets go
+        // of it at the game's next frame and starts over on the window that
+        // frame is drawn in, a new picture this capture opens, or the one
+        // that follows the game to its new window does. Whatever else keeps
+        // it going too: it's as stuck for them.
+        if let Some(s) = &source
+            && restarted != Some(s.number)
+            && s.orphaned(pid)
+        {
+            eprintln!("game hook: the window it copied the game from is gone (the game made it anew, as on a video restart, or is closing); starting it over on the window the game draws in now");
+            restarted = Some(s.number);
+            let _ = unsafe { SetEvent(hook_stop.0) };
+        }
         if !super::system::window_alive(window) {
             break Ok(());
         }
+        keep_pace(hook_info, interval);
         // A new picture to copy from: the first, or the hook started over
         // (the game resized or reset its graphics, or a capturer asked).
         let number = picture_number(hook_info).filter(|n| opened != Some(*n));
         if number.is_some() && number == noticed {
             opened = number;
-            source = None;
             match Source::open(gpu, unsafe { &*hook_info }, window) {
-                Ok(s) => {
+                Ok(Some(s)) => {
                     eprintln!("game hook: capturing {}×{} ({}) after {:.1?}", s.cx, s.cy, s.kind(), began.elapsed());
                     source = Some(s);
                 }
+                // Gone already: the hook let go of it since and is starting
+                // over on another (a stop it was sent before this picture
+                // was up, which it keeps till it has one: OBS sends one each
+                // time it stops capturing). That one is opened once it's up,
+                // the last picture kept meanwhile. (This was taken for
+                // another graphics card than ours, and the capture went
+                // through the CPU for good.)
+                Ok(None) => {}
                 Err(e) if !unsafe { (*hook_info).force_shmem } => {
                     // Likely on another graphics card than ours: through the
                     // CPU instead. Stopping makes the hook start over.
                     eprintln!("game hook: {e:#}; trying shared memory");
+                    source = None;
                     unsafe { (*hook_info).force_shmem = true };
                     let _ = unsafe { SetEvent(hook_stop.0) };
                 }
@@ -468,7 +497,7 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
             if Instant::now() > deadline {
                 break Err(anyhow::anyhow!("the hook loaded but sent no picture (is the game drawing?)"));
             }
-            if !nudged && began.elapsed() > Duration::from_secs(3) {
+            if !nudged && began.elapsed() > Duration::from_secs(3) && has_picture(unsafe { &*hook_info }, window) {
                 nudged = true;
                 let _ = unsafe { SetEvent(hook_stop.0) };
             }
@@ -520,12 +549,33 @@ fn run(dir: &Path, gpu: &Gpu, window: HWND, latest: &Arc<Latest>, fps: u32, stop
     };
     // Stopped, unless something else still keeps it capturing (OBS, or our
     // capture taking over from this one): stopping makes it start over, and
-    // that one's picture would stop meanwhile.
+    // that one's picture would stop meanwhile. Only while it has a picture,
+    // and not again if it was just asked to start over: it keeps a stop till
+    // it next has one, and one it let go of by itself (the game deleted its
+    // GL context with its window, or released its swap chain) it's starting
+    // over from already: the stop took that new picture away from the
+    // capture following the game (it showed the last one for 3 s here).
     drop(keepalive);
-    if open_mutex(&format!("CaptureHook_KeepAlive{pid}")).is_none() {
+    let asked = source.as_ref().is_some_and(|s| restarted == Some(s.number));
+    if !asked && has_picture(unsafe { &*hook_info }, window) && open_mutex(&format!("CaptureHook_KeepAlive{pid}")).is_none() {
         let _ = unsafe { SetEvent(hook_stop.0) };
     }
     result
+}
+
+/// Keep the hook copying the game's pictures at least every `interval` ns.
+/// Another capturer of the same game sets its own pace: OBS's Game Capture
+/// sets it back to twice OBS's frame rate every 2 s (its
+/// `reset_frame_interval`, read in OBS's source): with OBS at 60 fps, 120
+/// pictures a second at most, whatever the game draws, far too few to blend
+/// from. Both take their pictures from the same copy, so the quicker pace
+/// serves both: it's set back whenever it's slower.
+fn keep_pace(info: *mut HookInfo, interval: u64) {
+    // Written by the other capturer at any time.
+    let pace = unsafe { &raw mut (*info).frame_interval };
+    if unsafe { pace.read_volatile() } > interval {
+        unsafe { pace.write_volatile(interval) };
+    }
 }
 
 /// The number of the picture the hook copies the game's into, once it has
@@ -539,14 +589,31 @@ fn picture_number(info: *const HookInfo) -> Option<u32> {
     (major != 0).then_some(number)
 }
 
-/// How often to look at the hook's copy of the game's picture, for `fps`
-/// looks a second: four times per look, so that when each picture came up is
-/// known to a quarter of a look (twice, a game at twice the rate came out in
-/// uneven steps), but at most 2400 a second (a guess at what's cheap; each
-/// look still makes a signature), and never under twice per look.
-fn reads_per_second(fps: u32) -> f64 {
-    let fps = fps.max(1) as f64;
-    (4.0 * fps).min(2400.0).max(2.0 * fps)
+/// A window handle the hook wrote in its info: 32 bits, as window handles
+/// are passed between 32- and 64-bit programs, sign-extended.
+fn hook_window(window: u32) -> HWND {
+    HWND(window as i32 as isize as *mut std::ffi::c_void)
+}
+
+/// What the memory telling where the hook's picture is may be named: by the
+/// top-level window of the one it copies from, and the picture's number. The
+/// hook may have picked another window of the game than ours (`window`).
+fn picture_names(info: &HookInfo, window: HWND) -> [String; 3] {
+    let roots = [window, hook_window(info.window)].map(|w| unsafe { GetAncestor(w, GA_ROOT) }.0 as usize as u64);
+    [roots[0], info.window as u64, roots[1]].map(|w| format!("CaptureHook_Texture_{w}_{}", info.map_id))
+}
+
+/// The hook has a picture now: it keeps its memory open while it has one,
+/// and closes it as it lets go. (Taken to while shared memory is captured
+/// from it, which this keeps open too.)
+fn has_picture(info: &HookInfo, window: HWND) -> bool {
+    picture_number(info).is_some() && picture_names(info, window).iter().any(|n| View::open(n, std::mem::size_of::<u32>()).is_some())
+}
+
+/// How often to look at the hook's copy of the game's picture (see
+/// [`CaptureRate::hook_reads_per_second`]).
+pub(crate) fn reads_per_second(rate: CaptureRate) -> f64 {
+    rate.hook_reads_per_second()
 }
 
 /// Start loading the hook into the game with OBS's helper, the way OBS does
@@ -577,6 +644,13 @@ struct Source {
     /// None for shared memory (uploaded by the copy) or a texture shaders
     /// can't read.
     signature_view: Option<ID3D11ShaderResourceView>,
+    /// Its number (see `picture_number`), the window the hook copies the
+    /// game's pictures from (the one the game draws in, which can be a child
+    /// of the one recorded), and the name of the memory the hook tells where
+    /// they are in, which it keeps open for as long as it copies them.
+    number: u32,
+    window: HWND,
+    name: String,
 }
 
 impl Source {
@@ -587,7 +661,31 @@ impl Source {
         }
     }
 
-    fn open(gpu: &Gpu, info: &HookInfo, window: HWND) -> Result<Self> {
+    /// The window the hook copies from is gone from the game (`pid`):
+    /// destroyed, or its handle now another program's. The game made a new
+    /// one, and draws there, and the hook is still on the old one: OBS's
+    /// OpenGL capture copies only the device context it started on (every
+    /// other one the game presents is passed over), and lets go of it only if
+    /// the game resizes that window or deletes its GL context. A game that
+    /// makes its window anew needn't do either: SDL leaves the GL context of
+    /// a window it destroys as it is (ioquake3's `vid_restart` goes that
+    /// way), and LWJGL 2 keeps its context for the new window. The hook then
+    /// copies nothing, ever, and the picture stays as it last was, for every
+    /// capturer; asking it to start over doesn't help while it holds one
+    /// (issue #74). Not when it let go by itself, as it does when the game
+    /// deletes the context first, or for Direct3D (it lets go of a swap
+    /// chain that's released, or presented past for 16 frames): it closes
+    /// its memory then. With shared memory, which this keeps open too, it's
+    /// taken to still have it.
+    fn orphaned(&self, pid: u32) -> bool {
+        let gone = !super::system::window_alive(self.window) || super::system::window_pid(self.window) != pid;
+        gone && (self.memory.is_some() || View::open(&self.name, std::mem::size_of::<u32>()).is_some())
+    }
+
+    /// The hook's picture now, as its info says. None: its memory's gone
+    /// already (the hook makes it before it says it's up, so it let go of
+    /// it since).
+    fn open(gpu: &Gpu, info: &HookInfo, window: HWND) -> Result<Option<Self>> {
         if info.hook_ver_major > HOOK_VER_MAJOR {
             bail!("the hook is version {}.{}, newer than this app knows", info.hook_ver_major, info.hook_ver_minor);
         }
@@ -595,11 +693,9 @@ impl Source {
         if cx < 2 || cy < 2 {
             bail!("the game's picture is {cx}×{cy}");
         }
-        // Named by the game's top-level window and a counter; the hook may
-        // have picked another window of the game than ours.
-        let root = unsafe { GetAncestor(window, GA_ROOT) };
-        let names = [root.0 as usize as u64, info.window as u64].map(|w| format!("CaptureHook_Texture_{w}_{}", info.map_id));
-        let view = names.iter().find_map(|n| View::open(n, info.map_size as usize)).context("can't open the hook's frame")?;
+        let Some((name, view)) = picture_names(info, window).into_iter().find_map(|n| Some((n.clone(), View::open(&n, info.map_size as usize)?))) else {
+            return Ok(None);
+        };
         let (input, memory) = if info.capture_type == 1 {
             let handle = unsafe { *view.ptr::<u32>() } as usize;
             let mut texture: Option<ID3D11Texture2D> = None;
@@ -615,7 +711,7 @@ impl Source {
         let copyable = matches!(desc.Format, DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB | DXGI_FORMAT_B8G8R8A8_TYPELESS) && !info.flip;
         let view = if copyable { None } else { Some(super::quad::shader_view(gpu, &input)?) };
         let signature_view = if memory.is_some() { None } else { view.clone().or_else(|| super::quad::shader_view(gpu, &input).ok()) };
-        Ok(Self { cx, cy, flip: info.flip, input, view, memory, signature_view })
+        Ok(Some(Self { cx, cy, flip: info.flip, input, view, memory, signature_view, number: info.map_id, window: hook_window(info.window), name }))
     }
 
     /// Copy the newest frame into `latest` (through `target`, its render
@@ -759,6 +855,13 @@ mod tests {
         assert_eq!(o.dxgi_resize, 0x36c30);
         assert_eq!(o.dxgi2_release, 0x335a0);
         assert_eq!(o.d3d8_present, 0);
+    }
+
+    #[test]
+    fn window_handles_from_the_hook() {
+        assert_eq!(hook_window(0x0004_0A2E).0 as isize, 0x0004_0A2E);
+        // Sign-extended, as Windows passes them between 32- and 64-bit programs.
+        assert_eq!(hook_window(0xFFFF_FFFE).0 as isize, -2);
     }
 
     #[test]

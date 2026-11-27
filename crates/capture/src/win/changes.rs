@@ -59,10 +59,12 @@ const FORCE_AFTER: f64 = 0.1;
 /// would be too old to belong in a frame anyway, and a driver that loses an
 /// answer must not hold the ring for good.
 const GIVE_UP: f64 = 0.25;
-/// The signature reads every this many rows.
-const SIGNATURE_ROWS: u32 = 2;
+/// The signature reads one texel in this many, on a slant (see
+/// `ps_signature`): every row and every column has some, so a line a pixel
+/// thin and this long is never missed.
+const SIGNATURE_EVERY: u32 = 8;
 /// The comparison's size, in blocks.
-const BLOCKS: (u32, u32) = (160, 90);
+const BLOCKS: (u32, u32) = (80, 45);
 
 struct Slot {
     picture: Arc<Latest>,
@@ -246,7 +248,7 @@ impl Changes {
         let _lock = gpu.exclusive();
         let at = host_now();
         let slot = &self.ring[i];
-        quad.signature(gpu, &slot.signature.0, BLOCKS, source, source_size, SIGNATURE_ROWS);
+        quad.signature(gpu, &slot.signature.0, BLOCKS, source, source_size, SIGNATURE_EVERY);
         let forced = at - self.last_new.max(self.last_forced) > FORCE_AFTER;
         let (check, before, size) = match self.before {
             // (Compared by signature, `before`'s size is the source's.)
@@ -266,6 +268,9 @@ impl Changes {
             }
             None => (Check::First, at, copy()),
         };
+        // Sent now: the signature reads the game's picture when the graphics
+        // card runs it, and the look is timed `at` (one held back to the next
+        // look's flush was seen up to a look late, timed early).
         unsafe { gpu.context.Flush() };
         let Some(size) = size else { return };
         self.push(Pending { slot: i, at, before, size, cursor, check }, source_size);
@@ -302,6 +307,7 @@ impl Changes {
     /// cursor moved goes up too, but only counts as a new picture for frame
     /// blending once the game has drawn nothing new for a while (a menu).
     pub(crate) fn resolve(&mut self, gpu: &Gpu, latest: &Latest, latest_target: &ID3D11RenderTargetView, draw_cursor: &mut dyn FnMut(&ID3D11RenderTargetView, (u32, u32))) {
+        let mut resolved_any = false;
         while let Some(p) = self.pending.front() {
             // Whether it brought a new picture, and whether its slot holds it.
             let (mut differs, copied) = match p.check {
@@ -358,9 +364,23 @@ impl Changes {
                 self.last_new = at;
             }
             self.counted.2 += differs as u32;
-            unsafe { gpu.context.CopyResource(&latest.texture, &self.ring[slot].picture.texture) };
-            draw_cursor(latest_target, p.size);
-            latest.mark(p.size, at, counts);
+            let region = D3D11_BOX { left: 0, top: 0, front: 0, right: p.size.0.min(latest.width), bottom: p.size.1.min(latest.height), back: 1 };
+            if counts
+                && latest.wants_queue()
+                && let Ok(pool_slot) = latest.take_pool_slot()
+            {
+                unsafe { gpu.context.CopySubresourceRegion(&pool_slot.texture, 0, 0, 0, 0, &self.ring[slot].picture.texture, 0, Some(&region)) };
+                draw_cursor(&pool_slot.target, p.size);
+                latest.push_queued(pool_slot, p.size, at);
+            } else {
+                latest.begin_write();
+                unsafe { gpu.context.CopySubresourceRegion(&latest.texture, 0, 0, 0, 0, &self.ring[slot].picture.texture, 0, Some(&region)) };
+                draw_cursor(latest_target, p.size);
+                latest.mark(p.size, at, counts);
+            }
+            resolved_any = true;
+        }
+        if resolved_any {
             unsafe { gpu.context.Flush() };
         }
     }

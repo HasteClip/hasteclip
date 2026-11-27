@@ -46,6 +46,8 @@ mod glass;
 mod go_live;
 mod handoff;
 mod hover_play;
+mod import_apps;
+mod import_ui;
 #[cfg(windows)]
 mod key_hook;
 #[cfg(target_os = "macos")]
@@ -81,6 +83,7 @@ mod sources_ui;
 mod store;
 mod thumbs;
 mod tray;
+mod tray_badge;
 mod theme;
 mod transfer;
 mod time_field;
@@ -664,6 +667,8 @@ struct App {
     pub(crate) copy_rx: std::sync::mpsc::Receiver<Result<(), String>>,
     /// An export or import of clips running (see `transfer.rs`).
     transfer: Option<transfer::Transfer>,
+    /// The Import clips dialog, while it's open.
+    pub(crate) import: Option<import_ui::ImportDialog>,
     /// The library's shared clips, the uploads and unshares running, the
     /// server being asked about links, and the Share with a link dialog
     /// (see `links.rs`).
@@ -939,6 +944,7 @@ impl App {
             copy_tx,
             copy_rx,
             transfer: None,
+            import: None,
             links,
             link_jobs: Vec::new(),
             link_checks: Vec::new(),
@@ -1650,6 +1656,7 @@ impl eframe::App for App {
         self.collection_dialog(&ctx);
         self.delete_dialog(&ctx);
         self.free_up_dialog(&ctx);
+        self.import_dialog(&ctx);
         self.link_dialog(&ctx);
         self.close_dialog(&ctx);
         self.keys_dialog(&ctx);
@@ -2080,7 +2087,8 @@ impl App {
     /// Do what the tray (or another launch) asked.
     fn pump_tray(&mut self, ctx: &egui::Context) {
         let Some(tray) = &self.tray else { return };
-        tray.update(self.rec_state.clipping);
+        let status = tray::Status::of(self.rec_state.clipping, self.rec_state.recording, self.rec_state.streaming);
+        tray.update(self.rec_state.clipping, status);
         for cmd in tray.take() {
             match cmd {
                 tray::Cmd::Open => self.show_window(ctx),

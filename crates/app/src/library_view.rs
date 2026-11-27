@@ -1258,7 +1258,7 @@ impl App {
             }
         }
         ui_kit::menu_sep(ui);
-        if Item::new("Import clips…").icon(icon::DOWNLOAD_SIMPLE).tip("Clips exported from HasteClip on another computer (.hasteclip files). Or drop the files on the window").show(ui).clicked() {
+        if Item::new("Import clips…").icon(icon::DOWNLOAD_SIMPLE).tip("From another clipping app (NVIDIA, Medal, OBS, Steam…), a folder, or a .hasteclip file").show(ui).clicked() {
             action = Some(Action::Import);
         }
         if Item::new(format!("Show clips folder in {}", crate::file_manager())).icon(icon::FOLDER_OPEN).show(ui).clicked()
@@ -1435,7 +1435,7 @@ impl App {
                 self.delete_clips(&paths);
             }
             Action::Export(paths) => self.export_clips(&paths),
-            Action::Import => self.import_clips_dialog(),
+            Action::Import => self.open_import(),
             Action::FreeUp(paths) => self.ask_free_up(&paths),
         }
     }

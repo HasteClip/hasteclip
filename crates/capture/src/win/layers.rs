@@ -19,7 +19,7 @@ use std::thread;
 use std::time::Duration;
 
 use super::camera::CameraLayer;
-use super::d3d::{self, Gpu, Latest};
+use super::d3d::{self, CaptureRate, Gpu, Latest};
 use super::system;
 use crate::layers::{Layer, LayerSource, SharedLayers};
 
@@ -38,10 +38,9 @@ pub(crate) struct Feeds {
     blends: Mutex<Vec<(u64, Arc<Latest>)>>,
     /// Goes up each time a layer gets another picture, or loses one.
     generation: AtomicU64,
-    /// The rate a display or window is captured at (the looks a second,
-    /// with frame blending), shared with the captures, which take up a
-    /// change.
-    fps: Arc<std::sync::atomic::AtomicU32>,
+    /// The rate a display or window is captured at (packed [`CaptureRate`]),
+    /// shared with the captures, which take up a change.
+    rate: Arc<AtomicU64>,
 }
 
 /// One layer's picture.
@@ -122,14 +121,14 @@ fn still_texture(gpu: &Gpu, image: &crate::StillImage) -> anyhow::Result<Arc<Lat
 }
 
 impl Feeds {
-    pub(crate) fn new(gpu: &Gpu, layers: SharedLayers, fps: u32) -> Arc<Self> {
+    pub(crate) fn new(gpu: &Gpu, layers: SharedLayers, rate: CaptureRate) -> Arc<Self> {
         let feeds = Arc::new(Self {
             gpu: gpu.clone(),
             layers,
             feeds: Mutex::new(Vec::new()),
             blends: Mutex::new(Vec::new()),
             generation: AtomicU64::new(0),
-            fps: Arc::new(std::sync::atomic::AtomicU32::new(fps)),
+            rate: Arc::new(AtomicU64::new(rate.pack())),
         });
         feeds.update();
         feeds
@@ -181,10 +180,10 @@ impl Feeds {
             .collect()
     }
 
-    /// Displays and windows are captured at `fps` from now on (the looks
-    /// a second: frame blending changed).
-    pub(crate) fn set_fps(&self, fps: u32) {
-        self.fps.store(fps, Ordering::Relaxed);
+    /// Displays and windows are captured at `rate` from now on (frame blending
+    /// changed).
+    pub(crate) fn set_rate(&self, rate: CaptureRate) {
+        self.rate.store(rate.pack(), Ordering::Relaxed);
     }
 
     /// Follow the layer list: a picture for each layer added (or changed
@@ -213,14 +212,14 @@ impl Feeds {
                     }
                 }
                 LayerSource::Camera { .. } => continue,
-                LayerSource::Display { id, .. } => match CaptureFeed::start(&self.gpu, Target::Display(id.clone()), self.fps.clone()) {
+                LayerSource::Display { id, .. } => match CaptureFeed::start(&self.gpu, Target::Display(id.clone()), self.rate.clone()) {
                     Ok(display) => Feed::Display { id: id.clone(), display },
                     Err(e) => {
                         eprintln!("display layer: {e:#}");
                         continue;
                     }
                 },
-                LayerSource::Window { app, .. } => match CaptureFeed::start(&self.gpu, Target::Window(app.clone()), self.fps.clone()) {
+                LayerSource::Window { app, .. } => match CaptureFeed::start(&self.gpu, Target::Window(app.clone()), self.rate.clone()) {
                     Ok(window) => Feed::Window { app: app.clone(), window },
                     Err(e) => {
                         eprintln!("window layer: {e:#}");
@@ -229,7 +228,7 @@ impl Feeds {
                 },
                 LayerSource::Browser { url, width, height, css, .. } => {
                     let host = super::browser::BrowserHost::start(url.clone(), *width, *height, css.clone());
-                    match CaptureFeed::start(&self.gpu, Target::Browser(host), self.fps.clone()) {
+                    match CaptureFeed::start(&self.gpu, Target::Browser(host), self.rate.clone()) {
                         Ok(page) => Feed::Browser { url: url.clone(), size: (*width, *height), css: css.clone(), page },
                         Err(e) => {
                             eprintln!("browser layer: {e:#}");
@@ -577,9 +576,8 @@ struct CaptureFeed {
 }
 
 impl CaptureFeed {
-    /// Captured at `rate` (frames a second, as `d3d::Capture::start` takes
-    /// them), which can change while it runs.
-    fn start(gpu: &Gpu, target: Target, rate: Arc<std::sync::atomic::AtomicU32>) -> anyhow::Result<Self> {
+    /// Captured at `rate` (packed [`CaptureRate`]), which can change while it runs.
+    fn start(gpu: &Gpu, target: Target, rate: Arc<AtomicU64>) -> anyhow::Result<Self> {
         // Room for any display (a window fits in the biggest; one bigger
         // is shrunk to fit): it can be another by the time it's found.
         let (w, h) = system::largest_display_box();
@@ -595,19 +593,19 @@ impl CaptureFeed {
                 Target::Browser(_) => "browser layer".to_owned(),
             };
             while !stop2.load(Ordering::Relaxed) {
-                let fps = rate.load(Ordering::Relaxed);
+                let r = CaptureRate::unpack(rate.load(Ordering::Relaxed));
                 let started = match &target {
                     Target::Display(id) => system::connected_monitor(id)
                         .ok_or_else(|| anyhow::anyhow!("the display isn't connected"))
-                        .and_then(|monitor| d3d::monitor_item(monitor).and_then(|item| d3d::Capture::start(&gpu, &item, &latest2, d3d::Of::Display(monitor), fps)))
+                        .and_then(|monitor| d3d::monitor_item(monitor).and_then(|item| d3d::Capture::start(&gpu, &item, &latest2, d3d::Of::Display(monitor), r)))
                         .map(|c| (c, None)),
                     Target::Window(app) => system::find_app_window(app)
                         .ok_or_else(|| anyhow::anyhow!("{app} isn't open"))
-                        .and_then(|hwnd| d3d::window_item(hwnd).and_then(|item| d3d::Capture::start(&gpu, &item, &latest2, d3d::Of::Window(hwnd), fps)).map(|c| (c, Some(hwnd)))),
+                        .and_then(|hwnd| d3d::window_item(hwnd).and_then(|item| d3d::Capture::start(&gpu, &item, &latest2, d3d::Of::Window(hwnd), r)).map(|c| (c, Some(hwnd)))),
                     Target::Browser(host) => host
                         .window()
                         .ok_or_else(|| anyhow::anyhow!("the page isn't up yet"))
-                        .and_then(|hwnd| d3d::window_item(hwnd).and_then(|item| d3d::Capture::start(&gpu, &item, &latest2, d3d::Of::Page(hwnd), fps)).map(|c| (c, Some(hwnd)))),
+                        .and_then(|hwnd| d3d::window_item(hwnd).and_then(|item| d3d::Capture::start(&gpu, &item, &latest2, d3d::Of::Page(hwnd), r)).map(|c| (c, Some(hwnd)))),
                 };
                 match started {
                     Ok((capture, window)) => {
@@ -615,11 +613,11 @@ impl CaptureFeed {
                         // A window closed ends its capture; one hidden away
                         // (not minimized) is looked for again, it may be another.
                         let gone = |w: Option<windows::Win32::Foundation::HWND>| w.is_some_and(|h| !system::window_alive(h));
-                        let mut at = fps;
+                        let mut at = r;
                         while !stop2.load(Ordering::Relaxed) && !capture.is_closed() && !gone(window) {
                             thread::sleep(Duration::from_millis(50));
                             // Frame blending changed: as fast as its looks.
-                            let now = rate.load(Ordering::Relaxed);
+                            let now = CaptureRate::unpack(rate.load(Ordering::Relaxed));
                             if now != at {
                                 capture.set_rate(now);
                                 at = now;
