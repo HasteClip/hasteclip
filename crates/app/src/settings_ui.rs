@@ -125,7 +125,7 @@ fn group_matches(name: &str, f: &Filter) -> bool {
         #[cfg(target_os = "macos")]
         "Permissions" => crate::setup::Need::ALL.iter().any(|n| f.shows(n.words()) || f.shows(&[n.label()])) || f.shows(&["permissions", "privacy", "allow"]),
         "Voice" => f.shows(&["save by voice", "hasteclip that", "speech", "command", "voice samples", "review", "keep", "improve"]),
-        "App" => f.shows(&["appearance", "theme", "dark", "light", "system", "open at login", "autostart", "startup", "start with", "closing the window", "tray", "menu bar", "quit", "discord", "activity", "rich presence"]),
+        "App" => f.shows(&["appearance", "theme", "dark", "light", "system", "open at login", "autostart", "startup", "start with", "start minimized", "start minimised", "closing the window", "tray", "menu bar", "quit", "discord", "activity", "rich presence"]),
         "About" => f.shows(&["update", "version", "what's new", "license", "licence", "about", "source code", "copyright", "open source", "reset", "defaults"]),
         _ => false,
     }
@@ -965,7 +965,9 @@ impl App {
                     }
                 });
             }
-            if f.shows(&["open at login", "autostart", "startup", "start with"]) {
+            // Start minimized is found by its own words too, beside the
+            // switch it needs.
+            if f.shows(&["open at login", "autostart", "startup", "start with", "start minimized", "start minimised", "start in the tray", "start in the menu bar"]) {
                 let mut on = crate::autostart::is_on();
                 let (r, _) = l.row(Row::new(crate::autostart::label()), |ui| ui_kit::switch(ui, &mut on));
                 if r.changed()
@@ -1940,6 +1942,16 @@ mod search_tests {
         // Nothing of Video's finds it.
         let f = Filter { q: "discord".to_owned() };
         assert!(!Pane::Video.groups().iter().any(|g| group_matches(g, &f)));
+    }
+
+    /// Start minimized is found by its own name, in App, where it sits
+    /// under the autostart switch it needs.
+    #[test]
+    fn searching_finds_start_minimized() {
+        for q in ["minimized", "start minimized", "minimised"] {
+            let f = Filter { q: q.to_owned() };
+            assert!(group_matches("App", &f), "{q}");
+        }
     }
 
     /// Video's settings are found in the group they're in on its pane.
