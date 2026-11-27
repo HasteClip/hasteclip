@@ -125,7 +125,7 @@ fn group_matches(name: &str, f: &Filter) -> bool {
         #[cfg(target_os = "macos")]
         "Permissions" => crate::setup::Need::ALL.iter().any(|n| f.shows(n.words()) || f.shows(&[n.label()])) || f.shows(&["permissions", "privacy", "allow"]),
         "Voice" => f.shows(&["save by voice", "hasteclip that", "speech", "command", "voice samples", "review", "keep", "improve"]),
-        "App" => f.shows(&["appearance", "theme", "dark", "light", "system", "open at login", "autostart", "startup", "start with", "closing the window", "tray", "menu bar", "quit", "discord", "activity", "rich presence"]),
+        "App" => f.shows(&["appearance", "theme", "dark", "light", "system", "open at login", "autostart", "startup", "start with", "start in the tray", "start in the menu bar", "start minimized", "start minimised", "closing the window", "tray", "menu bar", "quit", "discord", "activity", "rich presence"]),
         "About" => f.shows(&["update", "version", "what's new", "license", "licence", "about", "source code", "copyright", "open source", "reset", "defaults"]),
         _ => false,
     }
@@ -964,14 +964,23 @@ impl App {
                     }
                 });
             }
-            if f.shows(&["open at login", "autostart", "startup", "start with"]) {
+            if f.shows(&["open at login", "autostart", "startup", "start with", "start in the tray", "start in the menu bar", "start minimized", "start minimised"]) {
                 let mut on = crate::autostart::is_on();
                 let (r, _) = l.row(Row::new(crate::autostart::label()), |ui| ui_kit::switch(ui, &mut on));
                 if r.changed()
                     && let Err(e) = crate::autostart::set(on)
                 {
+                    on = !on;
                     self.toast_error(format!("Couldn't change that: {e}"));
                 }
+                // Where it starts. Only with a tray: without one, its window
+                // opens all the same (see `main`).
+                let place = if cfg!(target_os = "macos") { "menu bar" } else { "tray" };
+                let label = format!("Start in the {place}");
+                let tip = format!("Started with the computer, it waits in the {place}: clipping and shortcuts work, and the window stays closed. Off: the window opens.");
+                l.well("autostart_well", on && self.tray.is_some(), |l| {
+                    l.row(Row::new(&label).kid().tip(&label, &tip), |ui| ui_kit::switch(ui, &mut self.settings.start_in_tray));
+                });
             }
             if self.tray.is_some() && f.shows(&["closing the window", "tray", "menu bar", "quit"]) {
                 let place = if cfg!(target_os = "macos") { "menu bar" } else { "tray" };

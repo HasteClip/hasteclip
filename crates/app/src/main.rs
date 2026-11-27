@@ -214,8 +214,11 @@ fn main() -> eframe::Result<()> {
     if !test_instance {
         proxy::forget_kept();
     }
-    // Started with the computer: straight to the tray.
-    let background = std::env::args().any(|a| a == autostart::BACKGROUND) && tray::available();
+    // Started with the computer: straight to the tray, unless it's set to
+    // open its window then (Settings' Start in the tray), so the settings
+    // are read before the window opens.
+    let settings = RecordSettings::load();
+    let background = std::env::args().any(|a| a == autostart::BACKGROUND) && settings.start_in_tray && tray::available();
     // Before anything talks to the desktop portal (screen capture, shortcuts),
     // which wants to know who we are, and needs our `.desktop` file for that.
     #[cfg(target_os = "linux")]
@@ -288,7 +291,7 @@ fn main() -> eframe::Result<()> {
             #[cfg(target_os = "macos")]
             shell::centre_window_buttons(cc);
             ui_kit::apply(&cc.egui_ctx);
-            Ok(Box::new(App::new(cc.egui_ctx.clone(), instance, background)))
+            Ok(Box::new(App::new(cc.egui_ctx.clone(), instance, background, settings)))
         }),
     );
     // The window couldn't open because a system library is missing: say
@@ -805,10 +808,10 @@ struct App {
 }
 
 impl App {
-    /// `background`: started with the computer, for the tray.
-    fn new(ctx: egui::Context, instance: Option<std::net::TcpListener>, background: bool) -> Self {
+    /// `background`: started with the computer, for the tray. `settings`:
+    /// as saved (`RecordSettings::load`).
+    fn new(ctx: egui::Context, instance: Option<std::net::TcpListener>, background: bool, settings: RecordSettings) -> Self {
         add_symbol_font(&ctx);
-        let settings = RecordSettings::load();
         let screen_placement = std::sync::Arc::new(std::sync::Mutex::new(settings.screen_placement()));
         // egui keeps the window's frame in step (on Wayland, drawn by winit).
         ctx.set_theme(settings.theme.preference());

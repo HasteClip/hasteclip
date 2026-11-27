@@ -1,10 +1,13 @@
 //! Starting HasteClip with the computer: the user's startup list on Windows
 //! (the registry's Run key, no admin needed), a login item (LaunchAgent) on
-//! macOS, an autostart entry on Linux. It starts in the tray (`--background`).
-//! The switch reads and writes that entry itself, so it always shows what's
-//! really set, and nothing changes unless it's flipped.
+//! macOS, an autostart entry on Linux. It starts in the tray (`--background`),
+//! or with its window open if Settings' Start in the tray is off: that's read
+//! at launch (`RecordSettings::start_in_tray`), so the entry is the same
+//! either way. The switch reads and writes that entry itself, so it always
+//! shows what's really set, and nothing changes unless it's flipped.
 
-/// The launch argument for starting in the tray.
+/// The launch argument for starting with the computer: in the tray, unless
+/// it's set to open its window then.
 pub const BACKGROUND: &str = "--background";
 
 /// What the switch is called here.
