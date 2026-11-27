@@ -1603,6 +1603,10 @@ pub struct RecordSettings {
     /// Closing the window keeps HasteClip running in the tray (where
     /// there is one) instead of quitting.
     pub close_to_tray: bool,
+    /// Started with the computer, it waits in the tray (where there is
+    /// one) instead of opening its window. Read at launch (see `main`):
+    /// the startup entry is the same either way (`autostart`).
+    pub start_in_tray: bool,
     /// The first close asked which (then it just does it).
     pub close_asked: bool,
     /// macOS: which time the permissions screen was last shown at launch
@@ -1715,6 +1719,7 @@ impl Default for RecordSettings {
             library_sort: LibrarySort::Newest,
             theme: Theme::System,
             close_to_tray: true,
+            start_in_tray: true,
             close_asked: false,
             setup_shown: 0,
             game_titles: GameTitles::default(),
@@ -3578,6 +3583,14 @@ mod tests {
         )
         .unwrap();
         assert!(s.webcam.unwrap().enabled);
+    }
+
+    /// Settings saved before there was a choice start in the tray, as
+    /// starting with the computer always did; a choice saved is kept.
+    #[test]
+    fn older_settings_start_in_the_tray() {
+        assert!(RecordSettings::from_saved(Some(br#"{"fps": 60}"#)).start_in_tray);
+        assert!(!RecordSettings::from_saved(Some(br#"{"fps": 60, "start_in_tray": false}"#)).start_in_tray);
     }
 
     /// The one webcam of older settings becomes the first of the list, in
