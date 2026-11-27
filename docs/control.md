@@ -51,7 +51,7 @@ because the time changes.
 | `streaming` | bool | Live. |
 | `recording_secs` | number | Whole seconds since the recording started. Only there while recording. |
 | `stream_secs` | number | Whole seconds since going live. Only there while live. |
-| `clip_secs` | number | How far back a clip reaches. |
+| `clip_secs` | number | How far back a clip reaches: everything the replay buffer keeps (Clip length in Settings). A clip asked for with a longer `secs` is this long. |
 | `can_screenshot` | bool | Screenshots work on this system. |
 | `can_stream` | bool | Streaming works on this system. |
 | `scene` | number | The id of the scene shown. |
@@ -101,7 +101,7 @@ see it.
 
 | Request | What it does |
 |---|---|
-| `{"do":"save_clip"}` | Saves a clip while clipping. While recording, it also marks the moment (and only marks it when clipping is off), as the Save clip shortcut does. |
+| `{"do":"save_clip"}` | Saves a clip while clipping. While recording, it also marks the moment (and only marks it when clipping is off), as the Save clip shortcut does. Add `"secs":30` to save only the last 30 seconds; more than `clip_secs` (or right after clipping started, more than it has yet) saves everything there is, as left out or `0` does. HasteClip 0.8 ignores `secs` and saves everything. |
 | `{"do":"screenshot"}` | Takes a screenshot. |
 | `{"do":"mark"}` | Marks the moment in the recording. |
 | `{"do":"clipping"}` | Starts or stops clipping. Add `"on":true` or `"on":false` to only start or only stop. |

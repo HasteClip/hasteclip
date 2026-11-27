@@ -23,6 +23,11 @@ use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 
 use crate::settings::{ShortcutAction, Shortcuts};
 
+/// What each registered shortcut's id triggers, for the shortcut event
+/// handler, with how far back each Save clip one reaches (`None`: all
+/// that's kept).
+type Ids = Arc<Mutex<Vec<(u32, ShortcutAction, Option<u32>)>>>;
+
 /// The registered shortcuts. The manager must stay alive for them to work.
 pub struct Registered {
     /// `None` when the desktop portal has them instead.
@@ -36,8 +41,8 @@ pub struct Registered {
     ctx: egui::Context,
     /// What's registered now, with the action each id triggers.
     active: Vec<(HotKey, ShortcutAction)>,
-    /// The same by id, for the shortcut event handler.
-    ids: Arc<Mutex<Vec<(u32, ShortcutAction)>>>,
+    /// The same by id.
+    ids: Ids,
     /// Presses from the handler, and whether it saved the clip (or took the
     /// screenshot) itself.
     presses: Receiver<(ShortcutAction, bool)>,
@@ -55,7 +60,7 @@ impl Registered {
     /// clip saves and Take a screenshot takes it through `quick` as the key is
     /// pressed, frames or not.
     pub fn new(ctx: egui::Context, quick: crate::service::QuickSave) -> Result<Self, String> {
-        let ids: Arc<Mutex<Vec<(u32, ShortcutAction)>>> = Default::default();
+        let ids: Ids = Default::default();
         let (tx, presses) = channel();
         #[cfg(target_os = "linux")]
         if crate::portal_shortcuts::wanted() {
@@ -71,10 +76,10 @@ impl Registered {
         let (handler_ids, wake) = (ids.clone(), ctx.clone());
         let tx = Mutex::new(tx);
         let press: Arc<dyn Fn(u32) + Send + Sync> = Arc::new(move |id: u32| {
-            let action = handler_ids.lock().ok().and_then(|ids| ids.iter().find(|(i, _)| *i == id).map(|(_, a)| *a));
-            if let Some(action) = action {
+            let found = handler_ids.lock().ok().and_then(|ids| ids.iter().find(|(i, ..)| *i == id).map(|(_, a, secs)| (*a, *secs)));
+            if let Some((action, secs)) = found {
                 let saved = match action {
-                    ShortcutAction::SaveClip => quick.save(),
+                    a if a.saves_clip() => quick.save_last(secs),
                     ShortcutAction::Screenshot => quick.screenshot(),
                     _ => false,
                 };
@@ -145,7 +150,10 @@ impl Registered {
         }
         self.errors.clear();
         let mut valid = Vec::new();
-        for action in ShortcutAction::ALL.into_iter().filter(|a| a.available()) {
+        // Every Save clip shortcut, whatever its length, goes the same way
+        // as the rest: registered, watched by the key tap or hook, or bound
+        // through the desktop portal.
+        for action in wanted.actions().into_iter().filter(|a| a.available()) {
             let text = wanted.get(action);
             if text.is_empty() {
                 continue;
@@ -172,12 +180,12 @@ impl Registered {
             self.portal = None;
             let list = valid.iter().map(|(_, a)| (*a, wanted.get(*a).to_owned())).collect();
             if let Some(quick) = self.quick.clone() {
-                self.portal = Some(crate::portal_shortcuts::Portal::bind(list, ours, self.ctx.clone(), quick));
+                self.portal = Some(crate::portal_shortcuts::Portal::bind(list, wanted.clone(), ours, self.ctx.clone(), quick));
             }
         }
         let _ = valid;
         if let Ok(mut ids) = self.ids.lock() {
-            *ids = self.active.iter().map(|(h, a)| (h.id(), *a)).collect();
+            *ids = self.active.iter().map(|(h, a)| (h.id(), *a, wanted.clip_secs(*a))).collect();
         }
         #[cfg(target_os = "macos")]
         crate::key_tap::watch(&self.active.iter().map(|(h, _)| *h).collect::<Vec<_>>());

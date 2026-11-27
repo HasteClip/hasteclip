@@ -473,7 +473,8 @@ impl App {
         };
         let btn = if state.clipping {
             Btn::new(Kind::Primary, if saving { "Saving…" } else { "Save clip" })
-                .keys(self.shortcut_keys(A::SaveClip))
+                // The keys that do the same: all that's kept.
+                .keys(self.settings.shortcuts.whole_clip().and_then(|a| self.shortcut_keys(a)))
                 .tip(format!("Save the last {}", crate::settings_ui::length_words(self.settings.replay_seconds)))
         } else if state.recording {
             Btn::new(Kind::Stop, "Stop recording").with_icon(egui_phosphor::fill::STOP).filled().keys(self.shortcut_keys(A::ToggleRecord)).tip("Stop and save the recording")

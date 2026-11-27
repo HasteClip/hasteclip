@@ -34,7 +34,7 @@ use futures_util::StreamExt;
 use futures_util::future::{Either, select};
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 
-use crate::settings::ShortcutAction;
+use crate::settings::{ShortcutAction, Shortcuts};
 
 /// The app's id with the desktop: the portal keeps our shortcuts under it,
 /// and it names the `.desktop` file that says what we're called.
@@ -95,13 +95,14 @@ pub struct Portal {
 
 impl Portal {
     /// Bind `wanted` (each action with its keys, as `global_hotkey` text) in
-    /// the background. `ctx` is woken when one is pressed; Save clip and
+    /// the background; `all` says how far back each Save clip one reaches,
+    /// and names it. `ctx` is woken when one is pressed; Save clip and
     /// Take a screenshot are done through `quick` as they're pressed, as
     /// the UI may not run then (a hidden window gets no frames). `ours`: they were
     /// just changed in Settings, so where the keys are set here (KDE), ours
     /// win; else (starting up) keys changed in the desktop's settings meanwhile
     /// are taken, and only missing ones set.
-    pub fn bind(wanted: Vec<(ShortcutAction, String)>, ours: bool, ctx: egui::Context, quick: crate::service::QuickSave) -> Self {
+    pub fn bind(wanted: Vec<(ShortcutAction, String)>, all: Shortcuts, ours: bool, ctx: egui::Context, quick: crate::service::QuickSave) -> Self {
         let (tx, events) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let state = Arc::new(Mutex::new(State::Binding));
@@ -118,7 +119,7 @@ impl Portal {
                 // keys of the ones it has.
                 let new: Vec<NewShortcut> = wanted
                     .iter()
-                    .map(|(action, keys)| NewShortcut::new(id(*action), action.label()).preferred_trigger(trigger(keys).as_deref()))
+                    .map(|(action, keys)| NewShortcut::new(id(*action), name(*action, &all)).preferred_trigger(trigger(keys).as_deref()))
                     .collect();
                 let bound = proxy.bind_shortcuts(&session, &new, None, Default::default()).await?.response()?;
                 let assigned = |list: &[ashpd::desktop::global_shortcuts::Shortcut]| list.iter().filter_map(|s| Some((action(s.id())?, s.trigger_description().to_owned()))).collect();
@@ -128,7 +129,7 @@ impl Portal {
                 if let Some(conn) = kde::connect().await {
                     let mut now = Vec::new();
                     for (action, keys) in &wanted {
-                        let Ok(theirs) = kde::key(&conn, *action).await else { continue };
+                        let Ok(theirs) = kde::key(&conn, *action, &name(*action, &all)).await else { continue };
                         let mine = kde::to_qt(keys);
                         let mut kept = theirs;
                         if theirs != mine {
@@ -136,9 +137,9 @@ impl Portal {
                                 Some(Some(text)) if !ours => adopted2.lock().unwrap().push((*action, text)),
                                 // Keys we can't write in Settings: left as they are.
                                 Some(None) if !ours => {}
-                                _ => match kde::set(&conn, *action, mine).await {
+                                _ => match kde::set(&conn, *action, &name(*action, &all), mine).await {
                                     Ok(()) => kept = mine,
-                                    Err(e) => eprintln!("KDE shortcuts: couldn't set the keys for {}: {e}", action.label()),
+                                    Err(e) => eprintln!("KDE shortcuts: couldn't set the keys for {}: {e}", name(*action, &all)),
                                 },
                             }
                         }
@@ -158,7 +159,7 @@ impl Portal {
                         Either::Left((Some(press), _)) => {
                             if let Some(a) = action(press.shortcut_id()) {
                                 let done = match a {
-                                    ShortcutAction::SaveClip => quick.save(),
+                                    a if a.saves_clip() => quick.save_last(all.clip_secs(a)),
                                     ShortcutAction::Screenshot => quick.screenshot(),
                                     _ => false,
                                 };
@@ -172,7 +173,7 @@ impl Portal {
                             // Changed in KDE's settings: ours follow.
                             if let Some((conn, known)) = &mut kde_keys {
                                 for (action, was) in known.iter_mut() {
-                                    if let Ok(k) = kde::key(conn, *action).await
+                                    if let Ok(k) = kde::key(conn, *action, &name(*action, &all)).await
                                         && k != *was
                                     {
                                         *was = k;
@@ -250,17 +251,33 @@ impl Drop for Portal {
     }
 }
 
-fn id(action: ShortcutAction) -> &'static str {
+/// A shortcut's id with the desktop. More Save clip ones go by their place
+/// (`save-clip-2` is the second): their keys stay theirs when their length
+/// changes.
+fn id(action: ShortcutAction) -> String {
     match action {
-        ShortcutAction::SaveClip => "save-clip",
-        ShortcutAction::ToggleBuffer => "toggle-replay-buffer",
-        ShortcutAction::ToggleRecord => "toggle-recording",
-        ShortcutAction::Screenshot => "take-screenshot",
+        ShortcutAction::SaveClip => "save-clip".into(),
+        ShortcutAction::MoreClip(i) => format!("save-clip-{}", u32::from(i) + 2),
+        ShortcutAction::ToggleBuffer => "toggle-replay-buffer".into(),
+        ShortcutAction::ToggleRecord => "toggle-recording".into(),
+        ShortcutAction::Screenshot => "take-screenshot".into(),
     }
 }
 
 fn action(id: &str) -> Option<ShortcutAction> {
+    if let Some(n) = id.strip_prefix("save-clip-").and_then(|n| n.parse::<u8>().ok()).filter(|n| *n >= 2) {
+        return Some(ShortcutAction::MoreClip(n - 2));
+    }
     ShortcutAction::ALL.into_iter().find(|a| self::id(*a) == id)
+}
+
+/// What the desktop calls a shortcut in its settings: a Save clip one
+/// with a length says it ("Save clip (last 30 seconds)").
+fn name(action: ShortcutAction, all: &Shortcuts) -> String {
+    match all.clip_secs(action) {
+        Some(secs) => format!("{} (last {})", action.label(), crate::settings_ui::length_words(secs)),
+        None => action.label().to_owned(),
+    }
 }
 
 /// A `global_hotkey` shortcut ("alt+F10") as the XDG shortcuts spec writes
@@ -342,21 +359,23 @@ mod kde {
         zbus::Connection::session().await.inspect_err(|e| eprintln!("KDE shortcuts: {e}")).ok()
     }
 
-    fn action_id(action: ShortcutAction) -> Vec<&'static str> {
-        vec![APP_ID, id(action), "HasteClip", action.label()]
+    /// Its id there: our app, the shortcut's id, and their names (`name`,
+    /// as the desktop shows it).
+    fn action_id(action: ShortcutAction, name: &str) -> Vec<String> {
+        vec![APP_ID.to_owned(), id(action), "HasteClip".to_owned(), name.to_owned()]
     }
 
     /// The first keys a shortcut has there, if any.
-    pub async fn key(conn: &zbus::Connection, action: ShortcutAction) -> zbus::Result<Option<i32>> {
-        let reply = conn.call_method(Some("org.kde.kglobalaccel"), "/kglobalaccel", Some("org.kde.KGlobalAccel"), "shortcutKeys", &(action_id(action),)).await?;
+    pub async fn key(conn: &zbus::Connection, action: ShortcutAction, name: &str) -> zbus::Result<Option<i32>> {
+        let reply = conn.call_method(Some("org.kde.kglobalaccel"), "/kglobalaccel", Some("org.kde.KGlobalAccel"), "shortcutKeys", &(action_id(action, name),)).await?;
         let keys: Vec<(Vec<i32>,)> = reply.body().deserialize()?;
         Ok(keys.first().and_then(|(k,)| k.first().copied()).filter(|k| *k != 0))
     }
 
     /// Give a shortcut these keys there (or none).
-    pub async fn set(conn: &zbus::Connection, action: ShortcutAction, key: Option<i32>) -> zbus::Result<()> {
+    pub async fn set(conn: &zbus::Connection, action: ShortcutAction, name: &str, key: Option<i32>) -> zbus::Result<()> {
         let keys: Vec<(Vec<i32>,)> = key.map(|k| (vec![k, 0, 0, 0],)).into_iter().collect();
-        conn.call_method(Some("org.kde.kglobalaccel"), "/kglobalaccel", Some("org.kde.KGlobalAccel"), "setForeignShortcutKeys", &(action_id(action), keys)).await?;
+        conn.call_method(Some("org.kde.kglobalaccel"), "/kglobalaccel", Some("org.kde.KGlobalAccel"), "setForeignShortcutKeys", &(action_id(action, name), keys)).await?;
         Ok(())
     }
 
@@ -420,8 +439,18 @@ mod tests {
 
     #[test]
     fn ids_round_trip() {
-        for a in ShortcutAction::ALL {
-            assert_eq!(action(id(a)), Some(a));
+        for a in ShortcutAction::ALL.into_iter().chain([ShortcutAction::MoreClip(0), ShortcutAction::MoreClip(7)]) {
+            assert_eq!(action(&id(a)), Some(a));
         }
+        assert_eq!(id(ShortcutAction::MoreClip(0)), "save-clip-2");
+        assert_eq!(action("save-clip-1"), None);
+    }
+
+    #[test]
+    fn save_clip_names_say_their_length() {
+        let mut all = Shortcuts::default();
+        all.more_clips.push(crate::settings::ClipShortcut { keys: "alt+F11".into(), secs: Some(30) });
+        assert_eq!(name(ShortcutAction::SaveClip, &all), "Save clip");
+        assert_eq!(name(ShortcutAction::MoreClip(0), &all), "Save clip (last 30 seconds)");
     }
 }

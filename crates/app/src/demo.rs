@@ -872,7 +872,7 @@ pub(crate) fn capture_thread(rx: mpsc::Receiver<crate::service::Cmd>, tx: mpsc::
                     running = running.with(mode, true);
                     let _ = tx.send(Evt::State(running));
                 }
-                Cmd::SaveClip(dir, details) => {
+                Cmd::SaveClip(dir, details, _) => {
                     let next = SAVES.get().and_then(|q| q.lock().ok()?.pop_front());
                     let tx = tx.clone();
                     std::thread::spawn(move || {
