@@ -2,12 +2,7 @@
 //! (the registry's Run key, no admin needed), a login item (LaunchAgent) on
 //! macOS, an autostart entry on Linux. It starts in the tray (`--background`).
 //! The switch reads and writes that entry itself, so it always shows what's
-//! really set, and nothing changes unless it's flipped, except once: a new
-//! install turns it on ([`new_install`]). Uninstalling takes it away on
-//! Windows (the installer's hook, in `main`); macOS and Linux have no
-//! uninstaller to do it.
-
-use std::path::Path;
+//! really set, and nothing changes unless it's flipped.
 
 /// The launch argument for starting in the tray.
 pub const BACKGROUND: &str = "--background";
@@ -43,7 +38,7 @@ pub fn set(on: bool) -> Result<(), String> {
 /// computer would launch the developer's build. A Mac app opened straight
 /// from its disk image, or from where it was downloaded (macOS runs that
 /// from a copy of its own), won't be there when you next log in.
-fn not_installed(exe: &Path) -> Option<&'static str> {
+fn not_installed(exe: &std::path::Path) -> Option<&'static str> {
     if exe.components().any(|c| c.as_os_str() == "target") {
         return Some("only the installed app can start with the computer");
     }
@@ -55,7 +50,9 @@ fn not_installed(exe: &Path) -> Option<&'static str> {
 
 /// A new install's first launch (see `RecordSettings::autostart_pending`):
 /// HasteClip starts with the computer from now on, in the tray, as a clipper
-/// only saves what happens while it runs. Not on a Linux desktop without a
+/// only saves what happens while it runs. It's the one time the entry changes
+/// without the switch being flipped, besides uninstalling on Windows (the
+/// installer's hook, in `main`, takes it away). Not on a Linux desktop without a
 /// tray: started there, it would open its window every time you log in.
 /// Whether that's settled: not while this copy isn't the installed app (a
 /// build of your own, a Mac app opened from its disk image), so the
@@ -167,6 +164,7 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     /// Only the installed app starts with the computer: not a build of your
     /// own, nor a Mac app opened from its disk image or from Downloads.
