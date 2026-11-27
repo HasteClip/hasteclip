@@ -175,9 +175,16 @@ fn main() -> eframe::Result<()> {
     logfile::log_cursor();
     // The installer's hooks (install, update, uninstall) run the app with special
     // arguments and exit here; a downloaded update left uninstalled is put in
-    // place now. Does nothing in a development build.
+    // place now. Does nothing in a development build. Uninstalled, it no
+    // longer starts with Windows (nothing would be there to start).
     #[cfg(windows)]
-    velopack::VelopackApp::build().run();
+    velopack::VelopackApp::build()
+        .on_before_uninstall_fast_callback(|_| {
+            if let Err(e) = autostart::set(false) {
+                eprintln!("couldn't take HasteClip off the startup list: {e}");
+            }
+        })
+        .run();
     #[cfg(target_os = "linux")]
     if update_linux::apply_pending_at_launch() {
         return Ok(());
@@ -1007,6 +1014,14 @@ impl App {
             sessions: Default::default(),
             presence_since: None,
         };
+        // A new install starts with the computer from its first launch (see
+        // `autostart::new_install`). Saved at once, so the next launch knows
+        // it's no new install, or that the installed app still has to do it.
+        if app.settings.autostart_pending && app.persist_settings {
+            app.settings.autostart_pending = !autostart::new_install();
+            app.saved_settings = app.settings.to_json();
+            RecordSettings::save_json(&app.saved_settings);
+        }
         // Dev aid: `HASTECLIP_OPEN_EDITOR=<clip>` opens the editor at launch, so the
         // editor can be checked without clicking through the library.
         if let Some(clip) = std::env::var_os("HASTECLIP_OPEN_EDITOR") {

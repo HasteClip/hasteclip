@@ -1572,6 +1572,12 @@ pub struct RecordSettings {
     pub replay_seconds: u32,
     /// Start the replay buffer as soon as the app opens, so you never miss a moment.
     pub auto_start_buffer: bool,
+    /// A new install still has to start with the computer
+    /// ([`crate::autostart::new_install`]): set on the first launch with no
+    /// settings saved (see [`RecordSettings::load`]), kept while the copy
+    /// opened isn't the installed app. Off in settings from before, which
+    /// keep the start-up entry they had.
+    pub autostart_pending: bool,
     /// Record a game on the games and apps list the whole time it's open
     /// (see `sessions.rs`).
     pub record_sessions: bool,
@@ -1582,6 +1588,8 @@ pub struct RecordSettings {
     /// Going live: where to, and how.
     pub stream: StreamCfg,
     /// Saying "HasteClip that" saves a clip (while the replay buffer runs).
+    /// Off until turned on: listening is yours to choose. (Every settings
+    /// file has it, from the first version on, so a choice saved stays.)
     pub voice_clip: bool,
     /// Keep short snippets of the microphone around what the voice detector fires on or
     /// nearly fires on, to listen through and label (never sent anywhere by itself).
@@ -1696,13 +1704,14 @@ impl Default for RecordSettings {
 
             replay_seconds: 60,
             auto_start_buffer: true,
+            autostart_pending: false,
             record_sessions: false,
             auto_update: true,
             // On to begin with: friends see what you clip, and where to get
             // HasteClip. Settings saved before keep theirs (off).
             discord_presence: true,
             stream: StreamCfg::default(),
-            voice_clip: true,
+            voice_clip: false,
             voice_samples: false,
             encoder: Encoder::Auto,
             container: Container::Mp4,
@@ -1977,10 +1986,24 @@ fn load_path() -> Option<PathBuf> {
     std::env::var_os("HASTECLIP_SETTINGS").map(PathBuf::from).or_else(settings_path)
 }
 
+/// HasteClip's first launch here: no settings saved where they would be,
+/// and no clips folder where clips go (`clips`: with no settings, the
+/// default one). Older versions saved settings only once one was changed,
+/// but made that folder as soon as clipping started, so one that kept every
+/// setting as it was isn't taken for a new install.
+fn new_install(settings: Option<&std::path::Path>, clips: &std::path::Path) -> bool {
+    settings.is_some_and(|p| !p.exists()) && !clips.exists()
+}
+
 impl RecordSettings {
     /// Last saved settings, or defaults on first run / unreadable file.
     pub fn load() -> Self {
-        Self::from_saved(load_path().and_then(|p| std::fs::read(p).ok()).as_deref())
+        let path = load_path();
+        let mut s = Self::from_saved(path.as_ref().and_then(|p| std::fs::read(p).ok()).as_deref());
+        if new_install(path.as_deref(), &s.output_dir) {
+            s.autostart_pending = true;
+        }
+        s
     }
 
     /// Settings from a saved file (defaults without one), brought up to date.
@@ -3149,6 +3172,50 @@ mod screen_capture_tests {
         let s: RecordSettings = serde_json::from_str(r#"{"screen_capture": "duplication"}"#).unwrap();
         assert_eq!(capture::ScreenCapture::from(s.screen_capture), capture::ScreenCapture::Duplication);
         assert!(s.to_json().contains(r#""screen_capture": "duplication""#));
+    }
+}
+
+#[cfg(test)]
+mod new_install_tests {
+    use super::*;
+
+    /// A new install: nothing saved, and no clips folder. Settings saved
+    /// before, or a clips folder an older version made, aren't one.
+    #[test]
+    fn only_a_first_launch_is_a_new_install() {
+        let dir = std::env::temp_dir().join(format!("hc-new-install-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (settings, clips) = (dir.join("settings.json"), dir.join("hasteclip"));
+        assert!(new_install(Some(&settings), &clips));
+        assert!(!new_install(None, &clips), "nowhere to keep settings, so no telling");
+        std::fs::create_dir_all(&clips).unwrap();
+        assert!(!new_install(Some(&settings), &clips), "clipped here before");
+        std::fs::remove_dir_all(&clips).unwrap();
+        std::fs::write(&settings, "{}").unwrap();
+        assert!(!new_install(Some(&settings), &clips), "settings saved before");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Settings from before leave the start-up entry as it was, as does a
+    /// reset; a new install still waiting for the installed app keeps
+    /// waiting until it's opened.
+    #[test]
+    fn only_a_new_install_waits_to_start_with_the_computer() {
+        let s: RecordSettings = serde_json::from_str(r#"{"fps": 60}"#).unwrap();
+        assert!(!s.autostart_pending);
+        assert!(!RecordSettings::default().autostart_pending);
+        let waiting = RecordSettings { autostart_pending: true, ..Default::default() };
+        assert!(RecordSettings::from_saved(Some(waiting.to_json().as_bytes())).autostart_pending);
+    }
+
+    /// Saving by voice is off in a new install; settings that have it on
+    /// (every saved file says, from the first version on) keep it.
+    #[test]
+    fn voice_is_off_until_turned_on() {
+        assert!(!RecordSettings::default().voice_clip);
+        let on: RecordSettings = serde_json::from_str(r#"{"voice_clip": true}"#).unwrap();
+        assert!(RecordSettings::from_saved(Some(on.to_json().as_bytes())).voice_clip);
     }
 }
 
