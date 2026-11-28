@@ -1,24 +1,24 @@
 {
- "time": "2026-11-27T05:21:02Z",
+ "time": "2026-11-28T04:57:08Z",
  "releases": {
   "v0.8.0": {
    "published": "2026-11-10T00:41:32Z",
    "files": {
     "assets.win.json": 1,
     "HasteClip-0.7.0-full.nupkg": 2,
-    "HasteClip-0.8.0-delta.nupkg": 383,
+    "HasteClip-0.8.0-delta.nupkg": 385,
     "HasteClip-0.8.0-full.nupkg": 10,
-    "HasteClip-linux-x64.tar.gz": 65,
+    "HasteClip-linux-x64.tar.gz": 66,
     "HasteClip-linux-x64.tar.gz.sha256": 22,
-    "HasteClip-mac-arm64.dmg": 72,
+    "HasteClip-mac-arm64.dmg": 75,
     "HasteClip-mac-arm64.zip": 12,
     "HasteClip-mac-arm64.zip.sha256": 11,
     "HasteClip-web-engine-linux-x64-156.0.26.tar.xz": 5,
     "HasteClip-web-engine-linux-x64-156.0.26.tar.xz.sha256": 4,
-    "HasteClip-win-Portable.zip": 8,
-    "HasteClip-win-Setup.exe": 463,
+    "HasteClip-win-Portable.zip": 10,
+    "HasteClip-win-Setup.exe": 497,
     "RELEASES": 2,
-    "releases.win.json": 80708
+    "releases.win.json": 86201
    },
    "ids": {
     "assets.win.json": 729548582,
@@ -43,7 +43,7 @@
    "files": {
     "assets.win.json": 1,
     "HasteClip-0.6.0-full.nupkg": 2,
-    "HasteClip-0.7.0-delta.nupkg": 265,
+    "HasteClip-0.7.0-delta.nupkg": 266,
     "HasteClip-0.7.0-full.nupkg": 10,
     "HasteClip-linux-x64.tar.gz": 56,
     "HasteClip-linux-x64.tar.gz.sha256": 6,
@@ -53,7 +53,7 @@
     "HasteClip-win-Portable.zip": 15,
     "HasteClip-win-Setup.exe": 304,
     "RELEASES": 2,
-    "releases.win.json": 102570
+    "releases.win.json": 108063
    },
    "ids": {
     "assets.win.json": 706980360,
@@ -76,7 +76,7 @@
    "files": {
     "assets.win.json": 1,
     "HasteClip-0.5.0-full.nupkg": 1,
-    "HasteClip-0.6.0-delta.nupkg": 267,
+    "HasteClip-0.6.0-delta.nupkg": 268,
     "HasteClip-0.6.0-full.nupkg": 3,
     "HasteClip-linux-x64.tar.gz": 12,
     "HasteClip-linux-x64.tar.gz.sha256": 5,
@@ -86,7 +86,7 @@
     "HasteClip-win-Portable.zip": 3,
     "HasteClip-win-Setup.exe": 86,
     "RELEASES": 1,
-    "releases.win.json": 111421
+    "releases.win.json": 116910
    },
    "ids": {
     "assets.win.json": 692930288,
@@ -109,7 +109,7 @@
    "files": {
     "assets.win.json": 4,
     "HasteClip-0.4.0-full.nupkg": 1,
-    "HasteClip-0.5.0-delta.nupkg": 276,
+    "HasteClip-0.5.0-delta.nupkg": 277,
     "HasteClip-0.5.0-full.nupkg": 9,
     "HasteClip-linux-x64.tar.gz": 5,
     "HasteClip-linux-x64.tar.gz.sha256": 1,
@@ -119,7 +119,7 @@
     "HasteClip-win-Portable.zip": 2,
     "HasteClip-win-Setup.exe": 14,
     "RELEASES": 2,
-    "releases.win.json": 112613
+    "releases.win.json": 118104
    },
    "ids": {
     "assets.win.json": 689746532,
@@ -150,7 +150,7 @@
     "HasteClip-win-Portable.zip": 6,
     "HasteClip-win-Setup.exe": 360,
     "RELEASES": 1,
-    "releases.win.json": 134670
+    "releases.win.json": 140160
    },
    "ids": {
     "assets.win.json": 660792356,
@@ -171,7 +171,7 @@
    "files": {
     "assets.win.json": 1,
     "HasteClip-0.2.0-full.nupkg": 1,
-    "HasteClip-0.3.0-delta.nupkg": 117,
+    "HasteClip-0.3.0-delta.nupkg": 118,
     "HasteClip-0.3.0-full.nupkg": 2,
     "HasteClip-linux-x64.tar.gz": 17,
     "HasteClip-linux-x64.tar.gz.sha256": 4,
@@ -179,7 +179,7 @@
     "HasteClip-win-Portable.zip": 4,
     "HasteClip-win-Setup.exe": 90,
     "RELEASES": 1,
-    "releases.win.json": 136028
+    "releases.win.json": 141515
    },
    "ids": {
     "assets.win.json": 657679296,
@@ -208,7 +208,7 @@
     "HasteClip-win-Portable.zip": 3,
     "HasteClip-win-Setup.exe": 200,
     "RELEASES": 1,
-    "releases.win.json": 137832
+    "releases.win.json": 143316
    },
    "ids": {
     "assets.win.json": 651583381,
@@ -235,7 +235,7 @@
     "HasteClip-win-Portable.zip": 1,
     "HasteClip-win-Setup.exe": 11,
     "RELEASES": 1,
-    "releases.win.json": 137879
+    "releases.win.json": 143362
    },
    "ids": {
     "assets.win.json": 648665540,
